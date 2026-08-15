@@ -8,3 +8,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+memmap2.workspace = true
+thiserror.workspace = true
+
+[[bin]]
+name = "gguf-info"
+path = "src/bin/gguf_info.rs"
