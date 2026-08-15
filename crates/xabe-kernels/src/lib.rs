@@ -21,6 +21,9 @@
 //!   single most important module in the crate: 30 of Qwen3.6's 40 layers
 //!   are Gated DeltaNet, and it has no flash-attention-style reference
 //!   implementation anywhere else to lean on. Start here.
+//! - [`gemv`] — row-major scalar GEMV, the oracle for the LM head's
+//!   248,320 x 2,048 matrix-vector product, plus the `argmax` the sampled
+//!   token actually comes from.
 //! - [`moe`] — router top-k, block-aligned dispatch
 //!   (`moe_align_block_size`), and the grouped-GEMM forward pass.
 //! - [`attention`] — causal GQA softmax attention, naive and
@@ -41,6 +44,7 @@ pub mod attention;
 pub mod compare;
 pub mod conv;
 pub mod gdn;
+pub mod gemv;
 pub mod moe;
 pub mod norm;
 pub mod quant;
