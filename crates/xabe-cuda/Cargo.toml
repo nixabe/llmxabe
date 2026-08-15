@@ -8,3 +8,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "cublaslt", "fallback-dynamic-loading", "cuda-12040"] }
