@@ -8,3 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+xabe-model.workspace = true
+thiserror.workspace = true
+rustc-hash.workspace = true
+parking_lot.workspace = true
