@@ -423,6 +423,35 @@ than 73.48.
 before there was a KV cache. Real decode is measured in the next section, and
 it turns out the floor was the *pessimistic* proxy, not the flattering one.
 
+## NVRTC: 22 of 32 compiles were redundant (2026-08-16)
+
+The `--log-level debug` instrumentation added with the `tracing` migration
+logs every NVRTC invocation, which made a build-time cost visible that nobody
+had looked for. `LayerOpsKernels::new` takes only a context — it has no
+geometry to specialize on — and is constructed independently by `forward.rs`
+and by the GDN, attention and MoE blocks, so all four produced byte-identical
+PTX. `Forward::reshape` then doubled the whole bill by building a second shape
+over the same weights.
+
+Fixed by memoizing `kernels::compile` on its source. Measured with
+`bench_decode --log-level debug`, building two shapes (prefill 128 and decode
+1) on GPU 0:
+
+| | NVRTC invocations | NVRTC total | build, 2 shapes |
+| --- | ---: | ---: | ---: |
+| before | 32 | 5,875 ms | 15.5 s |
+| after | **10** | **1,633 ms** | **11.1 s** |
+
+**4.24 s of NVRTC removed, 28% off the build.** This is build time, not
+inference time: it changes how long `Forward::new` takes and nothing about
+tok/s. It is worth recording because the "build s" column in `bench_forward`
+is measured and reported, and two thirds of it was duplicate work.
+
+The key is the source string, which is sound because PTX is a pure function of
+(source, arch) and arch is a constant. PTX is cached, not modules — a
+`CudaModule` belongs to the context that loaded it, and loading still happens
+per context, which is what keeps this correct across the three GPUs.
+
 ## Decode, measured (2026-08-16)
 
 `tests/decode.rs` landed the KV cache and the carried recurrent state, so
