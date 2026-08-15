@@ -5,15 +5,15 @@
 | Kernel | Layers | Risk | Plan | Status |
 | --- | --- | --- | --- | --- |
 | Gated DeltaNet, recurrent (decode) | 30 | **critical** | Delta rule, one token at a time | **sm_75 kernel, max_abs 2.98e-8 vs reference** |
-| Gated DeltaNet, chunked (prefill) | 30 | **critical** | Port from llama.cpp; needs per-chunk triangular inverses | CPU reference |
-| GDN short convolution (depthwise, width 4) | 30 | medium | Write; causal depthwise conv over the fused qkv stream, before the delta rule | not started |
-| MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; Q6_K dequant in prologue | CPU reference |
-| Flash attention (GQA 16:2, head 256) | 10 | medium | Port llama.cpp sm_75 path | CPU reference |
+| Gated DeltaNet, chunked (prefill) | 30 | **critical** | Forward substitution per chunk, not explicit inverses | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
+| GDN short convolution (depthwise, width 4) | 30 | medium | Write; causal depthwise conv over the fused qkv stream, before the delta rule | in progress |
+| MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference** |
+| Flash attention (GQA 16:2, head 256) | 10 | medium | Online softmax, `BM = 1`, scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window** |
 | LM head GEMV (2048 × 248,320) | 1 | medium | Write; split-K, dominates weight bandwidth | not started |
-| `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | CPU reference |
-| mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | CPU reference |
+| `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | **sm_75 kernel, tables exact vs reference** |
+| mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | **sm_75 kernel, tail bit-identical** |
 | Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | **sm_75 kernel, bit-identical to reference** |
-| Router top-k over 256 experts | 40 | low | Write; warp-level bitonic | CPU reference |
+| Router top-k over 256 experts | 40 | low | Write; warp-level bitonic | **sm_75 kernel, expert IDs exact vs reference** |
 | RMSNorm, SwiGLU, residual | all | low | Write | CPU reference |
 | Vision encoder | — | deferred | Out of scope — images stay on llama.cpp | n/a |
 
@@ -26,6 +26,34 @@ The short convolution was missing from this table entirely until the weight
 schema made it visible — `qwen35moe.ssm.conv_kernel = 4`, one
 `ssm_conv1d.weight` per GDN layer. It is not optional and it is not folded
 into the delta rule; see [MODEL.md](MODEL.md).
+
+### What the landed kernels do not yet do
+
+Every kernel above is gated on **correctness against the CPU reference**, and
+none of them has been tuned. Three limits are worth stating so the numbers
+above are not read as more than they are:
+
+- **No tensor cores anywhere.** Attention is the scalar fp32 path. The
+  `m16n8k8` MMA family that `compute_75` makes reachable runs at roughly 8×
+  the fp32 FMA rate, and none of that is in hand. It is also unreachable at
+  the current `BM = 1` shape — `m16n8k8` needs 16 query rows resident, which
+  means re-tiling — and fp16 operands would end the fp32 comparison the kernel
+  is gated on. The re-tiling that unlocks MMA is the same change that raises
+  arithmetic intensity, and at ~0.5 FLOP/byte attention is bandwidth-bound, so
+  the intensity is the half that pays.
+- **The MoE dispatch kernel is single-block.** Correct and deterministic, fine
+  at decode shapes, not tuned for large prefill batches.
+- **Graph capture is argued, not demonstrated.** The MoE path has fixed grids,
+  fixed buffers and a device-side token count precisely so it can be captured,
+  but no capture has been performed yet. That is milestone 06's gate, and
+  until it runs this remains a structural claim.
+
+**Shared memory on this hardware is 48 KiB per block**, not 64 KiB. The 64 KiB
+figure is per-SM; a block reaches it only by opting in through
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, which cudarc's
+`LaunchConfig` does not expose. Both landed kernels that budget shared memory
+(attention at 1,088 B and the chunked GDN solve at 33 KiB) are sized against
+48 KiB and need no opt-in.
 
 ## Order of work
 
