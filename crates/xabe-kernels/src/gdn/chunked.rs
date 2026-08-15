@@ -28,13 +28,13 @@
 //! exp(log_decay_t)`.
 //!
 //! Within one chunk of length `C` (0-indexed `t = 0..C`), let `S_in` be the
-//! state carried in from before the chunk, `lambda_t = exp(sum_{i<=t}
-//! log_decay_i)` the cumulative in-chunk decay through and including token
-//! `t`, and `T_t = S_t / lambda_t` the "undecayed" state. Substituting into
-//! the recurrence and simplifying (the `a_t` cancels) gives a *decay-free*
-//! delta rule on `T`, with value rescaled by the *inverse* of the
-//! cumulative decay: `T_t = T_{t-1} + beta_t (v_t/lambda_t - T_{t-1} k_t)
-//! k_t^T`, `T_{-1} = S_in`.
+//! state carried in from before the chunk, `g_t = sum_{i<=t} log_decay_i`
+//! the cumulative in-chunk log-decay through and including token `t`,
+//! `lambda_t = exp(g_t)`, and `T_t = S_t / lambda_t` the "undecayed" state.
+//! Substituting into the recurrence and simplifying (the `a_t` cancels)
+//! gives a *decay-free* delta rule on `T`, with value rescaled by the
+//! *inverse* of the cumulative decay: `T_t = T_{t-1} + beta_t (v_t/lambda_t
+//! - T_{t-1} k_t) k_t^T`, `T_{-1} = S_in`.
 //!
 //! Because every step of that recurrence adds a single outer product to
 //! `T`, `T_t = S_in + sum_{i<=t} u_i k_i^T` for some per-token vector
@@ -47,12 +47,8 @@
 //! ```
 //!
 //! In matrix form, with `A[t][i] = beta_t (k_i . k_t)` for `i < t` (zero
-//! elsewhere — strictly lower triangular) and `W[t] = beta_t * (v_t/lambda_t
-//! minus S_in k_t)`: `(I + A) U = W`, so `U = (I + A)^{-1} W`. `I + A` is
-//! unit lower triangular (ones on the diagonal, since `A`'s diagonal is
-//! zero) — exactly what
-//! [`crate::gdn::tri::invert_unit_lower_triangular`] solves by forward
-//! substitution.
+//! elsewhere — strictly lower triangular) and `W[t] = beta_t (v_t/lambda_t
+//! minus S_in k_t)`: `(I + A) U = W`, so `U = (I + A)^{-1} W`.
 //!
 //! (Some presentations of the ungated delta rule instead write this as
 //! `(I - A')^{-1}` for a differently-signed `A'`; that is an equivalent
@@ -66,6 +62,72 @@
 //! Once `U` is known, the per-token output and the chunk-end state follow
 //! directly: `o_t = S_t q_t = lambda_t (S_in q_t + sum_{i<=t} u_i (k_i .
 //! q_t))`, and `S_{C-1} = lambda_{C-1} (S_in + sum_i u_i k_i^T)`.
+//!
+//! # Why the unknown solved for is `lambda_t u_t`, not `u_t`
+//!
+//! That last block is the algebra, and it **was** what this module
+//! computed. It is unusable in fp32 at this model's decay rates: `1/lambda_t`
+//! is unbounded below, and Qwen3.6's per-token log-decays reach **-91.578**,
+//! so `lambda_1` is already `1.691e-40` (already subnormal in fp32) and
+//! `v_1 / lambda_1` overflows fp32 at `|v| > 5.8e-2`, against activations of
+//! order 1. Measured on the real rates over 197 tokens at
+//! `head_dim = 128`, `chunk_len = 64`: **25082 of 25216 outputs and 16384 of
+//! 16384 state elements non-finite** — see
+//! [`tests::chunked_forward_stays_finite_at_this_models_real_decay_rates`],
+//! which carries those numbers as the regression it guards. The recurrent
+//! form is immune, because it decays the state one token at a time and never
+//! accumulates; the differential test in `xabe-engine` therefore had to
+//! *exclude* this reference as an oracle on exactly the inputs that matter
+//! most.
+//!
+//! The fix is a change of unknown, not a clamp. Substitute `u'_t = lambda_t
+//! u_t` and multiply the `t`-th row of the system through by `lambda_t`:
+//!
+//! ```text
+//! u'_t + beta_t sum_{i<t} (k_i . k_t) (lambda_t/lambda_i) u'_i
+//!                                 = beta_t * (v_t - lambda_t * (S_in k_t))
+//! o_t   = lambda_t * (S_in q_t) + sum_{i<=t} (lambda_t/lambda_i) u'_i (k_i . q_t)
+//! S_out = lambda_{C-1} * S_in + sum_i (lambda_{C-1}/lambda_i) u'_i k_i^T
+//! ```
+//!
+//! In matrix form, with `A'[t][i] = beta_t (k_i . k_t) exp(g_t - g_i)` for
+//! `i < t` (zero elsewhere — strictly lower triangular) and `W'[t] = beta_t
+//! (v_t - lambda_t (S_in k_t))`: `(I + A') U' = W'`, so `U' = (I + A')^{-1}
+//! W'`. `I + A'` is still unit lower triangular (ones on the diagonal, since
+//! `A'`'s diagonal is zero) — exactly what
+//! [`crate::gdn::tri::invert_unit_lower_triangular`] solves by forward
+//! substitution, unchanged. The intra-chunk attention matrix picks up the
+//! same ratio: `P'[t][i] = (k_i . q_t) exp(g_t - g_i)` for `i <= t`, whose
+//! `i = t` entry is `exp(0) = 1`.
+//!
+//! Every surviving decay factor is either `lambda_t = exp(g_t)` or a ratio
+//! `lambda_a / lambda_i = exp(g_a - g_i)` with `a >= i`, and `g_a - g_i =
+//! sum_{i<m<=a} log_decay_m` is a sum of *actual per-token log-decays over a
+//! sub-range of the chunk*. **No division by a decay remains anywhere**, and
+//! no exponential of a positive quantity is formed from non-positive
+//! log-decays. For this model every `log_decay <= 0` structurally — `gate-N
+//! = softplus(alpha + dt_bias) * ssm_a` with every entry of `ssm_a` negative
+//! and softplus positive — so every exponent is `<= 0`, every factor is in
+//! `(0, 1]`, and `exp` cannot overflow. The failure mode that remains is
+//! underflow to `+0`, which is the correct limit: a state that has decayed
+//! below fp32 really has stopped contributing.
+//!
+//! No clamp and no epsilon is added. llama.cpp's `build_delta_net_chunking`
+//! (`src/models/delta-net-base.cpp`) builds `decay_mask = exp(g_cs_j -
+//! g_cs_i)` and `g_diff = exp(g_last - g_cum)` the same way and never
+//! divides; it quotes the PyTorch reference's `torch.clamp(..., max=50.0)`
+//! in a comment but **emits no clamp of its own**, and a clamp at `+50`
+//! could not bind here anyway because every exponent above is non-positive.
+//! A clamp would change the answer silently on exactly the inputs it fired
+//! for.
+//!
+//! The device kernel `xabe_cuda::kernels::gdn_chunked` carries the same
+//! substitution (it reached it first, for the same measured reason) and
+//! differs only in solving the triangular system by forward substitution
+//! rather than by materialising `(I + A')^{-1}`; its module docs give the
+//! shared-memory and stability argument for that choice. This module keeps
+//! the explicit inverse because it is graded on being a legible
+//! transcription of the derivation above.
 
 use crate::gdn::recurrent::{GdnState, l2_normalize, output_scale, zero_state};
 use crate::gdn::tri::{invert_unit_lower_triangular, matmul};
@@ -135,27 +197,33 @@ pub fn chunked_forward(
             .collect();
         let k_norm: Vec<Vec<f32>> = (start..end).map(|t| l2_normalize(&k[t], 1e-6)).collect();
 
-        // Cumulative in-chunk decay, inclusive of token t's own decay.
-        let mut lambda = vec![0.0f32; c];
+        // Cumulative in-chunk log-decay, inclusive of token t's own decay,
+        // kept in **log space**. `lambda_t = exp(g_t)` is materialised only
+        // where it multiplies something; it is never divided by, and no
+        // reciprocal of it is ever formed. See the module docs.
+        let mut gcum = vec![0.0f32; c];
         let mut running = 0.0f32;
         for i in 0..c {
             running += log_decay[start + i];
-            lambda[i] = running.exp();
+            gcum[i] = running;
         }
 
-        // W[t] = beta_t * (v_t/lambda_t - S_in . k_t)
+        // W'[t] = beta_t * (v_t - lambda_t * (S_in k_t))
         let s_in_t = transpose(&state, head_dim, head_dim); // [head_dim(k), head_dim(v)]
         let s_in_dot_k = matmul(&flatten(&k_norm), &s_in_t, c, head_dim, head_dim); // [c, head_dim(v)]
         let mut w = vec![0.0f32; c * head_dim];
         for t in 0..c {
             let beta_t = beta[start + t];
+            let lambda_t = gcum[t].exp();
             for vi in 0..head_dim {
-                let v_tilde = v[start + t][vi] / lambda[t];
-                w[t * head_dim + vi] = beta_t * (v_tilde - s_in_dot_k[t * head_dim + vi]);
+                let predicted = lambda_t * s_in_dot_k[t * head_dim + vi];
+                w[t * head_dim + vi] = beta_t * (v[start + t][vi] - predicted);
             }
         }
 
-        // A[t][i] = beta_t * (k_i . k_t) for i < t, else 0.
+        // A'[t][i] = beta_t * (k_i . k_t) * lambda_t/lambda_i for i < t, else
+        // 0. The ratio is `exp(g_t - g_i)` — the decay accumulated strictly
+        // between token i and token t — not a quotient of two exponentials.
         let mut a = vec![0.0f32; c * c];
         for t in 0..c {
             for i in 0..t {
@@ -164,13 +232,15 @@ pub fn chunked_forward(
                     .zip(k_norm[t].iter())
                     .map(|(&a, &b)| a * b)
                     .sum();
-                a[t * c + i] = beta[start + t] * dot;
+                a[t * c + i] = beta[start + t] * dot * (gcum[t] - gcum[i]).exp();
             }
         }
         let m_inv = invert_unit_lower_triangular(&a, c);
-        let u = matmul(&m_inv, &w, c, c, head_dim); // [c, head_dim(v)]
+        let u = matmul(&m_inv, &w, c, c, head_dim); // [c, head_dim(v)], holds U'
 
-        // Causal-inclusive intra-chunk attention: P[t][i] = k_i . q_t for i <= t.
+        // Causal-inclusive intra-chunk attention, carrying the same decay
+        // ratio: P'[t][i] = (k_i . q_t) * lambda_t/lambda_i for i <= t. The
+        // i = t entry has ratio exp(0) = 1.
         let mut p = vec![0.0f32; c * c];
         for t in 0..c {
             for i in 0..=t {
@@ -179,26 +249,39 @@ pub fn chunked_forward(
                     .zip(q_scaled[t].iter())
                     .map(|(&a, &b)| a * b)
                     .sum();
-                p[t * c + i] = dot;
+                p[t * c + i] = dot * (gcum[t] - gcum[i]).exp();
             }
         }
         let o_intra = matmul(&p, &u, c, c, head_dim); // [c, head_dim(v)]
         let o_inter = matmul(&flatten(&q_scaled), &s_in_t, c, head_dim, head_dim); // [c, head_dim(v)]
 
+        // o_t = lambda_t * (S_in q_t) + sum_{i<=t} (lambda_t/lambda_i) u'_i
+        // (k_i . q_t). lambda_t multiplies the *inter*-chunk term only: the
+        // intra-chunk term already carries its ratio per summand, because the
+        // unknown solved for is lambda_i u_i.
         for t in 0..c {
+            let lambda_t = gcum[t].exp();
             let mut o = vec![0.0f32; head_dim];
             for vi in 0..head_dim {
-                o[vi] = lambda[t] * (o_inter[t * head_dim + vi] + o_intra[t * head_dim + vi]);
+                o[vi] = lambda_t * o_inter[t * head_dim + vi] + o_intra[t * head_dim + vi];
             }
             outputs[start + t] = o;
         }
 
-        // Chunk-end state: S_end = lambda_{C-1} * (S_in + sum_i u_i k_i^T).
-        let u_t = transpose(&u, c, head_dim); // [head_dim(v), c]
+        // Chunk-end state: S_end = lambda_{C-1} * S_in
+        //                          + sum_i (lambda_{C-1}/lambda_i) u'_i k_i^T.
+        let mut u_carried = u;
+        for i in 0..c {
+            let ratio = (gcum[c - 1] - gcum[i]).exp();
+            for vi in 0..head_dim {
+                u_carried[i * head_dim + vi] *= ratio;
+            }
+        }
+        let u_t = transpose(&u_carried, c, head_dim); // [head_dim(v), c]
         let sum_term = matmul(&u_t, &flatten(&k_norm), head_dim, c, head_dim); // [head_dim(v), head_dim(k)]
-        let lambda_last = lambda[c - 1];
+        let lambda_last = gcum[c - 1].exp();
         for idx in 0..head_dim * head_dim {
-            state[idx] = lambda_last * (state[idx] + sum_term[idx]);
+            state[idx] = lambda_last * state[idx] + sum_term[idx];
         }
 
         start = end;
@@ -381,6 +464,103 @@ mod tests {
             &tol,
         );
         assert_matches(&chunk_state, &rec_state, &tol);
+    }
+
+    /// The per-token log-decays measured on the real model, as `(token,
+    /// log_decay)`.
+    ///
+    /// The first two are verbatim from Qwen3.6: block 0's smallest per-token
+    /// log-decay is -91.578 (token 1, value head 9) and block 20's is -12.436
+    /// (token 9, head 7). The other two put the same magnitudes in the second
+    /// and third chunks, so a failure has to survive a chunk-to-chunk state
+    /// handoff rather than only the opening chunk.
+    const REAL_DECAY_SPIKES: [(usize, f32); 4] =
+        [(1, -91.578), (9, -12.436), (70, -91.578), (150, -45.0)];
+
+    /// The oracle must stay finite at the decay rates the real model actually
+    /// produces.
+    ///
+    /// This is the defect this module was reformulated to fix. The old
+    /// `v_t / lambda_t` form needed the reciprocal of a cumulative decay, and
+    /// `lambda` reaches `exp(-91.578) = 1.691e-40` by the second token of a
+    /// chunk, so the quotient overflowed fp32 at `|v_t| > 5.8e-2` against
+    /// activations of order 1. Measured on this exact input with that form:
+    /// **25082 of 25216 outputs and 16384 of 16384 state elements
+    /// non-finite**. With the substitution `u'_t =
+    /// lambda_t u_t` (see the module docs) no decay is ever divided by, every
+    /// surviving factor is `exp` of a non-positive argument, and the count is
+    /// 0 and 0.
+    ///
+    /// `xabe-kernels` is the project's oracle: every CUDA kernel is graded
+    /// against it, so an oracle that cannot evaluate the real model's inputs
+    /// silently ungates everything downstream.
+    #[test]
+    fn chunked_forward_stays_finite_at_this_models_real_decay_rates() {
+        let cfg = xabe_model::ModelConfig::qwen3_6_35b_a3b();
+        let head_dim = cfg.gdn.head_dim as usize;
+        let chunk_len = cfg.gdn.chunk_len as usize;
+        // 197 = 3 * 64 + 5: three whole chunks and a ragged tail, so the
+        // spikes land in three different chunks and a state handoff follows
+        // each one.
+        let seq_len = 197;
+
+        let mut rng = Xorshift64Star::new(0xDECA);
+        let (q, k, v, mut log_decay, beta) = random_sequence(&mut rng, seq_len, head_dim);
+        for (t, value) in REAL_DECAY_SPIKES {
+            assert!(t < seq_len);
+            log_decay[t] = value;
+        }
+        // A non-zero carried-in state, so the `lambda_t * (S_in k_t)` term is
+        // exercised rather than multiplied by zero.
+        let initial_state: GdnState = rng.vec_f32(head_dim * head_dim, -0.25, 0.25);
+
+        let (out, state) = chunked_forward(
+            head_dim,
+            chunk_len,
+            &q,
+            &k,
+            &v,
+            &log_decay,
+            &beta,
+            Some(&initial_state),
+        );
+
+        let flat_out = flatten_outputs(&out);
+        let out_nonfinite = flat_out.iter().filter(|x| !x.is_finite()).count();
+        let state_nonfinite = state.iter().filter(|x| !x.is_finite()).count();
+        println!(
+            "min per-token log-decay {:.3} (lambda {:.3e}); non-finite: \
+             {out_nonfinite}/{} outputs, {state_nonfinite}/{} state elements",
+            log_decay.iter().copied().fold(f32::INFINITY, f32::min),
+            log_decay
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min)
+                .exp(),
+            flat_out.len(),
+            state.len(),
+        );
+        assert_eq!(
+            out_nonfinite, 0,
+            "the chunked reference produced non-finite outputs at the real model's decay rates",
+        );
+        assert_eq!(state_nonfinite, 0, "the chunk-end state is non-finite");
+
+        // Finite is necessary but not sufficient: the recurrent form never
+        // accumulates a decay and is immune to this defect, so it is the
+        // oracle for the oracle here.
+        let (rec_out, rec_state) = recurrent_forward(
+            head_dim,
+            &q,
+            &k,
+            &v,
+            &log_decay,
+            &beta,
+            Some(&initial_state),
+        );
+        let tol = Tolerance::gdn_chunk_vs_recurrent();
+        assert_matches(&flat_out, &flatten_outputs(&rec_out), &tol);
+        assert_matches(&state, &rec_state, &tol);
     }
 
     #[test]

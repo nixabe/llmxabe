@@ -48,12 +48,20 @@
 //! [`device_chunked_gdn_survives_this_models_real_decay_rates`] injects those
 //! exact measured values and gates on the result being finite.
 //!
-//! That case compares against the **recurrent** reference only. The host
-//! `chunked_forward` in `xabe-kernels` still divides by the cumulative decay,
-//! so it overflows on precisely these inputs and cannot serve as an oracle for
-//! them; the case detects that per head, says so, and gates on the recurrent
-//! form, which never accumulates a decay and is immune. If the host chunked
-//! form is fixed, the case starts gating on it too without further edits.
+//! That case originally compared against the **recurrent** reference only,
+//! because the host `chunked_forward` in `xabe-kernels` divided by the
+//! cumulative decay too and overflowed on precisely these inputs, so it could
+//! not serve as an oracle for them. The case detected that per head, said so,
+//! and fell back to the recurrent form, which never accumulates a decay and is
+//! immune.
+//!
+//! The host form has since been reformulated the same way. The mechanism
+//! worked as designed: with zero heads now excluded, this case gates against
+//! the host chunked oracle again with **no edit to the gating logic** — and at
+//! `2.235e-8`, some 450x tighter than the recurrent-form comparison. The
+//! per-head exclusion is deliberately kept rather than deleted, so a future
+//! regression degrades this test to a weaker oracle loudly instead of
+//! silently comparing against `NaN`.
 //!
 //! **Broadcast convention.** The CPU reference runs one head, so this file
 //! performs the query/key head broadcast, and it used to do so with
@@ -714,7 +722,8 @@ fn device_chunked_gdn_survives_this_models_real_decay_rates() {
     }
     println!(
         "  xabe-kernels' host chunked_forward overflowed on {host_chunked_overflowed}/{value_heads} \
-         heads and was excluded as an oracle for those; it still divides by the cumulative decay",
+         heads and was excluded as an oracle for those \
+         (0 is expected: the host form no longer divides by the cumulative decay)",
     );
 }
 

@@ -24,8 +24,9 @@
 //!
 //! That statement is unusable in fp32 on this model. `1/lambda_t` is
 //! unbounded: Qwen3.6's per-token log-decays reach **-91.58** (block 0, head
-//! 9), so `lambda_1` is already `2.46e-42` and `v_1 / lambda_1` overflows fp32
-//! at `|v| > 1.2e-4` — the measured `max|v_1|` there is `6.95`. Run as written,
+//! 9), so `lambda_1` is already `1.691e-40` (subnormal) and `v_1 / lambda_1`
+//! overflows fp32 at `|v| > 5.75e-2` — the measured `max|v_1|` there is `6.95`,
+//! two orders past it. Run as written,
 //! block 0's chunked prefill was 38912/38912 `NaN` and block 20's was
 //! 20480/38912. Block 4, whose worst per-token log-decay is only -5.99, came
 //! through and agreed with the recurrent form to `5.96e-8`, so the formulation
