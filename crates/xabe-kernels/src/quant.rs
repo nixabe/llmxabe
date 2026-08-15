@@ -368,3 +368,224 @@ mod tests {
         assert!((y[0] - 2.0).abs() < 1e-4, "y[0] = {}", y[0]);
     }
 }
+
+// ---------------------------------------------------------------------
+// Decoding whole rows from GGUF bytes
+// ---------------------------------------------------------------------
+//
+// The block structs above mirror `ggml-common.h` field for field, but Rust
+// gives no layout guarantee for them, so the bytes are parsed explicitly
+// rather than transmuted. That is the correct call regardless of speed:
+// these are reference paths, and a `#[repr(C)]` transmute would silently
+// depend on padding rules that differ from C's for `[i8; 32]` followed by
+// nothing.
+
+/// Serialized size of one Q8_0 block: `ggml_half` + 32 × `int8_t`.
+pub const BLOCK_Q8_0_BYTES: usize = 2 + QK8_0;
+/// Serialized size of one Q6_K superblock: `ql` + `qh` + `scales` +
+/// `ggml_half`.
+pub const BLOCK_Q6_K_BYTES: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+
+/// A block's bytes were the wrong length for its format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSizeError {
+    /// Format name, for the message.
+    pub format: &'static str,
+    /// Bytes the format requires.
+    pub expected: usize,
+    /// Bytes supplied.
+    pub found: usize,
+}
+
+impl core::fmt::Display for BlockSizeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} needs {} bytes per block, got {}",
+            self.format, self.expected, self.found
+        )
+    }
+}
+
+impl std::error::Error for BlockSizeError {}
+
+impl BlockQ8_0 {
+    /// Parse one block from its on-disk representation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlockSizeError> {
+        if bytes.len() != BLOCK_Q8_0_BYTES {
+            return Err(BlockSizeError {
+                format: "q8_0",
+                expected: BLOCK_Q8_0_BYTES,
+                found: bytes.len(),
+            });
+        }
+        let d = f16::from_le_bytes([bytes[0], bytes[1]]);
+        let mut qs = [0i8; QK8_0];
+        for (q, &b) in qs.iter_mut().zip(&bytes[2..]) {
+            *q = b as i8;
+        }
+        Ok(Self { d, qs })
+    }
+}
+
+impl BlockQ6K {
+    /// Parse one superblock from its on-disk representation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlockSizeError> {
+        if bytes.len() != BLOCK_Q6_K_BYTES {
+            return Err(BlockSizeError {
+                format: "q6_K",
+                expected: BLOCK_Q6_K_BYTES,
+                found: bytes.len(),
+            });
+        }
+        const QL: usize = QK_K / 2;
+        const QH: usize = QK_K / 4;
+        const SC: usize = QK_K / 16;
+
+        let mut ql = [0u8; QL];
+        ql.copy_from_slice(&bytes[..QL]);
+        let mut qh = [0u8; QH];
+        qh.copy_from_slice(&bytes[QL..QL + QH]);
+        let mut scales = [0i8; SC];
+        for (s, &b) in scales.iter_mut().zip(&bytes[QL + QH..QL + QH + SC]) {
+            *s = b as i8;
+        }
+        let d_off = QL + QH + SC;
+        let d = f16::from_le_bytes([bytes[d_off], bytes[d_off + 1]]);
+        Ok(Self { ql, qh, scales, d })
+    }
+}
+
+/// Dequantize a whole Q8_0 row.
+///
+/// `bytes` must be a whole number of blocks; the returned length is
+/// `bytes.len() / BLOCK_Q8_0_BYTES * QK8_0`.
+pub fn dequantize_row_q8_0(bytes: &[u8]) -> Result<Vec<f32>, BlockSizeError> {
+    if !bytes.len().is_multiple_of(BLOCK_Q8_0_BYTES) {
+        return Err(BlockSizeError {
+            format: "q8_0 row",
+            expected: BLOCK_Q8_0_BYTES,
+            found: bytes.len() % BLOCK_Q8_0_BYTES,
+        });
+    }
+    let mut out = Vec::with_capacity(bytes.len() / BLOCK_Q8_0_BYTES * QK8_0);
+    for chunk in bytes.chunks_exact(BLOCK_Q8_0_BYTES) {
+        out.extend_from_slice(&dequantize_q8_0(&BlockQ8_0::from_bytes(chunk)?));
+    }
+    Ok(out)
+}
+
+/// Dequantize a whole Q6_K row.
+pub fn dequantize_row_q6_k(bytes: &[u8]) -> Result<Vec<f32>, BlockSizeError> {
+    if !bytes.len().is_multiple_of(BLOCK_Q6_K_BYTES) {
+        return Err(BlockSizeError {
+            format: "q6_K row",
+            expected: BLOCK_Q6_K_BYTES,
+            found: bytes.len() % BLOCK_Q6_K_BYTES,
+        });
+    }
+    let mut out = Vec::with_capacity(bytes.len() / BLOCK_Q6_K_BYTES * QK_K);
+    for chunk in bytes.chunks_exact(BLOCK_Q6_K_BYTES) {
+        out.extend_from_slice(&dequantize_q6_k(&BlockQ6K::from_bytes(chunk)?));
+    }
+    Ok(out)
+}
+
+/// Widen an fp16 row to fp32.
+pub fn dequantize_row_f16(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+/// Widen a bf16 row to fp32.
+///
+/// bf16 is fp32 with the low 16 mantissa bits removed, so widening is a
+/// shift — not the fp16 conversion, which has a different exponent width.
+/// Getting these two confused produces values wrong by large powers of two,
+/// which is exactly the kind of error that still looks like a plausible
+/// weight distribution.
+pub fn dequantize_row_bf16(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+        .collect()
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    #[test]
+    fn block_sizes_match_the_ggml_layout() {
+        // These are the numbers GGUF's own tensor directory is computed
+        // from, so a mismatch here misaligns every block after the first.
+        assert_eq!(BLOCK_Q8_0_BYTES, 34);
+        assert_eq!(BLOCK_Q6_K_BYTES, 210);
+    }
+
+    #[test]
+    fn q8_0_round_trips_through_bytes() {
+        let mut x = [0.0f32; QK8_0];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = (i as f32 - 16.0) * 0.25;
+        }
+        let block = quantize_q8_0(&x);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&block.d.to_le_bytes());
+        bytes.extend(block.qs.iter().map(|&q| q as u8));
+
+        let parsed = BlockQ8_0::from_bytes(&bytes).expect("parses");
+        assert_eq!(parsed.d.to_bits(), block.d.to_bits());
+        assert_eq!(parsed.qs, block.qs);
+        assert_eq!(dequantize_q8_0(&parsed), dequantize_q8_0(&block));
+    }
+
+    #[test]
+    fn q6_k_round_trips_through_bytes() {
+        let mut x = [0.0f32; QK_K];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = ((i % 61) as f32 - 30.0) * 0.1;
+        }
+        let block = quantize_q6_k(&x);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&block.ql);
+        bytes.extend_from_slice(&block.qh);
+        bytes.extend(block.scales.iter().map(|&s| s as u8));
+        bytes.extend_from_slice(&block.d.to_le_bytes());
+        assert_eq!(bytes.len(), BLOCK_Q6_K_BYTES);
+
+        let parsed = BlockQ6K::from_bytes(&bytes).expect("parses");
+        assert_eq!(dequantize_q6_k(&parsed), dequantize_q6_k(&block));
+    }
+
+    #[test]
+    fn negative_scales_survive_the_byte_round_trip() {
+        // `scales` and `qs` are int8 on disk but arrive as u8. Reading them
+        // unsigned would flip the sign of roughly half of every tensor while
+        // leaving the magnitudes plausible.
+        let bytes = [0xFFu8; BLOCK_Q8_0_BYTES];
+        let block = BlockQ8_0::from_bytes(&bytes).expect("parses");
+        assert!(block.qs.iter().all(|&q| q == -1), "int8 read as unsigned");
+    }
+
+    #[test]
+    fn bf16_widening_is_a_shift_not_an_fp16_conversion() {
+        // 1.0f32 is 0x3F800000; its bf16 form is the top half, 0x3F80.
+        let one = dequantize_row_bf16(&0x3F80u16.to_le_bytes());
+        assert_eq!(one, vec![1.0f32]);
+        // The same bit pattern read as fp16 is 1.875, which is what a
+        // confused implementation would return.
+        let as_f16 = dequantize_row_f16(&0x3F80u16.to_le_bytes());
+        assert!((as_f16[0] - 1.875).abs() < 1e-6, "{:?}", as_f16);
+    }
+
+    #[test]
+    fn a_row_that_is_not_a_whole_number_of_blocks_is_rejected() {
+        assert!(dequantize_row_q6_k(&[0u8; BLOCK_Q6_K_BYTES + 1]).is_err());
+        assert!(dequantize_row_q8_0(&[0u8; 33]).is_err());
+    }
+}

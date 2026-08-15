@@ -23,6 +23,7 @@
 
 pub mod arena;
 pub mod device;
+pub mod kernels;
 pub mod spike;
 
 pub use arena::{ALIGNMENT, Allocation, ArenaError, DeviceArena, memory_info};
@@ -30,4 +31,5 @@ pub use device::{
     ComputeCapability, DeviceInfo, GateFailure, MIN_COMPUTE_CAPABILITY, check_gate,
     driver_available, probe_all,
 };
+pub use kernels::dequant::{DequantError, Dequantizer};
 pub use spike::{CheckOutcome, SpikeReport, TOOLCHAIN_DECISION};

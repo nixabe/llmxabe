@@ -221,6 +221,7 @@ dependencies = [
  "xabe-cache",
  "xabe-cuda",
  "xabe-gguf",
+ "xabe-kernels",
  "xabe-model",
  "xabe-sched",
 ]
