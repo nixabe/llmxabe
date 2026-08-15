@@ -52,6 +52,7 @@ use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::block::moe::MoeBlock;
 use xabe_engine::forward::{Forward, Stage, arena_holds};
+use xabe_engine::state::SequenceState;
 use xabe_engine::weights::DeviceWeights;
 use xabe_gguf::GgufFile;
 use xabe_model::config::{LayerKind, ModelConfig};
@@ -416,8 +417,22 @@ fn main() {
             .map(|i| ((i * 7919 + 1234) % config.vocab_size as usize) as i32)
             .collect();
 
+        // One state, reset before every pass: this profiles a cold prefill,
+        // so each repetition must start at position 0 with a zeroed recurrent
+        // state rather than continue the previous one.
+        let mut state = match forward.new_state(&stream, n) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("n = {n}: FAILED to allocate sequence state: {e}");
+                continue;
+            }
+        };
+
         for _ in 0..WARMUP {
-            forward.run(&stream, &ids, |_, _| {}).expect("warmup");
+            state.reset(&stream).expect("reset");
+            forward
+                .run(&stream, &mut state, &ids, |_, _| {})
+                .expect("warmup");
         }
         stream.synchronize().expect("sync");
 
@@ -428,17 +443,21 @@ fn main() {
         // adjacent measurement windows is comparable to the thing being
         // measured. Two brackets around the instrumented block make that
         // drift visible instead of letting it masquerade as overhead.
-        let timed_plain = |f: &mut Forward| {
+        let timed_plain = |f: &mut Forward, st: &mut SequenceState| {
             let mut plain = Vec::with_capacity(reps);
             for _ in 0..reps {
+                // Inside the timed region: the reset used to live inside
+                // `run`, and moving it out would make these numbers
+                // incomparable with the ones already recorded.
                 let t = Instant::now();
-                f.run(&stream, &ids, |_, _| {}).expect("pass");
+                st.reset(&stream).expect("reset");
+                f.run(&stream, st, &ids, |_, _| {}).expect("pass");
                 stream.synchronize().expect("sync");
                 plain.push(t.elapsed().as_secs_f64() * 1e3);
             }
             stats(&plain)
         };
-        let (plain_mean, plain_sd) = timed_plain(&mut forward);
+        let (plain_mean, plain_sd) = timed_plain(&mut forward, &mut state);
 
         // --- the same passes with the event markers on ----------------------
         forward
@@ -449,7 +468,10 @@ fn main() {
         let mut worst: BTreeMap<Bucket, f64> = BTreeMap::new();
         for _ in 0..reps {
             let t = Instant::now();
-            forward.run(&stream, &ids, |_, _| {}).expect("pass");
+            state.reset(&stream).expect("reset");
+            forward
+                .run(&stream, &mut state, &ids, |_, _| {})
+                .expect("pass");
             stream.synchronize().expect("sync");
             instrumented.push(t.elapsed().as_secs_f64() * 1e3);
 
@@ -471,7 +493,7 @@ fn main() {
         }
         let (inst_mean, inst_sd) = stats(&instrumented);
         forward.disable_profiling();
-        let (plain2_mean, plain2_sd) = timed_plain(&mut forward);
+        let (plain2_mean, plain2_sd) = timed_plain(&mut forward, &mut state);
         let plain_best = plain_mean.min(plain2_mean);
 
         let gpu_total: f64 = totals.values().map(|v| stats(v).0).sum();

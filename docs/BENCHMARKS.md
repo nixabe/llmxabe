@@ -358,7 +358,7 @@ CUDA_VISIBLE_DEVICES=2 LLMXABE_BENCH_N=1,19,128,512 LLMXABE_BENCH_REPS=10 \
 | | llama.cpp | llmxabe | llmxabe's position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens — a full forward over a batch | `pp512` **2,051.30 ± 168.24 tok/s** | n = 512, **73.48 ± 0.23 tok/s** | **27.9× slower** |
-| Decode | `tg128` **104.72 ± 0.36 tok/s**, 9.55 ms/token | *no KV cache yet — no comparable number* | — |
+| Decode | `tg128` **104.72 ± 0.36 tok/s**, 9.55 ms/token | *no KV cache at the time — see "Decode, measured" below* | — |
 | Cost of one token's worth of work, best case | 9.55 ms (a warm decode step) | 32.61 ms (a cold n = 1 pass) | **3.4× slower**, and the comparison flatters llmxabe |
 
 llmxabe's full sweep, 2 warmup passes discarded, 10 timed repetitions, stream
@@ -419,10 +419,66 @@ baseline measured immediately prior to the change on the same card, not the
 GPU-2 numbers in the superseded table — which is why it reads 69.84 rather
 than 73.48.
 
-**The n = 1 row is still a latency floor, not a decode rate.** Nothing about
-the MoE tiling added a KV cache or a carried recurrent state; every pass is
-still a cold full forward. The 1.90× figure remains the charitable reading of
-the gap, for exactly the reasons given above.
+**The n = 1 row is a latency floor, not a decode rate** — it was measured
+before there was a KV cache. Real decode is measured in the next section, and
+it turns out the floor was the *pessimistic* proxy, not the flattering one.
+
+## Decode, measured (2026-08-16)
+
+`tests/decode.rs` landed the KV cache and the carried recurrent state, so
+there is now a number that compares to `llama-bench -n` rather than a proxy.
+From `bench_decode`, greedy argmax fed back in, 4 warmup steps discarded:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./target/release/bench_decode 128 64
+```
+
+| | llama.cpp | llmxabe | position |
+| --- | ---: | ---: | --- |
+| Decode, ~128-token context | `tg128` **104.72 ± 0.36 tok/s**, 9.55 ms/token | **65.25 tok/s**, 15.33 ± 0.10 ms/token | **1.61× slower** |
+
+That is the first honest decode comparison this project has had. The old
+"1.90× at the decode floor" line used a cold `n = 1` pass as a stand-in, and
+it was **too harsh**: a real decode step does not re-zero 30 recurrent states
+and reaches 15.33 ms where the cold pass needed 18.16 ms.
+
+Per-step latency is tight — sd 0.10 ms, p99 15.56 ms — so the mean is
+meaningful rather than an average over a bimodal distribution.
+
+### Decode gets slower with context, and by how much
+
+Over 2,000 steps from a 128-token prompt, context 132 → 2,132:
+
+| | ms/step | tok/s |
+| --- | ---: | ---: |
+| first 10% (context ~132) | 15.56 | 64.3 |
+| last 10% (context ~2,132) | 19.79 | 50.5 |
+| mean over the whole run | 17.73 ± 1.37 | 56.4 |
+
+**+27.2% over 2,000 tokens**, and that slope is the attention kernel reading
+a growing cache. The arithmetic says the slope is far worse than it should
+be:
+
+```text
+KV read per step at ctx 2,132
+  = 10 attention layers x 2,132 positions x 2 kv_heads x 256 x 4 B x 2 (K,V)
+  = 83 MiB
+observed cost of the growth   4.23 ms   (19.79 - 15.56)
+implied bandwidth             19.6 GB/s     = 2.9% of the card's 672 GB/s
+```
+
+**The cause is parallelism, not bandwidth.** The flash kernel's grid is
+`(n_query, q_heads)`, so at `n_query = 1` it launches **16 blocks on a
+72-SM card** — 56 SMs idle, and each surviving block streams its whole KV
+window sequentially. The kernel is latency-bound at decode shape, and the
+`BM = 1` tiling that is correct for prefill is the wrong shape here.
+
+The standard fix is to split the KV window across blocks and combine the
+partial softmaxes — flash-decoding, which is what vLLM's paged attention and
+llama.cpp's parallel-block `fattn` path both do. That is a decode-specific
+kernel, not a re-tiling of the existing one, and it is the largest identified
+win left on the decode path. It is **not yet implemented**, and the 65.25
+tok/s above is the number without it.
 
 ### The MoE path in isolation
 
@@ -922,11 +978,13 @@ yet. The continue/stop gate needs restating around the grouped GEMM.
 - **The dequant header re-read in isolation.** Bounded by inference from the
   q6_K/q8_0 comparison, not measured directly; measuring it means editing a
   kernel this workstream does not own.
-- **Anything at long context.** The largest batch measured is 512 tokens with no
-  KV cache. The conclusion that attention is negligible is a statement about
-  this shape and would not survive 32K.
-- **Decode.** llmxabe has no KV cache and no carried recurrent state, so there
-  is no decode number to compare against `tg128`; the n = 1 row is a floor.
+- **Anything at long context.** The largest *prefill* measured is 512 tokens.
+  The conclusion that attention is negligible is a statement about that shape
+  and does not survive decode: at a 2,132-token context the KV read is 27% of
+  a decode step and climbing. See "Decode, measured".
+- **Decode past ~2K context.** Measured to 2,132 positions. The +27.2% slope
+  over that range is real and unresolved; nothing here says where it goes at
+  32K.
 - **Multi-GPU.** Every figure is one card.
 - The GDN chunked delta rule kernels (`gdn_chunk_*`, 3.8% at n = 512) were
   timed but not analyzed against a roofline.

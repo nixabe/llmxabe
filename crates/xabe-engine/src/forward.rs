@@ -49,12 +49,27 @@
 //!   [`ForwardReport::attention_duplicate_bytes`], and the fix is the same
 //!   `ResidentTensor` this file already uses for the other two shapes.
 //!
-//! # What is deliberately not here
+//! # Prefill and decode are the same code
 //!
-//! No KV cache and no decode. The attention blocks see one self-contained
-//! 19-position window and the GDN states start zeroed, which is exactly what
-//! the oracle captured (`state_predelta-N` is all zeros). Carrying either
-//! across calls is G007's.
+//! A pass is built for a fixed token count, so a 19-token prefill and a
+//! one-token decode step are two `Forward` objects — but they run the same
+//! forty blocks over one [`SequenceState`], which owns the KV caches and the
+//! recurrent states. Everything that makes a step a *continuation* lives in
+//! that state and nothing lives here.
+//!
+//! Build the second shape with [`Forward::reshape`], never a second
+//! [`Forward::new`]: the 28.3 GiB of MoE weights are shared by reference
+//! count, and two copies do not fit on a 48 GiB card.
+//!
+//! `tests/decode.rs` gates the equivalence directly — prefilling 19 tokens,
+//! prefilling 18 and decoding 1, and prefilling 12 and decoding 7 all select
+//! the same token with cosine 1.000000000 between their logits.
+//!
+//! A pass over a fresh or [`SequenceState::reset`] state is a cold prefill:
+//! position 0, zeroed recurrent state, which is exactly what the oracle
+//! captured (`state_predelta-N` is all zeros). That is what
+//! `tests/forward_pass.rs` requires, and it is why the reset is the caller's
+//! choice rather than something this file does unconditionally.
 //!
 //! Every projection is fp32 against dequantized weights. llama.cpp quantizes
 //! its *activations* to `q8_1` and dots in int8, which is 1,000-10,000x less
@@ -81,8 +96,9 @@ use xabe_model::config::{LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role};
 
 use crate::block::attention::{AttentionBlockError, AttentionKernelSet, GatedAttentionBlock};
-use crate::block::gdn::{GdnBlock, GdnBlockError, GdnGeometry, GdnLayerWeights, GdnState};
+use crate::block::gdn::{GdnBlock, GdnBlockError, GdnGeometry, GdnLayerWeights};
 use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
+use crate::state::{SequenceState, StateError};
 use crate::weights::DeviceWeights;
 
 /// Elements per Q8_0 block, and its serialized size.
@@ -206,6 +222,18 @@ pub enum ForwardError {
     /// Every block validates its buffer lengths exactly rather than accepting
     /// a prefix, so the token count is fixed at construction.
     WrongTokenCount { expected: usize, got: usize },
+    /// Sequence state could not be allocated or reset.
+    State(StateError),
+    /// The state carries a different number of layers than this pass runs.
+    ///
+    /// A state is indexed by slot inside the pass, so a mismatch would silently
+    /// fold layer 7's tokens into layer 6's recurrent matrix rather than fail.
+    StateShape {
+        expected_gdn: usize,
+        expected_attention: usize,
+        got_gdn: usize,
+        got_attention: usize,
+    },
 }
 
 impl std::fmt::Display for ForwardError {
@@ -256,6 +284,17 @@ impl std::fmt::Display for ForwardError {
             Self::WrongTokenCount { expected, got } => write!(
                 f,
                 "this pass was built for {expected} tokens and was given {got}",
+            ),
+            Self::State(e) => write!(f, "{e}"),
+            Self::StateShape {
+                expected_gdn,
+                expected_attention,
+                got_gdn,
+                got_attention,
+            } => write!(
+                f,
+                "this pass runs {expected_gdn} Gated DeltaNet and {expected_attention} attention \
+                 layers, but the state carries {got_gdn} and {got_attention}",
             ),
         }
     }
@@ -477,8 +516,14 @@ pub struct Forward {
     w_output_norm: ManuallyDrop<CudaSlice<f32>>,
     w_lm_head: ManuallyDrop<CudaSlice<u8>>,
     gdn_weights: Vec<ManuallyDrop<GdnLayerWeights>>,
-    gdn_states: Vec<GdnState>,
-    moe_weights: Vec<MoeLayerWeights>,
+    /// Shared with every other shape built over the same model.
+    ///
+    /// At 725 MiB per layer these are 28.3 GiB — the single largest thing on
+    /// the card, and the model's only copy of those roles. A second `Forward`
+    /// for a different token count must borrow them rather than upload again;
+    /// two copies do not fit on a 48 GiB device, which is why this is an
+    /// `Arc` rather than a `Vec`. See [`Forward::reshape`].
+    moe_weights: Arc<Vec<MoeLayerWeights>>,
 
     d_tokens: CudaSlice<i32>,
     hidden_state: CudaSlice<f32>,
@@ -511,6 +556,62 @@ impl Forward {
         weights: &DeviceWeights,
         config: ModelConfig,
         tokens: usize,
+    ) -> Result<Self, ForwardError> {
+        Self::build(ctx, stream, file, directory, weights, config, tokens, None)
+    }
+
+    /// Build a second pass over the **same resident weights**, for a different
+    /// token count.
+    ///
+    /// This is what makes decode possible at all. Every kernel in the chain
+    /// validates its buffer lengths against the declared geometry exactly, so
+    /// a pass is built for one token count and cannot serve another — but the
+    /// 28.3 GiB of MoE weights cannot be uploaded twice on a 48 GiB card, and
+    /// re-uploading them per shape would cost more than the generation.
+    ///
+    /// So the shapes are separate and the weights are not. The returned pass
+    /// shares this one's MoE weights by reference count and re-derives every
+    /// other weight as a fresh alias into the same arena; only the scratch and
+    /// the ten attention blocks' copies are genuinely new, which at `tokens =
+    /// 1` is a few hundred MiB rather than thirty gigabytes.
+    ///
+    /// The two passes are still separate objects with separate buffers, so
+    /// they must be driven over one [`SequenceState`] to be one sequence.
+    ///
+    /// [`ForwardReport::moe_bytes`] on the result is zero: the weights are
+    /// real but they are not this pass's, and counting them twice would make
+    /// the sum of two reports claim more VRAM than the card has.
+    pub fn reshape(
+        &self,
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        file: &GgufFile,
+        directory: &Directory<'_>,
+        weights: &DeviceWeights,
+        tokens: usize,
+    ) -> Result<Self, ForwardError> {
+        Self::build(
+            ctx,
+            stream,
+            file,
+            directory,
+            weights,
+            self.config.clone(),
+            tokens,
+            Some(Arc::clone(&self.moe_weights)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        file: &GgufFile,
+        directory: &Directory<'_>,
+        weights: &DeviceWeights,
+        config: ModelConfig,
+        tokens: usize,
+        shared_moe: Option<Arc<Vec<MoeLayerWeights>>>,
     ) -> Result<Self, ForwardError> {
         let hidden = config.hidden_size as usize;
         let vocab = config.vocab_size as usize;
@@ -571,13 +672,11 @@ impl Forward {
         let gdn_geometry = GdnGeometry::from_config(&config, tokens, rms_eps);
         let gdn = GdnBlock::new(ctx, gdn_geometry)?;
         let mut gdn_weights = Vec::new();
-        let mut gdn_states = Vec::new();
         for layer in 0..config.num_layers {
             if config.layer_kind(layer) != LayerKind::GatedDeltaNet {
                 continue;
             }
             gdn_weights.push(ManuallyDrop::new(alias_gdn_layer(weights, stream, layer)?));
-            gdn_states.push(gdn.state(stream)?);
         }
 
         // --- the 10 Gated Attention layers, which copy --------------------
@@ -602,13 +701,22 @@ impl Forward {
         // --- the MoE, on every block ---------------------------------------
         let moe_geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, tokens);
         let moe = MoeBlock::new(ctx, stream, moe_geometry, rms_eps)?;
-        let mut moe_weights = Vec::with_capacity(config.num_layers as usize);
-        let mut moe_bytes = 0u64;
-        for layer in 0..config.num_layers {
-            let w = MoeLayerWeights::upload(stream, file, directory, layer, &moe_geometry)?;
-            moe_bytes += w.bytes() as u64;
-            moe_weights.push(w);
-        }
+        let (moe_weights, moe_bytes) = match shared_moe {
+            // Already on the card, uploaded by the pass this one was reshaped
+            // from. Reported as zero bytes because they are not this pass's to
+            // account for — see `reshape`.
+            Some(shared) => (shared, 0u64),
+            None => {
+                let mut uploaded = Vec::with_capacity(config.num_layers as usize);
+                let mut bytes = 0u64;
+                for layer in 0..config.num_layers {
+                    let w = MoeLayerWeights::upload(stream, file, directory, layer, &moe_geometry)?;
+                    bytes += w.bytes() as u64;
+                    uploaded.push(w);
+                }
+                (Arc::new(uploaded), bytes)
+            }
+        };
 
         let lm_head = LmHeadKernels::new(
             ctx,
@@ -642,7 +750,6 @@ impl Forward {
             w_output_norm,
             w_lm_head,
             gdn_weights,
-            gdn_states,
             moe_weights,
             d_tokens: stream.alloc_zeros::<i32>(tokens)?,
             hidden_state: stream.alloc_zeros::<f32>(tokens * hidden)?,
@@ -726,7 +833,21 @@ impl Forward {
         &self.logits
     }
 
-    /// Run the whole pass over `token_ids`, from a cold start.
+    /// Allocate carried state for one sequence of up to `max_seq` positions.
+    ///
+    /// The state is separate from the pass because a pass is built for a fixed
+    /// token count and a sequence is not: prefill and decode are two `Forward`
+    /// objects of different shapes over one [`SequenceState`]. See that type's
+    /// module docs.
+    pub fn new_state(
+        &self,
+        stream: &Arc<CudaStream>,
+        max_seq: usize,
+    ) -> Result<SequenceState, ForwardError> {
+        SequenceState::new(stream, &self.gdn, &self.config, max_seq).map_err(ForwardError::State)
+    }
+
+    /// Run the whole pass over `token_ids`, continuing `state`.
     ///
     /// `on_waypoint` is called with `(None, embedding)` once and then with
     /// `(Some(N), l_out_N)` after each of the 40 blocks, before the buffer is
@@ -736,28 +857,31 @@ impl Forward {
     ///
     /// The callback runs on the host, so it must synchronise if it reads.
     ///
-    /// # Cold start
+    /// # Where this pass starts
     ///
-    /// Every Gated DeltaNet state — the recurrent matrix **and** the
-    /// convolution cache — is zeroed first, so this is a pure function of
-    /// `token_ids` and two calls with the same input give the same answer.
-    /// Without it the second call would resume from the first's carried state
-    /// and produce a completely different, entirely finite result: the
-    /// convolution would see the previous prompt's last three tokens and the
-    /// delta rule would start from a populated matrix. That is a decode, and
-    /// a decode is not what this is.
+    /// At `state.position()`. The attention blocks append their keys and
+    /// values there and rotate by it, and the Gated DeltaNet blocks fold into
+    /// whatever matrix the state already holds. So:
     ///
-    /// It is also what the oracle captured — `state_predelta-N` is all zeros
-    /// for every captured block — so it is what a comparison against the
-    /// capture requires. Carrying state deliberately across calls is G007's,
-    /// and will need this to become a choice rather than an unconditional
-    /// reset.
+    /// - A fresh state, or one that has been [`SequenceState::reset`], gives a
+    ///   **cold prefill**: position 0, zeroed recurrent state. That is a pure
+    ///   function of `token_ids`, and it is what the oracle captured
+    ///   (`state_predelta-N` is all zeros for every captured block), so it is
+    ///   what a comparison against the capture requires.
+    /// - A state left where a previous call finished gives a **continuation**,
+    ///   which is what decode is.
     ///
-    /// The zeroing is a `cuMemsetD8Async` per state, not a reallocation:
-    /// `AGENTS.md` rule 6 forbids allocating on this path.
+    /// The distinction used to be made here, by zeroing unconditionally. It is
+    /// the caller's now, because the whole difference between prefill and
+    /// decode is which of the two they want, and a pass that always resets can
+    /// only ever be the first. Forgetting to reset is not silent: a second
+    /// cold prefill through a used state resumes the previous prompt's
+    /// convolution taps and recurrent matrix, and produces a completely
+    /// different, entirely finite result.
     pub fn run(
         &mut self,
         stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
         token_ids: &[i32],
         mut on_waypoint: impl FnMut(Option<u32>, &CudaSlice<f32>),
     ) -> Result<(), ForwardError> {
@@ -767,15 +891,23 @@ impl Forward {
                 got: token_ids.len(),
             });
         }
+        // A state built for a different model would index the wrong cache in
+        // the middle of the pass, so it is checked once at the edge instead.
+        let (gdn_layers, attn_layers) = (self.gdn_weights.len(), self.attention.len());
+        if state.gdn_layers() != gdn_layers || state.attention_layers() != attn_layers {
+            return Err(ForwardError::StateShape {
+                expected_gdn: gdn_layers,
+                expected_attention: attn_layers,
+                got_gdn: state.gdn_layers(),
+                got_attention: state.attention_layers(),
+            });
+        }
 
         if let Some(p) = &mut self.profile {
             p.begin(stream)?;
         }
 
-        for state in &mut self.gdn_states {
-            stream.memset_zeros(&mut state.conv)?;
-            stream.memset_zeros(&mut state.recurrent)?;
-        }
+        let pos_offset = state.position();
         stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
         self.mark(stream, Stage::Reset)?;
         self.embed(stream)?;
@@ -791,19 +923,18 @@ impl Forward {
                     self.gdn.forward(
                         stream,
                         &self.gdn_weights[gdn_slot],
-                        &mut self.gdn_states[gdn_slot],
+                        state.gdn_mut(gdn_slot),
                         &self.hidden_state,
                         &mut self.mixer_out,
                     )?;
                     gdn_slot += 1;
                 }
                 LayerKind::GatedAttention => {
-                    // Position 0 is the batch's first token: this pass is a
-                    // cold prefill, so absolute and relative positions agree.
                     self.attention[attn_slot].forward(
                         stream,
                         &self.hidden_state,
-                        0,
+                        state.kv_mut(attn_slot),
+                        pos_offset,
                         &mut self.mixer_out,
                     )?;
                     attn_slot += 1;
@@ -855,6 +986,11 @@ impl Forward {
             &mut self.logits,
         )?;
         self.mark(stream, Stage::LmHead)?;
+        // Last, and only on success: every block has now appended, so the
+        // state's claim about how many positions its caches hold is true.
+        // Advancing earlier would leave a failed pass claiming positions that
+        // no cache was written for, and the next call would read them.
+        state.advance(self.tokens);
         Ok(())
     }
 

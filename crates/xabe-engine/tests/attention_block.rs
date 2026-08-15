@@ -76,7 +76,9 @@ use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_engine::block::attention::{AttentionKernelSet, GatedAttentionBlock, attention_layers};
+use xabe_engine::block::attention::{
+    AttentionKernelSet, GatedAttentionBlock, KvCache, attention_layers,
+};
 use xabe_engine::weights::DeviceWeights;
 use xabe_gguf::{GgufFile, GgufValue};
 use xabe_kernels::attention::{causal_attention_streaming, kv_head_for_query_head};
@@ -981,8 +983,11 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         let mut d_out = stream
             .alloc_zeros::<f32>(tokens * hidden)
             .expect("alloc output");
+        // A cache sized to this window and written from position 0 makes the
+        // pass a cold prefill, which is what the capture recorded.
+        let mut cache = KvCache::new(&stream, &config, tokens).expect("kv cache allocates");
         block
-            .forward(&stream, &d_in, 0, &mut d_out)
+            .forward(&stream, &d_in, &mut cache, 0, &mut d_out)
             .expect("block forward launches");
         stream.synchronize().expect("sync after forward");
 

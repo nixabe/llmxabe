@@ -365,6 +365,10 @@ pub enum AttentionError {
     /// Rejected rather than clamped: a short K buffer would be read past its
     /// end for every query deep enough to reach the missing rows, and the
     /// result would still look like attention.
+    ///
+    /// For `key` and `value`, `expected` is a lower bound rather than an exact
+    /// size — see [`AttentionKernels::forward`] on why a cache is allowed to be
+    /// longer than its filled window.
     BufferShape {
         what: &'static str,
         expected: usize,
@@ -506,6 +510,24 @@ impl AttentionKernels {
         Ok(())
     }
 
+    /// Like [`Self::expect_len`], for the buffers a cache is allowed to
+    /// over-allocate. Too small is still fatal — that is the read-past-the-end
+    /// case — but too large is the ordinary steady state of a KV cache.
+    fn expect_at_least(
+        what: &'static str,
+        buf_len: usize,
+        needed: usize,
+    ) -> Result<(), AttentionError> {
+        if buf_len < needed {
+            return Err(AttentionError::BufferShape {
+                what,
+                expected: needed,
+                actual: buf_len,
+            });
+        }
+        Ok(())
+    }
+
     /// Deinterleave the packed `attn_q` projection output into a query tensor
     /// and an output-gate tensor.
     ///
@@ -610,6 +632,16 @@ impl AttentionKernels {
     /// keys `[0, key_offset + i]`. `key_offset == 0` with `n_query == n_keys`
     /// is a full prefill; `key_offset == n_keys - 1` with `n_query == 1` is a
     /// decode step against a cached window.
+    ///
+    /// `k` and `v` may be **longer** than the window. A KV cache is allocated
+    /// once for the longest sequence the worker admits and then filled a token
+    /// at a time, so from the second decode step onward the buffer is
+    /// necessarily larger than `n_keys`. The kernel indexes keys by absolute
+    /// position and reads nothing above `key_offset + n_query - 1`, so the
+    /// tail is untouched rather than merely unused. Requiring an exact length
+    /// here would force the cache to be re-sliced per step, and there is
+    /// nothing to gain by it. `q` and `out` stay exact: those are indexed by
+    /// the launch geometry, so a wrong length there is a wrong launch.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -632,8 +664,8 @@ impl AttentionKernels {
         let q_elems = n_query * self.q_heads * self.head_dim;
         let kv_elems = n_keys * self.kv_heads * self.head_dim;
         Self::expect_len("query", q.len(), q_elems)?;
-        Self::expect_len("key", k.len(), kv_elems)?;
-        Self::expect_len("value", v.len(), kv_elems)?;
+        Self::expect_at_least("key", k.len(), kv_elems)?;
+        Self::expect_at_least("value", v.len(), kv_elems)?;
         Self::expect_len("output", out.len(), q_elems)?;
 
         let cfg = LaunchConfig {
@@ -824,5 +856,28 @@ mod tests {
         assert_eq!(256 % 32, 0);
         assert_eq!(16 % 2, 0);
         assert_eq!(64 % 2, 0);
+    }
+
+    #[test]
+    fn a_kv_cache_may_be_longer_than_its_filled_window_but_never_shorter() {
+        // The asymmetry is the whole point: a cache is allocated for the
+        // longest admissible sequence and filled one token at a time, so
+        // "longer than the window" is its steady state from decode step two
+        // onward. "Shorter" is the read-past-the-end bug this check exists to
+        // catch, and it stays fatal.
+        assert!(AttentionKernels::expect_at_least("key", 4096, 4096).is_ok());
+        assert!(AttentionKernels::expect_at_least("key", 1 << 20, 4096).is_ok());
+
+        let err = AttentionKernels::expect_at_least("key", 4095, 4096)
+            .expect_err("one float short must not be accepted");
+        let message = err.to_string();
+        assert!(
+            message.contains("4096") && message.contains("4095"),
+            "{message}"
+        );
+
+        // The query and the output are indexed by the launch geometry rather
+        // than by absolute position, so they keep the exact check.
+        assert!(AttentionKernels::expect_len("query", 4097, 4096).is_err());
     }
 }

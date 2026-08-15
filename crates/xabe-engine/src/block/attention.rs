@@ -19,6 +19,7 @@
 //! | key and value projections | [`LmHeadKernels::forward`] | `Kcur-N` / `Vcur-N` (first) |
 //! | per-head RMSNorm on the key | [`LayerOpsKernels::rms_norm`] | `Kcur_normed-N` |
 //! | partial rotary on query and key | [`AttentionKernels::rope`] | `Qcur-N` / `Kcur-N` (second) |
+//! | append roped keys and raw values to the cache | [`KvCache`] | — |
 //! | causal GQA attention | [`AttentionKernels::forward`] | `attn_pregate-N` |
 //! | `sigmoid(gate)` and its product | [`AttnElementwise`] | `gate_sigmoid-N` / `attn_gated-N` |
 //! | output projection | [`LmHeadKernels::forward`] | `attn_output-N` |
@@ -76,7 +77,7 @@
 //! `attn_residual-N`, which is a stronger oracle than a CPU reference — but
 //! they belong in `xabe_cuda::kernels::layer_ops` once that file is free.
 //!
-//! # Fixed token count
+//! # Fixed token count, and the KV cache that works with it
 //!
 //! A block is constructed for exactly `tokens` positions per call.
 //! [`LmHeadKernels::forward`] and [`AttentionKernels::forward`] both validate
@@ -86,6 +87,21 @@
 //! different lengths. Chunked prefill and decode therefore need either a
 //! block per shape or a prefix-tolerant length check in those two kernels.
 //! This is a property of their validation, not of the arithmetic here.
+//!
+//! **A block per shape is the option taken**, and it is the one that keeps
+//! `AGENTS.md` rule 5: every launch shape stays a function of the declared
+//! geometry, so a decode block built at `tokens = 1` has identical launch
+//! dimensions on every step and is capturable in a CUDA graph. A prefix
+//! tolerance would have made the grid depend on a host value and given that
+//! up for the entire pass.
+//!
+//! What is *not* duplicated per shape is the state. [`KvCache`] and
+//! [`GdnState`](crate::block::gdn::GdnState) are owned by the caller and passed in, so a prefill block at
+//! `tokens = 19` and a decode block at `tokens = 1` write to and read from the
+//! same cache — which is what makes the second of those a continuation of the
+//! first rather than a separate sequence. The weights are aliases into the
+//! arena and are not duplicated either, so a second block shape costs only its
+//! own scratch, which at `tokens = 1` is negligible.
 
 use std::sync::Arc;
 
@@ -286,6 +302,17 @@ pub enum AttentionBlockError {
         expected: usize,
         actual: usize,
     },
+    /// The sequence would run past the end of its key/value cache.
+    ///
+    /// The cache is allocated once for the longest sequence a worker admits,
+    /// so this is admission control having failed upstream rather than a
+    /// recoverable condition. Rejected rather than wrapped: overwriting
+    /// position 0 would silently answer from a different prompt.
+    CacheExhausted {
+        position: usize,
+        tokens: usize,
+        max_seq: usize,
+    },
 }
 
 impl std::fmt::Display for AttentionBlockError {
@@ -325,6 +352,15 @@ impl std::fmt::Display for AttentionBlockError {
             } => write!(
                 f,
                 "{what} holds {actual} floats, but this geometry needs {expected}",
+            ),
+            Self::CacheExhausted {
+                position,
+                tokens,
+                max_seq,
+            } => write!(
+                f,
+                "{tokens} tokens at position {position} would need {} cache slots, but the cache holds {max_seq}",
+                position + tokens,
             ),
         }
     }
@@ -436,6 +472,80 @@ impl AttentionKernelSet {
             )?,
             elementwise: AttnElementwise::new(ctx)?,
         })
+    }
+}
+
+/// One attention layer's key/value cache for one sequence.
+///
+/// This is the memory that makes decode cheaper than re-prefilling: without
+/// it, emitting token `n` costs a pass over all `n` positions, and generation
+/// is quadratic in the length of what it has already said.
+///
+/// # Why it is a plain slab and not the paged pool
+///
+/// `xabe-cache` owns a two-group pager built for many concurrent sequences
+/// sharing a pool, and that is the right structure for the server. This type
+/// is the single-sequence case, allocated once for `max_seq` positions and
+/// filled in order. Wiring the pager to the device is milestone 07's job; a
+/// contiguous cache is what lets the decode path be measured before that
+/// lands, and the kernel's absolute-position indexing is the same either way.
+///
+/// # Size
+///
+/// `2 * kv_heads * head_dim * 4` bytes per position per layer — 4 KiB for
+/// Qwen3.6, whose 2 KV heads are the entire reason a 256-wide head dimension
+/// is affordable. Ten attention layers of forty makes 40 KiB per token, so a
+/// 32,768-token sequence costs 1.25 GiB. The other thirty layers are Gated
+/// DeltaNet and carry a fixed-size recurrent state instead, which is what
+/// [`GdnState`](crate::block::gdn::GdnState) holds and why this model's cache does not grow the way a
+/// forty-layer dense model's would.
+pub struct KvCache {
+    k: CudaSlice<f32>,
+    v: CudaSlice<f32>,
+    kv_dim: usize,
+    max_seq: usize,
+}
+
+impl KvCache {
+    /// Allocate a zeroed cache for `max_seq` positions of one attention layer.
+    ///
+    /// Zeroed rather than uninitialised because the value is read back for
+    /// positions the kernel is allowed to reach, and a NaN left in an
+    /// unwritten slot would propagate through the softmax rather than being
+    /// masked away.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        config: &ModelConfig,
+        max_seq: usize,
+    ) -> Result<Self, AttentionBlockError> {
+        let kv_dim = config.attention.kv_heads as usize * config.attention.head_dim as usize;
+        Ok(Self {
+            k: stream.alloc_zeros::<f32>(max_seq * kv_dim)?,
+            v: stream.alloc_zeros::<f32>(max_seq * kv_dim)?,
+            kv_dim,
+            max_seq,
+        })
+    }
+
+    /// Positions this cache can hold.
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
+    /// Device bytes held, both halves.
+    pub fn bytes(&self) -> u64 {
+        2 * (self.max_seq * self.kv_dim * size_of::<f32>()) as u64
+    }
+
+    /// The cached keys, `[max_seq][kv_heads][head_dim]`, rotary already
+    /// applied. Positions at or above the sequence length are zero.
+    pub fn keys(&self) -> &CudaSlice<f32> {
+        &self.k
+    }
+
+    /// The cached values, same layout, not normed and not rotated.
+    pub fn values(&self) -> &CudaSlice<f32> {
+        &self.v
     }
 }
 
@@ -571,13 +681,23 @@ impl GatedAttentionBlock {
     /// aliasing would make the ordering a race rather than a dependency.
     ///
     /// `pos_offset` is the absolute position of token 0, which is what the
-    /// rotary embedding rotates by. The attention window is this batch alone:
-    /// there is no KV cache yet, so query row `i` attends to keys `[0, i]` of
-    /// the same batch. Carrying a cache across calls is G007's job.
+    /// rotary embedding rotates by and where this batch's keys and values are
+    /// appended to `cache`. Query row `i` therefore attends to every key in
+    /// `[0, pos_offset + i]` — this batch's own keys and every key the cache
+    /// already held. `pos_offset == 0` is a cold prefill and `n_query == 1`
+    /// with `pos_offset == n - 1` is a decode step; they are the same code.
+    ///
+    /// The keys written to the cache are the *roped* keys, and the values are
+    /// the raw projections. That asymmetry is not an oversight: rotary is a
+    /// function of absolute position, so a key rotated once at write time is
+    /// correct for every later query, whereas rotating on read would redo the
+    /// same work for the whole window on every step. Values are never rotated
+    /// at all.
     pub fn forward(
         &mut self,
         stream: &Arc<CudaStream>,
         hidden_state: &CudaSlice<f32>,
+        cache: &mut KvCache,
         pos_offset: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), AttentionBlockError> {
@@ -586,6 +706,13 @@ impl GatedAttentionBlock {
         let q_elems = t * self.q_heads * self.head_dim;
         expect_len("block input", hidden_state.len(), hidden_elems)?;
         expect_len("block output", out.len(), hidden_elems)?;
+        if pos_offset + t > cache.max_seq {
+            return Err(AttentionBlockError::CacheExhausted {
+                position: pos_offset,
+                tokens: t,
+                max_seq: cache.max_seq,
+            });
+        }
 
         let k = &self.kernels;
 
@@ -684,19 +811,34 @@ impl GatedAttentionBlock {
             self.rope_theta,
         )?;
 
-        // 8. Causal GQA attention over this window.
+        // 8. Append this batch's keys and values to the cache, at the absolute
+        //    positions they belong to. A device-to-device copy rather than a
+        //    kernel: the projections already wrote a contiguous
+        //    `[t][kv_heads][head_dim]` run and the cache is the same layout, so
+        //    this is one `cuMemcpyDtoDAsync` per half on the same stream, which
+        //    orders it after the rope and before the attention read.
+        let span = t * self.kv_heads * self.head_dim;
+        let at = pos_offset * self.kv_heads * self.head_dim;
+        let mut k_slot = cache.k.slice_mut(at..at + span);
+        stream.memcpy_dtod(&self.key_roped, &mut k_slot)?;
+        let mut v_slot = cache.v.slice_mut(at..at + span);
+        stream.memcpy_dtod(&self.value, &mut v_slot)?;
+
+        // 9. Causal GQA attention over the whole cached window, not just this
+        //    batch. `n_keys` is the filled length; the cache buffer itself is
+        //    longer and the kernel reads none of the tail.
         k.mixer.forward(
             stream,
             &self.query_roped,
-            &self.key_roped,
-            &self.value,
+            &cache.k,
+            &cache.v,
             &mut self.pregate,
             t,
-            t,
-            0,
+            pos_offset + t,
+            pos_offset,
         )?;
 
-        // 9. The output gate.
+        // 10. The output gate.
         k.elementwise.sigmoid_gate(
             stream,
             &self.pregate,
@@ -706,7 +848,7 @@ impl GatedAttentionBlock {
             q_elems,
         )?;
 
-        // 10. Output projection.
+        // 11. Output projection.
         k.out.forward(
             stream,
             QuantTensor {
@@ -718,7 +860,7 @@ impl GatedAttentionBlock {
             &mut self.projected,
         )?;
 
-        // 11. Residual.
+        // 12. Residual.
         k.elementwise
             .residual_add(stream, hidden_state, &self.projected, out, hidden_elems)?;
 

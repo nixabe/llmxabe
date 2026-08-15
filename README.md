@@ -3,20 +3,22 @@
 A single-process CUDA inference engine for `Qwen3.6-35B-A3B` on 3× Quadro
 RTX 8000, written in Rust.
 
-> **Status: the forward pass runs and is correct; there is no decode loop
-> yet.** The model is resident on one GPU (733 tensors, 29.65 GiB, read back
-> bit-identical) and a full 40-block forward pass runs entirely on the
-> device — Gated DeltaNet, gated attention, and the 256-expert MoE. Against
-> golden data captured from llama.cpp it produces **the same argmax token**
-> (25358, `' Tokyo'`) at logit 19.936268.
+> **Status: the model generates.** It is resident on one GPU (733 tensors,
+> 29.65 GiB, read back bit-identical), a full 40-block forward pass runs
+> entirely on the device — Gated DeltaNet, gated attention, and the
+> 256-expert MoE — and it now decodes autoregressively against a KV cache and
+> a carried recurrent state. Against golden data captured from llama.cpp it
+> produces **the same argmax token** (25358, `' Tokyo'`) at logit 19.936268,
+> and prefilling 12 tokens then decoding 7 reaches that same token with
+> cosine 1.000000000 against prefilling all 19 at once.
 >
-> What it cannot do: **there is no KV cache and no carried recurrent state**,
-> so every pass is a cold full forward and the engine cannot generate a
-> second token. There is no HTTP surface. See [Milestones](#milestones) for
-> the itemized state.
+> What it cannot do: there is **no HTTP surface**, no tokenizer, no batching
+> across sequences, and no CUDA graph capture. It generates token ids for one
+> sequence at a time. See [Milestones](#milestones) for the itemized state.
 >
-> Measured prefill is **200.87 ± 0.75 tok/s** at 512 tokens against
-> llama.cpp's 2,070.50 on the same card — **10.3× slower**. See
+> Measured against llama.cpp on the same card: prefill **200.87 ± 0.75 tok/s**
+> at 512 tokens against 2,070.50 (**10.3× slower**), decode **65.25 tok/s**
+> against `tg128`'s 104.72 (**1.61× slower**). See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why this exists
@@ -196,9 +198,10 @@ Numbering follows the design plan. "Gate" is the condition for calling it done.
 | 02 | Differential harness | Per-tensor max-abs + cosine thresholds | done |
 | 03 | FP16 dense forward | Correct logits, any speed | **done** (fp32, not fp16) — full 40-block pass, argmax 25358 matching llama.cpp |
 | 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | **done** — dequant bit-identical over 8.4 M elements; grouped GEMM tiled, 9.3× on the MoE path, expert ids exact on all 37 tokens × top-8 |
-| 05 | Flash attention port, sm_75 | Correct at 128K | **done at batch scale, unverified at 128K** — scalar fp32, `BM = 1`, no tensor cores; correctness checked against golden data at 19 and 512 tokens only |
+| 05 | Flash attention port, sm_75 | Correct at 128K | **correct at batch and decode shape, unverified at 128K** — scalar fp32, `BM = 1`, no tensor cores; gated against golden data at 19 and 512 tokens and against the batch path at decode shape. At `n_query = 1` the grid is 16 blocks on 72 SMs and the KV read runs at ~2.9% of peak bandwidth — see BENCHMARKS.md |
+| 05b | Autoregressive decode | Incremental path equals batch path | **done** — KV cache + carried recurrent state; prefill-12-then-decode-7 matches a 19-token prefill at cosine 1.000000000, same argmax. 65.25 tok/s at 128-token context vs llama.cpp's 104.72 |
 | 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started; launch overhead measured at ~0.4% at n=512, so it is no longer a gate |
-| 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done |
+| 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done; the device side runs a **single-sequence contiguous** KV cache (`block::attention::KvCache`), not yet the pager |
 | 08 | Multi-worker + router + shared cache | Hit rate ≥ llama.cpp baseline | host side done |
 | 09 | MTP speculative decode | Accept rate vs n-gram baseline | not started |
 

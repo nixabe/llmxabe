@@ -716,7 +716,30 @@ after R3, not because it is worth doing now.
 
 ---
 
-### R1 — KV cache and persistent recurrent state
+### R1 — KV cache and persistent recurrent state — **DONE (2026-08-16)**
+
+Landed as `block::attention::KvCache` plus `state::SequenceState`, gated by
+`tests/decode.rs`. What it is **not**: `xabe-cache`'s two-group pager, which
+is still host-side only. This is one contiguous cache for one sequence, which
+is what makes a single-stream decode number measurable; the pager is what
+makes three concurrent sequences work, and that is R2's and milestone 07's.
+
+**Measured.** 65.25 tok/s at a 128-token context against llama.cpp's `tg128`
+104.72 — **1.61× slower**. The prediction below that this "is not an
+optimization, it is the feature that makes every other decode number
+meaningful" held, and it corrected a number in the other direction than
+expected: the cold `n = 1` pass had been used as a decode proxy at 18.16 ms,
+and a real decode step is **15.33 ms**, because it does not re-zero 30
+recurrent states. The proxy was pessimistic, not flattering.
+
+**What it exposed.** Decode cost grows +27.2% from context 132 to 2,132, and
+the implied bandwidth on the KV read is 19.6 GB/s — 2.9% of peak. The cause
+is that the flash kernel's grid is `(n_query, q_heads)`, so `n_query = 1`
+launches 16 blocks on a 72-SM card. That is a new item, R10 below, and it is
+now the largest identified win on the decode path.
+
+The entry as it was written before the work, kept because its reasoning is
+what the measurement above is scored against:
 
 **sm_75: yes.** No architecture dependency.
 
@@ -1090,6 +1113,38 @@ prerequisite for any MMQ-style port.**
 - **L2-grouped launch order at decode.** `GROUP_SIZE_M` = 1 is vLLM's own
   rule when `M // E` is small (`fused_moe.py:1390-1391`), and ours is 0.
   Reserve it for prefill.
+
+---
+
+### R10 — Flash-decoding: split the KV window across blocks
+
+**sm_75: yes.** No architecture dependency; it is a grid-shape change plus a
+softmax combine, not a tensor-core path.
+
+**What.** At `n_query = 1` the attention grid is `(1, q_heads)` = 16 blocks.
+Split each query head's KV window into `S` chunks, run `16 * S` blocks each
+computing a partial online softmax over its chunk, then combine the partials
+with their running maxima and sums. This is flash-decoding; vLLM's paged
+attention and llama.cpp's parallel-block `fattn` path both do it.
+
+**Mechanism.** 16 blocks on 72 SMs leaves 78% of the machine idle, and each
+block streams its whole window sequentially, so the kernel is latency-bound
+rather than bandwidth-bound. `S = 8` would fill the card.
+
+**Expected win.** Bounded by the measured slope: the KV read costs 4.23 ms of
+a 19.79 ms step at 2,132 positions. Perfect parallelism removes most of that
+4.23 ms and none of the other 15.56, so at this context it is worth about 27%
+— and it grows with context, which is the point. It does **nothing** at short
+context, where the 16 blocks are already enough to cover a small window.
+
+**Cost.** A second attention kernel specialized for `n_query = 1`, plus the
+combine. The existing kernel stays for prefill, where `BM = 1` over many query
+rows already fills the grid. The partial-softmax combine is the part that is
+easy to get subtly wrong, and it needs its own differential test against the
+single-block path — which now exists, because `tests/decode.rs` gates the
+decode shape against the batch shape.
+
+**Depends on.** R1, which is done.
 
 ---
 

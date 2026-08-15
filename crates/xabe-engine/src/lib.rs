@@ -22,10 +22,12 @@ pub mod block;
 pub mod engine;
 pub mod forward;
 pub mod router;
+pub mod state;
 pub mod weights;
 pub mod worker;
 
 pub use engine::{Engine, Placement, PlacementError};
 pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
+pub use state::{SequenceState, StateError};
 pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
 pub use worker::{Worker, WorkerId};

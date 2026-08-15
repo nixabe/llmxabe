@@ -374,9 +374,19 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
     // 152 KiB — not a clean compute time, and reported as what it is.
     let mut embedded = Vec::new();
     let mut block_out: Vec<Vec<f32>> = Vec::with_capacity(config.num_layers as usize);
+
+    // A fresh state is a cold start: position 0, zeroed recurrent state. That
+    // is what the capture recorded — `state_predelta-N` is all zeros for every
+    // captured block — so it is what this comparison requires, and every
+    // rerun below resets back to it.
+    let mut state = forward
+        .new_state(&stream, tokens)
+        .expect("sequence state allocates");
+    assert_eq!(state.position(), 0, "a fresh state must be a cold start");
+
     let ran = Instant::now();
     forward
-        .run(&stream, g.tokens(), |waypoint, buf| {
+        .run(&stream, &mut state, g.tokens(), |waypoint, buf| {
             let host = stream.clone_dtoh(buf).expect("waypoint read-back");
             stream.synchronize().expect("sync");
             match waypoint {
@@ -401,8 +411,9 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
     let mut clean_total = Duration::ZERO;
     while clean_total < Duration::from_secs(2) && passes < 20 {
         let t0 = Instant::now();
+        state.reset(&stream).expect("back to a cold start");
         forward
-            .run(&stream, g.tokens(), |_, _| {})
+            .run(&stream, &mut state, g.tokens(), |_, _| {})
             .expect("the forward pass reruns");
         stream.synchronize().expect("sync");
         clean_total += t0.elapsed();

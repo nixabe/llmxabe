@@ -170,9 +170,22 @@ fn main() {
             .map(|i| ((i * 7919 + 1234) % config.vocab_size as usize) as i32)
             .collect();
 
+        // One state, reset before every pass. This benchmark measures a cold
+        // prefill, so each repetition must start from position 0 with a zeroed
+        // recurrent state; without the reset the second pass would be a
+        // continuation of the first and would measure something else.
+        let mut state = match forward.new_state(&stream, n) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("{n:>7} | FAILED to allocate sequence state: {e}");
+                continue;
+            }
+        };
+
         let mut failed = false;
         for _ in 0..WARMUP {
-            if let Err(e) = forward.run(&stream, &ids, |_, _| {}) {
+            state.reset(&stream).expect("reset");
+            if let Err(e) = forward.run(&stream, &mut state, &ids, |_, _| {}) {
                 error!("{n:>7} | FAILED during warmup: {e}");
                 failed = true;
                 break;
@@ -188,8 +201,15 @@ fn main() {
 
         let mut samples = Vec::with_capacity(reps);
         for _ in 0..reps {
+            // The reset is inside the timed region because it used to be
+            // inside `run`, and moving it out would make these numbers
+            // quietly incomparable with every prefill measurement already in
+            // docs/BENCHMARKS.md.
             let t = Instant::now();
-            forward.run(&stream, &ids, |_, _| {}).expect("forward pass");
+            state.reset(&stream).expect("reset");
+            forward
+                .run(&stream, &mut state, &ids, |_, _| {})
+                .expect("forward pass");
             stream.synchronize().expect("sync");
             samples.push(t.elapsed().as_secs_f64() * 1e3);
         }
