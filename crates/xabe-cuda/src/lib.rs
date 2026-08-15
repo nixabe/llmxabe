@@ -32,4 +32,5 @@ pub use device::{
     driver_available, probe_all,
 };
 pub use kernels::dequant::{DequantError, Dequantizer};
+pub use kernels::gdn::{GdnError, GdnKernels, GdnScratch};
 pub use spike::{CheckOutcome, SpikeReport, TOOLCHAIN_DECISION};

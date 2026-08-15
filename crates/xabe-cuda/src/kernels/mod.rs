@@ -10,6 +10,7 @@
 //! and so a build needs no CUDA toolkit — only a driver at runtime.
 
 pub mod dequant;
+pub mod gdn;
 
 use cudarc::nvrtc::{CompileOptions, Ptx};
 
