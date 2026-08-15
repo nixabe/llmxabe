@@ -8,3 +8,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+xabe-model.workspace = true
+half.workspace = true
+thiserror.workspace = true
