@@ -12,4 +12,5 @@
 *.gguf
 *.safetensors
 /goldens/
+/.golden/
 /bench-results/
