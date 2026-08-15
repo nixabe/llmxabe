@@ -3,9 +3,12 @@
 A single-process CUDA inference engine for `Qwen3.6-35B-A3B` on 3× Quadro
 RTX 8000, written in Rust.
 
-> **Status: foundation.** The host-side engine — GGUF loading, hybrid cache,
-> scheduler, CPU reference kernels — is implemented and tested. The CUDA
-> kernels are not. This does not yet run a model. See
+> **Status: kernels in progress.** The host-side engine — GGUF loading,
+> hybrid cache, scheduler, CPU reference kernels — is implemented and tested.
+> The model now becomes **resident on a GPU** (733 tensors, 29.65 GiB, read
+> back bit-identical), and three device kernels exist: Q8_0 and Q6_K
+> dequantization, and the Gated DeltaNet decode step. There is still no
+> forward pass, so **this does not yet run a model**. See
 > [Milestones](#milestones) for exactly what is and is not done.
 
 ## Why this exists
@@ -147,10 +150,10 @@ Numbering follows the design plan. "Gate" is the condition for calling it done.
 | # | Milestone | Gate | Status |
 | --- | --- | --- | --- |
 | 00 | Toolchain spike | Inline PTX confirmed, or cudarc chosen | done |
-| 01 | GDN kernel prototype | Cosine ≥ 1e-3 vs reference on 4K tokens | CPU reference only |
+| 01 | GDN kernel prototype | Cosine ≥ 1e-3 vs reference | **decode form done** — max_abs 2.98e-8, cosine 1.000000000 over 512 tokens at the real geometry. Chunked prefill form not started |
 | 02 | Differential harness | Per-tensor max-abs + cosine thresholds | done |
 | 03 | FP16 dense forward | Correct logits, any speed | not started |
-| 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | CPU reference only |
+| 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | **dequant done** — bit-identical to the reference over 8.4 M elements of real weights. Grouped GEMM not started |
 | 05 | Flash attention port, sm_75 | Correct at 128K | not started |
 | 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started |
 | 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done |

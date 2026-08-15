@@ -49,9 +49,14 @@ rather than taken on trust.
 | --- | --- | --- | --- |
 | Embeddings (in + out) | 1.017 B | 1.017 B | **exact** |
 | LM head alone | 0.509 B | 0.509 B | **exact** |
-| Expert weights | 32.34 B | 33.02 B | ~2% low |
-| Projections | 1.305 B | ~1.44 B | ~9% low |
-| Total (excl. MTP) | 34.66 B | 35.50 B | ~2.4% low |
+| Expert weights | 32.338 B | 32.212 B | +0.39% |
+| Total (text path) | 34.660 B | 34.661 B | **−0.001%** |
+
+These are now produced by a test rather than by hand:
+`xabe_model::weights::WeightSchema` derives every expected tensor name and
+shape from `ModelConfig` alone, and
+`crates/xabe-model/tests/real_model_weights.rs` resolves it against the file.
+All 753 tensors match, with none left unclaimed.
 
 Tensor type histogram: `q6_K` 80 tensors / 16.41 GiB, `q8_0` 303 / 13.86 GiB,
 `f32` 368 / 0.10 GiB, `bf16` 2. Total tensor data 30.36 GiB.
@@ -74,15 +79,22 @@ matters for the bandwidth arithmetic below.
    stack, so this is not a bug, but a loader that assumes `num_layers` covers
    every `blk.N` tensor in the file will be wrong.
 
-3. **There is a short-convolution cache the config does not model.**
-   llama.cpp maintains a separate conv cache (`n_embd_r()`) alongside the
-   recurrent state — roughly 96 KiB per layer, ~2.8 MiB per sequence across
-   30 layers. That is about 5% on top of the 60 MiB state, small but
-   structurally absent from `gdn_state_bytes_per_sequence()`.
+3. **There is a short convolution the kernel inventory did not list.**
+   Every GDN layer carries `ssm_conv1d.weight` of shape `[4, 8192]` —
+   `qwen35moe.ssm.conv_kernel = 4` — a causal depthwise convolution over the
+   fused q/k/v stream, applied before the delta rule. `ModelConfig` counts its
+   parameters, but [KERNELS.md](KERNELS.md) had no entry for the kernel and
+   `gdn_state_bytes_per_sequence()` does not model its cache: llama.cpp keeps
+   a separate conv cache (`n_embd_r()`) of roughly 96 KiB per layer, ~2.8 MiB
+   per sequence across 30 layers. That is ~5% on top of the 60 MiB state —
+   small, but structurally missing rather than rounded away.
 
-The residual 2.4% gap in total parameters is unexplained and should be closed
-before any VRAM figure is treated as exact. It is a slight *under*-estimate,
-so budgets derived from it are optimistic rather than dangerous.
+> **A previously reported 2.4% gap was an accounting error, not a config
+> error.** An earlier hand-rolled comparison put `ModelConfig` 2.4% below the
+> file. The whole difference was `blk.40`: the MTP head is a complete
+> dense-attention block with its own 256-expert MoE — 0.84 B parameters — and
+> it was being counted on the file side but not the config side. Compared like
+> for like on the text path, the derivation is accurate to **0.001%**.
 
 ## VRAM budget per card
 

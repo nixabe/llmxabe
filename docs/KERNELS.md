@@ -4,20 +4,28 @@
 
 | Kernel | Layers | Risk | Plan | Status |
 | --- | --- | --- | --- | --- |
-| Gated DeltaNet (chunked delta rule) | 30 | **critical** | Port from llama.cpp; prefill form needs per-chunk triangular inverses | CPU reference |
+| Gated DeltaNet, recurrent (decode) | 30 | **critical** | Delta rule, one token at a time | **sm_75 kernel, max_abs 2.98e-8 vs reference** |
+| Gated DeltaNet, chunked (prefill) | 30 | **critical** | Port from llama.cpp; needs per-chunk triangular inverses | CPU reference |
+| GDN short convolution (depthwise, width 4) | 30 | medium | Write; causal depthwise conv over the fused qkv stream, before the delta rule | not started |
 | MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; Q6_K dequant in prologue | CPU reference |
 | Flash attention (GQA 16:2, head 256) | 10 | medium | Port llama.cpp sm_75 path | CPU reference |
 | LM head GEMV (2048 × 248,320) | 1 | medium | Write; split-K, dominates weight bandwidth | not started |
 | `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | CPU reference |
 | mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | CPU reference |
-| Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | CPU reference |
+| Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | **sm_75 kernel, bit-identical to reference** |
 | Router top-k over 256 experts | 40 | low | Write; warp-level bitonic | CPU reference |
 | RMSNorm, SwiGLU, residual | all | low | Write | CPU reference |
 | Vision encoder | — | deferred | Out of scope — images stay on llama.cpp | n/a |
 
 "CPU reference" means a scalar fp32 implementation exists in `xabe-kernels`
-with differential tests, and no GPU kernel has been written. See
-[TESTING.md](TESTING.md).
+with differential tests, and no GPU kernel has been written. Where a device
+kernel exists the measured agreement against that reference is quoted, because
+"implemented" without a number is not a status. See [TESTING.md](TESTING.md).
+
+The short convolution was missing from this table entirely until the weight
+schema made it visible — `qwen35moe.ssm.conv_kernel = 4`, one
+`ssm_conv1d.weight` per GDN layer. It is not optional and it is not folded
+into the delta rule; see [MODEL.md](MODEL.md).
 
 ## Order of work
 

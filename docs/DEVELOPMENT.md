@@ -156,9 +156,18 @@ found.
    cost is still an estimate.
 3. What fraction of platform traffic is multimodal — determines whether the
    retained llama.cpp instance is permanent or transitional.
-4. ~~Confirm the GDN state shape from `config.json`.~~ Derived as
-   32 × 128 × 128 × fp32 per layer; see [MODEL.md](MODEL.md) for what the GGUF
-   metadata shows.
+4. ~~Confirm the GDN state shape from `config.json`.~~ **Answered.**
+   32 × 128 × 128 × fp32 per layer, confirmed against the file's own metadata
+   (`ssm.state_size 128`, `ssm.inner_size 4096`, `ssm.time_step_rank 32`) and
+   against every GDN tensor shape. The device kernel runs at this geometry and
+   agrees with the reference to 2.98e-8.
+8. ~~Is `ModelConfig`'s parameter count 2.4% low?~~ **No — that was an
+   accounting error.** The gap was entirely `blk.40`, the MTP head, counted on
+   the file side but not the config side. Like for like on the text path the
+   derivation is accurate to 0.001%. See [MODEL.md](MODEL.md).
+9. The GDN short convolution cache (~2.8 MiB per sequence) is not modelled by
+   `gdn_state_bytes_per_sequence()`. **Open** — small, but it is a real
+   omission rather than a rounding choice.
 5. ~~Does llama.cpp master support MTP for this architecture?~~ Yes — HEAD
    includes MTP ubatch serialization.
 6. Observed `sim_best` distribution in the server logs. That is the current
