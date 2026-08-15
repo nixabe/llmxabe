@@ -39,6 +39,7 @@
 
 pub mod attention;
 pub mod compare;
+pub mod conv;
 pub mod gdn;
 pub mod moe;
 pub mod norm;

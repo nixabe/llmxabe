@@ -13,6 +13,7 @@ pub mod attention;
 pub mod dequant;
 pub mod gdn;
 pub mod gdn_chunked;
+pub mod layer_ops;
 pub mod moe;
 
 use cudarc::nvrtc::{CompileOptions, Ptx};
