@@ -216,6 +216,11 @@ dependencies = [
 [[package]]
 name = "xabe-engine"
 version = "0.1.0"
+dependencies = [
+ "xabe-cache",
+ "xabe-model",
+ "xabe-sched",
+]
 
 [[package]]
 name = "xabe-gguf"
@@ -252,6 +257,13 @@ dependencies = [
 [[package]]
 name = "xabe-server"
 version = "0.1.0"
+dependencies = [
+ "xabe-cache",
+ "xabe-cuda",
+ "xabe-engine",
+ "xabe-model",
+ "xabe-sched",
+]
 
 [[package]]
 name = "zerocopy"

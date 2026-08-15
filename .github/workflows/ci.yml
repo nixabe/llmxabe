@@ -34,14 +34,14 @@ jobs:
         run: |
           cargo clippy \
             -p xabe-gguf -p xabe-model -p xabe-cache \
-            -p xabe-sched -p xabe-kernels \
+            -p xabe-sched -p xabe-kernels -p xabe-engine \
             --all-targets -- -D warnings
 
       - name: Tests
         run: |
           cargo test \
             -p xabe-gguf -p xabe-model -p xabe-cache \
-            -p xabe-sched -p xabe-kernels
+            -p xabe-sched -p xabe-kernels -p xabe-engine
         # Tests that need the 32 GB model file skip themselves and say so.
         # A skip is not a pass; see CONTRIBUTING.md.
 
@@ -49,7 +49,7 @@ jobs:
         run: |
           cargo doc --no-deps \
             -p xabe-gguf -p xabe-model -p xabe-cache \
-            -p xabe-sched -p xabe-kernels
+            -p xabe-sched -p xabe-kernels -p xabe-engine
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -57,7 +57,7 @@ jobs:
   # built with fallback-dynamic-loading, so it links against whatever driver
   # exists at runtime. The milestone-00 spike inside it skips without a GPU.
   cuda:
-    name: xabe-cuda (build only)
+    name: xabe-cuda + xabe-server (build only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,10 +76,10 @@ jobs:
           sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev"]'
 
       - name: Clippy
-        run: cargo clippy -p xabe-cuda --all-targets -- -D warnings
+        run: cargo clippy -p xabe-cuda -p xabe-server --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build -p xabe-cuda
+        run: cargo build -p xabe-cuda -p xabe-server
 
   # The design plan is a local draft and must never enter the tree; likewise
   # model weights, which are 32 GB.

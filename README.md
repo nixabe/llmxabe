@@ -114,7 +114,14 @@ CUDA work additionally needs the CUDA 12.x toolkit on `PATH`:
 
 ```sh
 cargo run -p xabe-cuda --bin probe     # device inventory and sm_75 gate
+cargo run -p xabe-server               # full engine preflight
 ```
+
+The preflight validates the whole startup path — model config, cache geometry,
+scheduler construction, device gate, VRAM budget against the card's *measured*
+memory, and engine assembly. Three design rules are enforced by construction,
+so a preflight that builds these types has checked them. It does not serve
+requests; there is no HTTP surface yet.
 
 Tests that read the real model file look for it at
 `$LLMXABE_MODEL`, falling back to the path in `docs/DEVELOPMENT.md`. They skip

@@ -7,4 +7,13 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "llmxabe"
+path = "src/main.rs"
+
 [dependencies]
+xabe-model.workspace = true
+xabe-cache.workspace = true
+xabe-sched.workspace = true
+xabe-engine.workspace = true
+xabe-cuda.workspace = true
