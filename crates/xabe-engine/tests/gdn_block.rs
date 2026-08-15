@@ -23,22 +23,28 @@
 //! ## Two findings this file exists to have produced
 //!
 //! **The query/key heads are shared by modulo, and both landed GDN kernels
-//! divide.** llama.cpp's fused op indexes the query/key head as
+//! divided.** llama.cpp's fused op indexes the query/key head as
 //! `fastmodulo(h_idx, n_k_heads)` and its non-fused fallback broadcasts with
 //! `ggml_repeat_4d`, which tiles; `xabe_cuda::kernels::gdn` and
-//! `::gdn_chunked` both compute `h / heads_per_kv` internally.
+//! `::gdn_chunked` both computed `h / heads_per_kv` internally.
 //! [`the_query_key_head_broadcast_is_modulo_not_division`] discriminates the
 //! two against the captured `final_output-N` using nothing but captured
-//! tensors. `block::gdn` therefore materialises the broadcast itself.
+//! tensors, and still does. Both kernels were corrected in `d4d2f4d`, so
+//! `block::gdn` no longer materialises the broadcast and this file no longer
+//! widens the capture's 16-head `q_conv_predelta` / `k_conv_predelta` before
+//! feeding them to the mixer.
 //!
-//! **The chunked prefill kernel overflows on this model's real decay rates.**
-//! `gdn_chunk_solve_and_apply` forms `v_t / lambda_t` where
+//! **The chunked prefill kernel overflowed on this model's real decay rates.**
+//! `gdn_chunk_solve_and_apply` formed `v_t / lambda_t` where
 //! `lambda_t = exp(sum_{i<=t} log_decay_i)`. Block 0 head 9 has a per-token
-//! log-decay of -91.58, so `lambda` reaches 2.5e-42 by the second token and the
-//! quotient is `inf`. See
+//! log-decay of -91.58, so `lambda` reached 2.5e-42 by the second token and the
+//! quotient was `inf`. See
 //! [`the_chunked_prefill_kernel_overflows_on_this_models_decay_rates`], which
-//! localizes it to a token and a head. Everything else in this file therefore
-//! drives the block through the recurrent form.
+//! localizes where that would have happened and now gates the chunked form
+//! against the recurrent one instead of failing. The chained end-to-end test
+//! still drives the block one token at a time, because that also threads the
+//! convolution cache and the recurrent state through 19 separate calls — the
+//! carry a decode loop performs, and exercised nowhere else.
 //!
 //! ## The one large tolerance, and why it is not this block's
 //!
@@ -334,31 +340,11 @@ fn gate(step: &str, r: &ComparisonResult, tolerance: &Tolerance) {
     }
 }
 
-/// Expand a `[tokens][qk_heads][head_dim]` tensor to
-/// `[tokens][value_heads][head_dim]` under a head map.
-fn broadcast_heads(
-    src: &[f32],
-    tokens: usize,
-    qk_heads: usize,
-    value_heads: usize,
-    head_dim: usize,
-    modulo: bool,
-) -> Vec<f32> {
-    let mut out = vec![0.0f32; tokens * value_heads * head_dim];
-    for t in 0..tokens {
-        for h in 0..value_heads {
-            let hq = if modulo {
-                h % qk_heads
-            } else {
-                h / (value_heads / qk_heads)
-            };
-            let from = (t * qk_heads + hq) * head_dim;
-            let to = (t * value_heads + h) * head_dim;
-            out[to..to + head_dim].copy_from_slice(&src[from..from + head_dim]);
-        }
-    }
-    out
-}
+// A host `broadcast_heads` used to live here, to widen the capture's 16-head
+// `q_conv_predelta` / `k_conv_predelta` to 32 heads for a mixer that could not
+// do the mapping itself. Both kernels index `h % qk_heads` now, so nothing in
+// this file broadcasts and the head map is discriminated only where it belongs
+// — inside `delta_rule_host`, against `final_output-N`.
 
 // ---------------------------------------------------------------------------
 // A host transcription of llama.cpp's fused gated delta net
@@ -451,9 +437,12 @@ fn norm_and_gate_host(
 /// Drive the mixer one token at a time over a whole sequence.
 ///
 /// The recurrent kernel is a decode kernel: it advances the state by exactly
-/// one token. Running a sequence through it is what a decode loop does, and —
-/// until `gdn_chunked` stops overflowing on this model's decay rates — it is
-/// also the only form this file can use for a 19-token prefill.
+/// one token. Running a sequence through it is what a decode loop does, and it
+/// is what anchors the chunked form, which now also runs on this model's decay
+/// rates.
+///
+/// `q` and `k` are `[tokens][qk_heads][head_dim]`, `v` is
+/// `[tokens][value_heads][head_dim]`.
 fn mix_recurrently(
     block: &mut GdnBlock,
     stream: &Arc<CudaStream>,
@@ -466,12 +455,23 @@ fn mix_recurrently(
 ) -> Vec<f32> {
     let geo = block.geometry();
     let wide = geo.value_dim();
+    let narrow = geo.key_dim();
     let heads = geo.value_heads;
+    assert_eq!(
+        q.len(),
+        tokens * narrow,
+        "q is [tokens][qk_heads][head_dim]"
+    );
+    assert_eq!(
+        k.len(),
+        tokens * narrow,
+        "k is [tokens][qk_heads][head_dim]"
+    );
     let mut state = block.state(stream).expect("state allocates");
     let mut out = Vec::with_capacity(tokens * wide);
     for t in 0..tokens {
-        let d_q = htod(stream, &q[t * wide..(t + 1) * wide]);
-        let d_k = htod(stream, &k[t * wide..(t + 1) * wide]);
+        let d_q = htod(stream, &q[t * narrow..(t + 1) * narrow]);
+        let d_k = htod(stream, &k[t * narrow..(t + 1) * narrow]);
         let d_v = htod(stream, &v[t * wide..(t + 1) * wide]);
         let d_g = htod(stream, &log_decay[t * heads..(t + 1) * heads]);
         let d_b = htod(stream, &beta[t * heads..(t + 1) * heads]);
@@ -496,9 +496,9 @@ fn mix_recurrently(
 ///
 /// llama.cpp's fused op indexes it as `fastmodulo(h_idx, n_k_heads)` and its
 /// non-fused fallback broadcasts with `ggml_repeat_4d`, which tiles — so value
-/// head 17 reads query/key head 1, not 8. Both landed GDN kernels implement
-/// `h / heads_per_kv` instead, which is why `block::gdn` materialises the
-/// broadcast itself rather than delegating it.
+/// head 17 reads query/key head 1, not 8. Both landed GDN kernels implemented
+/// `h / heads_per_kv` until `d4d2f4d`; `block::gdn` materialised the broadcast
+/// itself in the meantime, and now delegates it.
 ///
 /// The discrimination runs entirely on captured tensors: golden
 /// `q_conv_predelta` / `k_conv_predelta` / `v_conv_predelta`, golden `gate` and
@@ -885,8 +885,9 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         // --- 5. the q/k/v slice, and the L2 norm the mixer folds in ----------
         let d_gold_silu = htod(&stream, gold("conv_output_silu"));
         let wide = tokens * geo.value_dim();
-        let mut d_q = stream.alloc_zeros::<f32>(wide).expect("q");
-        let mut d_k = stream.alloc_zeros::<f32>(wide).expect("k");
+        let narrow = tokens * geo.key_dim();
+        let mut d_q = stream.alloc_zeros::<f32>(narrow).expect("q");
+        let mut d_k = stream.alloc_zeros::<f32>(narrow).expect("k");
         let mut d_v = stream.alloc_zeros::<f32>(wide).expect("v");
         block
             .split_qkv(&stream, &d_gold_silu, &mut d_q, &mut d_k, &mut d_v, tokens)
@@ -902,24 +903,19 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
 
         // q and k leave the block un-normalized — the mixer kernels normalize
         // internally — so the comparison against `*_conv_predelta` applies
-        // ggml's own l2 norm on the host, per (token, value head).
+        // ggml's own l2 norm on the host, per (token, query/key head). The
+        // split emits exactly the capture's `[head_dim, qk_heads, tokens]`, so
+        // there is nothing to broadcast on either side.
         for (tag, buf) in [("q_conv_predelta", &d_q), ("k_conv_predelta", &d_k)] {
             let raw = dtoh(&stream, buf);
-            let mut normed = vec![0.0f32; wide];
-            for chunk in 0..tokens * geo.value_heads {
+            assert_eq!(raw.len(), narrow);
+            let mut normed = vec![0.0f32; narrow];
+            for chunk in 0..tokens * geo.qk_heads {
                 let base = chunk * geo.head_dim;
                 normed[base..base + geo.head_dim]
                     .copy_from_slice(&l2_norm_ggml(&raw[base..base + geo.head_dim]));
             }
-            let reference = broadcast_heads(
-                fx.golden.f32(&named(tag)),
-                tokens,
-                geo.qk_heads,
-                geo.value_heads,
-                geo.head_dim,
-                true,
-            );
-            let r = report(tag, &normed, &reference);
+            let r = report(tag, &normed, fx.golden.f32(&named(tag)));
             gate(tag, &r, &ANCHORED_ELEMENTWISE);
         }
 
@@ -993,31 +989,16 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
 
         // --- 7/8. the delta rule, then final_output-N ------------------------
         //
-        // Fed llama.cpp's already-L2-normalized q/k. The mixer kernels
-        // normalize again, which is idempotent to about 5e-7 on a unit vector
-        // (`1/sqrt(1 + 1e-6)`), and folds in the `1/sqrt(head_dim)` output
+        // Fed llama.cpp's already-L2-normalized q/k, at their own 16 heads —
+        // the kernels pair value head `h` with query/key head `h % 16`
+        // themselves. The mixer normalizes again, which is idempotent to about
+        // 5e-7 on a unit vector, and folds in the `1/sqrt(head_dim)` output
         // scale that llama.cpp applies at the end instead.
-        let bq = broadcast_heads(
-            gold("q_conv_predelta"),
-            tokens,
-            geo.qk_heads,
-            geo.value_heads,
-            geo.head_dim,
-            true,
-        );
-        let bk = broadcast_heads(
-            gold("k_conv_predelta"),
-            tokens,
-            geo.qk_heads,
-            geo.value_heads,
-            geo.head_dim,
-            true,
-        );
         let core = mix_recurrently(
             &mut block,
             &stream,
-            &bq,
-            &bk,
+            gold("q_conv_predelta"),
+            gold("k_conv_predelta"),
             gold("v_conv_predelta"),
             gold("gate"),
             gold("beta_sigmoid"),

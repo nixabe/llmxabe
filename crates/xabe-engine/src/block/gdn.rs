@@ -40,17 +40,37 @@
 //! stretches. So value head `h` reads query/key head `h % 16`, and value heads
 //! 0 and 16 share a query/key head — *not* 0 and 1.
 //!
-//! [`xabe_cuda::kernels::gdn`] and [`xabe_cuda::kernels::gdn_chunked`] hard-code
-//! the other convention: `qk_head = h / heads_per_kv`. Rather than edit a
-//! landed kernel, this block **materialises the broadcast itself** in
-//! [`GdnBlock::split_qkv`] and constructs both kernels with
-//! `qk_heads == value_heads`, which makes their internal mapping the identity
-//! and leaves this file as the single place the convention is stated. The cost
-//! is that the chunked form computes its two Gram matrices 32 times per chunk
-//! instead of 16 — correct, and 2x more work than necessary. See
-//! `gdn_block.rs`'s `the_query_key_head_broadcast_is_modulo_not_division`,
-//! which discriminates the two mappings against the captured
-//! `final_output-N`.
+//! [`xabe_cuda::kernels::gdn`] and [`xabe_cuda::kernels::gdn_chunked`] **used
+//! to** hard-code the other convention, `qk_head = h / heads_per_kv`, and this
+//! block worked around it: [`GdnBlock::split_qkv`] materialised the broadcast
+//! itself and both kernels were constructed with `qk_heads == value_heads` so
+//! their internal mapping became the identity. That cost the chunked form its
+//! two Gram matrices 32 times per chunk instead of 16.
+//!
+//! Both kernels now compute `qk_head = h % qk_heads` themselves (`d4d2f4d`),
+//! so the workaround is gone: they are constructed with the real 16 and
+//! [`GdnBlock::split_qkv`] emits a plain `[tokens][qk_heads][head_dim]` slice.
+//! `gdn_block.rs`'s `the_query_key_head_broadcast_is_modulo_not_division`
+//! still discriminates the two mappings against the captured `final_output-N`,
+//! on captured tensors only, so the convention stays pinned by a measurement
+//! rather than by this paragraph.
+//!
+//! **What removing it bought, measured** — `gdn_chunked::prefill` alone, one
+//! Quadro RTX 8000, 32 value heads, `chunk_len = 64`, the two constructions
+//! driven back to back in the same process:
+//!
+//! | tokens | chunks | `qk_heads = 32` | `qk_heads = 16` |
+//! | --- | --- | --- | --- |
+//! | 19 | 1 | 0.280 ms | 0.267 ms |
+//! | 512 | 8 | 8.798 ms | 7.581 ms |
+//! | 2048 | 32 | 35.203 ms | 30.343 ms |
+//!
+//! Half the Gram work is **14%** of the prefill's wall clock, not half of it:
+//! the two `chunk_len x chunk_len` Gram matrices are a minority of the kernel
+//! sequence and the triangular solve dominates. The q/k buffers do halve
+//! outright — 67 MiB to 33.5 MiB of scratch at 2048 tokens, plus the two Gram
+//! buffers from 1 MiB to 512 KiB — which is the larger of the two wins and the
+//! one that does not depend on how the solve is shaped.
 //!
 //! **`ssm_a` is stored already negated.** `gate-N = softplus(alpha + dt_bias) *
 //! ssm_a` *is* the per-head log-decay; there is no second negation. Every entry
@@ -60,26 +80,27 @@
 //! the whole fused stream, so q, k and v are all convolved *and* activated
 //! before anything is sliced apart.
 //!
-//! # A landed kernel this block cannot currently use for prefill
+//! # A landed kernel that this block once could not use for prefill
 //!
 //! [`Self::forward`](GdnBlock::forward) dispatches a multi-token batch to
-//! [`xabe_cuda::kernels::gdn_chunked`], which is the right shape of decision.
-//! That kernel does not survive this model's numbers:
-//! `gdn_chunk_solve_and_apply` forms `v_t / lambda_t` with `lambda_t =
-//! exp(sum_{i<=t} log_decay_i)`, and Qwen3.6's per-token log-decays reach
-//! **-91.58** (block 0, head 9). `lambda` is then 2.5e-42 by the second token
-//! and the quotient overflows fp32, so the chunk fills with `inf` and then
-//! `NaN`. Block 20 does the same by token 9; block 4, whose worst per-token
-//! log-decay is only -5.99, comes through cleanly and agrees with the
-//! recurrent form to `5.96e-8`.
+//! [`xabe_cuda::kernels::gdn_chunked`]. That kernel **used to** fail on this
+//! model's numbers: `gdn_chunk_solve_and_apply` formed `v_t / lambda_t` with
+//! `lambda_t = exp(sum_{i<=t} log_decay_i)`, and Qwen3.6's per-token
+//! log-decays reach **-91.58** (block 0, head 9), so `lambda` was 2.5e-42 by
+//! the second token, the quotient overflowed fp32, and the chunk filled with
+//! `inf` and then `NaN`. Block 20 did the same by token 9; block 4, whose
+//! worst per-token log-decay is only -5.99, came through cleanly throughout.
 //!
-//! llama.cpp is immune in both of its forms — its fused CUDA op is recurrent
-//! and never accumulates a decay, and `build_delta_net_chunking` only ever
-//! *multiplies* by `exp(g_cum)` and `exp(g_cum_last - g_cum)`, both bounded
-//! above by 1. `gdn_block.rs`'s
-//! `the_chunked_prefill_kernel_overflows_on_this_models_decay_rates` localizes
-//! it to a token and a head and fails until it is fixed. The fix belongs in
-//! `crates/xabe-cuda/src/kernels/gdn_chunked.rs`, not here.
+//! It was fixed in `d4d2f4d` by substituting `u'_t = lambda_t u_t`, which
+//! leaves every surviving factor as `exp` of a *non-positive* sum of real
+//! per-token log-decays and therefore in `(0, 1]`. llama.cpp was immune in
+//! both of its forms for the same reason: its fused CUDA op is recurrent and
+//! never accumulates a decay, and `build_delta_net_chunking` only ever
+//! *multiplies* by `exp(g_cum)` and `exp(g_cum_last - g_cum)`.
+//! `gdn_block.rs`'s
+//! `the_chunked_prefill_kernel_overflows_on_this_models_decay_rates` still
+//! reports where the cumulative decay would have overflowed, and now gates the
+//! chunked form against the recurrent one instead of failing.
 //!
 //! # What is deliberately not done here
 //!
@@ -247,19 +268,24 @@ __global__ void gdn_silu(
     }
 }
 
-// Slice the convolved q/k/v stream apart and broadcast q/k to the value heads.
+// Slice the convolved q/k/v stream apart. No broadcast: q and k come out at
+// their own 16 heads and the mixer kernels do `qk_head = h % qk_heads`.
 //
 // The stream is [2 * qk_heads * head_dim | value_heads * head_dim] per token,
 // contiguous, which is the layout `attn_qkv.weight`'s output width implies and
-// `build_layer_attn_linear`'s three `ggml_view_4d` offsets confirm.
+// `build_layer_attn_linear`'s three `ggml_view_4d` offsets confirm. The three
+// outputs are therefore exactly llama.cpp's `q_conv-N` / `k_conv-N`
+// (`[head_dim, qk_heads, tokens]`) and `v_conv_predelta-N`
+// (`[head_dim, value_heads, tokens]`) — the same shapes, not a widened form.
 //
-// **qk_head = h % qk_heads.** llama.cpp's fused op uses `fastmodulo(h_idx,
-// n_k_heads)` and its fallback uses `ggml_repeat_4d`, which tiles. Dividing
-// instead — the other plausible reading, and the one both GDN kernels
-// implement internally — pairs the wrong query with the wrong value and stays
-// finite and fluent.
+// This kernel **used to** materialise `qk_head = h % qk_heads` itself, because
+// both GDN kernels indexed `h / heads_per_kv` internally and had to be handed
+// an already-wide q and k. They index by modulo now, so the broadcast is
+// theirs and this is a plain slice.
 //
-// grid: (value_heads, tokens). block: head_dim threads.
+// grid: (value_heads, tokens). block: head_dim threads. Blocks with
+// `h < qk_heads` write q and k as well as v, so the two ranges are covered by
+// one launch and the low 16 heads do the extra pair of stores.
 __global__ void gdn_split_qkv(
     const float* __restrict__ conv,
     float* __restrict__ q,
@@ -275,14 +301,17 @@ __global__ void gdn_split_qkv(
 
     int key_dim  = qk_heads * head_dim;
     int conv_dim = 2 * key_dim + value_heads * head_dim;
-    int hq = h % qk_heads;
 
     const float* c = conv + (long long)t * conv_dim;
-    long long o = ((long long)t * value_heads + h) * head_dim + d;
 
-    q[o] = c[hq * head_dim + d];
-    k[o] = c[key_dim + hq * head_dim + d];
-    v[o] = c[2 * key_dim + h * head_dim + d];
+    v[((long long)t * value_heads + h) * head_dim + d] =
+        c[2 * key_dim + h * head_dim + d];
+
+    if (h < qk_heads) {
+        long long o = ((long long)t * qk_heads + h) * head_dim + d;
+        q[o] = c[h * head_dim + d];
+        k[o] = c[key_dim + h * head_dim + d];
+    }
 }
 
 // The per-head decay and write gates.
@@ -485,6 +514,16 @@ impl GdnGeometry {
         self.value_heads * self.head_dim
     }
 
+    /// Width of one token's query or key stream (2048).
+    ///
+    /// Half `value_dim`, because there are half as many query/key heads. This
+    /// is the width [`GdnBlock::split_qkv`] emits and both mixer kernels
+    /// expect; handing them `value_dim` instead is the workaround this block
+    /// carried until the kernels learned the modulo mapping themselves.
+    pub const fn key_dim(&self) -> usize {
+        self.qk_heads * self.head_dim
+    }
+
     /// Floats in one sequence's convolution cache.
     pub const fn conv_state_len(&self) -> usize {
         self.conv_dim() * (self.conv_kernel - 1)
@@ -632,10 +671,10 @@ pub struct GdnTrace<'a> {
     pub conv_raw: &'a CudaSlice<f32>,
     /// `conv_output_silu-N`, `[tokens][conv_dim]`.
     pub conv_silu: &'a CudaSlice<f32>,
-    /// `q_conv-N` sliced and broadcast, `[tokens][value_heads][head_dim]`.
+    /// `q_conv-N`, `[tokens][qk_heads][head_dim]` — the capture's own shape.
     /// **Not** L2-normalized: the mixer kernels do that internally.
     pub q: &'a CudaSlice<f32>,
-    /// `k_conv-N` sliced and broadcast, `[tokens][value_heads][head_dim]`.
+    /// `k_conv-N`, `[tokens][qk_heads][head_dim]`.
     pub k: &'a CudaSlice<f32>,
     /// `v_conv_predelta-N`, `[tokens][value_heads][head_dim]`.
     pub v: &'a CudaSlice<f32>,
@@ -706,14 +745,17 @@ impl Scratch {
         let conv = tokens * g.conv_dim();
         let heads = tokens * g.value_heads;
         let value = tokens * g.value_dim();
+        // q and k are half the width of v: 16 query/key heads against 32 value
+        // heads. They were `value` too while this block broadcast them itself.
+        let key = tokens * g.key_dim();
         Ok(Self {
             tokens,
             normed: stream.alloc_zeros::<f32>(hidden)?,
             qkv: stream.alloc_zeros::<f32>(conv)?,
             conv_raw: stream.alloc_zeros::<f32>(conv)?,
             conv_silu: stream.alloc_zeros::<f32>(conv)?,
-            q: stream.alloc_zeros::<f32>(value)?,
-            k: stream.alloc_zeros::<f32>(value)?,
+            q: stream.alloc_zeros::<f32>(key)?,
+            k: stream.alloc_zeros::<f32>(key)?,
             v: stream.alloc_zeros::<f32>(value)?,
             z: stream.alloc_zeros::<f32>(value)?,
             alpha: stream.alloc_zeros::<f32>(heads)?,
@@ -755,11 +797,12 @@ pub struct GdnBlock {
 impl GdnBlock {
     /// Compile every kernel this block needs, for `geometry`.
     ///
-    /// Both mixer kernels are constructed with `qk_heads == value_heads`. That
-    /// is not a mistake: their internal head-sharing map is
-    /// `qk_head = h / heads_per_kv`, and llama.cpp's is `h % qk_heads`, so this
-    /// block materialises the broadcast itself and hands them an already-wide
-    /// q and k. See the module docs.
+    /// Both mixer kernels get the model's real `qk_heads` (16), so they apply
+    /// `qk_head = h % qk_heads` themselves over a narrow q and k. They were
+    /// constructed with `qk_heads == value_heads` while their internal map was
+    /// `h / heads_per_kv` and this block had to pre-broadcast; that made the
+    /// chunked form compute its two `chunk_len x chunk_len` Gram matrices 32
+    /// times per chunk rather than 16. See the module docs.
     pub fn new(ctx: &Arc<CudaContext>, geometry: GdnGeometry) -> Result<Self, GdnBlockError> {
         let stream = ctx.default_stream();
 
@@ -768,13 +811,13 @@ impl GdnBlock {
             ctx,
             geometry.head_dim,
             geometry.value_heads,
-            geometry.value_heads,
+            geometry.qk_heads,
         )?;
         let chunked = GdnChunkedKernels::new(
             ctx,
             geometry.head_dim,
             geometry.value_heads,
-            geometry.value_heads,
+            geometry.qk_heads,
             geometry.chunk_len,
         )?;
         let recurrent_scratch = recurrent.scratch(&stream)?;
@@ -1133,12 +1176,13 @@ impl GdnBlock {
         Ok(())
     }
 
-    /// Slice the convolved stream into q, k and v, broadcasting q and k from
-    /// `qk_heads` to `value_heads` by **modulo**.
+    /// Slice the convolved stream into q, k and v.
     ///
-    /// All three outputs come out `[tokens][value_heads][head_dim]`, which is
-    /// what both mixer kernels want once they are constructed with
-    /// `qk_heads == value_heads`.
+    /// `q` and `k` come out `[tokens][qk_heads][head_dim]` and `v`
+    /// `[tokens][value_heads][head_dim]` — the shapes llama.cpp captures, and
+    /// the shapes both mixer kernels want now that they index the query/key
+    /// head as `h % qk_heads` themselves. This used to broadcast q and k up to
+    /// `value_heads` because they did not.
     pub fn split_qkv(
         &self,
         stream: &Arc<CudaStream>,
@@ -1149,10 +1193,11 @@ impl GdnBlock {
         tokens: usize,
     ) -> Result<(), GdnBlockError> {
         let g = self.geometry;
+        let narrow = tokens * g.key_dim();
         let wide = tokens * g.value_dim();
         check_len("split conv", tokens * g.conv_dim(), conv.len())?;
-        check_len("split q", wide, q.len())?;
-        check_len("split k", wide, k.len())?;
+        check_len("split q", narrow, q.len())?;
+        check_len("split k", narrow, k.len())?;
         check_len("split v", wide, v.len())?;
         if tokens == 0 {
             return Ok(());
@@ -1175,9 +1220,10 @@ impl GdnBlock {
             .arg(&qk_heads)
             .arg(&value_heads);
         // SAFETY: the grid is (value_heads, tokens) and the block head_dim
-        // threads, so every write is at `(t * value_heads + h) * head_dim + d`
-        // inside `tokens * value_heads * head_dim`, and every read is inside
-        // `t * conv_dim + conv_dim` because `h % qk_heads < qk_heads`.
+        // threads, so every write to `v` is at
+        // `(t * value_heads + h) * head_dim + d` inside `wide`, and the writes
+        // to `q` and `k` are guarded by `h < qk_heads`, which puts them inside
+        // `narrow`. Every read is inside `t * conv_dim + conv_dim`.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
@@ -1254,9 +1300,11 @@ impl GdnBlock {
 
     /// Advance the recurrent state over `tokens` tokens and write their output.
     ///
-    /// `q`, `k` and `v` are all `[tokens][value_heads][head_dim]` — q and k
-    /// already broadcast — and `log_decay` and `beta` are
-    /// `[tokens][value_heads]`.
+    /// `q` and `k` are `[tokens][qk_heads][head_dim]`, `v` is
+    /// `[tokens][value_heads][head_dim]`, and `log_decay` and `beta` are
+    /// `[tokens][value_heads]`. The kernels pair value head `h` with query/key
+    /// head `h % qk_heads`; they took an already-broadcast q and k until they
+    /// learned to do that themselves.
     ///
     /// One token takes the recurrent kernel and more than one takes the chunked
     /// kernel. The two must agree: prefill fills the state a later decode
@@ -1275,9 +1323,10 @@ impl GdnBlock {
         tokens: usize,
     ) -> Result<Mixer, GdnBlockError> {
         let g = self.geometry;
+        let narrow = tokens * g.key_dim();
         let wide = tokens * g.value_dim();
-        check_len("mix q", wide, q.len())?;
-        check_len("mix k", wide, k.len())?;
+        check_len("mix q", narrow, q.len())?;
+        check_len("mix k", narrow, k.len())?;
         check_len("mix v", wide, v.len())?;
         check_len("mix log_decay", tokens * g.value_heads, log_decay.len())?;
         check_len("mix beta", tokens * g.value_heads, beta.len())?;
@@ -1358,21 +1407,30 @@ mod tests {
     }
 
     #[test]
-    fn the_query_key_broadcast_is_modulo_because_that_is_what_ggml_repeat_does() {
-        // The single most consequential line in this file. llama.cpp's fused op
-        // computes `fastmodulo(h_idx, n_k_heads)` and its fallback reaches the
-        // same mapping through `ggml_repeat_4d`, which tiles rather than
-        // stretches. Both GDN kernels implement `h / heads_per_kv` instead, so
-        // this block must not delegate the broadcast to them — asserted
-        // structurally, because no synthetic input distinguishes the two
-        // cheaply and the numeric discrimination lives in `gdn_block.rs`.
-        assert!(GDN_BLOCK_SRC.contains("int hq = h % qk_heads;"));
+    fn the_split_emits_the_captures_own_query_key_width_and_broadcasts_nothing() {
+        // The query/key head map — `fastmodulo(h_idx, n_k_heads)` in
+        // llama.cpp's fused op, `ggml_repeat_4d`'s tiling in its fallback —
+        // now lives in the two GDN kernels, whose own structural tests assert
+        // `int qk_head = h % qk_heads;` and that `heads_per_kv` does not
+        // appear. What this file must not do is re-introduce a broadcast on
+        // top of that, which would pair every value head with query/key head
+        // `(h % 16) % 16` at 2x the Gram work and *still* look correct.
         let body =
             &GDN_BLOCK_SRC[at("__global__ void gdn_split_qkv(")..at("__global__ void gdn_gates(")];
         assert!(
-            !body.contains("h / qk_heads"),
-            "the broadcast reverted to division",
+            body.contains("if (h < qk_heads) {"),
+            "the split no longer writes q and k at their own head count",
         );
+        assert!(
+            !body.contains("h % qk_heads") && !body.contains("h / qk_heads"),
+            "the split re-introduced a head map; that belongs in the kernels",
+        );
+        // And the widths it writes into differ, which is what makes the
+        // absence of a broadcast observable rather than merely stated.
+        let g = geometry();
+        assert_eq!(g.key_dim(), 2048);
+        assert_eq!(g.value_dim(), 4096);
+        assert_eq!(g.value_dim(), 2 * g.key_dim());
     }
 
     #[test]
@@ -1445,6 +1503,10 @@ mod tests {
         // of `ssm_conv1d.weight`'s channel count.
         assert_eq!(g.conv_dim(), 8192);
         assert_eq!(g.value_dim(), 4096);
+        assert_eq!(g.key_dim(), 2048);
+        // The fused stream is two key widths and one value width, which is
+        // what makes the slice offsets in `gdn_split_qkv` a partition.
+        assert_eq!(g.conv_dim(), 2 * g.key_dim() + g.value_dim());
         // Three carried inputs per channel, and 2 MiB of recurrent state.
         assert_eq!(g.conv_state_len(), 8192 * 3);
         assert_eq!(g.recurrent_state_len(), 32 * 128 * 128);

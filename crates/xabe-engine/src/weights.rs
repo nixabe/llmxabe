@@ -22,10 +22,13 @@
 //!   byte against the mapping.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cudarc::driver::{CudaContext, CudaStream, DriverError};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DriverError};
 use xabe_cuda::arena::{ALIGNMENT, Allocation, ArenaError, DeviceArena, memory_info};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::weights::{Directory, Role};
@@ -162,6 +165,61 @@ impl LoadReport {
     }
 }
 
+/// A borrowed view of one resident tensor, shaped like an owned buffer.
+///
+/// # Why this exists
+///
+/// The arena is a single 29.6 GiB `CudaSlice<u8>`, and every kernel entry
+/// point in `xabe-cuda` takes `&CudaSlice<T>` — [`xabe_cuda::kernels::moe::
+/// QuantTensor`] carries one and validates its *whole* element count against
+/// the declared geometry. `cudarc` 0.19 can produce a `CudaView` of a
+/// sub-range but not a `CudaSlice`, so a tensor inside the arena could not be
+/// handed to a kernel at all. Both landed blocks worked around that by copying
+/// their layer's weights into fresh allocations at construction — 725 MiB per
+/// MoE layer, which does not survive being multiplied by 40.
+///
+/// This is the alternative: `cuMemAlloc` returns a plain device address, a
+/// sub-range of it is also a plain device address, and
+/// [`CudaStream::upgrade_device_ptr`] wraps one back into a `CudaSlice`. The
+/// result aliases memory it does not own, so it is kept in a [`ManuallyDrop`]
+/// and tied to the arena's lifetime: dropping it would ask the driver to free
+/// a pointer into the middle of the slab, or — for the tensor at offset 0 —
+/// free the whole model.
+///
+/// Nothing is copied and nothing is allocated. The cost is one `unsafe` and
+/// the leaked `Arc<CudaStream>` clone inside each alias, which is bounded by
+/// the tensor count and lives as long as the process does anyway.
+pub struct ResidentTensor<'a, T> {
+    slice: ManuallyDrop<CudaSlice<T>>,
+    _arena: PhantomData<&'a DeviceArena>,
+}
+
+impl<T> Deref for ResidentTensor<'_, T> {
+    type Target = CudaSlice<T>;
+
+    fn deref(&self) -> &CudaSlice<T> {
+        &self.slice
+    }
+}
+
+impl<T> ResidentTensor<'_, T> {
+    /// Give up the lifetime tie and hand back the raw aliasing slice.
+    ///
+    /// For the callers that need an *owned* `CudaSlice` in a struct field and
+    /// cannot hold a borrow — [`crate::block::gdn::GdnLayerWeights`] is the
+    /// one in this crate.
+    ///
+    /// # Safety
+    ///
+    /// The returned slice does not own its memory. The caller must ensure it
+    /// is **never dropped** (keep it in a [`ManuallyDrop`], or
+    /// [`std::mem::forget`] it) and that it does not outlive the
+    /// [`DeviceWeights`] it came from.
+    pub unsafe fn into_aliasing_slice(self) -> CudaSlice<T> {
+        ManuallyDrop::into_inner(self.slice)
+    }
+}
+
 /// The model, resident on one device.
 pub struct DeviceWeights {
     arena: DeviceArena,
@@ -176,9 +234,15 @@ impl DeviceWeights {
     /// spending a minute copying, and so the arena is exactly the right size —
     /// which is what makes a skipped tensor detectable.
     pub fn required_bytes(directory: &Directory<'_>) -> u64 {
+        Self::required_bytes_where(directory, |_| true)
+    }
+
+    /// As [`Self::required_bytes`], over the roles `keep` accepts.
+    pub fn required_bytes_where(directory: &Directory<'_>, keep: impl Fn(Role) -> bool) -> u64 {
         directory
             .entries()
             .iter()
+            .filter(|e| keep(e.spec.role))
             .map(|e| (e.info.n_bytes as usize).next_multiple_of(ALIGNMENT) as u64)
             .sum()
     }
@@ -192,7 +256,33 @@ impl DeviceWeights {
         file: &GgufFile,
         directory: &Directory<'_>,
     ) -> Result<(Self, LoadReport), LoadError> {
-        let capacity = Self::required_bytes(directory);
+        Self::load_where(ctx, stream, file, directory, |_| true)
+    }
+
+    /// As [`Self::load`], but only for the roles `keep` accepts.
+    ///
+    /// The arena is still sized exactly from what it will hold, so
+    /// [`LoadReport::complete`] and the `used == capacity` check keep their
+    /// meaning: a *selected* tensor that was never uploaded is still caught.
+    /// What is lost is the guarantee that the arena is the whole model — the
+    /// caller now owns that, and [`Self::find`] returns `None` for anything
+    /// filtered out rather than a wrong pointer.
+    ///
+    /// This exists because a consumer that cannot take a [`ResidentTensor`]
+    /// has to hold its own copy, and paying for both is what makes a 29.6 GiB
+    /// model not fit on a 48 GiB card. Filtering those roles out of the arena
+    /// keeps exactly one copy of every tensor on the device. It is a stopgap
+    /// for that specific shape of API mismatch, not a general facility: a
+    /// consumer taught to take a borrowed view should be dropped from the
+    /// filter rather than kept out of the arena.
+    pub fn load_where(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        file: &GgufFile,
+        directory: &Directory<'_>,
+        keep: impl Fn(Role) -> bool,
+    ) -> Result<(Self, LoadReport), LoadError> {
+        let capacity = Self::required_bytes_where(directory, &keep);
         let (free_before, _) = memory_info(ctx)?;
 
         // Leave the driver room for its own allocations; a request that
@@ -212,7 +302,7 @@ impl DeviceWeights {
         let mut index = HashMap::with_capacity(directory.len());
         let mut bytes = 0u64;
 
-        for entry in directory.entries() {
+        for entry in directory.entries().iter().filter(|e| keep(e.spec.role)) {
             let name = entry.spec.name.as_str();
             let data = file
                 .tensor_bytes(name)
@@ -277,6 +367,76 @@ impl DeviceWeights {
     /// The backing arena, for handing device pointers to kernels.
     pub fn arena(&self) -> &DeviceArena {
         &self.arena
+    }
+
+    /// A zero-copy alias of one resident tensor's bytes.
+    ///
+    /// `None` if the tensor is not resident — either the directory never named
+    /// it, or [`Self::load_where`] filtered it out. Nothing is copied: see
+    /// [`ResidentTensor`] for what the alias is and why it exists.
+    pub fn bytes_of(
+        &self,
+        stream: &Arc<CudaStream>,
+        role: Role,
+        layer: Option<u32>,
+    ) -> Option<ResidentTensor<'_, u8>> {
+        let alloc = self.find(role, layer)?.alloc;
+        // SAFETY: `alloc` came from this arena's bump allocator, so
+        // `[offset, offset + len)` is inside the slab and was written by the
+        // upload; `u8` has no invalid bit patterns and no alignment
+        // requirement. The result is wrapped in a `ManuallyDrop` below, so the
+        // driver is never asked to free an address it did not hand out, and
+        // the returned lifetime keeps it inside the arena's.
+        Some(unsafe { self.alias(stream, &alloc, alloc.len) })
+    }
+
+    /// A zero-copy alias of one resident tensor, read as `f32`.
+    ///
+    /// `None` if the tensor is not resident, is not stored as `f32`, or does
+    /// not hold a whole number of them. The stored type is checked rather than
+    /// assumed: reading a Q8_0 tensor's bytes as floats produces finite,
+    /// plausible garbage.
+    pub fn f32_of(
+        &self,
+        stream: &Arc<CudaStream>,
+        role: Role,
+        layer: Option<u32>,
+    ) -> Option<ResidentTensor<'_, f32>> {
+        let placement = self.find(role, layer)?;
+        if placement.ggml_type != GgmlType::F32 || !placement.alloc.len.is_multiple_of(4) {
+            return None;
+        }
+        let alloc = placement.alloc;
+        // SAFETY: as `bytes_of`, plus: every arena offset is a multiple of
+        // `ALIGNMENT` (256) and so satisfies `f32`'s 4-byte alignment, the
+        // length is a whole number of `f32`s, and the stored type was checked
+        // to be `f32` — so the bytes are a valid little-endian `f32` array on
+        // the little-endian hosts this crate supports.
+        Some(unsafe { self.alias(stream, &alloc, alloc.len / 4) })
+    }
+
+    /// Wrap `[alloc.offset, alloc.offset + alloc.len)` of the slab as `len`
+    /// elements of `T`.
+    ///
+    /// # Safety
+    ///
+    /// `alloc` must be a reservation from this arena and `len * size_of::<T>()`
+    /// must be at most `alloc.len`; the bytes must be a valid `[T]`.
+    unsafe fn alias<T>(
+        &self,
+        stream: &Arc<CudaStream>,
+        alloc: &Allocation,
+        len: usize,
+    ) -> ResidentTensor<'_, T> {
+        let (base, _sync) = self.arena.slab().device_ptr(stream);
+        let ptr = base + alloc.offset as u64;
+        // SAFETY: the caller guarantees the range and the element type; the
+        // slice is immediately sealed in a `ManuallyDrop`.
+        let slice = unsafe { stream.upgrade_device_ptr::<T>(ptr, len) };
+        ResidentTensor {
+            slice: ManuallyDrop::new(slice),
+            _arena: PhantomData,
+        }
     }
 
     /// Read `sample` tensors back and compare them byte for byte with `file`.

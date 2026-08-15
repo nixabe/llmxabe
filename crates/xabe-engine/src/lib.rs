@@ -20,6 +20,7 @@
 
 pub mod block;
 pub mod engine;
+pub mod forward;
 pub mod router;
 pub mod weights;
 pub mod worker;
