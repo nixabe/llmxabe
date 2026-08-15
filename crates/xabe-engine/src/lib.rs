@@ -18,6 +18,7 @@
 //! deterministic and testable without a device, which is deliberate:
 //! scheduling and routing policy should be debuggable on a laptop.
 
+pub mod block;
 pub mod engine;
 pub mod router;
 pub mod weights;

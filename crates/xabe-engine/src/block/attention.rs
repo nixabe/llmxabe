@@ -1,0 +1,980 @@
+//! Gated Attention: 10 of Qwen3.6's 40 layers, plus the MTP head at block 40.
+//!
+//! Every layer whose index mod `pattern_period` equals `attention_offset` —
+//! 3, 7, 11, ... 39 — is this shape. Geometry is 16 query heads against 2 KV
+//! heads (GQA 8:1), head dimension 256, and **partial** rotary over the
+//! leading 64 of those 256 dimensions.
+//!
+//! The order of operations is transcribed from
+//! `llama.cpp/src/models/qwen35moe.cpp`, `llama_model_qwen35moe::graph::
+//! build_layer_attn`, which comments it as *"joint QG projection, QG split, Q
+//! norm, KV projection, K norm, RoPE, attention"*:
+//!
+//! | Step | This module | Golden node |
+//! | --- | --- | --- |
+//! | RMSNorm over the residual stream | [`LayerOpsKernels::rms_norm`] | `attn_norm-N` |
+//! | packed query+gate projection | [`LmHeadKernels::forward`] | `Qcur_full-N` |
+//! | deinterleave query from gate | [`AttentionKernels::split_query_and_gate`] | `Qcur_reshaped-N` / `gate_reshaped-N` |
+//! | per-head RMSNorm on the query | [`LayerOpsKernels::rms_norm`] | `Qcur_normed-N` |
+//! | key and value projections | [`LmHeadKernels::forward`] | `Kcur-N` / `Vcur-N` (first) |
+//! | per-head RMSNorm on the key | [`LayerOpsKernels::rms_norm`] | `Kcur_normed-N` |
+//! | partial rotary on query and key | [`AttentionKernels::rope`] | `Qcur-N` / `Kcur-N` (second) |
+//! | causal GQA attention | [`AttentionKernels::forward`] | `attn_pregate-N` |
+//! | `sigmoid(gate)` and its product | [`AttnElementwise`] | `gate_sigmoid-N` / `attn_gated-N` |
+//! | output projection | [`LmHeadKernels::forward`] | `attn_output-N` |
+//! | residual add | [`AttnElementwise`] | `attn_residual-N` |
+//!
+//! Every one of those tensors is exposed by an accessor on
+//! [`GatedAttentionBlock`] after [`GatedAttentionBlock::forward`], because
+//! that is what makes a wrong block *bisectable* against the capture rather
+//! than merely wrong — see `crates/xabe-engine/tests/attention_block.rs`.
+//!
+//! # The trap: `attn_q.weight` is interleaved, not halved
+//!
+//! `blk.N.attn_q.weight` is `[2048, 8192]` — twice the query width — and
+//! packs each head's query immediately followed by that head's **output
+//! gate**: `[q_h0, gate_h0, q_h1, gate_h1, ...]`, per-head stride
+//! `2 * head_dim`. Upstream reads the query with `ggml_view_3d(..., stride =
+//! n_embd_head * 2, ...)` and the gate with the same view at byte offset
+//! `n_embd_head`.
+//!
+//! Splitting the tensor into two contiguous halves instead is arithmetically
+//! valid, produces finite plausible activations, and is a **different model**:
+//! query heads 8..15 would be fed the gates of heads 0..7. The two readings
+//! agree exactly on head 0, so a spot check passes. This module never does
+//! the split itself — [`AttentionKernels::split_query_and_gate`] owns it, and
+//! `docs/ORACLE.md` §6.4 proves the layout from the capture (72,960 of 77,824
+//! elements disagree under the halves reading).
+//!
+//! # IMRoPE reduces to NEOX here, and that was checked rather than assumed
+//!
+//! `qwen35moe.cpp` applies `ggml_rope_multi` with `rope_type =
+//! LLAMA_ROPE_TYPE_IMROPE` and the file's `rope.dimension_sections`, which is
+//! `[11, 11, 10, 0]` for this model — three sections summing to 32, which is
+//! `rope.dimension_count / 2`. Interleaved M-RoPE assigns pair `s` to the
+//! t/h/w position channel by `s % 3`, and falls through to a **fourth**
+//! channel only when `s` runs past `3 * sections[c]` for its own class. With
+//! `[11, 11, 10, 0]` no pair in `0..32` falls through, and for a text batch
+//! llama.cpp sets the t/h/w channels to the token position (and only the
+//! unused fourth to 0, see `llm_graph_input_pos::set_input`). So every
+//! rotated dimension is rotated by the token's ordinary position, at
+//! `theta_base^(-2i/rope_dim)` — plain NEOX partial rotary, which is what
+//! [`AttentionKernels::rope`] implements.
+//!
+//! That reduction is asserted from the model file's own metadata in
+//! `tests/attention_block.rs`, so a model whose sections do not collapse this
+//! way fails loudly instead of being silently rotated wrong.
+//!
+//! # Two elementwise ops live here, and why
+//!
+//! `sigmoid(gate) * x` and `a + b` have no kernel in `xabe-cuda`:
+//! `layer_ops` has SwiGLU (`silu(gate) * up`), which is a different gate, and
+//! nothing at all adds two tensors. Rather than edit a crate this workstream
+//! does not own, [`AttnElementwise`] compiles the two through the same NVRTC
+//! entry point every other kernel uses. They are three lines each and are
+//! gated directly against `gate_sigmoid-N`, `attn_gated-N` and
+//! `attn_residual-N`, which is a stronger oracle than a CPU reference — but
+//! they belong in `xabe_cuda::kernels::layer_ops` once that file is free.
+//!
+//! # Fixed token count
+//!
+//! A block is constructed for exactly `tokens` positions per call.
+//! [`LmHeadKernels::forward`] and [`AttentionKernels::forward`] both validate
+//! buffer lengths against the declared geometry *exactly* rather than
+//! accepting a prefix, and the two disagree about what that geometry is
+//! (`max_tokens` versus `n_query`), so one buffer cannot serve both at two
+//! different lengths. Chunked prefill and decode therefore need either a
+//! block per shape or a prefix-tolerant length check in those two kernels.
+//! This is a property of their validation, not of the arithmetic here.
+
+use std::sync::Arc;
+
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+};
+
+use xabe_cuda::arena::ArenaError;
+use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels};
+use xabe_cuda::kernels::compile;
+use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
+use xabe_cuda::kernels::lm_head::{LmHeadError, LmHeadGeometry, LmHeadKernels};
+use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
+use xabe_gguf::GgmlType;
+use xabe_model::config::ModelConfig;
+use xabe_model::weights::Role;
+
+use crate::weights::DeviceWeights;
+
+/// The two elementwise operations this block needs and `xabe-cuda` does not
+/// yet provide.
+///
+/// Both are grid-stride over a fixed grid, so the launch shape does not
+/// depend on a host-side length and stays capturable in a CUDA graph
+/// (`AGENTS.md` rule 5).
+const ELEMENTWISE_SRC: &str = r#"
+extern "C" {
+
+// sig = sigmoid(gate); out = pregate * sig.
+//
+// `sigmoid` is spelled 1/(1+exp(-x)) because that is exactly
+// ggml_compute_forward_sigmoid / ggml_cuda_op_sigmoid, which is what produced
+// the `gate_sigmoid-N` tensor this is gated against. The algebraically equal
+// forms (tanh, or silu(x)/x) round differently.
+//
+// The sigmoid is written out as well as applied so a divergence can be
+// localized to the nonlinearity or to the product, not just to "the gate".
+__global__ void attn_sigmoid_gate(
+    const float* __restrict__ pregate,
+    const float* __restrict__ gate,
+    float* __restrict__ sig,
+    float* __restrict__ out,
+    long long n
+) {
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        float s = 1.0f / (1.0f + expf(-gate[i]));
+        sig[i] = s;
+        out[i] = pregate[i] * s;
+    }
+}
+
+// out = a + b. One rounding, so it is bit-identical to the scalar reference.
+__global__ void attn_residual_add(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    long long n
+) {
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+}
+"#;
+
+/// Threads per block for the two elementwise kernels.
+const ELEMENTWISE_BLOCK: usize = 256;
+
+/// Largest grid the elementwise kernels launch, independent of `n`.
+const ELEMENTWISE_MAX_GRID: usize = 1024;
+
+/// The sigmoid gate and the residual add, compiled once.
+pub struct AttnElementwise {
+    sigmoid_gate: CudaFunction,
+    residual_add: CudaFunction,
+}
+
+impl AttnElementwise {
+    /// Compile both kernels into one module.
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, AttentionBlockError> {
+        let ptx =
+            compile(ELEMENTWISE_SRC, "attn_elementwise").map_err(AttentionBlockError::Compile)?;
+        let module = ctx.load_module(ptx)?;
+        Ok(Self {
+            sigmoid_gate: module.load_function("attn_sigmoid_gate")?,
+            residual_add: module.load_function("attn_residual_add")?,
+        })
+    }
+
+    fn launch_config(n: usize) -> LaunchConfig {
+        LaunchConfig {
+            grid_dim: (
+                n.div_ceil(ELEMENTWISE_BLOCK).min(ELEMENTWISE_MAX_GRID) as u32,
+                1,
+                1,
+            ),
+            block_dim: (ELEMENTWISE_BLOCK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// `sig = sigmoid(gate)`, `out = pregate * sig`, over `n` elements.
+    pub fn sigmoid_gate(
+        &self,
+        stream: &Arc<CudaStream>,
+        pregate: &CudaSlice<f32>,
+        gate: &CudaSlice<f32>,
+        sig: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), AttentionBlockError> {
+        expect_len("sigmoid gate pregate", pregate.len(), n)?;
+        expect_len("sigmoid gate gate", gate.len(), n)?;
+        expect_len("sigmoid gate sigmoid", sig.len(), n)?;
+        expect_len("sigmoid gate out", out.len(), n)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let n_i64 = n as i64;
+        let mut builder = stream.launch_builder(&self.sigmoid_gate);
+        builder
+            .arg(pregate)
+            .arg(gate)
+            .arg(&mut *sig)
+            .arg(&mut *out)
+            .arg(&n_i64);
+        // SAFETY: the grid-stride loop is bounded by `n`, which was just
+        // checked against all four buffer lengths.
+        unsafe { builder.launch(Self::launch_config(n)) }?;
+        Ok(())
+    }
+
+    /// `out = a + b` over `n` elements.
+    pub fn residual_add(
+        &self,
+        stream: &Arc<CudaStream>,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), AttentionBlockError> {
+        expect_len("residual a", a.len(), n)?;
+        expect_len("residual b", b.len(), n)?;
+        expect_len("residual out", out.len(), n)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let n_i64 = n as i64;
+        let mut builder = stream.launch_builder(&self.residual_add);
+        builder.arg(a).arg(b).arg(&mut *out).arg(&n_i64);
+        // SAFETY: as above.
+        unsafe { builder.launch(Self::launch_config(n)) }?;
+        Ok(())
+    }
+}
+
+/// Something went wrong building or running a Gated Attention block.
+#[derive(Debug)]
+pub enum AttentionBlockError {
+    /// NVRTC rejected the elementwise source, or the module failed to load.
+    Compile(String),
+    /// The driver failed.
+    Driver(DriverError),
+    /// A reserved arena range could not be read back.
+    Arena(ArenaError),
+    /// One of the mixer kernels rejected a launch.
+    Attention(AttentionError),
+    /// RMSNorm rejected a launch.
+    LayerOps(LayerOpsError),
+    /// A projection rejected a launch.
+    Projection(LmHeadError),
+    /// The device weights do not carry a tensor this block needs.
+    ///
+    /// A missing projection is not recoverable by falling back to something
+    /// else: the block would produce finite, plausible, wrong activations.
+    MissingWeight { role: Role, layer: u32 },
+    /// A weight is not the element type this block unpacks.
+    WrongQuant {
+        role: Role,
+        layer: u32,
+        found: GgmlType,
+    },
+    /// A weight is not the shape the model geometry implies.
+    WrongShape {
+        role: Role,
+        layer: u32,
+        expected: Vec<u64>,
+        found: Vec<u64>,
+    },
+    /// The layer index is not a Gated Attention layer for this config.
+    NotAnAttentionLayer { layer: u32 },
+    /// A buffer is not the length the declared geometry requires.
+    BufferShape {
+        what: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for AttentionBlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Compile(m) => write!(f, "elementwise kernel compilation failed: {m}"),
+            Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
+            Self::Arena(e) => write!(f, "{e}"),
+            Self::Attention(e) => write!(f, "{e}"),
+            Self::LayerOps(e) => write!(f, "{e}"),
+            Self::Projection(e) => write!(f, "{e}"),
+            Self::MissingWeight { role, layer } => {
+                write!(f, "block {layer} has no resident `{role}` tensor")
+            }
+            Self::WrongQuant { role, layer, found } => write!(
+                f,
+                "blk.{layer} `{role}` is {found:?}; this block unpacks Q8_0 projections \
+                 and f32 norms only",
+            ),
+            Self::WrongShape {
+                role,
+                layer,
+                expected,
+                found,
+            } => write!(
+                f,
+                "blk.{layer} `{role}` has dims {found:?}, the model geometry implies {expected:?}",
+            ),
+            Self::NotAnAttentionLayer { layer } => write!(
+                f,
+                "layer {layer} is not a Gated Attention layer under this ModelConfig",
+            ),
+            Self::BufferShape {
+                what,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{what} holds {actual} floats, but this geometry needs {expected}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AttentionBlockError {}
+
+impl From<DriverError> for AttentionBlockError {
+    fn from(e: DriverError) -> Self {
+        Self::Driver(e)
+    }
+}
+impl From<ArenaError> for AttentionBlockError {
+    fn from(e: ArenaError) -> Self {
+        Self::Arena(e)
+    }
+}
+impl From<AttentionError> for AttentionBlockError {
+    fn from(e: AttentionError) -> Self {
+        Self::Attention(e)
+    }
+}
+impl From<LayerOpsError> for AttentionBlockError {
+    fn from(e: LayerOpsError) -> Self {
+        Self::LayerOps(e)
+    }
+}
+impl From<LmHeadError> for AttentionBlockError {
+    fn from(e: LmHeadError) -> Self {
+        Self::Projection(e)
+    }
+}
+
+fn expect_len(
+    what: &'static str,
+    actual: usize,
+    expected: usize,
+) -> Result<(), AttentionBlockError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(AttentionBlockError::BufferShape {
+            what,
+            expected,
+            actual,
+        })
+    }
+}
+
+/// Kernels shared by every Gated Attention block in a model.
+///
+/// Compiled once and shared: NVRTC compilation is a per-module cost, and ten
+/// text-stack blocks plus the MTP head would otherwise pay it forty-four
+/// times at startup. Everything here depends only on the geometry, never on
+/// which layer it is.
+pub struct AttentionKernelSet {
+    mixer: AttentionKernels,
+    ops: LayerOpsKernels,
+    /// hidden -> `2 * q_heads * head_dim`, the packed query+gate projection.
+    qgate: LmHeadKernels,
+    /// hidden -> `kv_heads * head_dim`. Shared by the key and the value —
+    /// they have identical geometry, so one compile serves both.
+    kv: LmHeadKernels,
+    /// `q_heads * head_dim` -> hidden.
+    out: LmHeadKernels,
+    elementwise: AttnElementwise,
+}
+
+impl AttentionKernelSet {
+    /// Compile every kernel a Gated Attention block launches, for `tokens`
+    /// positions per call.
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        config: &ModelConfig,
+        tokens: usize,
+    ) -> Result<Self, AttentionBlockError> {
+        let a = config.attention;
+        let hidden = config.hidden_size as usize;
+        let head_dim = a.head_dim as usize;
+        let q_dim = a.q_heads as usize * head_dim;
+        let kv_dim = a.kv_heads as usize * head_dim;
+
+        Ok(Self {
+            mixer: AttentionKernels::new(ctx, a.q_heads as usize, a.kv_heads as usize, head_dim)?,
+            ops: LayerOpsKernels::new(ctx)?,
+            qgate: LmHeadKernels::new(
+                ctx,
+                LmHeadGeometry {
+                    hidden,
+                    vocab: 2 * q_dim,
+                    max_tokens: tokens,
+                },
+            )?,
+            kv: LmHeadKernels::new(
+                ctx,
+                LmHeadGeometry {
+                    hidden,
+                    vocab: kv_dim,
+                    max_tokens: tokens,
+                },
+            )?,
+            out: LmHeadKernels::new(
+                ctx,
+                LmHeadGeometry {
+                    hidden: q_dim,
+                    vocab: hidden,
+                    max_tokens: tokens,
+                },
+            )?,
+            elementwise: AttnElementwise::new(ctx)?,
+        })
+    }
+}
+
+/// One Gated Attention block's weights, scratch, and forward pass.
+pub struct GatedAttentionBlock {
+    kernels: Arc<AttentionKernelSet>,
+    layer: u32,
+    tokens: usize,
+    hidden: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    rms_eps: f32,
+    rope_theta: f32,
+
+    w_input_norm: CudaSlice<f32>,
+    w_q_norm: CudaSlice<f32>,
+    w_k_norm: CudaSlice<f32>,
+    w_qgate: CudaSlice<u8>,
+    w_k: CudaSlice<u8>,
+    w_v: CudaSlice<u8>,
+    w_out: CudaSlice<u8>,
+
+    normed: CudaSlice<f32>,
+    packed: CudaSlice<f32>,
+    query: CudaSlice<f32>,
+    gate: CudaSlice<f32>,
+    query_normed: CudaSlice<f32>,
+    query_roped: CudaSlice<f32>,
+    key: CudaSlice<f32>,
+    key_normed: CudaSlice<f32>,
+    key_roped: CudaSlice<f32>,
+    value: CudaSlice<f32>,
+    pregate: CudaSlice<f32>,
+    gate_sigmoid: CudaSlice<f32>,
+    gated: CudaSlice<f32>,
+    projected: CudaSlice<f32>,
+}
+
+impl GatedAttentionBlock {
+    /// Resolve layer `layer`'s weights out of `weights` and allocate scratch.
+    ///
+    /// `rms_eps` is the file's `*.attention.layer_norm_rms_epsilon` and
+    /// `rope_theta` its `*.rope.freq_base`; neither is in [`ModelConfig`], and
+    /// guessing either produces a block that is finite and wrong, so both are
+    /// arguments rather than constants.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kernels: Arc<AttentionKernelSet>,
+        stream: &Arc<CudaStream>,
+        weights: &DeviceWeights,
+        config: &ModelConfig,
+        layer: u32,
+        tokens: usize,
+        rms_eps: f32,
+        rope_theta: f32,
+    ) -> Result<Self, AttentionBlockError> {
+        let a = config.attention;
+        let hidden = config.hidden_size as usize;
+        let head_dim = a.head_dim as usize;
+        let q_heads = a.q_heads as usize;
+        let kv_heads = a.kv_heads as usize;
+        let q_dim = q_heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+
+        let h = hidden as u64;
+        let w_input_norm = f32_weight(weights, stream, Role::InputNorm, layer, &[h])?;
+        let w_q_norm = f32_weight(weights, stream, Role::AttnQNorm, layer, &[head_dim as u64])?;
+        let w_k_norm = f32_weight(weights, stream, Role::AttnKNorm, layer, &[head_dim as u64])?;
+        let w_qgate = q8_0_weight(
+            weights,
+            stream,
+            Role::AttnQGate,
+            layer,
+            &[h, 2 * q_dim as u64],
+        )?;
+        let w_k = q8_0_weight(weights, stream, Role::AttnK, layer, &[h, kv_dim as u64])?;
+        let w_v = q8_0_weight(weights, stream, Role::AttnV, layer, &[h, kv_dim as u64])?;
+        let w_out = q8_0_weight(weights, stream, Role::AttnOut, layer, &[q_dim as u64, h])?;
+
+        Ok(Self {
+            kernels,
+            layer,
+            tokens,
+            hidden,
+            q_heads,
+            kv_heads,
+            head_dim,
+            rope_dim: a.rope_dim as usize,
+            rms_eps,
+            rope_theta,
+            w_input_norm,
+            w_q_norm,
+            w_k_norm,
+            w_qgate,
+            w_k,
+            w_v,
+            w_out,
+            normed: stream.alloc_zeros::<f32>(tokens * hidden)?,
+            packed: stream.alloc_zeros::<f32>(tokens * 2 * q_dim)?,
+            query: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            query_normed: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            query_roped: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            key: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            key_normed: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            key_roped: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            value: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            pregate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gate_sigmoid: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
+        })
+    }
+
+    /// Which block this is.
+    pub fn layer(&self) -> u32 {
+        self.layer
+    }
+
+    /// Positions this block was sized for. See the module docs on why it is
+    /// fixed.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Run the block over one self-contained window of `tokens` positions.
+    ///
+    /// `hidden_state` and `out` are both `[tokens][hidden]`, token-major, and
+    /// may not alias — the residual add reads `hidden_state` after every
+    /// projection has run, but `out` is written by a separate launch and
+    /// aliasing would make the ordering a race rather than a dependency.
+    ///
+    /// `pos_offset` is the absolute position of token 0, which is what the
+    /// rotary embedding rotates by. The attention window is this batch alone:
+    /// there is no KV cache yet, so query row `i` attends to keys `[0, i]` of
+    /// the same batch. Carrying a cache across calls is G007's job.
+    pub fn forward(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        hidden_state: &CudaSlice<f32>,
+        pos_offset: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), AttentionBlockError> {
+        let t = self.tokens;
+        let hidden_elems = t * self.hidden;
+        let q_elems = t * self.q_heads * self.head_dim;
+        expect_len("block input", hidden_state.len(), hidden_elems)?;
+        expect_len("block output", out.len(), hidden_elems)?;
+
+        let k = &self.kernels;
+
+        // 1. RMSNorm over the residual stream.
+        k.ops.rms_norm(
+            stream,
+            hidden_state,
+            &self.w_input_norm,
+            &mut self.normed,
+            t,
+            self.hidden,
+            self.rms_eps,
+        )?;
+
+        // 2. The packed query+gate projection.
+        k.qgate.forward(
+            stream,
+            QuantTensor {
+                bytes: &self.w_qgate,
+                quant: ExpertQuant::Q8_0,
+            },
+            &self.normed,
+            t,
+            &mut self.packed,
+        )?;
+
+        // 3. Deinterleave. See the module docs: this is the step that is a
+        //    different model if it is done as a halves split.
+        k.mixer
+            .split_query_and_gate(stream, &self.packed, &mut self.query, &mut self.gate, t)?;
+
+        // 4. Per-head RMSNorm on the query.
+        k.ops.rms_norm(
+            stream,
+            &self.query,
+            &self.w_q_norm,
+            &mut self.query_normed,
+            t * self.q_heads,
+            self.head_dim,
+            self.rms_eps,
+        )?;
+
+        // 5. Key and value projections, off the same normed input.
+        k.kv.forward(
+            stream,
+            QuantTensor {
+                bytes: &self.w_k,
+                quant: ExpertQuant::Q8_0,
+            },
+            &self.normed,
+            t,
+            &mut self.key,
+        )?;
+        k.kv.forward(
+            stream,
+            QuantTensor {
+                bytes: &self.w_v,
+                quant: ExpertQuant::Q8_0,
+            },
+            &self.normed,
+            t,
+            &mut self.value,
+        )?;
+
+        // 6. Per-head RMSNorm on the key. The value is not normed.
+        k.ops.rms_norm(
+            stream,
+            &self.key,
+            &self.w_k_norm,
+            &mut self.key_normed,
+            t * self.kv_heads,
+            self.head_dim,
+            self.rms_eps,
+        )?;
+
+        // 7. Partial rotary, on the query and the key only, before the GQA
+        //    broadcast — hence two head counts.
+        k.mixer.rope(
+            stream,
+            &self.query_normed,
+            &mut self.query_roped,
+            t,
+            self.q_heads,
+            self.rope_dim,
+            pos_offset,
+            self.rope_theta,
+        )?;
+        k.mixer.rope(
+            stream,
+            &self.key_normed,
+            &mut self.key_roped,
+            t,
+            self.kv_heads,
+            self.rope_dim,
+            pos_offset,
+            self.rope_theta,
+        )?;
+
+        // 8. Causal GQA attention over this window.
+        k.mixer.forward(
+            stream,
+            &self.query_roped,
+            &self.key_roped,
+            &self.value,
+            &mut self.pregate,
+            t,
+            t,
+            0,
+        )?;
+
+        // 9. The output gate.
+        k.elementwise.sigmoid_gate(
+            stream,
+            &self.pregate,
+            &self.gate,
+            &mut self.gate_sigmoid,
+            &mut self.gated,
+            q_elems,
+        )?;
+
+        // 10. Output projection.
+        k.out.forward(
+            stream,
+            QuantTensor {
+                bytes: &self.w_out,
+                quant: ExpertQuant::Q8_0,
+            },
+            &self.gated,
+            t,
+            &mut self.projected,
+        )?;
+
+        // 11. Residual.
+        k.elementwise
+            .residual_add(stream, hidden_state, &self.projected, out, hidden_elems)?;
+
+        Ok(())
+    }
+
+    /// `attn_norm-N`: the input RMSNorm, `[tokens][hidden]`.
+    pub fn normed_input(&self) -> &CudaSlice<f32> {
+        &self.normed
+    }
+    /// `Qcur_full-N`: the packed query+gate projection, `[tokens][2*q_dim]`.
+    pub fn packed_query_gate(&self) -> &CudaSlice<f32> {
+        &self.packed
+    }
+    /// `Qcur_reshaped-N`: the deinterleaved query, `[tokens][q_heads][head_dim]`.
+    pub fn query(&self) -> &CudaSlice<f32> {
+        &self.query
+    }
+    /// `gate_reshaped-N`: the deinterleaved output gate, same shape.
+    pub fn gate(&self) -> &CudaSlice<f32> {
+        &self.gate
+    }
+    /// `Qcur_normed-N`: the query after its per-head RMSNorm.
+    pub fn query_normed(&self) -> &CudaSlice<f32> {
+        &self.query_normed
+    }
+    /// `Qcur-N`: the query after partial rotary.
+    pub fn query_roped(&self) -> &CudaSlice<f32> {
+        &self.query_roped
+    }
+    /// `Kcur-N` (first record): the raw key projection, `[tokens][kv_dim]`.
+    pub fn key(&self) -> &CudaSlice<f32> {
+        &self.key
+    }
+    /// `Kcur_normed-N`: the key after its per-head RMSNorm.
+    pub fn key_normed(&self) -> &CudaSlice<f32> {
+        &self.key_normed
+    }
+    /// `Kcur-N` (second record): the key after partial rotary.
+    pub fn key_roped(&self) -> &CudaSlice<f32> {
+        &self.key_roped
+    }
+    /// `Vcur-N`: the value projection. Neither normed nor rotated.
+    pub fn value(&self) -> &CudaSlice<f32> {
+        &self.value
+    }
+    /// `attn_pregate-N`: attention output before the gate.
+    pub fn pregate(&self) -> &CudaSlice<f32> {
+        &self.pregate
+    }
+    /// `gate_sigmoid-N`: `sigmoid(gate)`.
+    pub fn gate_sigmoid(&self) -> &CudaSlice<f32> {
+        &self.gate_sigmoid
+    }
+    /// `attn_gated-N`: the gated attention output.
+    pub fn gated(&self) -> &CudaSlice<f32> {
+        &self.gated
+    }
+    /// `attn_output-N`: the output projection, before the residual add.
+    pub fn projected(&self) -> &CudaSlice<f32> {
+        &self.projected
+    }
+}
+
+/// Copy a resident Q8_0 tensor into a buffer of its own.
+///
+/// [`QuantTensor`] carries a whole `CudaSlice`, and its element count is
+/// checked against the declared geometry, so a sub-range of the weight arena
+/// cannot be passed directly — the arena is one 29.6 GiB slab. The copy is a
+/// device-to-host-to-device round trip of at most 17.8 MiB (`attn_q`), paid
+/// once at construction and never on the forward path. The right fix is a
+/// borrowed device view in `xabe-cuda`, which is not this workstream's file.
+fn q8_0_weight(
+    weights: &DeviceWeights,
+    stream: &Arc<CudaStream>,
+    role: Role,
+    layer: u32,
+    dims: &[u64],
+) -> Result<CudaSlice<u8>, AttentionBlockError> {
+    let placement = weights
+        .find(role, Some(layer))
+        .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
+    if placement.ggml_type != GgmlType::Q8_0 {
+        return Err(AttentionBlockError::WrongQuant {
+            role,
+            layer,
+            found: placement.ggml_type,
+        });
+    }
+    if placement.dims != dims {
+        return Err(AttentionBlockError::WrongShape {
+            role,
+            layer,
+            expected: dims.to_vec(),
+            found: placement.dims.clone(),
+        });
+    }
+    let bytes = weights.arena().read(stream, &placement.alloc)?;
+    Ok(stream.clone_htod(bytes.as_slice())?)
+}
+
+/// Copy a resident f32 norm vector into a typed buffer.
+fn f32_weight(
+    weights: &DeviceWeights,
+    stream: &Arc<CudaStream>,
+    role: Role,
+    layer: u32,
+    dims: &[u64],
+) -> Result<CudaSlice<f32>, AttentionBlockError> {
+    let placement = weights
+        .find(role, Some(layer))
+        .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
+    if placement.ggml_type != GgmlType::F32 {
+        return Err(AttentionBlockError::WrongQuant {
+            role,
+            layer,
+            found: placement.ggml_type,
+        });
+    }
+    if placement.dims != dims {
+        return Err(AttentionBlockError::WrongShape {
+            role,
+            layer,
+            expected: dims.to_vec(),
+            found: placement.dims.clone(),
+        });
+    }
+    let bytes = weights.arena().read(stream, &placement.alloc)?;
+    let values: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(f32::from_le_bytes)
+        .collect();
+    Ok(stream.clone_htod(values.as_slice())?)
+}
+
+/// Layers of `config` that are this block shape.
+///
+/// Derived from the pattern rather than listed, so a config change cannot
+/// leave a hardcoded list behind. For Qwen3.6 this is 3, 7, ... 39.
+pub fn attention_layers(config: &ModelConfig) -> impl Iterator<Item = u32> + '_ {
+    (0..config.num_layers).filter(move |&l| l % config.pattern_period == config.attention_offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xabe_model::config::LayerKind;
+
+    #[test]
+    fn the_attention_layers_are_the_ten_the_pattern_implies() {
+        let config = ModelConfig::qwen3_6_35b_a3b();
+        let layers: Vec<u32> = attention_layers(&config).collect();
+        assert_eq!(layers, vec![3, 7, 11, 15, 19, 23, 27, 31, 35, 39]);
+        assert_eq!(layers.len(), 10);
+        for &l in &layers {
+            assert_eq!(config.layer_kind(l), LayerKind::GatedAttention);
+        }
+        // And nothing else is.
+        for l in 0..config.num_layers {
+            assert_eq!(
+                layers.contains(&l),
+                config.layer_kind(l) == LayerKind::GatedAttention,
+                "layer {l} disagrees with ModelConfig::layer_kind",
+            );
+        }
+    }
+
+    #[test]
+    fn the_projection_geometries_are_the_ones_the_file_carries() {
+        // These four shapes are what `new` validates the resident tensors
+        // against, and getting one backwards is the failure `docs/ORACLE.md`
+        // §6.2 calls out: `attn_output` reads 4096 and writes 2048, the
+        // opposite of every other row in its table.
+        let config = ModelConfig::qwen3_6_35b_a3b();
+        let a = config.attention;
+        let hidden = u64::from(config.hidden_size);
+        let head_dim = u64::from(a.head_dim);
+        let q_dim = u64::from(a.q_heads) * head_dim;
+        let kv_dim = u64::from(a.kv_heads) * head_dim;
+
+        assert_eq!([hidden, 2 * q_dim], [2048, 8192]);
+        assert_eq!([hidden, kv_dim], [2048, 512]);
+        assert_eq!([q_dim, hidden], [4096, 2048]);
+        assert_eq!(head_dim, 256);
+    }
+
+    #[test]
+    fn the_projection_widths_satisfy_the_lm_head_kernels_staging_constraint() {
+        // `LmHeadKernels::new` rejects a `hidden` that is not a whole number
+        // of 16-block Q8_0 staging segments, i.e. a multiple of 512. Both
+        // input widths this block uses must clear that, or three of the four
+        // projections would fail to construct at runtime rather than here.
+        let config = ModelConfig::qwen3_6_35b_a3b();
+        let q_dim = (config.attention.q_heads * config.attention.head_dim) as usize;
+        for width in [config.hidden_size as usize, q_dim] {
+            assert_eq!(
+                width % 512,
+                0,
+                "width {width} is not a whole staging segment"
+            );
+        }
+    }
+
+    #[test]
+    fn the_elementwise_source_spells_ggmls_sigmoid_and_not_an_equal_form() {
+        // silu(x)/x and 0.5*(1+tanh(x/2)) are algebraically the same function
+        // and round differently. `gate_sigmoid-N` came off
+        // ggml_cuda_op_sigmoid, which is 1/(1+expf(-x)).
+        assert!(ELEMENTWISE_SRC.contains("float s = 1.0f / (1.0f + expf(-gate[i]));"));
+        // Scoped to the kernel body, so the comment above it that *names*
+        // the rejected forms does not satisfy its own assertion — the trap
+        // `layer_ops.rs` documents for the same kind of check.
+        let start = ELEMENTWISE_SRC
+            .find("__global__ void attn_sigmoid_gate(")
+            .expect("the sigmoid kernel is present");
+        let end = ELEMENTWISE_SRC
+            .find("// out = a + b.")
+            .expect("the residual kernel's comment is present");
+        let body = &ELEMENTWISE_SRC[start..end];
+        assert!(
+            !body.contains("tanh"),
+            "the sigmoid was rewritten into a form that rounds differently",
+        );
+        assert!(
+            !body.contains("__expf"),
+            "the fast exponential is not what produced the reference",
+        );
+    }
+
+    #[test]
+    fn the_residual_add_is_one_rounding() {
+        // `out = a + b` and nothing else, so it is bit-identical to the
+        // scalar reference and `attn_residual-N` can be gated exactly.
+        assert!(ELEMENTWISE_SRC.contains("out[i] = a[i] + b[i];"));
+    }
+
+    #[test]
+    fn a_length_that_matches_the_geometry_is_accepted_and_one_that_does_not_is_not() {
+        assert!(expect_len("x", 4, 4).is_ok());
+        let err = expect_len("x", 5, 4).unwrap_err();
+        assert!(err.to_string().contains('5'));
+        assert!(err.to_string().contains('4'));
+    }
+
+    #[test]
+    fn the_elementwise_grid_does_not_depend_on_a_host_sized_length() {
+        // AGENTS.md rule 5: a launch shape derived from a host-side value
+        // cannot be captured in a CUDA graph and replayed at another size.
+        // The grid saturates, and the grid-stride loop covers the rest.
+        let small = AttnElementwise::launch_config(1024);
+        let huge = AttnElementwise::launch_config(1 << 24);
+        assert_eq!(huge.grid_dim.0 as usize, ELEMENTWISE_MAX_GRID);
+        assert!(small.grid_dim.0 <= huge.grid_dim.0);
+        assert_eq!(small.block_dim.0 as usize, ELEMENTWISE_BLOCK);
+    }
+}
