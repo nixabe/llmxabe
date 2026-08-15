@@ -146,10 +146,18 @@ Q8_0 LM head and projections:
 | 128K | 2.684 | 2.856 | 5.54 | **121 tok/s** |
 | 256K | 5.369 | 2.856 | 8.23 | 82 tok/s |
 
-**These are ceilings derived from bandwidth, not observed rates.** No decode
-rate has been measured on this hardware yet. That measurement is the single
-most valuable one still outstanding — every number in this table is a ceiling
-with no floor beside it.
+**These are ceilings derived from bandwidth.** They have now been measured
+against llama.cpp on this hardware — see [BENCHMARKS.md](BENCHMARKS.md):
+
+| Context | Roofline | Measured (llama.cpp) | Fraction |
+| ---: | ---: | ---: | ---: |
+| 4K | 229 | 103.4 | 45.2% |
+| 32K | 191 | 92.4 | 48.5% |
+| 128K | 121 | 68.8 | 56.7% |
+
+The gap decomposes cleanly: the weight path achieves 44.5% of peak bandwidth,
+the KV path about 80%. The rooflines are sound; the MoE weight path is what
+falls short of them.
 
 ### Conclusions
 
@@ -158,11 +166,11 @@ with no floor beside it.
    ~109K the planning document implied. The hybrid architecture already saved
    4× on KV; what remains still comes to dominate, just further out.
 
-2. **`-ctk q8_0 -ctv q8_0` is worth benchmarking.** It halves the dominant term
-   at long context. The cost is dequantization inside the attention kernel,
-   which on Turing is not free, so it must be measured. This is the
-   highest-value experiment available without writing any Rust — see
-   [DEVELOPMENT.md](DEVELOPMENT.md#baseline-improvements-available-now).
+2. **`-ctk q8_0 -ctv q8_0` was benchmarked, and it is worse.** −15.5% at 32K
+   and −35.8% at 128K. The roofline argument for it assumed the KV path had
+   headroom; it does not, running already at ~80% of peak. Turing
+   dequantization inside the attention kernel costs more than halving the term
+   saves. Keep f16.
 
 3. **The LM head deserves its own optimization.** 540 MB/token for a single
    matrix — roughly 58% of what all forty MoE layers read combined. Either

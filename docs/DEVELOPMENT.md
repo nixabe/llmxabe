@@ -93,36 +93,50 @@ model across three, which is correct here: the model fits, and splitting would
 put PCIe on the decode path. `-t 4 -tb 4` partitions 12 vCPU across three
 replicas, and `--poll 0` avoids three spinning pollers competing for them.
 
-### Baseline improvements available now
+### Baseline tuning — now measured
 
-Three changes need no Rust at all and should be made independently of this
-project.
+These have been benchmarked on this host. Full data in
+[BENCHMARKS.md](BENCHMARKS.md).
 
-1. **Add `--top-k 20` and `--presence-penalty 1.5`.** These are Qwen's
-   published thinking-mode defaults and are currently unset. Presence penalty
-   is their stated remedy for repetition loops.
+1. **Add `--top-k 20`. Add penalties only deliberately.** `top_k 20` is free
+   (−1%). But **any** penalty sampler — `presence_penalty`, `repeat_penalty`,
+   `frequency_penalty` — costs **22–24% of decode throughput**, and the cost is
+   binary rather than proportional: `presence_penalty=0.1` costs the same as
+   `1.5`. With a 248,320-token vocabulary, the penalty pass runs over every
+   logit on the CPU each step.
 
-2. **A/B n-gram speculation against MTP.** The baseline uses
-   `--spec-type ngram-map-k4v`. n-gram wins on repetitive spans — code edits,
-   file rewrites — but this model ships a *trained* MTP head, and both the vLLM
-   and SGLang recipes recommend 2–3 speculative tokens for it. On varied prose
-   MTP is the likelier winner. llama.cpp master supports MTP for this
+   Qwen publishes `presence_penalty 1.5` as their remedy for repetition loops,
+   so this is a real quality-versus-throughput trade — but it is a trade, not a
+   free improvement, which is how an earlier revision of this document
+   described it. Turn it on if repetition is actually observed, not by default.
+
+2. **Keep `-ctk f16 -ctv f16`. Do not switch to `q8_0`.** This was predicted to
+   be the highest-value experiment available; it is measurably worse at every
+   depth and dramatically worse where it was supposed to help most: −15.5% at
+   32K and **−35.8% at 128K**. The KV path already runs at ~80% of peak
+   bandwidth, so there was little to buy, and Turing dequantization inside the
+   attention kernel costs more than the saving.
+
+3. **Choose `-np` deliberately.** Three slots buy 1.77× aggregate throughput
+   and cost 41% per-request latency, plus a further ~9.5% per-request
+   throughput at depth versus `-np 1`. Latency-sensitive, rarely-concurrent
+   workloads are measurably better served by `-np 1`.
+
+4. **A/B n-gram speculation against MTP.** Still unmeasured. The baseline uses
+   `--spec-type ngram-map-k4v`; n-gram wins on repetitive spans, but this model
+   ships a *trained* MTP head and both the vLLM and SGLang recipes recommend
+   2–3 speculative tokens for it. llama.cpp master supports MTP for this
    architecture, so this is runnable today.
-
-3. **Benchmark `-ctk q8_0 -ctv q8_0`.** This is the highest-value experiment
-   available without writing any Rust. It halves the dominant bandwidth term at
-   long context — 4.92 GB → 3.58 GB per token at 128K, a 37% roofline
-   improvement. The cost is dequantization work inside the attention kernel,
-   which on Turing is not free, so it must be measured rather than assumed.
 
 ## Open questions
 
 Carried from the design plan. Answered ones are struck through with what was
 found.
 
-1. Measured decode rate at 4K, 32K, and 128K today. Every roofline in
-   [MODEL.md](MODEL.md) is a ceiling with no measured floor beside it. **Still
-   open, and the most valuable single measurement available.**
+1. ~~Measured decode rate at 4K, 32K, and 128K today.~~ **Answered.** 103.4 /
+   92.4 / 68.8 tok/s respectively, against rooflines of 229 / 191 / 121. See
+   [BENCHMARKS.md](BENCHMARKS.md). The weight path runs at 44.5% of peak
+   bandwidth and the KV path at ~80%.
 2. VRAM cost of `mmproj-F16.gguf`. The file is 899 MB on disk; its resident
    cost is still an estimate.
 3. What fraction of platform traffic is multimodal — determines whether the

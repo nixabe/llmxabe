@@ -25,20 +25,31 @@ on a multi-user platform.
 In one address space it is a radix tree behind a lock.
 
 That is the *architectural* claim, and it is the only one made without
-qualification. Three further bets are being placed, and their size is unknown
-until measured:
+qualification. It is now also measured: resubmitting a 25,136-token prompt
+takes 0.3 s warm against 9.7 s cold — a **32× improvement in time-to-first-token**
+that today is confined to one process, so three replicas hold three copies of
+it.
 
-- **Fused MoE dispatch.** Naively, 9 active experts × 3 matrices × 40 layers is
-  1,080 small GEMVs per decoded token. Sorting tokens by expert and running one
-  grouped GEMM over contiguous runs collapses that to a single launch.
-- **CUDA graph capture.** One replay per decoded token instead of hundreds of
-  launches. This is the project's largest expected single win, and the reason
-  the MoE indirection tables must be built on-device.
+The performance bets have been benchmarked, and the results were not what the
+design plan expected. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+- **Fused MoE dispatch** and **CUDA graph capture** are *already implemented in
+  llama.cpp* (`mmid.cu`, `topk-moe.cu`, `USE_CUDA_GRAPH` — confirmed live at
+  runtime), as is Turing-specific kernel tuning. These are not wins this
+  project can claim; they are the bar it has to clear.
+- **The real headroom is efficiency.** llama.cpp reaches 104.79 tok/s at short
+  context, which is 44.5% of the 235 tok/s bandwidth roofline. That gap
+  decomposes: the MoE weight path runs at 44.5% of peak bandwidth while flash
+  attention streams KV at ~80%. Closing it is worth roughly 1.8× — but it means
+  beating an already-fused, already-graphed, already-tuned implementation.
+- **A GPU-side sampler is a newly identified win** the plan missed. With a
+  248,320-token vocabulary, any CPU penalty sampler costs 22–24% of decode
+  throughput.
 - **Compile-time specialization.** Shapes are fixed and known. A
-  general-purpose engine cannot assume that; this one can.
+  general-purpose engine cannot assume that; this one can. Still unmeasured.
 
 This project does not claim it will be faster than llama.cpp. That backend has
-years of CUDA tuning behind it.
+years of CUDA tuning behind it, and the benchmarks make that concrete.
 
 ## Target hardware and model
 
@@ -139,7 +150,7 @@ Numbering follows the design plan. "Gate" is the condition for calling it done.
 | 03 | FP16 dense forward | Correct logits, any speed | not started |
 | 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | CPU reference only |
 | 05 | Flash attention port, sm_75 | Correct at 128K | not started |
-| 06 | CUDA graph capture | **The justification gate — measure here** | not started |
+| 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started |
 | 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done |
 | 08 | Multi-worker + router + shared cache | Hit rate ≥ llama.cpp baseline | host side done |
 | 09 | MTP speculative decode | Accept rate vs n-gram baseline | not started |
@@ -150,7 +161,11 @@ needs per-chunk triangular matrix inversion. If it does not come together,
 nothing else matters — and that should be discovered in week three, not week
 twelve.
 
-Milestone 06 is the continue/stop gate for the project as a whole.
+Milestone 06 was designated the continue/stop gate for the project as a whole,
+on the assumption that graph capture over on-device MoE indirection was an
+unclaimed win. Benchmarking showed llama.cpp already captures graphs on every
+decode step, so that gate needs restating in terms of measured throughput
+against 104.79 tok/s rather than "does graph capture help".
 
 ## Scope
 
@@ -164,6 +179,7 @@ instance; text-only requests go to this engine.
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | Instructions for AI agents; the binding design rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Setup, workflow, commit and review conventions |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | **Measured llama.cpp baseline — start here for performance** |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component design and rationale |
 | [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md) | Milestone-00 gate results and the cudarc decision |
 | [docs/MODEL.md](docs/MODEL.md) | Qwen3.6 structure, VRAM and bandwidth analysis |
@@ -183,11 +199,14 @@ llama-server -a qwen3.6-35b-a3b -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
   -c 393216 -np 3 -b 4096 -ub 4096 \
   -fa on -ctk f16 -ctv f16 -cram 10240 \
   --jinja --reasoning-preserve \
-  --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5
+  --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
-Three improvements to that baseline are available today and need no Rust at
-all — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#baseline-improvements-available-now).
+Note the absence of `--presence-penalty`: it costs 22–24% of decode throughput
+on this model, because a 248,320-token vocabulary makes the CPU-side penalty
+pass expensive. Enable it only if repetition is actually observed.
+
+Measured baseline tuning results need no Rust at all — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#baseline-tuning--now-measured).
 
 ## License
 

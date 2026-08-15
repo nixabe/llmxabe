@@ -54,11 +54,17 @@ address space:
 | Restore latency blocking siblings | A device copy on a dedicated low-priority stream |
 
 This is the project's one *architectural* claim, and the only one made without
-qualification. It is a structural property, not a measurement.
+qualification. It is a structural property, not a measurement — though it is
+now supported by one: resubmitting a 25,136-token prompt drops
+time-to-first-token from 9.7 s to 0.3 s, a 32× improvement that is currently
+confined to a single process.
 
-Everything else — fused MoE dispatch, graph capture, compile-time
-specialization — is a performance bet. Their payoff is real but their size is
-unknown until milestone 06.
+Everything else is a performance bet, and benchmarking has since resolved two
+of them against the project: fused MoE dispatch and graph capture are **already
+implemented in llama.cpp**, so they are the bar rather than the advantage. What
+remains is the measured 44.5% efficiency of the MoE weight path, and
+compile-time specialization on fixed shapes, which is still unmeasured. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Crate boundaries
 
@@ -108,10 +114,18 @@ and the LM head. That is hundreds of kernel launches per token, on a workload
 where each kernel is memory-bound and short.
 
 Capturing the whole decode step and replaying it once per token removes launch
-overhead from the critical path. This is the largest single expected win, and
-it is why the MoE indirection tables must be built **on-device into fixed-size
-buffers**: anything sized by a host value makes the graph topology vary between
-replays, and the capture becomes worthless.
+overhead from the critical path, and it is why the MoE indirection tables must
+be built **on-device into fixed-size buffers**: anything sized by a host value
+makes the graph topology vary between replays, and the capture becomes
+worthless.
+
+> This was originally described as the largest single expected win.
+> Benchmarking showed **llama.cpp already captures graphs on every decode
+> step** — server logs report `graphs reused = 1195` over a 1,200-token
+> generation — and already fuses MoE dispatch. Graph capture is therefore the
+> bar to clear, not an advantage to claim. The measured headroom is elsewhere:
+> the MoE weight path runs at 44.5% of peak bandwidth against flash attention's
+> ~80%. See [BENCHMARKS.md](BENCHMARKS.md).
 
 The technique is to gate work on a `valid_tokens` scalar held in device memory,
 so the topology stays static while routing content varies freely. See
@@ -155,6 +169,7 @@ depends on the multimodal traffic fraction, which is not yet measured.
 
 ## Reading order
 
+0. [BENCHMARKS.md](BENCHMARKS.md) — what the baseline actually achieves
 1. [MODEL.md](MODEL.md) — what the architecture costs, and why decode is
    KV-bound at long context
 2. [CACHE.md](CACHE.md) — the two-group pager and prefix sharing

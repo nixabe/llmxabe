@@ -29,8 +29,28 @@ nothing else matters.
 That is why milestone 01 deliberately precedes the differential harness in
 milestone 02: you want to know in week three, not week twelve.
 
-Milestone 06 — graph capture over on-device MoE indirection — is the
-continue/stop gate for the project as a whole.
+Milestone 06 — graph capture over on-device MoE indirection — was the
+continue/stop gate for the project as a whole. Benchmarking has since shown
+llama.cpp already does both graph capture and MoE fusion, so the gate must be
+restated as measured throughput against the baseline's 104.79 tok/s rather than
+as "does graph capture help". See [BENCHMARKS.md](BENCHMARKS.md).
+
+### What the baseline already does
+
+Anything written here has to beat, not merely match, the following:
+
+| Capability | Where it lives in llama.cpp |
+| --- | --- |
+| MoE indirection (`mul_mat_id`) | `ggml/src/ggml-cuda/mmid.cu` |
+| Fused top-k routing | `ggml/src/ggml-cuda/topk-moe.cu` |
+| `ffn_up` + `ffn_gate` + GLU fusion | `ggml_cuda_should_fuse_mul_mat` |
+| CUDA graph capture and replay | `USE_CUDA_GRAPH`, `cudaGraphLaunch` |
+| Turing-tuned quantized matmul tiles | `mmq-config-turing.cuh` |
+
+Measured consequence: 104.79 tok/s at short context, 44.5% of the bandwidth
+roofline, with the weight path at 44.5% of peak and the KV path at ~80%. The
+inefficiency is concentrated in the weight path, which is where kernel work
+should go.
 
 ## Gated DeltaNet
 
