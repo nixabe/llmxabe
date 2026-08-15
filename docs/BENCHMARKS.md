@@ -319,6 +319,524 @@ it is worth about 1.8× if fully captured — but capturing it means beating an
 already-fused, already-graphed, already-Turing-tuned implementation, which is a
 materially harder proposition than the plan assumed.
 
+---
+
+# llmxabe's own forward pass, and where its time goes
+
+Everything above measures llama.cpp. This section measures **llmxabe**, on the
+same host, the same card, the same file, on the same day, and puts the two
+side by side.
+
+It exists because the engine now runs end to end (`crates/xabe-engine/src/forward.rs`,
+gated against the llama.cpp capture by `tests/forward_pass.rs`) and the first
+question after "is it right" is "is it fast". The answer is no, and the rest of
+this section is the arithmetic of *why*, measured rather than guessed.
+
+## Head to head
+
+Both sides measured on **GPU 2** of this host on 2026-08-16, one process on the
+card at a time.
+
+```sh
+# llama.cpp, build fd6863a69 (10456)
+CUDA_VISIBLE_DEVICES=2 llama-bench \
+  -m models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
+  -p 512 -n 128 -ngl 99 -r 3
+
+# llmxabe
+CUDA_VISIBLE_DEVICES=2 LLMXABE_BENCH_N=1,19,128,512 LLMXABE_BENCH_REPS=10 \
+  cargo run --release -p xabe-engine --bin bench_forward
+```
+
+| | llama.cpp | llmxabe | llmxabe's position |
+| --- | ---: | ---: | --- |
+| Prefill, 512 tokens — a full forward over a batch | `pp512` **2,051.30 ± 168.24 tok/s** | n = 512, **73.48 ± 0.23 tok/s** | **27.9× slower** |
+| Decode | `tg128` **104.72 ± 0.36 tok/s**, 9.55 ms/token | *no KV cache yet — no comparable number* | — |
+| Cost of one token's worth of work, best case | 9.55 ms (a warm decode step) | 32.61 ms (a cold n = 1 pass) | **3.4× slower**, and the comparison flatters llmxabe |
+
+llmxabe's full sweep, 2 warmup passes discarded, 10 timed repetitions, stream
+synchronized inside the timed region:
+
+| tokens | ms/pass | tok/s |
+| ---: | ---: | ---: |
+| 1 | 34.31 ± 3.10 | 29.14 ± 2.63 |
+| 19 | 485.33 ± 0.60 | 39.15 ± 0.05 |
+| 128 | 2,020.89 ± 9.03 | 63.34 ± 0.28 |
+| 512 | 6,967.54 ± 22.16 | 73.48 ± 0.23 |
+
+**Read the n = 1 row as a latency floor, not a decode rate.** llmxabe carries
+no KV cache and no recurrent state between calls, so every pass is a cold full
+forward; the module docs on `bench_forward` explain why comparing it to
+llama.cpp's `tg` would be comparing a cold pass against a warm incremental one.
+The n = 1 row is what one pass costs, and a real decode step cannot be faster
+than the work it shares with it. Against llama.cpp's *actual* decode it is
+3.4× behind, and that is the charitable reading.
+
+The ± 3.10 ms on the n = 1 row is host jitter, not GPU variance: the same
+configuration measured by CUDA events gives 32.61 ms with a 0.18 ms standard
+deviation, and the uninstrumented wall clock reaches 32.26 ± 0.01 ms once the
+host settles.
+
+**llmxabe loses to llama.cpp on every axis measured.** 27.9× at prefill, 3.4×
+at the decode floor. On the card's 672 GB/s streaming roofline, llama.cpp's
+decode moves the necessary weight bytes at **47.4% of peak** and llmxabe's
+n = 1 pass at **13.9%** — a figure derived below from the tensor sizes, and one
+that lands within a percentage point of the independent two-term fit earlier in
+this document (299 GB/s, 44.5%).
+
+## How the breakdown was measured
+
+**Which code this is.** Every llmxabe figure in this section was measured
+against commit **`89a38ba`** ("the full forward pass reproduces llama.cpp's
+token"), built `--release`, in a clean `git worktree` so that a concurrent
+workstream editing `crates/xabe-cuda/src/kernels/moe.rs` could not move the
+numbers mid-run. That precaution turned out to be necessary: a rebuild against
+the working tree part-way through this exercise already showed a materially
+faster MoE. **These numbers are a snapshot of `89a38ba` and will go stale.**
+The method below is the part meant to outlive them — re-run `profile_forward`
+rather than trusting the tables.
+
+`crates/xabe-engine/src/bin/profile_forward.rs` partitions one pass into 84
+consecutive, non-overlapping spans: the state reset, the embedding gather, a
+mixer and a MoE for each of the 40 blocks, the final norm, and the LM head.
+They sum to the pass, which is what makes the percentage column arithmetic
+rather than rhetoric.
+
+**CUDA events, not `Instant`.** Every launch in the pass is asynchronous, so a
+host clock read between two stages measures enqueue latency and not work.
+Timing 84 stages with `Instant` would need 84 `cuStreamSynchronize` calls per
+pass, draining the pipeline every time. `cuEventRecord` is a stream-ordered
+marker: the enqueue is cheap and the host reads the whole timeline once, after
+the pass.
+
+The instrumentation is **off by default**. `Forward::run` costs one
+always-false branch per stage boundary unless `enable_profiling` was called, so
+`bench_forward`'s figure remains the uninstrumented one.
+
+**Instrumentation overhead, measured rather than asserted.** `profile_forward`
+brackets the instrumented run with two uninstrumented ones:
+
+| n | events off (before) | events on | events off (after) |
+| ---: | ---: | ---: | ---: |
+| 1 | 40.52 ± 3.70 ms | 32.62 ± 0.18 ms | 32.26 ± 0.01 ms |
+| 512 | 6,833.18 ± 53.70 ms | 6,938.52 ± 19.26 ms | 6,967.73 ± 5.00 ms |
+
+At n = 1 the overhead is **+0.37 ms, +1.1%**. At n = 512 the instrumented run
+falls *between* the two uninstrumented brackets, so the overhead (+105 ms
+nominal, +1.5%) is **not distinguishable from run-to-run drift**. Neither
+figure changes any conclusion below, all of which turn on factors of 10 or
+more.
+
+A second instrument, `nsys profile -t cuda`, gives the per-kernel composition
+inside each stage. Its inflation was measured too: at n = 512 it reports
+7,096.55 ms/pass against 6,967.54 uninstrumented (**+1.9%**), so its absolute
+numbers are usable; at n = 1 it reports 44.32 ms against 34.31 (**+29%**),
+because the pass is 1,053 launches of mostly-small kernels and CUPTI's
+per-launch cost is not small relative to them. **The n = 1 kernel figures below
+are therefore rescaled to the CUDA-event total and should be read as shares,
+not as absolutes.**
+
+`ncu` was **not** usable: this host has
+`NVreg_RestrictProfilingToAdminUsers` set and the run fails with
+`ERR_NVGPUCTRPERM`. So there are no measured DRAM-traffic or achieved-FLOP
+hardware counters here. Every bandwidth and FLOP figure below is *necessary
+work divided by measured time* — a lower bound on what the kernel really moved,
+which is the conservative direction for every claim made from it.
+
+## Per-stage breakdown
+
+```sh
+CUDA_VISIBLE_DEVICES=2 LLMXABE_PROFILE_N=1,512 LLMXABE_PROFILE_REPS=5 \
+  cargo run --release -p xabe-engine --bin profile_forward
+```
+
+### n = 1 — 32.61 ms of GPU time
+
+| stage | ms total | ms each | % of pass | sd |
+| --- | ---: | ---: | ---: | ---: |
+| reset (30 GDN state memsets + id upload) | 0.194 | 0.194 | 0.60% | 0.004 |
+| embedding gather | 0.006 | 0.006 | 0.02% | 0.000 |
+| GDN mixer ×30 | 4.743 | 0.158 | 14.55% | 0.017 |
+| Gated Attention mixer ×10 | 0.894 | 0.089 | 2.74% | 0.005 |
+| **MoE on GDN layers ×30** | **19.455** | 0.648 | **59.66%** | 0.119 |
+| **MoE on attention layers ×10** | **6.410** | 0.641 | **19.66%** | 0.037 |
+| final RMSNorm | 0.005 | 0.005 | 0.02% | 0.001 |
+| LM head (1 position) | 0.904 | 0.904 | 2.77% | 0.001 |
+| **total** | **32.611** | | 100.00% | |
+
+**The MoE is 79.3% of the pass.** Everything else together is 20.7%.
+
+### n = 512 — 6,938.54 ms of GPU time
+
+| stage | ms total | ms each | % of pass | sd |
+| --- | ---: | ---: | ---: | ---: |
+| reset (30 GDN state memsets + id upload) | 0.261 | 0.261 | 0.00% | 0.076 |
+| embedding gather | 0.026 | 0.026 | 0.00% | 0.005 |
+| **GDN mixer ×30** | **1,782.98** | 59.433 | **25.70%** | 3.976 |
+| Gated Attention mixer ×10 | 157.66 | 15.766 | 2.27% | 0.240 |
+| **MoE on GDN layers ×30** | **3,792.71** | 126.424 | **54.66%** | 11.591 |
+| **MoE on attention layers ×10** | **1,203.97** | 120.397 | **17.35%** | 3.551 |
+| final RMSNorm | 0.023 | 0.023 | 0.00% | 0.000 |
+| LM head (1 position) | 0.910 | 0.910 | 0.01% | 0.001 |
+| **total** | **6,938.54** | | 100.00% | |
+
+**The MoE is 72.0% and the GDN mixer 25.7%.** Attention, the embedding, the
+final norm and the LM head together are 2.3%.
+
+The MoE costs the same on both layer kinds (126.4 ms vs 120.4 ms), which is
+what it should do — the MoE does not know what mixer preceded it. That
+agreement is a check on the instrumentation, not a finding.
+
+### Inside the stages: per-kernel, from `nsys`
+
+n = 512, rescaled from the nsys total (7,055.95 ms) to the CUDA-event total:
+
+| kernel | % of pass | ms/pass | launches/pass | grid | block |
+| --- | ---: | ---: | ---: | --- | --- |
+| `moe_expert_ffn` | **38.75%** | 2,688.9 | 40 | (512, 7936, 1) | (256,1,1) |
+| `moe_expert_down` | **28.65%** | 1,988.1 | 40 | (2048, 7936, 1) | (256,1,1) |
+| `gdn_proj_q8_0` | **20.80%** | 1,443.1 | 90 | (2048\|1024\|512, 512, 1) | (32,4,1) |
+| `moe_shared_down` | 2.34% | 162.1 | 40 | (2048, 512, 1) | (256,1,1) |
+| `moe_shared_ffn` | 2.28% | 158.1 | 40 | (512, 512, 1) | (256,1,1) |
+| `gdn_chunk_inter` | 2.11% | 146.5 | 240 | (64, 32, 1) | (128,1,1) |
+| `lm_head_gemv_b8` (attention projections) | 1.80% | 124.8 | 2,560 | (1024\|256\|64, 1, 1) | (32,8,1) |
+| `gdn_chunk_solve_and_apply` | 1.18% | 81.6 | 240 | (32, 1, 1) | (128,1,1) |
+| `moe_block_router_logits` | 0.70% | 48.6 | 40 | (256, 512, 1) | (256,1,1) |
+| `gdn_chunk_gram` | 0.54% | 37.8 | 240 | (64, 16, 1) | (64,1,1) |
+| `attn_flash_causal` | **0.33%** | 22.9 | 10 | (512, 16, 1) | (256,1,1) |
+| `moe_align_block_size` | **0.12%** | 8.6 | 40 | **(1, 1, 1)** | (256,1,1) |
+| everything else (19 kernels) | 0.32% | 22.3 | 583 | | |
+
+n = 1, shares only (see the inflation note above):
+
+| kernel | % of pass | ms/pass (rescaled) | grid |
+| --- | ---: | ---: | --- |
+| `moe_expert_down` | **48.87%** | 15.94 | (2048, 128, 1) |
+| `moe_expert_ffn` | **27.94%** | 9.11 | (512, 128, 1) |
+| `gdn_proj_q8_0` | 8.70% | 2.84 | (2048\|1024\|512, 1, 1) |
+| `lm_head_gemv_b1` | 3.60% | 1.17 | (31040, 1, 1) |
+| `moe_shared_ffn` | 1.60% | 0.52 | (512, 1, 1) |
+| `moe_route` | 1.42% | 0.46 | **(1, 1, 1)** |
+| `moe_shared_down` | 1.25% | 0.41 | (2048, 1, 1) |
+| `gdn_recurrent_step` | 1.07% | 0.35 | (128, 32, 1) |
+| `rms_norm_rows` | 0.90% | 0.29 | **(1, 1, 1)** |
+| `moe_block_router_logits` | 0.60% | 0.20 | (256, 1, 1) |
+| `moe_reduce` | 0.54% | 0.18 | **(1, 1, 1)** |
+| `moe_align_block_size` | 0.47% | 0.15 | **(1, 1, 1)** |
+| `attn_flash_causal` | **0.08%** | 0.03 | (1, 16, 1) |
+
+**Two kernels — `moe_expert_ffn` and `moe_expert_down` — are 67.4% of the pass
+at n = 512 and 76.8% at n = 1.** A third, `gdn_proj_q8_0`, brings it to 88.2%
+and 85.5%. Everything else in this engine is noise by comparison.
+
+## Against the rooflines
+
+The card is 672 GB/s and 16.3 TFLOP/s fp32. Every projection in this pass is a
+matvec against a dequantized weight matrix, so its arithmetic is exactly
+`2 × elements` FLOP per activation row and its necessary traffic is exactly the
+tensor's stored size per distinct matrix touched. Both come from the GGUF
+directory — `profile_forward` prints the per-tensor table it sums, so the model
+is auditable against the file rather than being a shape guess.
+
+### n = 1 — bandwidth-bound, and nowhere near the bandwidth
+
+| stage | necessary bytes | achieved GB/s | % of 672 GB/s | ideal ms |
+| --- | ---: | ---: | ---: | ---: |
+| GDN projections ×30 | 1,089,477,120 | 229.68 | 34.18% | 1.621 |
+| Gated Attention projections ×10 | 289,771,520 | 324.30 | 48.26% | 0.431 |
+| **MoE ×40** | 1,125,253,120 | **43.51** | **6.47%** | 1.674 |
+| LM head | 540,344,320 | **597.93** | **88.98%** | 0.804 |
+
+Whole pass: **3.045 GB of necessary traffic in 32.61 ms = 93.4 GB/s = 13.9% of
+peak.** A perfect implementation of the same arithmetic would take 4.53 ms —
+**221 tok/s**, which reproduces the project's own 235 tok/s roofline to within
+6%, from the tensor sizes rather than by assumption. llama.cpp's measured
+9.55 ms/token moves the same bytes at 318.9 GB/s, **47.4% of peak** — itself
+within a percentage point of the 299 GB/s two-term fit earlier in this
+document, which is a useful cross-check on both.
+
+The LM head is the outlier in the good direction: **88.98% of streaming peak**,
+almost nothing left on the table.
+
+### n = 512 — compute-bound, and nowhere near the compute
+
+| stage | FLOP | achieved GFLOP/s | % of 16.3 TFLOP/s | ideal ms |
+| --- | ---: | ---: | ---: | ---: |
+| GDN projections ×30 | 1,030.8 G | 578.13 | **3.55%** | 63.24 |
+| Gated Attention projections ×10 | 279.2 G | 1,770.70 | **10.86%** | 17.13 |
+| MoE ×40 | 1,181.1 G | 236.38 | **1.45%** | 72.46 |
+| LM head | 1.0 G | 1,117.41 | 6.86% | 0.06 |
+| **all matmuls** | **2,491.1 G** | **357.5** | **2.19%** | **152.83** |
+
+llama.cpp does the same 2,491 GFLOP in 249.6 ms — **9.98 TFLOP/s, 61.2% of the
+card's fp32 peak.** It clears 60% of fp32 peak because it is not spending fp32:
+its `mmq` path quantizes activations to `q8_1` and dots in int8 on the tensor
+cores, whose published peak on this card is 130.5 TOPS — **8× the fp32 peak**.
+Against *that* denominator llama.cpp is at 7.6%, an ordinary number for a GEMM.
+Against fp32 it looks superhuman only because it is using a different unit.
+(130.5 TOPS is the datasheet figure for this card, not something measured
+here.)
+
+**That is the single most important structural fact in this section.** llmxabe
+dequantizes to fp32 and dots in fp32, so its ceiling is 16.3 TFLOP/s. fp32 is
+not disqualifying by itself — a *flawless* fp32 pass would need 152.83 ms of
+matmul against llama.cpp's whole 249.6 ms. But a realistic well-tiled fp32 SIMT
+GEMM reaches perhaps 25% of peak, which is 611 ms of matmul and, with the
+non-matmul stages left as they are, about 980 ms for the pass: **3.9× behind
+llama.cpp**, as the ranked list below works out independently. Matching the
+baseline at prefill requires int8 tensor cores (`mma.m8n8k16.s8`, available on
+sm_75), not merely better tiling.
+
+## The suspected causes, confirmed and refuted
+
+Six causes were suspected before any of this was measured. **Four are
+essentially refuted, one is confirmed and dominant, one is confirmed but
+unquantifiable on this host.**
+
+### 1. "Attention is the scalar fp32 path, `BM = 1`, no `m16n8k8` tensor cores" — REFUTED as a cost
+
+The description is accurate: `attn_flash_causal` launches grid `(512, 16, 1)`,
+one query row per block, `BM = 1`, and it is fp32 throughout.
+
+It is also **0.33% of the pass at n = 512 and 0.08% at n = 1**. Deleting the
+attention kernel entirely — making it free — would recover **22.9 ms of 6,938**
+and **0.03 ms of 32.6**.
+
+The whole Gated Attention mixer is only 2.27% of the pass, and 79% of *that* is
+its projections (`lm_head_gemv_b8`, 124.8 ms) rather than the attention maths
+(22.9 ms). Attention is not where llmxabe's time goes.
+
+**Limit on this conclusion:** this is a 512-token self-contained window with no
+KV cache. Attention cost grows quadratically with context while everything else
+grows linearly, so at 32K this conclusion would flip. It is a statement about
+*this* benchmark, not about the engine at length.
+
+### 2. "The MoE dispatch kernel is single-block (one SM of 72)" — CONFIRMED as a fact, REFUTED as a cost
+
+`moe_align_block_size` does launch with grid `(1, 1, 1)`, at both sizes. At
+n = 1, seven more kernels degenerate to a single block because there is only
+one token to spread over: `moe_route`, `moe_reduce`, `moe_block_combine`,
+`moe_block_shared_gate`, `rms_norm_rows`, `gdn_gates`, `fwd_embed_q8_0`.
+
+Every kernel whose grid is exactly one block, summed:
+
+| | n = 1 | n = 512 |
+| --- | ---: | ---: |
+| single-block kernels | 8 | 1 (`moe_align_block_size` only) |
+| their total cost | **1.32 ms** | **8.58 ms** |
+| share of the pass | **4.03%** | **0.12%** |
+
+Parallelizing every one of them perfectly recovers **4.0% at n = 1** and
+**0.12% at n = 512**. It is real and it is small. `moe_align_block_size`
+specifically — the dispatch kernel the suspicion named — is **0.47% at n = 1
+and 0.12% at n = 512**.
+
+### 3. "The MoE grouped GEMM has no tiling or shared-memory reuse; its grid is the full fixed slot capacity, so most blocks early-out" — CONFIRMED, and it is the whole story
+
+Both halves are true, and together they are **67.4% of the pass at n = 512 and
+76.8% at n = 1**.
+
+**No tiling.** `moe_expert_ffn` launches one block per `(output row, slot)` and
+`moe_expert_down` one per `(output element, slot)`. Each block re-reads the
+activation row from global memory, streams its weight row element by element,
+and finishes with a full 256-thread block reduction. Nothing is staged in
+shared memory and nothing is reused across the 16 slots of a tile. The
+consequence is a **15.9× redundant weight read** at n = 512: an expert's
+matrices are re-fetched once per assigned token instead of once per tile of 16.
+How much of that redundancy L2 absorbs cannot be measured on this host (no
+`ncu`), so the true DRAM traffic lies somewhere between the **29.2 GB** the
+arithmetic needs and the **464.4 GB** a zero-reuse implementation would move.
+
+**Fixed-capacity grid.** `grid.y` is `sorted_capacity`, a compile-time bound
+(AGENTS.md rule 5 requires it, so that the launch shape stays replayable from a
+captured graph). Live slots are the rest:
+
+| n | `sorted_capacity` | live `(token, expert)` pairs | blocks doing work | early-out |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 128 | 8 | **6.25%** | **93.75%** |
+| 512 | 7,936 | 4,096 | **51.61%** | **48.39%** |
+
+At n = 1 the grid is **16× larger than the work in it**; at n = 512 it is 1.94×.
+
+**The sharpest single number in this whole section** is the comparison between
+the two expert kernels at n = 512:
+
+| kernel | quant | reduction length | MACs/thread | GFLOP | ms | GFLOP/s | % fp32 peak |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `moe_expert_ffn` | q6_K | 2,048 | 8 | 687.2 | 2,688.9 | 255.6 | 1.57% |
+| `moe_expert_down` | q8_0 | 512 | 2 | 343.6 | 1,988.1 | 172.8 | 1.06% |
+
+`moe_expert_down` does **half** the arithmetic of `moe_expert_ffn` and takes
+**74%** as long — it is **1.48× less efficient per FLOP** — while using the
+*cheaper* quantization format. The difference between them is the reduction
+length: 2 MACs per thread before an 8-step block reduction, against 8. That is
+the cost of no tiling, isolated, in one comparison.
+
+### 4. "Per-element Q6_K/Q8_0 dequant re-reads the superblock header for every element" — CONFIRMED as a fact, but bounded small
+
+It is true: `dequant_element(gate_q, gate_quant, base + j)` is called inside the
+innermost loop, per element, and recomputes the superblock offset each time.
+
+It cannot be isolated by measurement here — doing so means editing
+`crates/xabe-cuda/src/kernels/moe.rs`, which this workstream does not own, and
+`ncu`'s instruction counters are unavailable. But row 3's table **bounds it**:
+the q6_K kernel, whose per-element unpack is far more expensive (a 12-byte
+scale array plus two bit planes, against q8_0's single scale and one byte), is
+the *more* efficient of the two per FLOP. If header re-reads were the dominant
+term, the ordering would be the other way round.
+
+**Conclusion: real, worth fixing, but not the reason the MoE is 72% of the
+n = 512 pass and 79% of the n = 1 pass.** The reduction shape is.
+
+### 5. "The LM head computes logits for ALL positions; llama.cpp's pp computes only the last" — REFUTED outright
+
+It does not. `Forward::run` already does what llama.cpp does — it copies the
+last position's row out of the final norm and runs the head on one row, exactly
+mirroring `get_rows(cur, inp_out_ids)`. `forward.rs` has a test asserting it
+(`the_lm_head_runs_on_one_position_because_that_is_what_was_captured`).
+
+The measurement confirms it: **`lm_head_gemv_b1` launches once per pass**, and
+the LM head stage costs **0.904 ms at n = 1 and 0.910 ms at n = 512** — the
+same, because it does the same work either way. That is 2.77% of the n = 1 pass
+and **0.01%** of the n = 512 pass, at **88.98% of streaming peak**.
+
+The LM head is the best-optimized thing in this engine. There is nothing to
+recover here.
+
+### 6. "40 layers × many small launches, no fusion, no CUDA graph" — REFUTED
+
+**Launch overhead is already fully hidden.** At n = 1 the pass issues **1,053
+kernel launches** and the uninstrumented wall clock settles at 32.26 ± 0.01 ms
+against 32.61 ms of CUDA-event GPU time — the wall clock is *below* the
+instrumented GPU total, the difference being the event markers themselves. The
+exposed launch overhead is **not distinguishable from zero**. At n = 512 there
+are 4,263 launches and the gap is ~0.4%.
+
+The reason is unflattering: the kernels are slow enough to hide their own
+launches. `moe_expert_down` at n = 1 launches 262,144 blocks; the CPU has
+plenty of time to enqueue the next kernel. **CUDA graph capture would recover
+approximately nothing at these shapes** — and would only start to matter after
+the kernels got roughly 10× faster, at which point it should be re-measured.
+
+**Fusion of the elementwise glue is also small.** Every elementwise, norm,
+rope, conv and reduction kernel together (`gdn_silu`, `swiglu_mul`, `gdn_add`,
+`moe_block_combine`, `rms_norm_rows`, `attn_residual_add`, `moe_route`,
+`moe_reduce`, and eleven more) is **21.4 ms, 0.31% of the pass at n = 512** —
+and 1.71 ms, 5.25%, at n = 1. Perfect fusion recovers under a third of a
+percent where the pass is slowest.
+
+This one matters beyond itself: **milestone 06, CUDA graph capture, was
+designated "the justification gate" and "the largest single expected win".**
+The section above already showed llama.cpp has it. This measurement shows that
+in llmxabe, at the shapes it runs today, it would buy nothing at all.
+
+## Ranked by measured headroom
+
+Ordered by how many milliseconds each would recover **if perfect**, not by how
+appealing it sounds. "Realistic" assumes a well-tiled fp32 SIMT GEMM at 25% of
+the card's fp32 peak, which is an ordinary result for such a kernel and roughly
+7× better than what these kernels do now.
+
+### At n = 512 (prefill), out of 6,938.54 ms
+
+| # | Change | Now | Perfect | Realistic | Recovers (realistic) |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | Tile the MoE routed grouped GEMM (`moe_expert_ffn` + `moe_expert_down`) | 4,677 ms | 63 ms | 253 ms | **4,424 ms (63.8%)** |
+| 2 | Tile the GDN projections (`gdn_proj_q8_0`) | 1,443 ms | 63 ms | 253 ms | **1,190 ms (17.2%)** |
+| 3 | Tile the MoE shared expert (`moe_shared_ffn` + `moe_shared_down`) | 320 ms | 8 ms | 32 ms | **288 ms (4.2%)** |
+| 4 | The GDN chunked delta rule (`gdn_chunk_*`) | 266 ms | — | — | ≤ 266 ms (3.8%) |
+| 5 | Tile the attention projections (`lm_head_gemv_b8`) | 125 ms | 17 ms | 68 ms | **57 ms (0.8%)** |
+| 6 | Parallelize `moe_block_router_logits` | 48.6 ms | — | — | ≤ 48.6 ms (0.70%) |
+| 7 | Tensor-core / tiled flash attention | 22.9 ms | — | — | ≤ 22.9 ms (0.33%) |
+| 8 | Fuse the elementwise glue | 21.4 ms | — | — | ≤ 21.4 ms (0.31%) |
+| 9 | Parallelize `moe_align_block_size` (the dispatch kernel) | 8.6 ms | — | — | ≤ 8.6 ms (0.12%) |
+| 10 | CUDA graph capture | ~29 ms exposed | — | — | **≤ 29 ms (0.42%)** |
+| 11 | LM head | 0.91 ms | 0.80 ms | 0.80 ms | **0.11 ms (0.002%)** |
+
+Items 1–3 are **92.8% of the pass** and recover **85.1% of it**, and they are
+one change: *stage a tile of the weight matrix in shared memory and reuse it
+across a tile of tokens.* Items 6–11 together are **1.9%**.
+
+Doing 1, 2, 3 and 5 realistically gives ~980 ms → **522 tok/s**, still **3.9×
+behind llama.cpp's 2,051**. Closing the rest needs int8 tensor cores.
+
+### At n = 1 (latency floor), out of 32.61 ms
+
+At one token nothing is compute-bound; the binding roofline is bandwidth.
+
+| # | Change | Now | Perfect | Recovers |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | MoE: pack the grid to live slots and tile the GEMM | 25.87 ms | 1.67 ms | **24.20 ms (74.2%)** |
+| 2 | GDN projections | 4.74 ms | 1.62 ms | **3.12 ms (9.6%)** |
+| 3 | Parallelize the 8 single-block kernels | 1.32 ms | — | ≤ 1.32 ms (4.0%) |
+| 4 | Gated Attention mixer | 0.89 ms | 0.43 ms | **0.46 ms (1.4%)** |
+| 5 | Skip the 30 GDN state memsets (a decode would not do them) | 0.19 ms | 0 | **0.19 ms (0.6%)** |
+| 6 | LM head | 0.90 ms | 0.80 ms | **0.10 ms (0.3%)** |
+| 7 | CUDA graph capture | ~0 ms exposed | 0 | **~0 ms** |
+
+Item 1 alone is three quarters of the pass. Its mechanism at n = 1 is the
+**93.75% early-out**: 128 grid slots for 8 live pairs.
+
+Doing 1, 2 and 4 gives ~4.8 ms → **207 tok/s**, which would put llmxabe's
+latency floor **ahead** of llama.cpp's 104.72 tok/s decode. That is the
+optimistic reading and it should be treated with suspicion until a KV cache
+exists: the n = 1 pass has no cache to read, and llama.cpp's `tg128` does. It
+is nonetheless the clearest evidence that the decode-side gap is a kernel
+problem and not an architectural one.
+
+## What this changes
+
+**The engine's problem is one kernel shape, not six things.** Every suspected
+cause that could be isolated is worth under 3% of the pass. The one that could
+not be isolated — the per-element dequant — is bounded small by the q6_K/q8_0
+comparison. The remaining one, no tiling and no shared-memory reuse in the
+grouped GEMM, is worth **64% at prefill and 74% at the latency floor**. Every
+hour spent on tensor-core attention, dispatch parallelism, dequant
+micro-optimization or CUDA graph capture before that one is fixed is an hour
+spent on the 3%.
+
+**Prefill cannot be won in fp32.** llama.cpp runs the same 2,491 GFLOP at 61%
+of this card's fp32 peak because it is not spending fp32 — it dots in int8 on
+the tensor cores, which are 8× faster. A perfectly tiled fp32 llmxabe lands
+around 3.9× behind. This is a stated design consequence, not a tuning gap, and
+it needs a decision rather than more optimization.
+
+**The decode-side story is better than the prefill one**, and it is the side
+the project cares about. The n = 1 pass is bandwidth-bound at 13.9% of peak
+against llama.cpp's 47.4%, and the gap is the same MoE grouped GEMM. Fixing it
+is bounded, local, and does not require changing the arithmetic.
+
+**Milestone 06's premise is now measured and does not hold.** Graph capture
+buys ~0.4% at n = 512 and nothing measurable at n = 1, because launch overhead
+is already hidden behind slow kernels. The earlier finding was that llama.cpp
+already has graph capture; this one is that llmxabe would not benefit from it
+yet. The continue/stop gate needs restating around the grouped GEMM.
+
+## Not measured, in this section
+
+- **Any hardware counter.** `ncu` fails with `ERR_NVGPUCTRPERM` on this host, so
+  there is no measured DRAM traffic, L2 hit rate, occupancy, or instruction mix.
+  Every efficiency figure here is necessary-work ÷ measured-time, which
+  understates real traffic and therefore understates how far off peak the
+  kernels are.
+- **How much of the grouped GEMM's 16× redundant weight read L2 absorbs.** The
+  true DRAM traffic is bounded between 29.2 GB and 464.4 GB per pass at n = 512
+  and was not narrowed.
+- **The dequant header re-read in isolation.** Bounded by inference from the
+  q6_K/q8_0 comparison, not measured directly; measuring it means editing a
+  kernel this workstream does not own.
+- **Anything at long context.** The largest batch measured is 512 tokens with no
+  KV cache. The conclusion that attention is negligible is a statement about
+  this shape and would not survive 32K.
+- **Decode.** llmxabe has no KV cache and no carried recurrent state, so there
+  is no decode number to compare against `tg128`; the n = 1 row is a floor.
+- **Multi-GPU.** Every figure is one card.
+- The GDN chunked delta rule kernels (`gdn_chunk_*`, 3.8% at n = 512) were
+  timed but not analyzed against a roofline.
+- **Anything past `89a38ba`.** A concurrent workstream is rewriting the very
+  kernel this section identifies as dominant. The ranked list is a statement
+  about that commit; the first thing to do with it is re-measure.
+
 ## Reproducing
 
 Raw commands are recorded in the tables above. The decode sweep is:

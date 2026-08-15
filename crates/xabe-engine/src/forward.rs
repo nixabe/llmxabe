@@ -65,8 +65,10 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
+use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 
 use xabe_cuda::kernels::attention::AttentionError;
@@ -340,6 +342,120 @@ pub fn arena_holds(role: Role) -> bool {
     !MOE_OWNED_ROLES.contains(&role)
 }
 
+/// One timed span inside [`Forward::run`].
+///
+/// The spans partition the pass exactly: they are consecutive, none overlaps,
+/// and their sum is the pass. That is what makes a percentage column
+/// meaningful rather than merely suggestive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Zeroing the 30 Gated DeltaNet states and uploading the token ids.
+    Reset,
+    /// The `get_rows` embedding gather.
+    Embed,
+    /// One block's mixer — Gated DeltaNet or Gated Attention.
+    Mixer { layer: u32, kind: LayerKind },
+    /// One block's MoE: post-mixer norm, router, dispatch, grouped GEMM,
+    /// shared expert, combine, residual add.
+    Moe { layer: u32 },
+    /// The final RMSNorm over all positions.
+    FinalNorm,
+    /// The last-position row copy and the LM head GEMV.
+    LmHead,
+}
+
+impl std::fmt::Display for Stage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reset => write!(f, "reset"),
+            Self::Embed => write!(f, "embed"),
+            Self::Mixer { layer, kind } => {
+                let k = match kind {
+                    LayerKind::GatedDeltaNet => "gdn",
+                    LayerKind::GatedAttention => "attn",
+                };
+                write!(f, "mixer[{layer}:{k}]")
+            }
+            Self::Moe { layer } => write!(f, "moe[{layer}]"),
+            Self::FinalNorm => write!(f, "final_norm"),
+            Self::LmHead => write!(f, "lm_head"),
+        }
+    }
+}
+
+/// A per-stage GPU timeline for one pass, recorded with CUDA events.
+///
+/// # Why events and not `Instant`
+///
+/// Every launch in this pass is asynchronous, so a host clock read between two
+/// stages measures *launch* time, not work. Getting wall clock out of an
+/// `Instant` would need a `cuStreamSynchronize` per stage — 84 of them — which
+/// drains the pipeline 84 times and inflates the total by far more than the
+/// thing being measured. `cuEventRecord` is a stream-ordered marker: it costs
+/// one enqueue at record time and the host reads the timeline once, after the
+/// pass, from `cuEventElapsedTime`.
+///
+/// The events are created once, at [`Forward::enable_profiling`], and reused
+/// every pass — `AGENTS.md` rule 6 forbids allocating on this path, and that
+/// applies to the instrumentation as much as to the pass.
+///
+/// The residual overhead is real but small, and it is measured rather than
+/// assumed: run `bench_forward` with and without `LLMXABE_PROFILE` and the
+/// difference is the instrumentation. See `docs/BENCHMARKS.md`.
+pub struct StageProfile {
+    events: Vec<CudaEvent>,
+    stages: Vec<Stage>,
+    cursor: usize,
+}
+
+impl StageProfile {
+    /// `spans` timed spans need `spans + 1` boundary markers.
+    fn new(ctx: &Arc<CudaContext>, spans: usize) -> Result<Self, ForwardError> {
+        let mut events = Vec::with_capacity(spans + 1);
+        for _ in 0..=spans {
+            // The default flag keeps timing enabled; `new_event(None)` would
+            // create the event with `CU_EVENT_DISABLE_TIMING` and
+            // `elapsed_ms` would then fail.
+            events.push(ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?);
+        }
+        Ok(Self {
+            events,
+            stages: Vec::with_capacity(spans),
+            cursor: 0,
+        })
+    }
+
+    /// Record the opening marker and forget the previous pass.
+    fn begin(&mut self, stream: &Arc<CudaStream>) -> Result<(), ForwardError> {
+        self.stages.clear();
+        self.cursor = 0;
+        self.events[0].record(stream)?;
+        self.cursor = 1;
+        Ok(())
+    }
+
+    /// Close the span named `stage` at the stream's current position.
+    fn mark(&mut self, stream: &Arc<CudaStream>, stage: Stage) -> Result<(), ForwardError> {
+        self.events[self.cursor].record(stream)?;
+        self.cursor += 1;
+        self.stages.push(stage);
+        Ok(())
+    }
+
+    /// The last pass's timeline, in milliseconds of GPU time per span.
+    ///
+    /// Synchronizes on the events it reads, so it is safe to call immediately
+    /// after `run` returns.
+    pub fn spans(&self) -> Result<Vec<(Stage, f64)>, ForwardError> {
+        let mut out = Vec::with_capacity(self.stages.len());
+        for (i, &stage) in self.stages.iter().enumerate() {
+            let ms = self.events[i].elapsed_ms(&self.events[i + 1])?;
+            out.push((stage, ms as f64));
+        }
+        Ok(out)
+    }
+}
+
 /// The whole model, resident, wired end to end.
 pub struct Forward {
     config: ModelConfig,
@@ -371,6 +487,10 @@ pub struct Forward {
     final_norm: CudaSlice<f32>,
     last_hidden: CudaSlice<f32>,
     logits: CudaSlice<f32>,
+
+    /// `None` unless [`Self::enable_profiling`] was called. The hot path pays
+    /// one always-false branch per stage boundary when it is `None`.
+    profile: Option<StageProfile>,
 
     report: ForwardReport,
 }
@@ -531,6 +651,7 @@ impl Forward {
             final_norm: stream.alloc_zeros::<f32>(tokens * hidden)?,
             last_hidden: stream.alloc_zeros::<f32>(hidden)?,
             logits: stream.alloc_zeros::<f32>(vocab)?,
+            profile: None,
             report: ForwardReport {
                 arena_bytes: weights.arena().capacity() as u64,
                 moe_bytes,
@@ -544,6 +665,37 @@ impl Forward {
     /// Where this pass's device memory went.
     pub fn report(&self) -> ForwardReport {
         self.report
+    }
+
+    /// Start recording a per-stage GPU timeline on every subsequent [`Self::run`].
+    ///
+    /// Off by default: `bench_forward`'s figure must stay the uninstrumented
+    /// one. The events are allocated here, once, so enabling this does not
+    /// allocate on the pass itself.
+    pub fn enable_profiling(&mut self, ctx: &Arc<CudaContext>) -> Result<(), ForwardError> {
+        // Reset, embed, a mixer and a MoE per block, the final norm, the head.
+        let spans = 2 * self.config.num_layers as usize + 4;
+        self.profile = Some(StageProfile::new(ctx, spans)?);
+        Ok(())
+    }
+
+    /// Stop recording, and release the events.
+    pub fn disable_profiling(&mut self) {
+        self.profile = None;
+    }
+
+    /// The last pass's per-stage timeline, if [`Self::enable_profiling`] was called.
+    pub fn profile(&self) -> Option<&StageProfile> {
+        self.profile.as_ref()
+    }
+
+    /// Close a timed span, when profiling is on.
+    #[inline]
+    fn mark(&mut self, stream: &Arc<CudaStream>, stage: Stage) -> Result<(), ForwardError> {
+        match &mut self.profile {
+            Some(p) => p.mark(stream, stage),
+            None => Ok(()),
+        }
     }
 
     /// Positions this pass was built for.
@@ -616,18 +768,25 @@ impl Forward {
             });
         }
 
+        if let Some(p) = &mut self.profile {
+            p.begin(stream)?;
+        }
+
         for state in &mut self.gdn_states {
             stream.memset_zeros(&mut state.conv)?;
             stream.memset_zeros(&mut state.recurrent)?;
         }
         stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
+        self.mark(stream, Stage::Reset)?;
         self.embed(stream)?;
+        self.mark(stream, Stage::Embed)?;
         on_waypoint(None, &self.hidden_state);
 
         let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
         for layer in 0..self.config.num_layers {
             // 1. the mixer, into `attn_residual-N`.
-            match self.config.layer_kind(layer) {
+            let kind = self.config.layer_kind(layer);
+            match kind {
                 LayerKind::GatedDeltaNet => {
                     self.gdn.forward(
                         stream,
@@ -650,6 +809,7 @@ impl Forward {
                     attn_slot += 1;
                 }
             }
+            self.mark(stream, Stage::Mixer { layer, kind })?;
 
             // 2. the MoE, whose residual is the mixer output and whose
             //    `l_out` becomes the next block's input.
@@ -661,6 +821,7 @@ impl Forward {
                 &mut self.ffn_out,
                 &mut self.hidden_state,
             )?;
+            self.mark(stream, Stage::Moe { layer })?;
             on_waypoint(Some(layer), &self.hidden_state);
         }
 
@@ -674,6 +835,7 @@ impl Forward {
             self.hidden,
             self.rms_eps,
         )?;
+        self.mark(stream, Stage::FinalNorm)?;
 
         // 4. `result_output`: llama.cpp's `get_rows(cur, inp_out_ids)` keeps
         //    only the positions it was asked for, which for a prefill is the
@@ -692,6 +854,7 @@ impl Forward {
             1,
             &mut self.logits,
         )?;
+        self.mark(stream, Stage::LmHead)?;
         Ok(())
     }
 
