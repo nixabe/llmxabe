@@ -62,8 +62,33 @@ Tensor type histogram: `q6_K` 80 tensors / 16.41 GiB, `q8_0` 303 / 13.86 GiB,
 `f32` 368 / 0.10 GiB, `bf16` 2. Total tensor data 30.36 GiB.
 
 **Quantization is mixed, and not the way the planning document assumed.**
-Expert weights are Q6_K; the LM head *and the projections* are Q8_0. That
-matters for the bandwidth arithmetic below.
+The LM head *and the projections* are Q8_0. That matters for the bandwidth
+arithmetic below.
+
+It is also mixed *within the expert stacks*, which an earlier revision of this
+document got wrong by calling them simply "Q6_K". Verified tensor by tensor
+against the file's directory, not inferred:
+
+| Expert tensor | Blocks 0–38 | Block 39 | Block 40 (MTP) |
+|---|---|---|---|
+| `ffn_gate_exps` | `q6_K` | **`q8_0`** | `q6_K` |
+| `ffn_up_exps` | `q6_K` | **`q8_0`** | `q6_K` |
+| `ffn_down_exps` | `q8_0` | `q8_0` | `q8_0` |
+
+That accounts for the histogram exactly: 80 `q6_K` tensors is 40 blocks × 2
+(gate and up) with block 39 excluded, and the 41 down projections plus block
+39's gate and up are 43 of the `q8_0` count.
+
+Two consequences, both load-bearing:
+
+- A dequantization prologue that hard-codes Q6_K reads every expert down
+  projection as garbage. The format must travel with the pointer — see
+  `QuantTensor` in `crates/xabe-cuda/src/kernels/moe.rs`.
+- Nothing may assume a uniform format *per layer* either. Block 39 is the
+  counterexample, and it sits between two blocks that do match the pattern, so
+  a spot check on layers 0 and 20 would miss it.
+
+The shared-expert tensors (`ffn_*_shexp`) are Q8_0.
 
 ### Three findings from the real file
 
