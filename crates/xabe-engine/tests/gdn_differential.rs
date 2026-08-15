@@ -15,6 +15,29 @@
 //! drifting — and the state is what a later token, or a resumed prefix cache
 //! hit, actually depends on.
 //!
+//! ## The blind spot this test used to have
+//!
+//! The CPU reference runs **one head**, so the caller — this file — performs
+//! the query/key head broadcast itself. For a long time it did so with
+//! `qk = h / heads_per_kv`, which is exactly the mapping the kernel had
+//! hard-coded. Device and reference therefore agreed with each other while both
+//! disagreed with the model: llama.cpp indexes the query/key head as
+//! `fastmodulo(h_idx, n_k_heads)`
+//! (`ggml/src/ggml-cuda/gated_delta_net.cu:37`) and its non-fused fallback
+//! broadcasts with `ggml_repeat_4d`, which tiles. Gated against the captured
+//! `final_output-N`, `h % 16` reproduces block 0 to `max_abs 7.15e-7` and
+//! `h / 2` to `5.59e-1` at cosine `0.975`.
+//!
+//! A shared convention between the thing under test and the oracle is not a
+//! test of that convention, so two things changed:
+//!
+//! 1. the broadcast here is `h % qk_heads`, matching the fixed kernel; and
+//! 2. [`the_query_key_head_broadcast_is_modulo_not_division`] runs the *same*
+//!    device output against *both* mappings and requires the modulo one to
+//!    pass and the division one to fail. That test discriminates the two
+//!    without any captured tensor, so it would have caught the defect on the
+//!    day the kernel landed, and it fails if either side silently reverts.
+//!
 //! ## Why the two cannot be bit-identical
 //!
 //! Two differences are inherent and neither is a defect:
@@ -215,7 +238,10 @@ fn device_gdn_matches_the_reference_over_a_long_sequence() {
     let mut worst_out = 0.0f32;
     let mut worst_cos = 1.0f32;
     for h in 0..value_heads {
-        let qk = h / heads_per_kv;
+        // Modulo, not division — see the module docs. This line agreeing with
+        // the kernel is *not* evidence that either is right, which is what
+        // `the_query_key_head_broadcast_is_modulo_not_division` exists for.
+        let qk = h % qk_heads;
         let q: Vec<Vec<f32>> = (0..SEQ_LEN).map(|t| inputs.q[t][qk].clone()).collect();
         let k: Vec<Vec<f32>> = (0..SEQ_LEN).map(|t| inputs.k[t][qk].clone()).collect();
         let v: Vec<Vec<f32>> = (0..SEQ_LEN).map(|t| inputs.v[t][h].clone()).collect();
@@ -264,6 +290,128 @@ fn device_gdn_matches_the_reference_over_a_long_sequence() {
     println!(
         "gate: max_abs<{:.0e}, max_rel<{:.0e}, cosine>{:.9}",
         GATE.max_abs_error, GATE.max_rel_error, GATE.min_cosine_similarity,
+    );
+}
+
+/// Every value head's output, gathered from the interleaved device buffer.
+fn head_outputs(outputs: &[Vec<f32>], h: usize, head_dim: usize) -> Vec<f32> {
+    outputs
+        .iter()
+        .flat_map(|o| o[h * head_dim..(h + 1) * head_dim].to_vec())
+        .collect()
+}
+
+#[test]
+fn the_query_key_head_broadcast_is_modulo_not_division() {
+    // The test the long-sequence comparison above cannot be: it uses one
+    // broadcast convention on both sides, so it measures the kernel against a
+    // reference that shares the kernel's assumption. This one takes a single
+    // device run and scores it against *both* candidate mappings, so it says
+    // which one the device implements rather than assuming.
+    //
+    // With 4 value heads and 2 query/key heads the mappings are
+    //   modulo:   0->0, 1->1, 2->0, 3->1
+    //   division: 0->0, 1->0, 2->1, 3->1
+    // which agree on heads 0 and 3 and disagree on 1 and 2. The two heads that
+    // disagree are the measurement; the two that agree are the control, and
+    // they are checked too so that a kernel which is simply broken fails here
+    // as a broken kernel rather than as a mapping verdict.
+    //
+    // Measured against the mapping the kernel shipped with
+    // (`h / heads_per_kv`): value head 1 scores max_abs 2.131e-2 at cosine
+    // -0.056 and head 2 max_abs 2.354e-2 at cosine -0.263 — the outputs are
+    // not merely inaccurate, they point in an unrelated direction. With the
+    // kernel on modulo every head lands at max_abs 4e-9 to 1e-8, cosine
+    // 1.000000.
+    let Some(ctx) = setup() else { return };
+    let head_dim = 128usize;
+    let value_heads = 4usize;
+    let qk_heads = 2usize;
+    let heads_per_kv = value_heads / qk_heads;
+    const SEQ_LEN: usize = 8;
+
+    let inputs = Inputs::generate(SEQ_LEN, head_dim, value_heads, qk_heads);
+    let stream = ctx.default_stream();
+    let kernels = GdnKernels::new(&ctx, head_dim, value_heads, qk_heads).expect("compiles");
+    let mut scratch = kernels.scratch(&stream).expect("scratch");
+
+    let mut d_state = stream
+        .alloc_zeros::<f32>(value_heads * head_dim * head_dim)
+        .expect("state");
+    let mut d_out = stream
+        .alloc_zeros::<f32>(value_heads * head_dim)
+        .expect("out");
+
+    let mut device_outputs: Vec<Vec<f32>> = Vec::with_capacity(SEQ_LEN);
+    for t in 0..SEQ_LEN {
+        let d_q = stream.clone_htod(&inputs.q[t].concat()).expect("q");
+        let d_k = stream.clone_htod(&inputs.k[t].concat()).expect("k");
+        let d_v = stream.clone_htod(&inputs.v[t].concat()).expect("v");
+        let d_g = stream.clone_htod(&inputs.log_decay[t]).expect("g");
+        let d_b = stream.clone_htod(&inputs.beta[t]).expect("beta");
+        kernels
+            .step(
+                &stream,
+                &mut scratch,
+                &mut d_state,
+                &d_q,
+                &d_k,
+                &d_v,
+                &d_g,
+                &d_b,
+                &mut d_out,
+            )
+            .expect("step");
+        device_outputs.push(stream.clone_dtoh(&d_out).expect("out back"));
+    }
+    stream.synchronize().expect("sync");
+
+    let reference_for = |h: usize, qk: usize| -> Vec<f32> {
+        let q: Vec<Vec<f32>> = (0..SEQ_LEN).map(|t| inputs.q[t][qk].clone()).collect();
+        let k: Vec<Vec<f32>> = (0..SEQ_LEN).map(|t| inputs.k[t][qk].clone()).collect();
+        let v: Vec<Vec<f32>> = (0..SEQ_LEN).map(|t| inputs.v[t][h].clone()).collect();
+        let decay: Vec<f32> = (0..SEQ_LEN).map(|t| inputs.log_decay[t][h]).collect();
+        let beta: Vec<f32> = (0..SEQ_LEN).map(|t| inputs.beta[t][h]).collect();
+        recurrent_forward(head_dim, &q, &k, &v, &decay, &beta, None)
+            .0
+            .concat()
+    };
+
+    let mut discriminating = 0usize;
+    for h in 0..value_heads {
+        let candidate = head_outputs(&device_outputs, h, head_dim);
+        let modulo = h % qk_heads;
+        let division = h / heads_per_kv;
+
+        let m = compare(&candidate, &reference_for(h, modulo));
+        println!(
+            "value head {h}: h % qk_heads -> qk {modulo}: max_abs={:.3e} cosine={:.6}",
+            m.max_abs_error, m.cosine_similarity,
+        );
+        assert!(
+            m.max_abs_error <= GATE.max_abs_error
+                && m.cosine_similarity >= GATE.min_cosine_similarity,
+            "value head {h} does not read query/key head {modulo}: {m}",
+        );
+
+        if division == modulo {
+            continue;
+        }
+        discriminating += 1;
+        let d = compare(&candidate, &reference_for(h, division));
+        println!(
+            "value head {h}: h / heads_per_kv -> qk {division}: max_abs={:.3e} cosine={:.6}",
+            d.max_abs_error, d.cosine_similarity,
+        );
+        assert!(
+            d.max_abs_error > 1e-3 && d.cosine_similarity < 0.9,
+            "value head {h} is indistinguishable under the two broadcast \
+             conventions, so this test proves nothing: {d}",
+        );
+    }
+    assert_eq!(
+        discriminating, 2,
+        "the geometry must contain heads on which the two mappings disagree",
     );
 }
 

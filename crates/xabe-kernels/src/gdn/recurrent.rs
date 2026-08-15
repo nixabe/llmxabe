@@ -62,14 +62,28 @@ pub fn zero_state(head_dim: usize) -> GdnState {
     vec![0.0f32; head_dim * head_dim]
 }
 
-/// L2-normalizes a vector: `x / sqrt(sum(x^2) + eps)`.
+/// L2-normalizes a vector: `x / max(sqrt(sum(x^2)), eps)`.
 ///
-/// `eps` matches the FLA Triton kernel's `1e-6` inside the square root
-/// (`fused_recurrent.py:128-129`), guarding an all-zero vector from
-/// producing `NaN` rather than `0`.
+/// **`eps` floors the norm; it is not added to the sum of squares.** That is
+/// `ggml_l2_norm`, which is the op Qwen3.6's graph actually calls on `q_conv`
+/// and `k_conv` (`src/models/qwen35moe.cpp:456`): the CPU path computes
+/// `1/fmaxf(sqrtf(sum), eps)` (`ggml/src/ggml-cpu/ops.cpp:4204`) and the CUDA
+/// path `rsqrtf(fmaxf(sum, eps*eps))` (`ggml/src/ggml-cuda/norm.cu:273`), the
+/// same value written two ways. It still guards an all-zero vector from
+/// producing `NaN`, which is the only thing the FLA Triton kernel's
+/// `sqrt(sum + eps)` (`fused_recurrent.py:128-129`) was kept here for.
+///
+/// The two forms are not interchangeable. `sqrt(sum + eps)` shrinks every
+/// vector by a factor `1 - eps/(2*sum)` to first order — a systematic bias
+/// that grows as the norm falls. On the real `q_conv`/`k_conv` of blocks 0, 4
+/// and 20 the smallest sum of squares is `2.327e-3`, giving a worst relative
+/// scale error of `2.148e-4`, which agrees with `eps/(2*sum)` to four figures
+/// and is three orders of magnitude above the device-vs-reference agreement
+/// this crate gates on. Under the flooring form the epsilon binds only when
+/// `sqrt(sum) < eps`, so its exact value stops mattering in normal operation.
 pub fn l2_normalize(x: &[f32], eps: f32) -> Vec<f32> {
     let sum_sq: f32 = x.iter().map(|v| v * v).sum();
-    let inv_norm = 1.0 / (sum_sq + eps).sqrt();
+    let inv_norm = 1.0 / sum_sq.sqrt().max(eps);
     x.iter().map(|&v| v * inv_norm).collect()
 }
 
@@ -208,6 +222,34 @@ mod tests {
         let n = l2_normalize(&x, 0.0);
         let norm: f32 = n.iter().map(|v| v * v).sum();
         assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_l2_epsilon_floors_the_norm_and_does_not_shrink_a_normal_vector() {
+        // `ggml_l2_norm` is `1/max(sqrt(sum), eps)`, so on any vector whose
+        // norm exceeds eps the result is exactly unit-norm. `sqrt(sum + eps)`
+        // — the form this used to have — instead shrinks it by eps/(2*sum),
+        // which is 2.148e-4 at the smallest sum of squares measured on the
+        // real model's q_conv/k_conv (2.327e-3) and is therefore a real
+        // divergence from llama.cpp rather than round-off.
+        let small = [0.02f32, -0.03, 0.015, 0.0250];
+        let sum_sq: f32 = small.iter().map(|v| v * v).sum();
+        assert!(sum_sq < 3e-3, "sum of squares {sum_sq:e}");
+
+        let n = l2_normalize(&small, 1e-6);
+        let norm_sq: f32 = n.iter().map(|v| v * v).sum();
+        assert!(
+            (norm_sq - 1.0).abs() < 1e-6,
+            "the epsilon bound on a vector it should not have touched: |n|^2 = {norm_sq}",
+        );
+
+        // What the additive form would have produced, for contrast.
+        let additive = 1.0f32 / (sum_sq + 1e-6).sqrt();
+        let shrinkage = 1.0 - additive * sum_sq.sqrt();
+        assert!(
+            shrinkage > 1e-4,
+            "the two forms must actually differ on this input: {shrinkage:e}",
+        );
     }
 
     #[test]

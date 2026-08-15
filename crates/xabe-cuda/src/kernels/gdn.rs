@@ -13,7 +13,17 @@
 //! one layer's state for one sequence is 2 MiB — constant in sequence length,
 //! which is the whole point of the hybrid architecture.
 //!
-//! The 32 value heads share 16 query/key heads: `qk_head = v_head / 2`.
+//! The 32 value heads share 16 query/key heads by **modulo**:
+//! `qk_head = v_head % 16`, so value heads 0 and 16 share a query/key head —
+//! *not* 0 and 1. llama.cpp's fused op indexes it as
+//! `fastmodulo(h_idx, n_k_heads)` (`ggml/src/ggml-cuda/gated_delta_net.cu:37`),
+//! and its non-fused fallback reaches the same mapping through
+//! `ggml_repeat_4d` (`src/models/qwen35moe.cpp:466`), which *tiles* rather than
+//! stretches. Dividing instead — `v_head / 2`, the other plausible reading —
+//! pairs every value head with the wrong query and stays finite and fluent.
+//! That was this kernel's convention until it was gated against the captured
+//! `final_output-N`: `h % 16` reproduces it to `max_abs 7.15e-7`, `h / 2` to
+//! `5.59e-1` at cosine `0.975`.
 //!
 //! ## Why two kernels
 //!
@@ -47,10 +57,16 @@ use super::compile;
 
 /// The epsilon inside the L2 normalization.
 ///
-/// Matches FLA's `1e-6` (`fused_recurrent.py`), which is what
-/// `xabe_kernels::gdn::recurrent::recurrent_forward` uses. llama.cpp's op
-/// assumes q/k are normalized by a separate graph node and states no epsilon,
-/// so this is the only sourced value.
+/// It is a **floor on the norm**, not a term added to the sum of squares — see
+/// the `gdn_normalize_qk` source. `ggml_l2_norm` is
+/// `scale = 1/max(sqrt(sum), eps)` on the CPU
+/// (`ggml/src/ggml-cpu/ops.cpp:4204`) and `rsqrt(max(sum, eps*eps))` on CUDA
+/// (`ggml/src/ggml-cuda/norm.cu:273`), which is the same value; llama.cpp
+/// passes `hparams.f_norm_rms_eps` into it at `src/models/qwen35moe.cpp:456`.
+/// Under that form the epsilon only binds on a vector whose norm is below it,
+/// so its exact value is immaterial in normal operation and `1e-6` — FLA's
+/// value, and the one
+/// `xabe_kernels::gdn::recurrent::l2_normalize` uses — is safe to keep.
 pub const L2_EPS: f32 = 1e-6;
 
 const GDN_SRC: &str = r#"
@@ -113,11 +129,21 @@ __global__ void gdn_normalize_qk(
     float k_sq = block_reduce_sum(kv * kv, scratch);
     __syncthreads();
 
+    // `1/max(sqrt(sum), eps)`, which is ggml_l2_norm's formula verbatim
+    // (ggml-cpu/ops.cpp:4204; the CUDA path's rsqrt(max(sum, eps*eps)) is the
+    // same value). The epsilon FLOORS the norm rather than being added to the
+    // sum of squares, so it guards a zero vector from dividing by zero and
+    // otherwise never binds. `1/sqrt(sum + eps)` — the form this kernel used
+    // until it was measured against the real q_conv/k_conv of blocks 0/4/20 —
+    // instead shrinks every vector by eps/(2*sum): at the smallest observed
+    // sum of squares, 2.327e-3, that is 2.148e-4 relative, three orders of
+    // magnitude above this kernel's agreement with its reference.
+    //
     // rsqrtf would be faster and is not IEEE-exact; the reference divides by
     // sqrtf, and matching it keeps the disagreement attributable to the
     // reduction order alone.
-    q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;
-    k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));
+    q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;
+    k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));
 }
 
 // One recurrent step of the gated delta rule, for every value head at once.
@@ -139,7 +165,7 @@ __global__ void gdn_recurrent_step(
     const float* __restrict__ beta,
     float* __restrict__ out,
     int head_dim,
-    int heads_per_kv
+    int qk_heads
 ) {
     extern __shared__ float scratch[];
 
@@ -147,7 +173,11 @@ __global__ void gdn_recurrent_step(
     int h  = blockIdx.y;
     int j  = threadIdx.x;
 
-    int qk_head = h / heads_per_kv;
+    // **Modulo, not division.** llama.cpp's fused op is
+    // `fastmodulo(h_idx, n_k_heads)` and its fallback broadcasts with
+    // `ggml_repeat_4d`, which tiles. See the module docs for the measurement
+    // that discriminates the two against the captured `final_output-N`.
+    int qk_head = h % qk_heads;
     int qk_base = qk_head * head_dim;
     int v_base  = h * head_dim;
 
@@ -278,7 +308,11 @@ impl GdnKernels {
         })
     }
 
-    /// Value heads sharing each query/key head.
+    /// How many value heads share each query/key head.
+    ///
+    /// The *count*, not the mapping: value head `h` reads query/key head
+    /// `h % qk_heads`, so the heads sharing a query/key head are `hq`,
+    /// `hq + qk_heads`, `hq + 2 * qk_heads`, … and not a contiguous run.
     pub fn heads_per_kv(&self) -> usize {
         self.value_heads / self.qk_heads
     }
@@ -323,7 +357,7 @@ impl GdnKernels {
         out: &mut CudaSlice<f32>,
     ) -> Result<(), GdnError> {
         let head_dim = self.head_dim as i32;
-        let heads_per_kv = self.heads_per_kv() as i32;
+        let qk_heads = self.qk_heads as i32;
         // One float per warp, which is the most `block_reduce_sum` stores.
         let shared = (self.head_dim.div_ceil(32) * size_of::<f32>()) as u32;
 
@@ -364,7 +398,7 @@ impl GdnKernels {
             .arg(beta)
             .arg(out)
             .arg(&head_dim)
-            .arg(&heads_per_kv);
+            .arg(&qk_heads);
         // SAFETY: the grid is (head_dim, value_heads) and the block is
         // head_dim threads, so the flat state index
         // `(h * head_dim + vi) * head_dim + j` stays within
@@ -406,8 +440,44 @@ mod tests {
     fn the_scale_is_folded_into_q_only() {
         // Folding it into k as well would square it; folding it into neither
         // scales every GDN layer's output by 11.3x.
-        assert!(GDN_SRC.contains("q_out[base + j] = qv * (1.0f / sqrtf(q_sq + eps)) * scale;"));
-        assert!(GDN_SRC.contains("k_out[base + j] = kv * (1.0f / sqrtf(k_sq + eps));"));
+        assert!(
+            GDN_SRC.contains("q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;")
+        );
+        assert!(GDN_SRC.contains("k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));"));
+    }
+
+    #[test]
+    fn the_l2_epsilon_floors_the_norm_rather_than_being_added_to_the_sum() {
+        // `ggml_l2_norm` is `1/max(sqrt(sum), eps)`, so eps guards a zero
+        // vector and otherwise never binds. `1/sqrt(sum + eps)` looks
+        // equivalent and is not: it shrinks every vector by eps/(2*sum),
+        // measured at 2.148e-4 relative on the smallest-norm q/k of the real
+        // model's blocks 0/4/20. Asserted structurally because no synthetic
+        // input at a realistic scale distinguishes the two above the noise
+        // floor of the differential gate.
+        assert!(
+            !GDN_SRC.contains("q_sq + eps"),
+            "the L2 epsilon reverted to being added to the sum of squares",
+        );
+        assert!(!GDN_SRC.contains("k_sq + eps"));
+    }
+
+    #[test]
+    fn the_query_key_head_is_selected_by_modulo_not_division() {
+        // The single most consequential line in this file. llama.cpp's fused
+        // op computes `fastmodulo(h_idx, n_k_heads)`
+        // (ggml/src/ggml-cuda/gated_delta_net.cu:37) and its non-fused
+        // fallback broadcasts with `ggml_repeat_4d`, which tiles rather than
+        // stretches, so value head 17 reads query/key head 1 and not head 8.
+        // Division is finite, fluent and a different model; the numeric
+        // discrimination lives in
+        // `gdn_differential.rs::the_query_key_head_broadcast_is_modulo_not_division`.
+        assert!(GDN_SRC.contains("int qk_head = h % qk_heads;"));
+        assert!(
+            !GDN_SRC.contains("heads_per_kv"),
+            "the kernel still takes the sharing ratio, which only a division \
+             mapping needs",
+        );
     }
 
     #[test]
