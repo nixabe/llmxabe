@@ -1,4 +1,5 @@
-//! RMSNorm, partial rotary embedding, SwiGLU, and the GDN short convolution.
+//! RMSNorm, partial rotary embedding, SwiGLU, sigmoid gating, tensor add,
+//! softplus, and the GDN short convolution.
 //!
 //! The glue between the three big kernels. Individually none of these is
 //! interesting; collectively they are every operation a forward pass needs
@@ -6,13 +7,32 @@
 //! [`super::moe`] do not already cover, so G006 cannot exist without them.
 //!
 //! References: [`xabe_kernels::norm::rms_norm`],
-//! [`xabe_kernels::rope::apply_rope`], [`xabe_kernels::norm::swiglu`], and
+//! [`xabe_kernels::rope::apply_rope`], [`xabe_kernels::norm::swiglu`],
+//! [`xabe_kernels::norm::sigmoid_gate`], [`xabe_kernels::norm::residual_add`],
+//! [`xabe_kernels::norm::softplus`], and
 //! [`xabe_kernels::conv::causal_depthwise_conv1d`].
+//!
+//! ## Why the elementwise three live here and not in a block
+//!
+//! `sigmoid(gate) * x`, `a + b` and `softplus(x)` were each already written
+//! inline inside `xabe-engine`'s block implementations, because `xabe-cuda`
+//! had none of them: the attention block compiled its own two-kernel NVRTC
+//! module for the first two, the MoE block fused a sigmoid into its
+//! shared-expert router and an add into its combine kernel, and the GDN block
+//! fused a softplus into its gate kernel and carried its own `gdn_add`. Three
+//! blocks, three private copies. That is the wrong place for them: an
+//! engine-side inline kernel is invisible to the kernel
+//! inventory, gets no differential test of its own against the `xabe-kernels`
+//! oracle, and gets duplicated once per block type. Fusion inside a block is
+//! still legitimate — the GDN gate kernel computes `softplus`, the log-decay
+//! and `beta`'s sigmoid in one pass over one buffer, which three separate
+//! launches would not — but the *standalone* op has to exist, be tested, and
+//! be the thing a fused variant is checked against.
 //!
 //! ## One module, one compile, geometry per launch
 //!
 //! [`super::gdn`] and [`super::gdn_chunked`] fix their geometry at
-//! construction because the model fixes it. These four cannot: RMSNorm alone
+//! construction because the model fixes it. These cannot: RMSNorm alone
 //! runs at **three different widths** in one forward pass —
 //!
 //! - hidden 2048, for each layer's input norm and post-mixer norm and for the
@@ -23,12 +43,21 @@
 //! - head_dim 128, for the GDN output norm (`ssm_norm`, created at
 //!   `{ head_v_dim }`).
 //!
-//! so the width is a launch argument and is validated per launch. The four
-//! kernels share one NVRTC module because they share nothing else and five
-//! separate compiles would be five separate driver round-trips at startup.
+//! so the width is a launch argument and is validated per launch. The sigmoid
+//! gate has the same problem in a sharper form: its gate is elementwise for
+//! the attention output gate and **one scalar per token** for the MoE shared
+//! expert, so the shape is an argument ([`GateShape`]) and the gate buffer's
+//! length is checked against it on every launch rather than one of the two
+//! being assumed. The kernels share one NVRTC module because they share
+//! nothing else and eight separate compiles would be eight separate driver
+//! round-trips at startup.
 //!
 //! ## What is exact and what is not
 //!
+//! - **The tensor add is bit-exact.** One rounding per element in the operand
+//!   order given is the reference's exact operand sequence, and a lone add
+//!   has nothing to contract into an FMA, so it needs no intrinsic to get
+//!   there and is gated with `Tolerance::exact()`.
 //! - **The rotary tail is bit-exact.** Dimensions `[rope_dim, head_dim)` are
 //!   copied, not computed, so they come back byte-identical and the
 //!   differential test gates them with `Tolerance::exact()`. This is the
@@ -44,11 +73,16 @@
 //!   equality. Exactness is worth the two intrinsics here for the same reason
 //!   it was in [`super::dequant`]: a tolerance can hide a reversed tap order
 //!   on smooth input, and exact equality cannot.
-//! - **RMSNorm and SwiGLU are not exact**, and cannot be. RMSNorm reduces
-//!   2048 squares in a warp-shuffle tree where the reference sums them
-//!   sequentially, and fp32 addition is not associative; SwiGLU's `expf`
-//!   agrees with `f32::exp` to about an ulp. Both are unbiased and bounded,
-//!   so both are gated on a measured tolerance.
+//! - **RMSNorm, SwiGLU, the sigmoid gate and softplus are not exact**, and
+//!   cannot be. RMSNorm reduces 2048 squares in a warp-shuffle tree where the
+//!   reference sums them sequentially, and fp32 addition is not associative.
+//!   The other three are elementwise, so they have no reduction to
+//!   reassociate and their entire disagreement with the reference is `expf`
+//!   against `f32::exp` (and `logf` against `f32::ln`) — about an ulp each.
+//!   That is a much tighter situation than a matmul's, and the differential
+//!   test gates them accordingly rather than inheriting a matmul-era
+//!   tolerance. All are unbiased and bounded, so all are gated on a measured
+//!   tolerance.
 
 use std::sync::Arc;
 
@@ -226,6 +260,115 @@ __global__ void swiglu_mul(
     }
 }
 
+// out = sigmoid(gate) * x, with the gate either x's own shape or one scalar
+// per row broadcast across it.
+//
+// **Two shapes, because the model has two of these and they are not the same
+// op.** Assuming one and reindexing at the call site would work for whichever
+// caller guessed right and would silently read `rows` floats as `rows * width`
+// for the other, so `broadcast` is an argument and the gate length is checked
+// against it on every launch:
+//
+//  - the Gated Attention output gate is **elementwise** over
+//    [tokens][q_heads * head_dim] — 4096 gate values per token
+//    (`attn_gate` in `src/models/qwen35moe.cpp`, whose sigmoid is
+//    `attn_gate_sigmoid`);
+//  - the MoE shared expert's gate is **one scalar per token** —
+//    `ffn_gate_inp_shexp` is a single `[hidden]` row, so its projection
+//    collapses to a scalar — broadcast over the whole hidden dimension
+//    (`build_layer_ffn`).
+//
+// `1.0f / (1.0f + expf(-g))` is ggml_sigmoid verbatim (`op_sigmoid` in
+// `ggml/src/ggml-cuda/unary.cu`). The algebraically equal forms —
+// 0.5f * (1 + tanhf(x/2)), or silu(x)/x — round differently, and
+// `xabe_kernels::norm::sigmoid` spells it this same way.
+//
+// `sig` receives the nonlinearity on its own, so a divergence localizes to
+// the sigmoid or to the product rather than to "the gate", and so the caller
+// keeps llama.cpp's `attn_gate_sigmoid` waypoint. It is **gate's** shape, not
+// x's: when broadcasting, only the thread holding column 0 of a row writes
+// it, so no two threads write the same element.
+__global__ void sigmoid_gate_mul(
+    const float* __restrict__ x,
+    const float* __restrict__ gate,
+    float* __restrict__ sig,
+    float* __restrict__ out,
+    long long n,
+    int width,
+    int broadcast
+) {
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        long long g = i;
+        bool write_sig = true;
+        if (broadcast) {
+            long long row = i / (long long)width;
+            write_sig = (i - row * (long long)width) == 0;
+            g = row;
+        }
+        float s = 1.0f / (1.0f + expf(-gate[g]));
+        if (write_sig) sig[g] = s;
+        out[i] = x[i] * s;
+    }
+}
+
+// out = a + b, elementwise. The residual add.
+//
+// One rounding, exactly as `xabe_kernels::norm::residual_add`, so this is
+// bit-identical to the reference rather than close to it and the differential
+// test gates it with Tolerance::exact(). Unlike the convolution it needs no
+// __fadd_rn to get there: a lone add has nothing to contract into an FMA.
+//
+// There is no fused alternative to check this against — every residual add in
+// the model currently has nowhere to go — so the whole content of this kernel
+// is that the operands are added in the order given and nothing else happens
+// to them.
+__global__ void tensor_add(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ out,
+    long long n
+) {
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+// out = log(1 + exp(x)), with a passthrough above 20. The GDN alpha gate's
+// nonlinearity: `a_softplus = softplus(alpha + ssm_dt.bias)`, which is then
+// multiplied by the already-negated `ssm_a` to give the log-decay
+// (`qwen35moe.cpp`, `alpha_softplus` / `gate`).
+//
+// `(x > 20.0f) ? x : logf(1.0f + expf(x))` is ggml's formulation verbatim.
+// The same expression appears three times in llama.cpp — `op_softplus` in
+// `ggml/src/ggml-cuda/unary.cu` (the CUDA path), `op_softplus` in
+// `ggml/src/ggml-cpu/unary-ops.cpp`, and `ggml_compute_softplus_f32` in
+// `ggml/src/ggml-impl.h`.
+//
+// **The threshold is a correctness guard, not an optimization.** expf
+// overflows fp32 above x ~ 88.7, so a branch-free softplus returns inf where
+// the answer is x, and that inf becomes a non-finite log-decay that poisons
+// the whole recurrence. Where the branch is taken it is also invisible:
+// log(1 + e^20) - 20 is ~2.06e-9, about a thousandth of an fp32 ulp at that
+// magnitude.
+//
+// (ggml's SYCL backend uses the numerically better
+// `max(x,0) + log1p(exp(-|x|))` — `op_softplus` in
+// `ggml/src/ggml-sycl/element_wise.cpp` — but that is not the form the CUDA
+// and CPU paths take, and Qwen3.6's `a_softplus` comes off the CUDA one.)
+__global__ void softplus_elementwise(
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    long long n
+) {
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        float v = x[i];
+        out[i] = (v > 20.0f) ? v : logf(1.0f + expf(v));
+    }
+}
+
 // Causal depthwise convolution over the fused GDN q/k/v stream.
 //
 // out[t][ch] = sum_{i<K} w[ch][i] * xw(t - (K-1) + i, ch)
@@ -361,17 +504,56 @@ impl From<DriverError> for LayerOpsError {
     }
 }
 
+/// The shape of the gate tensor [`LayerOpsKernels::sigmoid_gate`] is given.
+///
+/// Qwen3.6 has two sigmoid gates and they are not the same op. This is an
+/// argument rather than an assumption because guessing wrong is not a crash:
+/// a broadcast gate read elementwise walks `rows * width` floats off the end
+/// of a `rows`-float buffer, and an elementwise gate read per-row applies
+/// every token's first gate value to that whole token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateShape {
+    /// One gate value per element: `gate` is `[rows][width]`, like `x`.
+    ///
+    /// The Gated Attention output gate — `attn_gate` in
+    /// `src/models/qwen35moe.cpp`, `q_heads * head_dim = 4096` values per
+    /// token.
+    Elementwise,
+    /// One gate value per row, broadcast across that row: `gate` is `[rows]`.
+    ///
+    /// The MoE shared expert's gate. `ffn_gate_inp_shexp` is a single
+    /// `[hidden]` row, so its projection collapses to one scalar per token,
+    /// which `build_layer_ffn` multiplies the whole shared-expert output by.
+    PerRow,
+}
+
+impl GateShape {
+    /// How many gate values a `[rows][width]` activation needs in this shape.
+    ///
+    /// Also the length of the `sig` output, which is the gate's shape rather
+    /// than `x`'s.
+    const fn gate_len(self, rows: usize, width: usize) -> usize {
+        match self {
+            Self::Elementwise => rows * width,
+            Self::PerRow => rows,
+        }
+    }
+}
+
 /// The compiled layer-op kernels.
 pub struct LayerOpsKernels {
     rms_norm: CudaFunction,
     rope: CudaFunction,
     swiglu: CudaFunction,
+    sigmoid_gate: CudaFunction,
+    add: CudaFunction,
+    softplus: CudaFunction,
     conv1d: CudaFunction,
     conv1d_state: CudaFunction,
 }
 
 impl LayerOpsKernels {
-    /// Compile all four operations into one module.
+    /// Compile every layer op into one module.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
         let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
         let module = ctx.load_module(ptx)?;
@@ -379,6 +561,9 @@ impl LayerOpsKernels {
             rms_norm: module.load_function("rms_norm_rows")?,
             rope: module.load_function("rope_partial")?,
             swiglu: module.load_function("swiglu_mul")?,
+            sigmoid_gate: module.load_function("sigmoid_gate_mul")?,
+            add: module.load_function("tensor_add")?,
+            softplus: module.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,
         })
@@ -528,21 +713,134 @@ impl LayerOpsKernels {
             return Ok(());
         }
 
-        const BLOCK: usize = 256;
-        // A fixed grid, not one derived from `n`: grid-stride keeps the launch
-        // shape independent of a host-side length so the launch can be
-        // captured in a CUDA graph and replayed at a different `n`.
-        let cfg = LaunchConfig {
-            grid_dim: (n.div_ceil(BLOCK).min(1024) as u32, 1, 1),
-            block_dim: (BLOCK as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
         let n_i64 = n as i64;
         let mut builder = stream.launch_builder(&self.swiglu);
         builder.arg(gate).arg(up).arg(out).arg(&n_i64);
         // SAFETY: the grid-stride loop is bounded by `n`, which is the length
         // checked above for all three buffers.
-        unsafe { builder.launch(cfg) }?;
+        unsafe { builder.launch(elementwise_cfg(n)) }?;
+        Ok(())
+    }
+
+    /// `out = sigmoid(gate) * x` over a `[rows][width]` activation, writing
+    /// the sigmoid itself to `sig`.
+    ///
+    /// `shape` says whether `gate` is elementwise or one scalar per row; see
+    /// [`GateShape`]. `gate` and `sig` are both that shape's length —
+    /// `rows * width` or `rows` — and `x` and `out` are always `rows * width`.
+    /// Every one of those lengths is checked here rather than assumed, which
+    /// is the point of taking the shape as an argument at all.
+    ///
+    /// `sig` exists so a divergence localizes to the nonlinearity or to the
+    /// product rather than to "the gate", and so the caller keeps llama.cpp's
+    /// `attn_gate_sigmoid` waypoint to compare against. In [`GateShape::PerRow`]
+    /// it costs `rows` floats.
+    ///
+    /// `out` may alias `x`: each thread reads and writes the same index and
+    /// reads `gate`, which is a different buffer. `sig` must not alias either.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sigmoid_gate(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        gate: &CudaSlice<f32>,
+        sig: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        width: usize,
+        shape: GateShape,
+    ) -> Result<(), LayerOpsError> {
+        if width == 0 {
+            return Err(LayerOpsError::UnsupportedWidth { width });
+        }
+        let n = rows * width;
+        let gate_len = shape.gate_len(rows, width);
+        check_len("sigmoid_gate x", n, x.len())?;
+        check_len("sigmoid_gate gate", gate_len, gate.len())?;
+        check_len("sigmoid_gate sigmoid", gate_len, sig.len())?;
+        check_len("sigmoid_gate out", n, out.len())?;
+        if rows == 0 {
+            return Ok(());
+        }
+
+        let n_i64 = n as i64;
+        let width_i32 = width as i32;
+        let broadcast_i32 = i32::from(shape == GateShape::PerRow);
+        let mut builder = stream.launch_builder(&self.sigmoid_gate);
+        builder
+            .arg(x)
+            .arg(gate)
+            .arg(sig)
+            .arg(out)
+            .arg(&n_i64)
+            .arg(&width_i32)
+            .arg(&broadcast_i32);
+        // SAFETY: the grid-stride loop is bounded by `n = rows * width`, the
+        // checked length of `x` and `out`. The gate index is `i` when not
+        // broadcasting and `i / width < rows` when broadcasting, which are
+        // exactly the two lengths `gate` and `sig` were checked against just
+        // above; `width != 0` so the division is defined.
+        unsafe { builder.launch(elementwise_cfg(n)) }?;
+        Ok(())
+    }
+
+    /// `out = a + b` over `n` elements — the residual add.
+    ///
+    /// Bit-identical to [`xabe_kernels::norm::residual_add`], not merely
+    /// close: one rounding per element, in the operand order given.
+    ///
+    /// `out` may alias either input; each thread touches one index of each.
+    pub fn add(
+        &self,
+        stream: &Arc<CudaStream>,
+        a: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), LayerOpsError> {
+        check_len("add a", n, a.len())?;
+        check_len("add b", n, b.len())?;
+        check_len("add out", n, out.len())?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        let n_i64 = n as i64;
+        let mut builder = stream.launch_builder(&self.add);
+        builder.arg(a).arg(b).arg(out).arg(&n_i64);
+        // SAFETY: the grid-stride loop is bounded by `n`, which is the length
+        // checked above for all three buffers.
+        unsafe { builder.launch(elementwise_cfg(n)) }?;
+        Ok(())
+    }
+
+    /// `out = log(1 + exp(x))` over `n` elements, with ggml's passthrough
+    /// above `x = 20`.
+    ///
+    /// The GDN alpha gate's nonlinearity. The passthrough is not optional:
+    /// without it `expf` overflows above `x ≈ 88.7` and the result is `inf`
+    /// where the answer is `x`. See [`xabe_kernels::norm::softplus`].
+    ///
+    /// `out` may alias `x`.
+    pub fn softplus(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n: usize,
+    ) -> Result<(), LayerOpsError> {
+        check_len("softplus x", n, x.len())?;
+        check_len("softplus out", n, out.len())?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        let n_i64 = n as i64;
+        let mut builder = stream.launch_builder(&self.softplus);
+        builder.arg(x).arg(out).arg(&n_i64);
+        // SAFETY: the grid-stride loop is bounded by `n`, which is the length
+        // checked above for both buffers.
+        unsafe { builder.launch(elementwise_cfg(n)) }?;
         Ok(())
     }
 
@@ -641,6 +939,22 @@ impl LayerOpsKernels {
 /// block must reach it. Threads past `width` contribute a zero partial.
 fn block_for_width(width: usize) -> usize {
     width.next_multiple_of(32).clamp(32, MAX_BLOCK)
+}
+
+/// Launch geometry for the four grid-stride elementwise kernels.
+///
+/// A grid capped at 1024 blocks rather than one derived from `n`: grid-stride
+/// keeps the launch shape independent of a host-side length, so the launch can
+/// be captured in a CUDA graph and replayed at a different `n` (`AGENTS.md`
+/// rule 5). The cap is what makes the shape *fixed*; without it the grid would
+/// track `n` and every new length would need a new capture.
+fn elementwise_cfg(n: usize) -> LaunchConfig {
+    const BLOCK: usize = 256;
+    LaunchConfig {
+        grid_dim: (n.div_ceil(BLOCK).min(1024) as u32, 1, 1),
+        block_dim: (BLOCK as u32, 1, 1),
+        shared_mem_bytes: 0,
+    }
 }
 
 /// Rejects a buffer whose length disagrees with the declared geometry.
@@ -782,8 +1096,126 @@ mod tests {
     #[test]
     fn swiglu_uses_the_accurate_exponential() {
         assert!(LAYER_OPS_SRC.contains("out[i] = (g / (1.0f + expf(-g))) * up[i];"));
-        let body = &LAYER_OPS_SRC[at("__global__ void swiglu_mul(")..at("// Causal depthwise")];
+        let body = &LAYER_OPS_SRC[at("__global__ void swiglu_mul(")..at("// out = sigmoid(gate)")];
         assert!(!body.contains("__expf"), "swiglu reverted to __expf");
+    }
+
+    #[test]
+    fn the_sigmoid_is_ggmls_reciprocal_form_and_not_an_algebraic_equivalent() {
+        // `op_sigmoid` in ggml/src/ggml-cuda/unary.cu is 1/(1+expf(-x)). The
+        // tanh form and silu(x)/x are equal on paper and round differently,
+        // and this kernel is gated against the reciprocal one.
+        assert!(LAYER_OPS_SRC.contains("float s = 1.0f / (1.0f + expf(-gate[g]));"));
+        let body = &LAYER_OPS_SRC
+            [at("__global__ void sigmoid_gate_mul(")..at("// out = a + b, elementwise")];
+        assert!(
+            !body.contains("tanh"),
+            "the sigmoid was rewritten as a tanh"
+        );
+        assert!(!body.contains("__expf"), "the gate reverted to __expf");
+    }
+
+    #[test]
+    fn the_sigmoid_gate_indexes_the_gate_by_row_only_when_it_broadcasts() {
+        // The whole point of the `broadcast` argument: the attention gate is
+        // elementwise and the shared expert's is one scalar per token. A
+        // kernel that hardcoded either would read the other's buffer at the
+        // wrong stride and stay finite while being wrong.
+        assert!(LAYER_OPS_SRC.contains("long long row = i / (long long)width;"));
+        assert!(LAYER_OPS_SRC.contains("            g = row;"));
+        assert!(LAYER_OPS_SRC.contains("        long long g = i;"));
+    }
+
+    #[test]
+    fn the_broadcast_sigmoid_is_written_once_per_row_not_once_per_element() {
+        // `sig` is gate's shape, so in broadcast mode `width` threads share
+        // one output element. They would all store the same value, but a
+        // guarded single writer is the difference between a benign race and a
+        // documented one — and it is what makes the differential test's
+        // "every sig entry was written" sentinel check meaningful.
+        assert!(
+            LAYER_OPS_SRC.contains("write_sig = (i - row * (long long)width) == 0;"),
+            "the broadcast sigmoid lost its single-writer guard",
+        );
+        assert!(LAYER_OPS_SRC.contains("if (write_sig) sig[g] = s;"));
+    }
+
+    #[test]
+    fn the_residual_add_is_a_single_rounding() {
+        // Nothing fused, nothing reassociated: `out[i] = a[i] + b[i]` is the
+        // reference's exact operand sequence, which is what lets the
+        // differential test gate it at exact equality rather than a
+        // tolerance. A scale folded in here would still look plausible.
+        assert!(LAYER_OPS_SRC.contains("        out[i] = a[i] + b[i];"));
+        let body =
+            &LAYER_OPS_SRC[at("__global__ void tensor_add(")..at("// out = log(1 + exp(x))")];
+        assert!(!body.contains("fma"), "the residual add grew an FMA");
+        // Scoped to the statement, not the whole body: the parameter list is
+        // full of `*` and a naive search would match those.
+        let store = body
+            .lines()
+            .find(|l| l.contains("out[i]"))
+            .expect("the residual add still stores through out[i]");
+        assert_eq!(
+            store.trim(),
+            "out[i] = a[i] + b[i];",
+            "the residual add is no longer a bare sum",
+        );
+    }
+
+    #[test]
+    fn the_softplus_keeps_ggmls_large_argument_passthrough() {
+        // `(x > 20) ? x : logf(1 + expf(x))` — op_softplus in
+        // ggml/src/ggml-cuda/unary.cu, ggml/src/ggml-cpu/unary-ops.cpp, and
+        // ggml_compute_softplus_f32 in ggml/src/ggml-impl.h, all three
+        // identical. Dropping the branch returns inf above x ~ 88.7 rather
+        // than saturating, and an inf log-decay poisons the recurrence.
+        assert!(LAYER_OPS_SRC.contains("out[i] = (v > 20.0f) ? v : logf(1.0f + expf(v));"));
+        // The threshold itself, checked arithmetically rather than trusted:
+        // f32::exp overflows well above 20, so the branch is what stands
+        // between the GDN alpha gate and a non-finite.
+        assert!(100.0f32.exp().is_infinite());
+        assert!(!(1.0f32 + 100.0f32.exp()).ln().is_finite());
+        // And it is continuous to far below an ulp of 20.
+        assert!((1.0f32 + 20.0f32.exp()).ln() - 20.0f32 < 1e-6);
+    }
+
+    #[test]
+    fn the_gate_length_a_shape_demands_is_the_one_the_model_actually_has() {
+        // Qwen3.6's two gates, spelled as literals because this crate does not
+        // depend on `xabe-model`: attention q_heads 16 * head_dim 256 = 4096
+        // values per token, and the MoE shared expert exactly one.
+        const TOKENS: usize = 64;
+        assert_eq!(
+            GateShape::Elementwise.gate_len(TOKENS, 4096),
+            TOKENS * 4096,
+            "the attention output gate is elementwise over the q projection",
+        );
+        assert_eq!(
+            GateShape::PerRow.gate_len(TOKENS, 2048),
+            TOKENS,
+            "the shared expert's gate is one scalar per token",
+        );
+        // A degenerate row count must not smuggle in a non-empty gate.
+        assert_eq!(GateShape::Elementwise.gate_len(0, 4096), 0);
+        assert_eq!(GateShape::PerRow.gate_len(0, 2048), 0);
+    }
+
+    #[test]
+    fn the_elementwise_grid_is_capped_and_does_not_track_n() {
+        // Grid-stride over a fixed grid: AGENTS.md rule 5 wants the launch
+        // shape independent of a host-side length so it survives graph
+        // capture and replay at a different n.
+        for n in [1usize, 255, 256, 1 << 20, 1 << 28] {
+            let cfg = elementwise_cfg(n);
+            assert_eq!(cfg.block_dim, (256, 1, 1), "at n={n}");
+            assert!((1..=1024).contains(&cfg.grid_dim.0), "at n={n}");
+            assert_eq!(cfg.shared_mem_bytes, 0);
+        }
+        // Small launches still cover every element without the stride loop,
+        // and large ones saturate the cap.
+        assert_eq!(elementwise_cfg(1).grid_dim.0, 1);
+        assert_eq!(elementwise_cfg(1 << 28).grid_dim.0, 1024);
     }
 
     #[test]

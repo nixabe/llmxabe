@@ -1,10 +1,22 @@
-//! RMSNorm, SwiGLU, and residual-add reference kernels.
+//! RMSNorm, SwiGLU, sigmoid gating, softplus, and residual-add reference
+//! kernels.
 //!
 //! These are the simple building blocks around the attention/GDN/MoE cores;
 //! they still need CPU references because every fused GPU kernel that folds
 //! them in (e.g. RMSNorm + quantize, or SwiGLU inside the MoE expert MLP)
 //! gets validated against a plain, obviously-correct version of the same
 //! math.
+//!
+//! ## Why [`silu`] and [`sigmoid`] spell the same sigmoid two different ways
+//!
+//! [`silu`] is `x / (1 + exp(-x))` — one division — and [`sigmoid`] is
+//! `1 / (1 + exp(-x))`, so `silu(x)` is *not* `x * sigmoid(x)` bit for bit:
+//! the second form rounds the reciprocal and then the product where the first
+//! rounds once. That is not an oversight to be tidied away. Each matches the
+//! ggml op whose output the corresponding device kernel is checked against
+//! (`ggml_silu` and `ggml_sigmoid` respectively), and rewriting either in
+//! terms of the other would move every measured differential by an ulp for no
+//! gain.
 
 /// Root-mean-square layer normalization.
 ///
@@ -35,6 +47,42 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// Logistic sigmoid: `1 / (1 + exp(-x))`.
+///
+/// Spelled as the reciprocal rather than `0.5 * (1 + tanh(x/2))` or
+/// `silu(x) / x`, because that is `ggml_sigmoid`'s own formula — `op_sigmoid`
+/// in `ggml/src/ggml-cuda/unary.cu` and in `ggml/src/ggml-cpu/unary-ops.cpp`.
+/// The three forms are algebraically equal and round differently, and this is
+/// the one whose output the Gated Attention output gate and the MoE shared
+/// expert's gate are compared against.
+pub fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Softplus: `log(1 + exp(x))`, with a passthrough above `x = 20`.
+///
+/// `(x > 20) ? x : log(1 + exp(x))` is ggml's formulation verbatim. The same
+/// expression appears three times in llama.cpp — `op_softplus` in
+/// `ggml/src/ggml-cuda/unary.cu` (the CUDA path), `op_softplus` in
+/// `ggml/src/ggml-cpu/unary-ops.cpp`, and `ggml_compute_softplus_f32` in
+/// `ggml/src/ggml-impl.h`, which `ggml_compute_forward_ssm_scan_f32` calls.
+///
+/// **The threshold is a correctness guard, not an optimization.** `exp(x)`
+/// overflows fp32 above `x ≈ 88.7`, so a branch-free softplus returns `inf`
+/// where the true value is `x`, and in the GDN alpha gate that `inf` becomes
+/// a non-finite log-decay that poisons the whole recurrence. Where the branch
+/// is *taken* it is also invisible: `log(1 + e^20) - 20` is about `2.06e-9`,
+/// roughly a thousandth of an fp32 ulp at that magnitude.
+///
+/// (ggml's SYCL backend uses the numerically better
+/// `max(x, 0) + log1p(exp(-|x|))` — `op_softplus` in
+/// `ggml/src/ggml-sycl/element_wise.cpp` — but that is not the form the CUDA
+/// and CPU paths take, and Qwen3.6's `a_softplus` tensor comes off the CUDA
+/// one. Matching the oracle beats improving on it.)
+pub fn softplus(x: f32) -> f32 {
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
+}
+
 /// SwiGLU gated feed-forward activation.
 ///
 /// `out_i = silu(gate_i) * up_i`
@@ -51,6 +99,33 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     gate.iter()
         .zip(up.iter())
         .map(|(&g, &u)| silu(g) * u)
+        .collect()
+}
+
+/// Sigmoid gating: `out_i = sigmoid(gate_i) * x_i`.
+///
+/// Qwen3.6 has two of these and they differ only in the *shape* of `gate`,
+/// which is the caller's problem, not this function's:
+///
+/// - the Gated Attention output gate is elementwise over `[tokens][q_dim]`
+///   (`attn_gate` in `src/models/qwen35moe.cpp`);
+/// - the MoE shared expert's gate is one scalar per token — `ffn_gate_inp_shexp`
+///   is a single `[hidden]` row, so its projection collapses to a scalar —
+///   broadcast over the whole hidden dimension (`build_layer_ffn`).
+///
+/// A broadcast gate is checked by expanding it and calling this, so there is
+/// one oracle rather than two that could drift apart.
+///
+/// `gate` and `x` must be the same length.
+pub fn sigmoid_gate(x: &[f32], gate: &[f32]) -> Vec<f32> {
+    assert_eq!(
+        x.len(),
+        gate.len(),
+        "sigmoid_gate: x and gate must be equal length"
+    );
+    x.iter()
+        .zip(gate.iter())
+        .map(|(&v, &g)| v * sigmoid(g))
         .collect()
 }
 
@@ -147,6 +222,114 @@ mod tests {
             .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
             .collect();
         assert_matches(&out, &naive, &Tolerance::tight_fp32());
+    }
+
+    #[test]
+    fn sigmoid_of_zero_is_one_half_and_it_saturates_symmetrically() {
+        assert_eq!(sigmoid(0.0), 0.5);
+        assert!((sigmoid(20.0) - 1.0).abs() < 1e-6);
+        assert!(sigmoid(-20.0).abs() < 1e-6);
+        // 1 - sigmoid(x) == sigmoid(-x), to within fp32 rounding.
+        for x in [-8.0f32, -1.5, 0.25, 3.0, 11.0] {
+            assert!((1.0 - sigmoid(x) - sigmoid(-x)).abs() < 1e-6, "at {x}");
+        }
+    }
+
+    #[test]
+    fn sigmoid_is_the_reciprocal_form_and_not_silu_divided_by_x() {
+        // The two spellings are algebraically equal and round differently.
+        // This asserts which one this crate is, because the device kernel is
+        // gated against ggml's `sigmoid`, not against `silu(x)/x`.
+        for x in [-3.0f32, -0.5, 0.7, 4.25] {
+            assert_eq!(sigmoid(x), 1.0 / (1.0 + (-x).exp()));
+        }
+    }
+
+    #[test]
+    fn softplus_matches_log1p_exp_below_the_threshold() {
+        // Away from the branch, softplus is just log(1 + e^x).
+        for x in [-10.0f32, -1.0, 0.0, 1.0, 19.0] {
+            assert_eq!(softplus(x), (1.0 + x.exp()).ln());
+        }
+        // log(1 + e^0) = log 2.
+        assert!((softplus(0.0) - std::f32::consts::LN_2).abs() < 1e-7);
+    }
+
+    #[test]
+    fn softplus_passes_large_arguments_through_instead_of_overflowing() {
+        // The reason ggml's threshold exists: e^100 is not representable in
+        // fp32, so the unguarded formula returns inf where the answer is 100.
+        assert!(
+            100.0f32.exp().is_infinite(),
+            "the premise of the passthrough no longer holds",
+        );
+        assert!(!(1.0 + 100.0f32.exp()).ln().is_finite());
+        assert_eq!(softplus(100.0), 100.0);
+        assert_eq!(softplus(1000.0), 1000.0);
+        // And the branch itself is invisible: at the threshold the difference
+        // between the two formulas is ~2.06e-9, a thousandth of an ulp of 20.
+        let jump = (1.0f32 + 20.0f32.exp()).ln() - 20.0f32;
+        assert!(jump < 1e-6, "the passthrough is discontinuous: {jump:e}");
+    }
+
+    #[test]
+    fn softplus_is_monotonic_and_never_negative() {
+        let mut rng = Xorshift64Star::new(41);
+        let mut xs = rng.vec_f32(256, -40.0, 40.0);
+        xs.sort_by(f32::total_cmp);
+        let mut prev = f32::NEG_INFINITY;
+        for x in xs {
+            let y = softplus(x);
+            assert!(y >= 0.0, "softplus({x}) = {y} is negative");
+            assert!(y >= prev, "softplus is not monotonic at {x}");
+            prev = y;
+        }
+    }
+
+    #[test]
+    fn sigmoid_gate_of_a_zero_gate_halves_the_input() {
+        let x = [4.0f32, -6.0];
+        let gate = [0.0f32, 0.0];
+        assert_matches(&sigmoid_gate(&x, &gate), &[2.0, -3.0], &Tolerance::exact());
+    }
+
+    #[test]
+    fn sigmoid_gate_saturates_to_the_input_and_to_zero() {
+        let x = [1.0f32, 1.0];
+        let out = sigmoid_gate(&x, &[30.0, -30.0]);
+        assert!((out[0] - 1.0).abs() < 1e-6, "an open gate must pass x");
+        assert!(out[1].abs() < 1e-6, "a closed gate must silence x");
+    }
+
+    #[test]
+    fn sigmoid_gate_matches_the_naive_per_element_definition() {
+        let mut rng = Xorshift64Star::new(51);
+        let x = rng.vec_f32(64, -3.0, 3.0);
+        let gate = rng.vec_f32(64, -12.0, 12.0);
+        let naive: Vec<f32> = x
+            .iter()
+            .zip(gate.iter())
+            .map(|(&v, &g)| v * (1.0 / (1.0 + (-g).exp())))
+            .collect();
+        assert_matches(&sigmoid_gate(&x, &gate), &naive, &Tolerance::exact());
+    }
+
+    #[test]
+    fn sigmoid_gate_is_not_swiglu() {
+        // silu(g)*u = g*sigmoid(g)*u, which is the extra factor of g that
+        // separates the MoE expert MLP's activation from the attention output
+        // gate. Confusing the two is the kind of bug a tolerance would pass
+        // wherever g happens to sit near 1.
+        let x = [2.0f32];
+        let gate = [3.0f32];
+        let gated = sigmoid_gate(&x, &gate);
+        let swi = swiglu(&gate, &x);
+        assert!(
+            (gated[0] - swi[0]).abs() > 1.0,
+            "sigmoid_gate {:?} and swiglu {:?} must not coincide",
+            gated,
+            swi,
+        );
     }
 
     #[test]

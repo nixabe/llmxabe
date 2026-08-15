@@ -1,9 +1,10 @@
 //! Differential test: the device layer ops against the scalar references, at
 //! the real Qwen3.6 geometry.
 //!
-//! These four kernels are the glue G006 (full forward pass) needs and the
+//! These kernels are the glue G006 (full forward pass) needs and the
 //! three big kernels do not provide: RMSNorm, partial rotary embedding,
-//! SwiGLU, and the Gated DeltaNet short causal convolution.
+//! SwiGLU, sigmoid gating, the residual add, softplus, and the Gated DeltaNet
+//! short causal convolution.
 //!
 //! ## What is compared
 //!
@@ -13,6 +14,12 @@
 //! - `xabe_kernels::rope::apply_rope` at head_dim 256 / rope_dim 64, with the
 //!   untouched tail checked **separately and exactly**.
 //! - `xabe_kernels::norm::swiglu` over a million elements.
+//! - `xabe_kernels::norm::sigmoid_gate` in **both** shapes the model uses: the
+//!   attention output gate, elementwise over `[tokens][4096]`, and the MoE
+//!   shared expert's gate, one scalar per token broadcast over hidden 2048.
+//! - `xabe_kernels::norm::residual_add` at hidden 2048, **exactly**.
+//! - `xabe_kernels::norm::softplus` over a range that straddles ggml's `x > 20`
+//!   passthrough and reaches past the point where an unguarded `exp` overflows.
 //! - `xabe_kernels::conv::causal_depthwise_conv1d` at the real 8192-channel,
 //!   4-tap geometry, batched and streamed one token at a time, plus the
 //!   convolution cache, plus a causality probe run on the device.
@@ -22,14 +29,28 @@
 //! `compare()` computes relative error as `|c - r| / max(|r|, 1e-6)`, so on
 //! any tensor with near-zero elements `max_rel_error` degenerates into
 //! `abs_error / 1e-6` and reports nothing about accuracy. That is the trap
-//! `gdn_differential.rs` documents, and it applies to exactly one of the four
+//! `gdn_differential.rs` documents, and it applies to exactly one of the
 //! kernels here — RoPE, whose rotation produces genuine cancellation. The
-//! other three were **measured** first and turned out to have informative
+//! others were **measured** first and turned out to have informative
 //! relative errors, so they are gated on all three metrics rather than
 //! inheriting a loose `max_rel_error` they do not need. Each tolerance below
 //! quotes the number it was set against.
 //!
-//! Two of the four are gated at **exact equality** instead, which is a much
+//! Softplus is the one case where `max_rel_error` is informative *and* large
+//! (`7.9e-6` against the sigmoid gate's `2.7e-7`), for a third reason that is
+//! neither the floor nor a kernel defect: ggml's `log(1 + exp(x))` carries the
+//! answer in the low bits of a number near 1 for mid-negative `x`, so one ulp
+//! of that intermediate is eight parts per million of the result. Both sides
+//! suffer it identically; the gate quotes it and asserts the driving element's
+//! absolute error separately so the explanation stays falsifiable.
+//!
+//! **None of these is a matmul.** llama.cpp's CUDA matmuls quantize their
+//! activations to q8_1, which makes a loose tolerance defensible *there*;
+//! these are elementwise or a single reduction against an exact fp32
+//! reference, and their disagreement is one ulp of `expf`/`logf`. The gates
+//! below are set from the measurement, not inherited.
+//!
+//! Three are gated at **exact equality** instead, which is a much
 //! stronger statement than any tolerance:
 //!
 //! - the rotary tail, because dimensions `[rope_dim, head_dim)` are copied
@@ -37,7 +58,9 @@
 //! - the whole convolution, because four taps in ascending order is the
 //!   reference's exact operand sequence and the kernel spells the
 //!   accumulation with `__fadd_rn`/`__fmul_rn` so nvcc cannot contract it
-//!   into an FMA.
+//!   into an FMA;
+//! - the residual add, because a lone `a + b` has one rounding and nothing to
+//!   contract.
 //!
 //! SKIPS — reporting that it skipped — without a driver or a supported
 //! device. It needs no model file: the geometry comes from `ModelConfig` and
@@ -48,10 +71,10 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_cuda::kernels::layer_ops::LayerOpsKernels;
+use xabe_cuda::kernels::layer_ops::{GateShape, LayerOpsKernels};
 use xabe_kernels::compare::{Tolerance, assert_matches, compare};
 use xabe_kernels::conv::{causal_depthwise_conv1d, gdn_conv_channels};
-use xabe_kernels::norm::{rms_norm, swiglu};
+use xabe_kernels::norm::{residual_add, rms_norm, sigmoid, sigmoid_gate, softplus, swiglu};
 use xabe_kernels::rng::Xorshift64Star;
 use xabe_kernels::rope::apply_rope;
 use xabe_model::config::ModelConfig;
@@ -90,6 +113,80 @@ const SWIGLU_GATE: Tolerance = Tolerance {
     min_cosine_similarity: 1.0 - 1e-7,
     allow_non_finite: false,
 };
+
+/// The sigmoid gate: elementwise, no reduction, so the entire disagreement is
+/// `expf` against `f32::exp` propagated through one multiply.
+///
+/// **All three metrics gate, at the fp32 rounding floor.** This is not a
+/// matmul — there is no q8_1 activation quantization anywhere near it — so it
+/// does not get a matmul-era tolerance. Worst measurement over both shapes,
+/// 393,216 elements and 262,208 gate values in total:
+///
+/// | tensor | max_abs | max_rel | on reference | cosine |
+/// |---|---|---|---|---|
+/// | attention gate, elementwise, 64x4096 | `4.768e-7` | `2.703e-7` | `2.692e-5` | `1.000000000` |
+/// | its sigmoid, 262,144 values | `1.192e-7` | `2.297e-7` | `2.534e-4` | `1.000000000` |
+/// | MoE shared gate, per-row, 64x2048 | `2.980e-8` | `2.384e-7` | `9.768e-4` | `1.000000000` |
+/// | its sigmoid, 64 values | `7.451e-9` | `1.228e-7` | `2.962e-5` | `1.000000000` |
+///
+/// `4.768e-7` is one ulp of the largest output (`|x| <= 3`), which is the
+/// floor: `sigmoid(g) * x` rounds once after a sigmoid that itself agrees to
+/// an ulp. `5e-6` is 10.5x that and `3e-6` is 11.1x the measured relative
+/// error, whose driving reference values (`2.7e-5`, `9.8e-4`) are 27x and
+/// 977x `compare()`'s `1e-6` floor and therefore informative.
+const SIGMOID_GATE: Tolerance = Tolerance {
+    max_abs_error: 5e-6,
+    max_rel_error: 3e-6,
+    min_cosine_similarity: 1.0 - 1e-7,
+    allow_non_finite: false,
+};
+
+/// Softplus: elementwise, so again no reassociation. `logf(1.0f + expf(x))`
+/// against `(1.0 + x.exp()).ln()` is two libm calls' worth of disagreement,
+/// and above `x = 20` both sides take the passthrough and agree bit for bit.
+///
+/// **All three metrics gate.** Measured over 16,384 elements spanning
+/// `x in [-40, 30]` plus the branch probes: `max_abs = 9.537e-7`,
+/// `max_rel = 7.941e-6` on a reference value of `1.466e-2`, cosine
+/// `1.000000000`. `1e-5` is 10.5x the absolute error and `1e-4` is 12.6x the
+/// relative one.
+///
+/// **`max_rel_error` is two orders looser than the sigmoid gate's, and not
+/// because of `compare()`'s `1e-6` floor** — the driving reference value is
+/// `1.466e-2`, four orders above it. It is ggml's formula: for `x` around
+/// `-4`, `exp(x)` is `~0.0148` and `1 + exp(x)` is `~1.0148`, so the quantity
+/// the logarithm actually needs is carried in the low bits of a number near 1
+/// and one ulp *of that sum* (`1.19e-7`) is `8e-6` *of the result*. Both sides
+/// suffer that amplification identically; what is left is whether their `expf`
+/// results straddle the same rounding boundary. The test asserts that
+/// interpretation via [`SOFTPLUS_MAX_REL_DRIVER_ABS_ERROR`] rather than
+/// asserting it in prose.
+const SOFTPLUS_GATE: Tolerance = Tolerance {
+    max_abs_error: 1e-5,
+    max_rel_error: 1e-4,
+    min_cosine_similarity: 1.0 - 1e-7,
+    allow_non_finite: false,
+};
+
+/// The absolute error permitted at the element driving softplus's
+/// `max_rel_error`.
+///
+/// This is what makes the looser `SOFTPLUS_GATE.max_rel_error` honest: the
+/// ratio is large because `1 + exp(x)` throws away the result's leading bits,
+/// not because the kernel is wrong. Measured worst case is `1.164e-7` — one
+/// ulp of the intermediate sum, exactly as predicted. `1e-6` is 8.6x that and
+/// 10x below `SOFTPLUS_GATE.max_abs_error`, so a kernel whose error is
+/// concentrated on the small-output region cannot satisfy both.
+const SOFTPLUS_MAX_REL_DRIVER_ABS_ERROR: f32 = 1e-6;
+
+/// The value `sig` is pre-filled with before a sigmoid-gate launch.
+///
+/// A sigmoid is in `(0, 1)`, so `-1` is a value the kernel cannot produce. In
+/// [`GateShape::PerRow`] only one thread per row writes `sig`, and this is what
+/// proves that guard selected exactly one writer per row rather than none for
+/// some of them — a check `alloc_zeros` could not support, because 0 is what a
+/// deeply negative gate legitimately rounds to.
+const SIG_SENTINEL: f32 = -1.0;
 
 /// RoPE, rotated span only — the tail is gated with [`Tolerance::exact`].
 ///
@@ -417,6 +514,348 @@ fn device_swiglu_matches_the_reference() {
 }
 
 #[test]
+fn device_sigmoid_gate_matches_the_reference_in_both_shapes_the_model_uses() {
+    // Two callers, two gate shapes, one kernel. The Gated Attention output
+    // gate is elementwise over the q projection; the MoE shared expert's gate
+    // is a single scalar per token broadcast over the whole hidden dimension.
+    // Both run here at the real widths, because a kernel that quietly assumed
+    // one of them would still produce finite, plausible numbers for the other.
+    let Some(ctx) = setup() else { return };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let stream = ctx.default_stream();
+    let kernels = LayerOpsKernels::new(&ctx).expect("kernels must compile");
+
+    const TOKENS: usize = 64;
+    let q_dim = config.attention.q_heads as usize * config.attention.head_dim as usize;
+    assert_eq!(q_dim, 4096, "the attention output gate is [4096, n_tokens]");
+    let hidden = config.hidden_size as usize;
+
+    let cases: [(&str, usize, usize, GateShape); 2] = [
+        (
+            "attention output gate",
+            TOKENS,
+            q_dim,
+            GateShape::Elementwise,
+        ),
+        ("moe shared expert gate", TOKENS, hidden, GateShape::PerRow),
+    ];
+
+    for (name, rows, width, shape) in cases {
+        let n = rows * width;
+        let gate_len = match shape {
+            GateShape::Elementwise => n,
+            GateShape::PerRow => rows,
+        };
+
+        let mut rng = Xorshift64Star::new(0x9999_0000 + width as u64);
+        let x = rng.vec_f32(n, -3.0, 3.0);
+        // Wide enough to reach both saturating limbs: sigmoid(-12) is ~6.1e-6
+        // and sigmoid(12) is ~1 - 6.1e-6, so a flipped exponent sign cannot
+        // hide in the middle of the range.
+        let gate = rng.vec_f32(gate_len, -12.0, 12.0);
+
+        // One oracle for both shapes: expand the broadcast gate on the host
+        // and call the same elementwise reference.
+        let expanded: Vec<f32> = match shape {
+            GateShape::Elementwise => gate.clone(),
+            GateShape::PerRow => (0..n).map(|i| gate[i / width]).collect(),
+        };
+        let reference = sigmoid_gate(&x, &expanded);
+        let sig_reference: Vec<f32> = gate.iter().map(|&g| sigmoid(g)).collect();
+
+        let d_x = stream.clone_htod(&x).expect("upload x");
+        let d_gate = stream.clone_htod(&gate).expect("upload gate");
+        let mut d_sig = stream
+            .clone_htod(&vec![SIG_SENTINEL; gate_len])
+            .expect("upload sigmoid sentinel");
+        let mut d_out = stream.alloc_zeros::<f32>(n).expect("alloc out");
+        kernels
+            .sigmoid_gate(
+                &stream, &d_x, &d_gate, &mut d_sig, &mut d_out, rows, width, shape,
+            )
+            .expect("sigmoid_gate launches");
+        let candidate = stream.clone_dtoh(&d_out).expect("read back out");
+        let sig = stream.clone_dtoh(&d_sig).expect("read back sigmoid");
+        stream.synchronize().expect("sync");
+
+        // Every gate element was written exactly once. In PerRow mode a single
+        // thread per row owns `sig[row]`, and a guard that selected no writer
+        // for some row would leave the sentinel behind here rather than
+        // showing up as a plausible-looking product downstream.
+        assert!(
+            !sig.contains(&SIG_SENTINEL),
+            "{name}: {} of {gate_len} sigmoid entries were never written",
+            sig.iter().filter(|&&v| v == SIG_SENTINEL).count(),
+        );
+
+        let sig_result = compare(&sig, &sig_reference);
+        println!(
+            "sigmoid_gate {name}: sigmoid over {gate_len} gate values -> \
+             max_abs={:.3e} cosine={:.9} max_rel={:.3e} on reference {:.3e}",
+            sig_result.max_abs_error,
+            sig_result.cosine_similarity,
+            sig_result.max_rel_error,
+            sig_reference[sig_result.max_rel_error_index].abs(),
+        );
+        assert_matches(&sig, &sig_reference, &SIGMOID_GATE);
+
+        let result = compare(&candidate, &reference);
+        println!(
+            "sigmoid_gate {name}: {rows} rows x {width} ({n} elements, gate {gate_len}) -> \
+             max_abs={:.3e} cosine={:.9} max_rel={:.3e} on reference {:.3e}",
+            result.max_abs_error,
+            result.cosine_similarity,
+            result.max_rel_error,
+            reference[result.max_rel_error_index].abs(),
+        );
+        assert_matches(&candidate, &reference, &SIGMOID_GATE);
+    }
+
+    println!(
+        "gate: max_abs<{:.0e}, max_rel<{:.0e}, cosine>{:.9}",
+        SIGMOID_GATE.max_abs_error, SIGMOID_GATE.max_rel_error, SIGMOID_GATE.min_cosine_similarity,
+    );
+}
+
+#[test]
+fn device_sigmoid_gate_broadcast_really_varies_per_token_and_not_per_element() {
+    // The probe that makes the shape claim falsifiable. Give one token a gate
+    // that is wide open and another one that is shut; if the kernel indexed a
+    // PerRow gate elementwise it would apply token 0's scalar to the first
+    // `width` elements of the *flattened* tensor and read past the buffer for
+    // the rest, and if it ignored `broadcast` entirely the length check would
+    // have rejected the launch. Neither of those reproduces this pattern.
+    let Some(ctx) = setup() else { return };
+    let stream = ctx.default_stream();
+    let kernels = LayerOpsKernels::new(&ctx).expect("kernels must compile");
+
+    let rows = 4usize;
+    let width = 2048usize;
+    let x = vec![1.0f32; rows * width];
+    // sigmoid(30) rounds to 1.0 and sigmoid(-30) to ~9.36e-14 in fp32.
+    let gate = vec![30.0f32, -30.0, 30.0, -30.0];
+
+    let d_x = stream.clone_htod(&x).expect("upload x");
+    let d_gate = stream.clone_htod(&gate).expect("upload gate");
+    let mut d_sig = stream
+        .clone_htod(&vec![SIG_SENTINEL; rows])
+        .expect("upload");
+    let mut d_out = stream.alloc_zeros::<f32>(rows * width).expect("alloc out");
+    kernels
+        .sigmoid_gate(
+            &stream,
+            &d_x,
+            &d_gate,
+            &mut d_sig,
+            &mut d_out,
+            rows,
+            width,
+            GateShape::PerRow,
+        )
+        .expect("sigmoid_gate launches");
+    let out = stream.clone_dtoh(&d_out).expect("read back");
+    stream.synchronize().expect("sync");
+
+    for row in 0..rows {
+        let span = &out[row * width..(row + 1) * width];
+        let open = row % 2 == 0;
+        for (j, &v) in span.iter().enumerate() {
+            if open {
+                assert!(
+                    (v - 1.0).abs() < 1e-6,
+                    "row {row} col {j}: an open gate must pass x through, got {v}",
+                );
+            } else {
+                assert!(
+                    v.abs() < 1e-6,
+                    "row {row} col {j}: a shut gate must silence x, got {v}",
+                );
+            }
+        }
+    }
+    println!(
+        "sigmoid_gate broadcast: {rows} tokens x {width} — alternating open/shut per-token \
+         scalars reached all {} elements of their own row and none of any other",
+        rows * width,
+    );
+}
+
+#[test]
+fn device_tensor_add_is_bit_identical_to_the_reference() {
+    // The residual add. There is no rounding freedom in `a + b`, so anything
+    // short of exact equality means the kernel is not doing what it says —
+    // a fused scale, a reassociation, an FMA with something else. A tolerance
+    // here would pass all three.
+    let Some(ctx) = setup() else { return };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let stream = ctx.default_stream();
+    let kernels = LayerOpsKernels::new(&ctx).expect("kernels must compile");
+
+    // The real shape: one hidden-size residual per token, twice per layer.
+    const TOKENS: usize = 256;
+    let n = TOKENS * config.hidden_size as usize;
+
+    let mut rng = Xorshift64Star::new(0xAAAA);
+    // Operands of very different magnitudes on purpose: `a + b` with
+    // |a| >> |b| is where a reassociated or fused form would lose the small
+    // operand entirely and still look right on smooth input.
+    let a = rng.vec_f32(n, -100.0, 100.0);
+    let b = rng.vec_f32(n, -1e-3, 1e-3);
+
+    let reference = residual_add(&a, &b);
+
+    let d_a = stream.clone_htod(&a).expect("upload a");
+    let d_b = stream.clone_htod(&b).expect("upload b");
+    let mut d_out = stream.alloc_zeros::<f32>(n).expect("alloc out");
+    kernels
+        .add(&stream, &d_a, &d_b, &mut d_out, n)
+        .expect("add launches");
+    let candidate = stream.clone_dtoh(&d_out).expect("read back");
+    stream.synchronize().expect("sync");
+
+    let result = compare(&candidate, &reference);
+    println!(
+        "tensor_add: {n} elements ({TOKENS} tokens x {}) -> max_abs={:.3e} cosine={:.9} \
+         (gate: exact equality)",
+        config.hidden_size, result.max_abs_error, result.cosine_similarity,
+    );
+    assert_eq!(
+        result.max_abs_error, 0.0,
+        "the residual add must be bit-identical to the reference",
+    );
+    assert_eq!(candidate, reference, "the residual add diverged");
+    assert_matches(&candidate, &reference, &Tolerance::exact());
+
+    // And in place, which is how a residual stream is actually updated.
+    let mut d_acc = stream.clone_htod(&a).expect("upload a");
+    let d_acc_ro = d_acc.clone();
+    kernels
+        .add(&stream, &d_acc_ro, &d_b, &mut d_acc, n)
+        .expect("in-place add launches");
+    let in_place = stream.clone_dtoh(&d_acc).expect("read back");
+    stream.synchronize().expect("sync");
+    assert_eq!(
+        in_place, reference,
+        "the in-place residual add diverged from the out-of-place one",
+    );
+    println!("tensor_add in place: {n} elements bit-identical to the reference");
+}
+
+#[test]
+fn device_softplus_matches_the_reference_including_its_large_argument_passthrough() {
+    // The GDN alpha gate's nonlinearity. What is actually being checked is
+    // ggml's `x > 20` branch: without it `expf` overflows above x ~ 88.7 and
+    // softplus returns inf where the answer is x, which becomes a non-finite
+    // log-decay and poisons the whole recurrence.
+    let Some(ctx) = setup() else { return };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let stream = ctx.default_stream();
+    let kernels = LayerOpsKernels::new(&ctx).expect("kernels must compile");
+
+    // The real shape: one alpha per (token, value head).
+    const TOKENS: usize = 512;
+    let heads = config.gdn.value_heads as usize;
+    let n = TOKENS * heads;
+
+    // Exact probes on the branch and well past where an unguarded exp dies.
+    // 88.0 is the last argument `expf` survives; 89.0 is the first it does
+    // not; both are above the threshold and must therefore come back as
+    // themselves.
+    let probes: [f32; 10] = [
+        0.0, 19.0, 19.999_998, 20.0, 20.000_002, 88.0, 89.0, 100.0, 1000.0, -80.0,
+    ];
+    assert!(
+        88.0f32.exp().is_finite() && 89.0f32.exp().is_infinite(),
+        "the probes no longer straddle fp32 exp overflow",
+    );
+
+    let mut rng = Xorshift64Star::new(0xBBBB);
+    let mut x = rng.vec_f32(n - probes.len(), -40.0, 30.0);
+    x.extend_from_slice(&probes);
+    assert_eq!(x.len(), n);
+
+    let reference: Vec<f32> = x.iter().map(|&v| softplus(v)).collect();
+    assert!(
+        reference.iter().all(|v| v.is_finite()),
+        "the reference itself overflowed; the CPU passthrough is broken",
+    );
+
+    let d_x = stream.clone_htod(&x).expect("upload x");
+    let mut d_out = stream.alloc_zeros::<f32>(n).expect("alloc out");
+    kernels
+        .softplus(&stream, &d_x, &mut d_out, n)
+        .expect("softplus launches");
+    let candidate = stream.clone_dtoh(&d_out).expect("read back");
+    stream.synchronize().expect("sync");
+
+    // The passthrough, checked exactly and by index rather than inferred from
+    // an aggregate: above 20 the kernel is a copy, so these are bit-identical.
+    for (k, &p) in probes.iter().enumerate() {
+        let i = n - probes.len() + k;
+        if p > 20.0 {
+            assert_eq!(
+                candidate[i], p,
+                "softplus({p}) must pass through unchanged, got {}",
+                candidate[i],
+            );
+        }
+        assert!(
+            candidate[i].is_finite(),
+            "softplus({p}) returned {} — the x > 20 passthrough is gone",
+            candidate[i],
+        );
+    }
+    println!(
+        "softplus passthrough: {:?} all returned themselves bit-exactly",
+        probes.iter().filter(|&&p| p > 20.0).collect::<Vec<_>>(),
+    );
+
+    let result = compare(&candidate, &reference);
+    println!(
+        "softplus: {n} elements ({TOKENS} tokens x {heads} value heads) over x in [-40, 30] \
+         plus probes -> max_abs={:.3e} cosine={:.9} max_rel={:.3e} on reference {:.3e}",
+        result.max_abs_error,
+        result.cosine_similarity,
+        result.max_rel_error,
+        reference[result.max_rel_error_index].abs(),
+    );
+    assert_eq!(result.non_finite_count, 0, "the device produced NaN/Inf");
+
+    // The evidence for leaving SOFTPLUS_GATE.max_rel_error two orders looser
+    // than the sigmoid gate's: the ratio is large because `1 + exp(x)` carries
+    // the answer in the low bits of a number near 1, not because the error is.
+    // If the error itself ever grows, this fails before the loose bound can
+    // absorb it.
+    let driver = result.max_rel_error_index;
+    let driver_abs_error = (candidate[driver] - reference[driver]).abs();
+    assert!(
+        driver_abs_error < SOFTPLUS_MAX_REL_DRIVER_ABS_ERROR,
+        "max_rel_error {:.3e} is driven by an absolute error of {driver_abs_error:.3e} on a \
+         reference value of {:.3e} (x = {:.3e}) — that is larger than one ulp of the \
+         intermediate `1 + exp(x)`, so it is a real error rather than the formula's own \
+         cancellation and max_abs_error alone is no longer a sufficient gate",
+        result.max_rel_error,
+        reference[driver].abs(),
+        x[driver],
+    );
+    println!(
+        "softplus max_rel driver: x={:.3e} abs_error={driver_abs_error:.3e} (bound {:.0e}) \
+         on reference {:.3e}",
+        x[driver],
+        SOFTPLUS_MAX_REL_DRIVER_ABS_ERROR,
+        reference[driver].abs(),
+    );
+
+    assert_matches(&candidate, &reference, &SOFTPLUS_GATE);
+    println!(
+        "gate: max_abs<{:.0e}, max_rel<{:.0e}, cosine>{:.9}",
+        SOFTPLUS_GATE.max_abs_error,
+        SOFTPLUS_GATE.max_rel_error,
+        SOFTPLUS_GATE.min_cosine_similarity,
+    );
+}
+
+#[test]
 fn device_gdn_conv1d_matches_the_reference_bit_for_bit() {
     let Some(ctx) = setup() else { return };
     let config = ModelConfig::qwen3_6_35b_a3b();
@@ -676,5 +1115,67 @@ fn a_shape_that_does_not_match_the_declared_geometry_is_rejected_not_run() {
     let err = kernels
         .conv1d(&stream, &d_x, &d_w, &mut d_state, &mut d_out, 1, 10, 99)
         .expect_err("an oversized conv_kernel must be rejected");
+    println!("rejected as expected: {err}");
+
+    // The gate shape, which is the one that matters most here: a PerRow gate
+    // read elementwise would walk 100 floats off the end of a 10-float buffer,
+    // so the length check is what stands between a mis-declared shape and an
+    // out-of-bounds read. Both directions are rejected.
+    let mut d_sig = stream.alloc_zeros::<f32>(10).expect("alloc");
+    let err = kernels
+        .sigmoid_gate(
+            &stream,
+            &d_x,
+            &d_w,
+            &mut d_sig,
+            &mut d_out,
+            10,
+            10,
+            GateShape::Elementwise,
+        )
+        .expect_err("a per-row gate declared elementwise must be rejected");
+    println!("rejected as expected: {err}");
+
+    let mut d_sig100 = stream.alloc_zeros::<f32>(100).expect("alloc");
+    let d_gate100 = stream.alloc_zeros::<f32>(100).expect("alloc");
+    let err = kernels
+        .sigmoid_gate(
+            &stream,
+            &d_x,
+            &d_gate100,
+            &mut d_sig100,
+            &mut d_out,
+            10,
+            10,
+            GateShape::PerRow,
+        )
+        .expect_err("an elementwise gate declared per-row must be rejected");
+    println!("rejected as expected: {err}");
+    // And the correctly-declared per-row form is accepted, so the two
+    // rejections above are about the shape and not about the call failing
+    // for some unrelated reason.
+    let d_gate10 = stream.alloc_zeros::<f32>(10).expect("alloc");
+    kernels
+        .sigmoid_gate(
+            &stream,
+            &d_x,
+            &d_gate10,
+            &mut d_sig,
+            &mut d_out,
+            10,
+            10,
+            GateShape::PerRow,
+        )
+        .expect("a correctly declared per-row gate must be accepted");
+    stream.synchronize().expect("sync");
+
+    // The add and softplus validate too, on the same helper.
+    let err = kernels
+        .add(&stream, &d_x, &d_w, &mut d_out, 100)
+        .expect_err("a short operand must be rejected");
+    println!("rejected as expected: {err}");
+    let err = kernels
+        .softplus(&stream, &d_x, &mut d_out, 99)
+        .expect_err("a length that matches neither buffer must be rejected");
     println!("rejected as expected: {err}");
 }
