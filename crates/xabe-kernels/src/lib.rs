@@ -40,6 +40,7 @@
 pub mod attention;
 pub mod compare;
 pub mod gdn;
+pub mod moe;
 pub mod norm;
 pub mod quant;
 pub mod rng;
