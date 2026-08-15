@@ -158,6 +158,7 @@ instance; text-only requests go to this engine.
 | [AGENTS.md](AGENTS.md) | Instructions for AI agents; the binding design rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Setup, workflow, commit and review conventions |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component design and rationale |
+| [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md) | Milestone-00 gate results and the cudarc decision |
 | [docs/MODEL.md](docs/MODEL.md) | Qwen3.6 structure, VRAM and bandwidth analysis |
 | [docs/CACHE.md](docs/CACHE.md) | Hybrid two-group cache and prefix sharing |
 | [docs/SCHEDULER.md](docs/SCHEDULER.md) | Chunked prefill, admission, preemption |
