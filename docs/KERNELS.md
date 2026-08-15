@@ -9,7 +9,7 @@
 | GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
 | MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference** |
 | Flash attention (GQA 16:2, head 256) | 10 | medium | Online softmax, `BM = 1`, scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window** |
-| LM head GEMV (2048 × 248,320) | 1 | medium | Write; split-K, dominates weight bandwidth | not started |
+| LM head GEMV (2048 × 248,320) | 1 | medium | ~~split-K~~ — one warp per row; dominates weight bandwidth | **sm_75 kernel, argmax exact, 81–89% of roofline** |
 | `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | **sm_75 kernel, tables exact vs reference** |
 | mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | **sm_75 kernel, tail bit-identical** |
 | Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | **sm_75 kernel, bit-identical to reference** |
@@ -58,6 +58,20 @@ above are not read as more than they are:
   fixed buffers and a device-side token count precisely so it can be captured,
   but no capture has been performed yet. That is milestone 06's gate, and
   until it runs this remains a structural claim.
+- **Batch tiling in the LM head is sublinear.** Eight tokens cost 2.58× one
+  token, not the 8× that reading the weights once instead of eight times would
+  allow, because activation loads scale with the tile while weight loads do
+  not. A register tile over rows is the next lever and is neither implemented
+  nor measured.
+
+**This table planned the LM head as split-K. That was wrong**, and the row now
+says so. Split-K manufactures parallelism when the output dimension is too
+small to fill the machine — the MoE decode regime, where three tokens meet a
+512-row expert matrix. The LM head is the opposite: one warp per output row is
+248,320 warps against 2,304 resident, a 107× surplus. Splitting K would add a
+launch, a `vocab × K` partial buffer and a split-dependent summation order for
+no occupancy gain. The rejection is asserted in a unit test so it fails loudly
+if the vocabulary ever shrinks.
 
 **Shared memory on this hardware is 48 KiB per block**, not 64 KiB. The 64 KiB
 figure is per-SM; a block reaches it only by opting in through
