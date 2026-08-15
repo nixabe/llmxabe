@@ -8,6 +8,8 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+tracing.workspace = true
+xabe-log.workspace = true
 memmap2.workspace = true
 thiserror.workspace = true
 

@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{CudaContext, CudaStream};
+use tracing::{info, warn};
 use xabe_cuda::kernels::moe::{ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor};
 
 /// Card peak, for the fraction-of-roofline column.
@@ -134,10 +135,12 @@ fn ms(d: Duration) -> f64 {
 }
 
 fn main() {
+    let args = xabe_log::init_from_args();
+
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
         Err(e) => {
-            println!("SKIPPED: no context on device 0: {e}");
+            warn!("SKIPPED: no context on device 0: {e}");
             return;
         }
     };
@@ -147,7 +150,7 @@ fn main() {
     let stack = probe.stack_elements();
     let one_expert = probe.intermediate * probe.hidden;
 
-    println!(
+    info!(
         "uploading synthetic expert stacks ({} experts)...",
         probe.num_experts
     );
@@ -164,7 +167,7 @@ fn main() {
         .expect("sdown");
     stream.synchronize().expect("sync");
     let routed_bytes = d_gate.len() + d_up.len() + d_down.len();
-    println!(
+    info!(
         "  {:.1} MiB routed + {:.1} MiB shared in {:.2?}\n",
         routed_bytes as f64 / (1024.0 * 1024.0),
         (d_sgate.len() + d_sup.len() + d_sdown.len()) as f64 / (1024.0 * 1024.0),
@@ -196,17 +199,14 @@ fn main() {
         quant: ExpertQuant::Q8_0,
     };
 
-    println!(
+    info!(
         "{:>7}  {:>9}  {:>10}  {:>10}  {:>10}  {:>8}  {:>10}  {:>9}",
         "tokens", "route", "dispatch", "grouped", "shared", "active", "GB/s uniq", "% peak",
     );
 
     // `bench_moe 512` restricts the sweep to one batch size, which is what a
     // profiler run wants.
-    let only: Vec<usize> = std::env::args()
-        .skip(1)
-        .filter_map(|a| a.parse().ok())
-        .collect();
+    let only: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
     let batches: Vec<usize> = if only.is_empty() {
         BATCHES.to_vec()
     } else {
@@ -287,7 +287,7 @@ fn main() {
             * 3.0;
         let tflops = flops / secs / 1e12;
 
-        println!(
+        info!(
             "{tokens:>7}  {:>8.3}m  {:>9.3}m  {:>9.3}m  {:>9.3}m  {active:>8}  {gb_uniq:>10.1}  {:>8.1}%",
             ms(t_route),
             ms(t_dispatch),
@@ -295,7 +295,7 @@ fn main() {
             ms(t_shared),
             100.0 * gb_uniq / PEAK_GB_S,
         );
-        println!(
+        info!(
             "         (grouped: {gb_naive:.1} GB/s if every (token,expert) pair \
              re-reads its expert = {:.1}% peak; {tflops:.2} TFLOP/s = {:.1}% of {PEAK_TFLOP_S})",
             100.0 * gb_naive / PEAK_GB_S,

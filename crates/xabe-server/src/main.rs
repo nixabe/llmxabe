@@ -17,6 +17,7 @@
 //! interval; the device gate rejects a heterogeneous fleet), so a preflight
 //! that successfully builds these types has checked them.
 
+use tracing::{error, info, warn};
 use xabe_cache::config::CacheConfig;
 use xabe_cuda::{check_gate, device};
 use xabe_engine::{Engine, RouterConfig};
@@ -41,18 +42,20 @@ fn gib(bytes: u64) -> f64 {
 }
 
 fn main() -> std::process::ExitCode {
-    println!("llmxabe preflight\n");
+    xabe_log::init_from_args();
+
+    info!("llmxabe preflight\n");
 
     // 1. Model configuration.
     let model = ModelConfig::qwen3_6_35b_a3b();
     match verify::check_config(&model) {
-        Ok(()) => println!("model            {} — config self-consistent", model.name),
+        Ok(()) => info!("model            {} — config self-consistent", model.name),
         Err(e) => {
-            println!("model            FAIL — {e}");
+            error!("model            FAIL — {e}");
             return std::process::ExitCode::FAILURE;
         }
     }
-    println!(
+    info!(
         "                 {} layers ({} attention, {} GDN), {} experts, vocab {}",
         model.num_layers,
         model.num_attention_layers(),
@@ -66,25 +69,25 @@ fn main() -> std::process::ExitCode {
     let cache = match CacheConfig::with_defaults(model.clone()) {
         Ok(c) => c,
         Err(e) => {
-            println!("cache            FAIL — {e}");
+            error!("cache            FAIL — {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    println!(
+    info!(
         "\ncache            attention block {} tokens → {:.2} MiB/page",
         cache.attention_block_size(),
         cache.attention_page_bytes() as f64 / (1024.0 * 1024.0)
     );
-    println!(
+    info!(
         "                 GDN retention R = {} tokens → {:.2} MiB/snapshot",
         cache.gdn_retention_interval(),
         cache.gdn_page_bytes() as f64 / (1024.0 * 1024.0)
     );
-    println!(
+    info!(
         "                 snapshot:KV ratio {:.2} over one retention interval",
         cache.snapshot_to_kv_ratio()
     );
-    println!("                 (capacity is reported per group and never summed)");
+    info!("                 (capacity is reported per group and never summed)");
 
     // 3. Scheduler. Construction rejects the budget-versus-block trap.
     let sched = match SchedulerConfig::with_defaults(
@@ -94,17 +97,17 @@ fn main() -> std::process::ExitCode {
     ) {
         Ok(s) => s,
         Err(e) => {
-            println!("\nscheduler        FAIL — {e}");
+            error!("\nscheduler        FAIL — {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
-    println!(
+    info!(
         "\nscheduler        token budget {} > block {} + decodes {} — accepted",
         sched.token_budget(),
         sched.block_size(),
         sched.max_concurrent_decodes()
     );
-    println!(
+    info!(
         "                 {} tokens charged per decode step ({} MTP drafts)",
         sched.tokens_per_decode_step(),
         sched.draft_tokens_per_step()
@@ -113,26 +116,26 @@ fn main() -> std::process::ExitCode {
     // 4. Devices. The only part that can be skipped — and it must be checked
     //    before the VRAM budget, so headroom is computed against this card's
     //    measured memory rather than a hardcoded assumption.
-    println!();
+    info!("");
     if !device::driver_available() {
-        println!("devices          SKIPPED — no CUDA driver on this host");
-        println!("\nPreflight incomplete: host-side configuration is valid, but the");
-        println!("device fleet was not checked. This is not a passing preflight.");
+        warn!("devices          SKIPPED — no CUDA driver on this host");
+        warn!("\nPreflight incomplete: host-side configuration is valid, but the");
+        info!("device fleet was not checked. This is not a passing preflight.");
         return std::process::ExitCode::FAILURE;
     }
 
     let devices = match device::probe_all() {
         Ok(d) => d,
         Err(e) => {
-            println!("devices          FAIL — {e:?}");
+            error!("devices          FAIL — {e:?}");
             return std::process::ExitCode::FAILURE;
         }
     };
     if let Err(e) = check_gate(&devices) {
-        println!("devices          FAIL — {e}");
+        error!("devices          FAIL — {e}");
         return std::process::ExitCode::FAILURE;
     }
-    println!(
+    info!(
         "devices          {} × {} (compute {}, {:.0} GB/s each)",
         devices.len(),
         devices[0].name,
@@ -150,15 +153,15 @@ fn main() -> std::process::ExitCode {
     );
     let usable = devices[0].total_memory;
     let headroom = vram.headroom_bytes(usable);
-    println!(
+    info!(
         "\nvram             {:.2} GiB of {:.2} GiB measured — {:.2} GiB headroom",
         gib(vram.total_bytes()),
         gib(usable),
         headroom as f64 / (1024.0 * 1024.0 * 1024.0)
     );
-    println!("                 (text-only; excludes the ~1.5 GiB vision encoder)");
+    info!("                 (text-only; excludes the ~1.5 GiB vision encoder)");
     if headroom < 0 {
-        println!("\nPreflight failed: this configuration does not fit in VRAM.");
+        error!("\nPreflight failed: this configuration does not fit in VRAM.");
         return std::process::ExitCode::FAILURE;
     }
 
@@ -173,13 +176,13 @@ fn main() -> std::process::ExitCode {
         SLOTS_PER_WORKER,
         RouterConfig::balanced(),
     );
-    println!(
+    info!(
         "\nengine           {} workers, {} attention blocks each, one shared prefix tree",
         engine.worker_count(),
         attention_blocks
     );
 
-    println!("\nPreflight passed. No HTTP surface yet — this engine cannot serve");
-    println!("requests. See README.md for what is and is not implemented.");
+    info!("\nPreflight passed. No HTTP surface yet — this engine cannot serve");
+    info!("requests. See README.md for what is and is not implemented.");
     std::process::ExitCode::SUCCESS
 }

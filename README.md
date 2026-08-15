@@ -156,6 +156,31 @@ memory, and engine assembly. Three design rules are enforced by construction,
 so a preflight that builds these types has checked them. It does not serve
 requests; there is no HTTP surface yet.
 
+### Console output
+
+Every binary routes its output through [`tracing`] and takes the same flag:
+
+```sh
+--log-level info | debug | trace     # default: info
+```
+
+`info` is the tool's own output — tables, results, summaries — and is what you
+get with no flag. `debug` adds setup detail: NVRTC compilation per kernel with
+timings, arena staging, resolved geometry. `trace` adds per-item detail, such
+as all 753 tensors as they are uploaded.
+
+There is deliberately no `warn` or `error` setting. `tracing`'s filter is an
+ordering, so warnings and errors are visible at every level the flag accepts;
+offering them as values would only let a caller hide problems. `INFO`, `DEBUG`
+and `TRACE` go to stdout and `WARN`/`ERROR` to stderr, so piping a table
+somewhere still leaves diagnostics on the terminal.
+
+`RUST_LOG` is honoured when the flag is absent, including per-target
+directives (`RUST_LOG=xabe_engine::weights=trace`). An explicit `--log-level`
+overrides it and says so.
+
+[`tracing`]: https://docs.rs/tracing
+
 Tests that read the real model file look for it at
 `$LLMXABE_MODEL`, falling back to the path in `docs/DEVELOPMENT.md`. They skip
 if it is absent rather than failing.

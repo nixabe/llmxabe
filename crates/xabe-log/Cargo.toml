@@ -1,13 +1,13 @@
 [package]
-name = "xabe-cuda"
+name = "xabe-log"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+description = "Shared tracing setup and --log-level parsing for llmxabe binaries"
 
 [dependencies]
 tracing.workspace = true
-xabe-log.workspace = true
-cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "cublaslt", "fallback-dynamic-loading", "cuda-12040"] }
+tracing-subscriber.workspace = true

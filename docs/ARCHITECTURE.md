@@ -88,6 +88,22 @@ xabe-gguf ──> xabe-model ──┬──> xabe-cache ──┐
 | `xabe-cuda` | Driver API, NVRTC, graphs, capability gate | Layers and experts |
 | `xabe-engine` | Worker lifecycle, router, orchestration | HTTP |
 | `xabe-server` | HTTP surface, admission queue | Everything below the engine |
+| `xabe-log` | `tracing` setup, `--log-level` parsing, output format | Every other crate |
+
+`xabe-log` sits outside the dependency chain above: it is a leaf that anything
+may depend on and that depends on nothing in the workspace.
+
+The rule that matters is about *who installs the subscriber*. Binaries call
+`xabe_log::init_from_args()` exactly once at startup; **library code emits
+`tracing` events and never installs a subscriber**, so an embedding process
+keeps control of where output goes and a test binary is free to install its
+own. No `xabe_log` symbol appears outside a `src/bin/`, `examples/` or
+`main.rs` file, and `crates_do_not_install_a_subscriber` in `xabe-log`'s test
+module asserts that by scanning the workspace.
+
+Cargo has no per-target dependency section, so the crates whose *binaries*
+need `xabe-log` list it as an ordinary dependency even though their libraries
+do not use it. That is a manifest limitation, not a layering claim.
 
 The split that earns its keep is `xabe-kernels` knowing nothing about CUDA.
 Reference implementations are the oracle for every GPU kernel, and they must be

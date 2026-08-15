@@ -8,4 +8,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+tracing.workspace = true
+xabe-log.workspace = true
 xabe-gguf.workspace = true

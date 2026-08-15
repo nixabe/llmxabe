@@ -75,6 +75,7 @@ it runs.
 | `xabe-cuda` | Driver API, streams, graphs, device probe | — |
 | `xabe-engine` | Worker, cache-aware router, orchestration | all of the above |
 | `xabe-server` | HTTP surface, admission queue | `xabe-engine` |
+| `xabe-log` | `tracing` setup, `--log-level`, output format | — |
 
 Dependencies point one way only. If you need `xabe-cache` to know something
 about scheduling, the abstraction is wrong — fix the boundary, do not add the
@@ -112,6 +113,12 @@ is bandwidth-bound, not latency-bound.
 - `cargo fmt --all` and `cargo clippy --workspace --all-targets` must be clean
   before you commit.
 - `cargo test --workspace` must pass before you commit.
+- **Never `println!` outside a test.** Binaries and examples log through
+  `tracing`; libraries emit events and never install a subscriber. Tool
+  output — tables, results — is `info!`, because `INFO` is the level that
+  means "appears by default". `xabe-log`'s `tests/layering.rs` scans the
+  workspace and fails the build otherwise. Levels are documented in
+  [CONTRIBUTING.md](CONTRIBUTING.md#console-output).
 
 ## Reporting results honestly
 

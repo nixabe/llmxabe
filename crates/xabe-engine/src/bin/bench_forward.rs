@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use cudarc::driver::CudaContext;
+use tracing::{error, info, warn};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::forward::{Forward, arena_holds};
@@ -78,27 +79,29 @@ fn stats(samples: &[f64]) -> (f64, f64) {
 }
 
 fn main() {
+    xabe_log::init_from_args();
+
     if !driver_available() {
-        println!("SKIPPED: no CUDA driver present");
+        warn!("SKIPPED: no CUDA driver present");
         return;
     }
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
         Err(e) => {
-            println!("SKIPPED: could not create a context on device 0: {e}");
+            warn!("SKIPPED: could not create a context on device 0: {e}");
             return;
         }
     };
     let info = DeviceInfo::from_context(0, &ctx).expect("device properties readable");
     if !info.is_supported() {
-        println!("SKIPPED: device 0 is below the sm_75 minimum");
+        warn!("SKIPPED: device 0 is below the sm_75 minimum");
         return;
     }
     let path = std::env::var_os("LLMXABE_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH));
     if !path.exists() {
-        println!("SKIPPED: model file not found at {}", path.display());
+        warn!("SKIPPED: model file not found at {}", path.display());
         return;
     }
 
@@ -113,8 +116,8 @@ fn main() {
     let stream = ctx.default_stream();
     let (free_at_start, total) = memory_info(&ctx).expect("memory info");
 
-    println!("device: {} ({})", info.name, info.compute_capability);
-    println!(
+    info!("device: {} ({})", info.name, info.compute_capability);
+    info!(
         "model:  {} ({:.2} GiB free of {:.2} GiB)",
         path.display(),
         free_at_start as f64 / (1u64 << 30) as f64,
@@ -127,18 +130,18 @@ fn main() {
     let (weights, report) =
         DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
             .expect("weight load");
-    println!(
+    info!(
         "arena:  {:.3} GiB in {:.1} s ({:.2} GB/s)\n",
         report.bytes as f64 / (1u64 << 30) as f64,
         load.elapsed().as_secs_f64(),
         report.throughput_gb_s(),
     );
 
-    println!(
+    info!(
         "{:>7} | {:>9} | {:>16} | {:>14}",
         "tokens", "build s", "ms/pass", "tok/s"
     );
-    println!("{:->7}-+-{:->9}-+-{:->16}-+-{:->14}", "", "", "", "");
+    info!("{:->7}-+-{:->9}-+-{:->16}-+-{:->14}", "", "", "", "");
 
     let mut peak_used = 0u64;
     for &n in &batches {
@@ -154,7 +157,7 @@ fn main() {
         ) {
             Ok(f) => f,
             Err(e) => {
-                println!("{n:>7} | FAILED to build: {e}");
+                error!("{n:>7} | FAILED to build: {e}");
                 continue;
             }
         };
@@ -170,7 +173,7 @@ fn main() {
         let mut failed = false;
         for _ in 0..WARMUP {
             if let Err(e) = forward.run(&stream, &ids, |_, _| {}) {
-                println!("{n:>7} | FAILED during warmup: {e}");
+                error!("{n:>7} | FAILED during warmup: {e}");
                 failed = true;
                 break;
             }
@@ -192,23 +195,23 @@ fn main() {
         }
 
         let (mean, sd) = stats(&samples);
-        println!(
+        info!(
             "{n:>7} | {build_s:>9.1} | {mean:>8.2} ± {sd:>5.2} | {:>8.2} ± {:>3.2}",
             n as f64 / (mean / 1e3),
             n as f64 / (mean / 1e3) * (sd / mean),
         );
     }
 
-    println!(
+    info!(
         "\npeak VRAM {:.3} GiB of {:.2} GiB",
         peak_used as f64 / (1u64 << 30) as f64,
         total as f64 / (1u64 << 30) as f64,
     );
-    println!(
+    info!(
         "warmup {WARMUP} discarded, {reps} timed repetitions, stream synchronized inside \
          the timed region",
     );
-    println!(
+    info!(
         "NOTE: no KV cache and no carried recurrent state — every pass is a cold full \
          forward. Comparable to llama.cpp `pp`, NOT to `tg`.",
     );

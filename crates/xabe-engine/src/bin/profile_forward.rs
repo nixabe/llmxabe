@@ -47,6 +47,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use cudarc::driver::CudaContext;
+use tracing::{error, info, warn};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::block::moe::MoeBlock;
@@ -284,27 +285,29 @@ fn gb_s(bytes: u64, ms: f64) -> f64 {
 }
 
 fn main() {
+    xabe_log::init_from_args();
+
     if !driver_available() {
-        println!("SKIPPED: no CUDA driver present");
+        warn!("SKIPPED: no CUDA driver present");
         return;
     }
     let ctx = match CudaContext::new(0) {
         Ok(c) => c,
         Err(e) => {
-            println!("SKIPPED: could not create a context on device 0: {e}");
+            warn!("SKIPPED: could not create a context on device 0: {e}");
             return;
         }
     };
     let info = DeviceInfo::from_context(0, &ctx).expect("device properties readable");
     if !info.is_supported() {
-        println!("SKIPPED: device 0 is below the sm_75 minimum");
+        warn!("SKIPPED: device 0 is below the sm_75 minimum");
         return;
     }
     let path = std::env::var_os("LLMXABE_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH));
     if !path.exists() {
-        println!("SKIPPED: model file not found at {}", path.display());
+        warn!("SKIPPED: model file not found at {}", path.display());
         return;
     }
 
@@ -319,14 +322,14 @@ fn main() {
     let stream = ctx.default_stream();
     let (free_at_start, total) = memory_info(&ctx).expect("memory info");
 
-    println!("device: {} ({})", info.name, info.compute_capability);
-    println!(
+    info!("device: {} ({})", info.name, info.compute_capability);
+    info!(
         "model:  {} ({:.2} GiB free of {:.2} GiB)",
         path.display(),
         free_at_start as f64 / (1u64 << 30) as f64,
         total as f64 / (1u64 << 30) as f64,
     );
-    println!("peak:   {PEAK_GB_S} GB/s, {PEAK_TFLOP_S} TFLOP/s fp32\n");
+    info!("peak:   {PEAK_GB_S} GB/s, {PEAK_TFLOP_S} TFLOP/s fp32\n");
 
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema resolves");
@@ -338,12 +341,12 @@ fn main() {
     // The byte and FLOP models below are only as good as this table, so it is
     // printed rather than trusted: every figure downstream is a sum over these
     // rows and can be checked against the file.
-    println!("the projections, as the GGUF stores them:");
-    println!(
+    info!("the projections, as the GGUF stores them:");
+    info!(
         "{:<22} | {:<7} | {:>12} | {:>12} | {:>6}",
         "tensor", "type", "elements", "bytes", "B/elt"
     );
-    println!(
+    info!(
         "{:-<22}-+-{:-<7}-+-{:-<12}-+-{:-<12}-+-{:-<6}",
         "", "", "", "", ""
     );
@@ -366,7 +369,7 @@ fn main() {
         (Role::LmHead, None),
     ] {
         if let Some(e) = directory.find(role, layer) {
-            println!(
+            info!(
                 "{:<22} | {:<7} | {:>12} | {:>12} | {:>6.3}",
                 e.spec.name,
                 e.info.ggml_type.name(),
@@ -377,18 +380,18 @@ fn main() {
         }
     }
 
-    println!("\nweight bytes as stored in the GGUF, per layer of each shape:");
-    println!("  GDN mixer         {:>12} B", bytes.gdn_layer);
-    println!("  Gated Attn mixer  {:>12} B", bytes.attn_layer);
-    println!(
+    info!("\nweight bytes as stored in the GGUF, per layer of each shape:");
+    info!("  GDN mixer         {:>12} B", bytes.gdn_layer);
+    info!("  Gated Attn mixer  {:>12} B", bytes.attn_layer);
+    info!(
         "  MoE fixed         {:>12} B (norms, router, shared expert)",
         bytes.moe_fixed
     );
-    println!(
+    info!(
         "  MoE per expert    {:>12} B ({} experts = {} B)",
         bytes.moe_per_expert, config.moe.num_experts, bytes.moe_all_experts
     );
-    println!("  LM head           {:>12} B\n", bytes.lm_head);
+    info!("  LM head           {:>12} B\n", bytes.lm_head);
 
     for &n in &batches {
         let mut forward = match Forward::new(
@@ -402,7 +405,7 @@ fn main() {
         ) {
             Ok(f) => f,
             Err(e) => {
-                println!("n = {n}: FAILED to build: {e}");
+                error!("n = {n}: FAILED to build: {e}");
                 continue;
             }
         };
@@ -473,27 +476,25 @@ fn main() {
 
         let gpu_total: f64 = totals.values().map(|v| stats(v).0).sum();
 
-        println!("================ n = {n} tokens ================");
-        println!(
+        info!("================ n = {n} tokens ================");
+        info!(
             "wall clock, events off : {plain_mean:8.2} ± {plain_sd:5.2} ms  ({:.2} tok/s)",
             n as f64 / (plain_mean / 1e3),
         );
-        println!(
+        info!(
             "wall clock, events on  : {inst_mean:8.2} ± {inst_sd:5.2} ms  \
              (instrumentation {:+.2} ms, {:+.2}%)",
             inst_mean - plain_best,
             (inst_mean - plain_best) / plain_best * 100.0,
         );
-        println!(
-            "wall clock, events off : {plain2_mean:8.2} ± {plain2_sd:5.2} ms  (repeated after)",
-        );
-        println!("GPU time, summed spans : {gpu_total:8.2} ms\n");
+        info!("wall clock, events off : {plain2_mean:8.2} ± {plain2_sd:5.2} ms  (repeated after)",);
+        info!("GPU time, summed spans : {gpu_total:8.2} ms\n");
 
-        println!(
+        info!(
             "{:<40} | {:>10} | {:>9} | {:>7} | {:>10}",
             "stage", "ms total", "ms each", "% pass", "sd ms"
         );
-        println!(
+        info!(
             "{:-<40}-+-{:-<10}-+-{:-<9}-+-{:-<7}-+-{:-<10}",
             "", "", "", "", ""
         );
@@ -504,18 +505,18 @@ fn main() {
                 Bucket::AttnMixer | Bucket::MoeOnAttn => 10.0,
                 _ => 1.0,
             };
-            println!(
+            info!(
                 "{:<40} | {mean:>10.3} | {:>9.3} | {:>6.2}% | {sd:>10.3}",
                 b.label(),
                 mean / count,
                 mean / gpu_total * 100.0,
             );
         }
-        println!(
+        info!(
             "{:-<40}-+-{:-<10}-+-{:-<9}-+-{:-<7}-+-{:-<10}",
             "", "", "", "", ""
         );
-        println!(
+        info!(
             "{:<40} | {gpu_total:>10.3} | {:>9} | 100.00% |",
             "total", ""
         );
@@ -534,12 +535,12 @@ fn main() {
         let pairs = rows * config.moe.experts_per_token as u64;
         let moe_ms = mean_of(Bucket::MoeOnGdn) + mean_of(Bucket::MoeOnAttn);
 
-        println!("\nagainst both rooflines ({PEAK_GB_S} GB/s, {PEAK_TFLOP_S} TFLOP/s fp32):");
-        println!(
+        info!("\nagainst both rooflines ({PEAK_GB_S} GB/s, {PEAK_TFLOP_S} TFLOP/s fp32):");
+        info!(
             "{:<34} | {:>13} | {:>8} | {:>7} | {:>13} | {:>9} | {:>7}",
             "stage", "bytes", "GB/s", "% peak", "FLOP", "GFLOP/s", "% peak",
         );
-        println!(
+        info!(
             "{:-<34}-+-{:-<13}-+-{:-<8}-+-{:-<7}-+-{:-<13}-+-{:-<9}-+-{:-<7}",
             "", "", "", "", "", "", "",
         );
@@ -550,7 +551,7 @@ fn main() {
             } else {
                 0.0
             };
-            println!(
+            info!(
                 "{label:<34} | {total_bytes:>13} | {achieved:>8.2} | {:>6.2}% | {flop:>13} | \
                  {gflops:>9.2} | {:>6.2}%",
                 achieved / PEAK_GB_S * 100.0,
@@ -603,11 +604,11 @@ fn main() {
         // integers and return. This is the fraction that matters.
         let geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, n);
         let capacity = geometry.sorted_capacity();
-        println!(
+        info!(
             "\nMoE grouped-GEMM grid.y = sorted_capacity = {capacity} slots, of which \
              {pairs} carry a live (token, expert) pair",
         );
-        println!(
+        info!(
             "  {:.2}% of blocks do work, {:.2}% early-out; a perfectly packed grid \
              would be {:.2}x smaller",
             pairs as f64 / capacity as f64 * 100.0,
@@ -616,7 +617,7 @@ fn main() {
         );
 
         // --- worst single instance, to expose per-layer spread --------------
-        println!("\nslowest single instance of each repeated stage:");
+        info!("\nslowest single instance of each repeated stage:");
         for b in [
             Bucket::GdnMixer,
             Bucket::AttnMixer,
@@ -624,13 +625,13 @@ fn main() {
             Bucket::MoeOnAttn,
         ] {
             if let Some(&ms) = worst.get(&b) {
-                println!("  {:<38} {ms:>8.3} ms", b.label());
+                info!("  {:<38} {ms:>8.3} ms", b.label());
             }
         }
-        println!();
+        info!("");
     }
 
-    println!(
+    info!(
         "{WARMUP} warmup passes discarded, {reps} timed repetitions. Stage times are CUDA \
          event deltas on the pass's own stream; the pass total is host wall clock with the \
          stream synchronized inside the timed region."

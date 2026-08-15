@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DriverError};
+use tracing::{debug, trace};
 use xabe_cuda::arena::{ALIGNMENT, Allocation, ArenaError, DeviceArena, memory_info};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::weights::{Directory, Role};
@@ -296,6 +297,19 @@ impl DeviceWeights {
             });
         }
 
+        debug!(
+            "device {}: staging {} of {} directory entries into a {:.3} GiB arena ({:.3} GiB free)",
+            ctx.ordinal(),
+            directory
+                .entries()
+                .iter()
+                .filter(|e| keep(e.spec.role))
+                .count(),
+            directory.len(),
+            capacity as f64 / (1u64 << 30) as f64,
+            free_before as f64 / (1u64 << 30) as f64,
+        );
+
         let started = Instant::now();
         let mut arena = DeviceArena::new(stream, capacity as usize)?;
         let mut placements = Vec::with_capacity(directory.len());
@@ -312,6 +326,16 @@ impl DeviceWeights {
                 })?;
             let alloc = arena.push(stream, data)?;
             bytes += data.len() as u64;
+            // Per-tensor, so `trace`. 753 lines is the point: it is the only
+            // way to see which tensor a load failed on, or that a role was
+            // silently filtered out by `keep`.
+            trace!(
+                "  {name}: {:?} {:?}, {} bytes at arena offset {}",
+                entry.info.ggml_type,
+                entry.info.dims,
+                data.len(),
+                alloc.offset,
+            );
 
             index.insert((entry.spec.role, entry.spec.layer), placements.len());
             placements.push(TensorPlacement {
@@ -337,6 +361,15 @@ impl DeviceWeights {
         );
 
         let tensors = placements.len();
+        debug!(
+            "device {}: {tensors} tensors, {:.3} GiB in {:.1} s ({:.2} GB/s); {:.3} GiB free after",
+            ctx.ordinal(),
+            bytes as f64 / (1u64 << 30) as f64,
+            elapsed.as_secs_f64(),
+            bytes as f64 / 1e9 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE),
+            free_after as f64 / (1u64 << 30) as f64,
+        );
+
         Ok((
             Self {
                 arena,

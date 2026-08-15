@@ -6,6 +6,7 @@ members = [
     "crates/xabe-cache",
     "crates/xabe-sched",
     "crates/xabe-kernels",
+    "crates/xabe-log",
     "crates/xabe-cuda",
     "crates/xabe-engine",
     "crates/xabe-server",
@@ -24,6 +25,7 @@ xabe-model = { path = "crates/xabe-model" }
 xabe-cache = { path = "crates/xabe-cache" }
 xabe-sched = { path = "crates/xabe-sched" }
 xabe-kernels = { path = "crates/xabe-kernels" }
+xabe-log = { path = "crates/xabe-log" }
 xabe-cuda = { path = "crates/xabe-cuda" }
 xabe-engine = { path = "crates/xabe-engine" }
 
@@ -33,6 +35,7 @@ half = "2"
 rustc-hash = "2"
 parking_lot = "0.12"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = 3

@@ -113,6 +113,34 @@ cargo test --workspace
 - Model weights, GGUF files, captured activation goldens.
 - Benchmark output.
 
+## Console output
+
+Nothing outside a test prints directly. Binaries and examples log through
+`tracing`; libraries emit events and never install a subscriber. Two tests in
+`xabe-log` enforce this by scanning the workspace, so a stray `println!` in a
+binary fails the build rather than quietly ignoring `--log-level`.
+
+Choosing a level:
+
+| Level | For | Rule of thumb |
+| --- | --- | --- |
+| `error!` | the run cannot produce its result | followed by a non-zero exit |
+| `warn!` | the result is real but something was surprising | a reader who ignores it may be misled |
+| `info!` | **the tool's own output** — tables, results, summaries | must appear with no flags |
+| `debug!` | setup: geometry, buffer sizes, compilation, resolved paths | O(components), not O(items) |
+| `trace!` | per-item: per-tensor, per-kernel, per-token | fine to be thousands of lines |
+
+`info!` for tool output is the part that surprises people. It is deliberate:
+`INFO` is the level that means "appears by default", and a table that used
+`println!` instead would escape both filtering and redirection. The default
+format prints an `INFO` event as its message and nothing else, so the
+rendering is unchanged from the `println!` it replaced — verified by
+byte-diffing four tools' output across the migration.
+
+Do not add a `trace!` inside a per-element loop. Per-tensor and per-layer are
+fine; the disabled-level check is cheap against work measured in milliseconds
+and expensive against work measured in nanoseconds.
+
 ## Reporting results
 
 The project's justification rests on a measurement nobody has taken yet

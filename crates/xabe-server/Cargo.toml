@@ -12,6 +12,8 @@ name = "llmxabe"
 path = "src/main.rs"
 
 [dependencies]
+tracing.workspace = true
+xabe-log.workspace = true
 xabe-model.workspace = true
 xabe-cache.workspace = true
 xabe-sched.workspace = true

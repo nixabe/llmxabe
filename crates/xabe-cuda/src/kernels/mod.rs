@@ -18,6 +18,7 @@ pub mod lm_head;
 pub mod moe;
 
 use cudarc::nvrtc::{CompileOptions, Ptx};
+use tracing::debug;
 
 /// The only architecture this project targets.
 ///
@@ -30,8 +31,17 @@ pub const TARGET_ARCH: &str = "compute_75";
 ///
 /// `name` appears in NVRTC's diagnostics, so it should identify the kernel
 /// rather than the caller.
+///
+/// Every kernel in the workspace compiles through here, so the `debug!` below
+/// is the whole NVRTC bill for a run: which modules were built, how large
+/// each source was, and what each cost. That matters because compilation is
+/// paid at `Forward::new` and shows up as the "build s" column in
+/// `bench_forward` — several seconds per batch size — and the only way to
+/// tell whether that is one slow kernel or thirty ordinary ones is to see the
+/// per-kernel split.
 pub fn compile(src: &str, name: &str) -> Result<Ptx, String> {
-    cudarc::nvrtc::compile_ptx_with_opts(
+    let started = std::time::Instant::now();
+    let result = cudarc::nvrtc::compile_ptx_with_opts(
         src,
         CompileOptions {
             arch: Some(TARGET_ARCH),
@@ -39,5 +49,13 @@ pub fn compile(src: &str, name: &str) -> Result<Ptx, String> {
             ..Default::default()
         },
     )
-    .map_err(|e| format!("{name}: {e:?}"))
+    .map_err(|e| format!("{name}: {e:?}"));
+
+    debug!(
+        "nvrtc {name}: {} source bytes for {TARGET_ARCH} in {:.0} ms{}",
+        src.len(),
+        started.elapsed().as_secs_f64() * 1e3,
+        if result.is_ok() { "" } else { " — FAILED" },
+    );
+    result
 }
