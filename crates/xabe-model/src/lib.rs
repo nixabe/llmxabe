@@ -12,5 +12,7 @@
 pub mod budget;
 pub mod config;
 pub mod verify;
+pub mod weights;
 
 pub use config::{AttentionConfig, GdnConfig, LayerKind, ModelConfig, MoeConfig};
+pub use weights::{Directory, Role, Section, TensorSpec, WeightError, WeightSchema};

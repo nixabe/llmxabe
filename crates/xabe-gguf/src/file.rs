@@ -189,6 +189,17 @@ impl GgufFile {
         self.metadata.keys().map(String::as_str)
     }
 
+    /// Fetch a metadata value without asserting its type.
+    ///
+    /// The typed accessors below are the ergonomic path when the caller
+    /// knows the GGUF key schema. This one exists for callers that must
+    /// handle whatever type the file actually carries — model loaders
+    /// tolerating `u32`/`u64` drift across converter versions, and
+    /// diagnostics that dump keys they have no schema for.
+    pub fn get(&self, key: &str) -> Option<&GgufValue> {
+        self.metadata.get(key)
+    }
+
     /// Fetch a `u32`-typed metadata value.
     ///
     /// Returns `None` both when the key is absent and when it is present

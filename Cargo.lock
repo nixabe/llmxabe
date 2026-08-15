@@ -242,6 +242,9 @@ dependencies = [
 [[package]]
 name = "xabe-model"
 version = "0.1.0"
+dependencies = [
+ "xabe-gguf",
+]
 
 [[package]]
 name = "xabe-sched"

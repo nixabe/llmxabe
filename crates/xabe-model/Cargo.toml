@@ -8,3 +8,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+xabe-gguf.workspace = true

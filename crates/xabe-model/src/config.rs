@@ -223,6 +223,22 @@ impl ModelConfig {
         }
     }
 
+    /// Number of multi-token-prediction blocks that follow the transformer
+    /// layers.
+    ///
+    /// The GGUF file reports `block_count = 41` for a 40-layer model: block 40
+    /// is the MTP head, a complete dense-attention block with its own MoE.
+    /// Anything iterating "all blocks in the file" must account for it, and
+    /// anything iterating "the layers that produce the next token" must not.
+    pub const fn mtp_layers(&self) -> u32 {
+        if self.has_mtp { 1 } else { 0 }
+    }
+
+    /// Total blocks present in the GGUF file, MTP head included.
+    pub const fn num_blocks(&self) -> u32 {
+        self.num_layers + self.mtp_layers()
+    }
+
     /// Which mixer the layer at `index` uses.
     ///
     /// The pattern repeats with period [`Self::pattern_period`]: three Gated
