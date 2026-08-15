@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local design drafts are kept out of the tree deliberately; see AGENTS.md.
+/qwen36-rust-engine-plan.md
+
+# OMC session state
+.omc/
+
+# Model weights and captured goldens are far too large to track.
+*.gguf
+*.safetensors
+/goldens/
+/bench-results/

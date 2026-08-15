@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/xabe-gguf",
+    "crates/xabe-model",
+    "crates/xabe-cache",
+    "crates/xabe-sched",
+    "crates/xabe-kernels",
+    "crates/xabe-cuda",
+    "crates/xabe-engine",
+    "crates/xabe-server",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nixabe/llmxabe"
+authors = ["llmxabe contributors"]
+
+[workspace.dependencies]
+xabe-gguf = { path = "crates/xabe-gguf" }
+xabe-model = { path = "crates/xabe-model" }
+xabe-cache = { path = "crates/xabe-cache" }
+xabe-sched = { path = "crates/xabe-sched" }
+xabe-kernels = { path = "crates/xabe-kernels" }
+xabe-cuda = { path = "crates/xabe-cuda" }
+xabe-engine = { path = "crates/xabe-engine" }
+
+thiserror = "2"
+memmap2 = "0.9"
+half = "2"
+rustc-hash = "2"
+parking_lot = "0.12"
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# Kernel-correctness work is unusably slow in a plain debug build; the
+# differential harness (docs/TESTING.md) runs thousands of reference ops.
+[profile.dev.package."*"]
+opt-level = 2
