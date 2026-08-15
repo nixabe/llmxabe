@@ -217,7 +217,10 @@ dependencies = [
 name = "xabe-engine"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
  "xabe-cache",
+ "xabe-cuda",
+ "xabe-gguf",
  "xabe-model",
  "xabe-sched",
 ]

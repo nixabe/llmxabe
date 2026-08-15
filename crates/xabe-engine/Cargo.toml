@@ -9,5 +9,8 @@ authors.workspace = true
 
 [dependencies]
 xabe-model.workspace = true
+xabe-gguf.workspace = true
+xabe-cuda.workspace = true
+cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040"] }
 xabe-cache.workspace = true
 xabe-sched.workspace = true

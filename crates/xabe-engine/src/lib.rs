@@ -20,8 +20,10 @@
 
 pub mod engine;
 pub mod router;
+pub mod weights;
 pub mod worker;
 
 pub use engine::{Engine, Placement, PlacementError};
 pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
+pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
 pub use worker::{Worker, WorkerId};

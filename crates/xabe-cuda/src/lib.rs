@@ -21,9 +21,11 @@
 //! distinctly from a pass — see [`spike::CheckOutcome`]. Do not read a green
 //! test run on a GPU-less machine as validation of device work.
 
+pub mod arena;
 pub mod device;
 pub mod spike;
 
+pub use arena::{ALIGNMENT, Allocation, ArenaError, DeviceArena, memory_info};
 pub use device::{
     ComputeCapability, DeviceInfo, GateFailure, MIN_COMPUTE_CAPABILITY, check_gate,
     driver_available, probe_all,
