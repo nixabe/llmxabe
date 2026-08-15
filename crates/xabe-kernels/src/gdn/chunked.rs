@@ -214,7 +214,7 @@ fn flatten(rows: &[Vec<f32>]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compare::{Tolerance, compare};
+    use crate::compare::{Tolerance, assert_matches};
     use crate::gdn::recurrent::recurrent_forward;
     use crate::rng::Xorshift64Star;
 
@@ -269,22 +269,16 @@ mod tests {
         let (chunk_out, chunk_state) =
             chunked_forward(head_dim, chunk_len, &q, &k, &v, &log_decay, &beta, None);
 
-        let result = compare(&flatten_outputs(&chunk_out), &flatten_outputs(&rec_out));
+        // Gate on the full tolerance -- max-abs, max-rel, non-finite count
+        // and cosine. Cosine alone would accept a uniformly scaled output,
+        // which is exactly the drift this crate exists to catch.
         let tol = Tolerance::gdn_chunk_vs_recurrent();
-        assert!(
-            result.cosine_similarity >= tol.min_cosine_similarity,
-            "chunked vs recurrent output mismatch: {result}"
+        assert_matches(
+            &flatten_outputs(&chunk_out),
+            &flatten_outputs(&rec_out),
+            &tol,
         );
-        assert!(
-            result.max_abs_error <= tol.max_abs_error,
-            "chunked vs recurrent output mismatch: {result}"
-        );
-
-        let state_result = compare(&chunk_state, &rec_state);
-        assert!(
-            state_result.cosine_similarity >= tol.min_cosine_similarity,
-            "chunked vs recurrent final-state mismatch: {state_result}"
-        );
+        assert_matches(&chunk_state, &rec_state, &tol);
     }
 
     #[test]
@@ -298,10 +292,10 @@ mod tests {
         let (chunk_out, _) =
             chunked_forward(head_dim, seq_len, &q, &k, &v, &log_decay, &beta, None);
 
-        let result = compare(&flatten_outputs(&chunk_out), &flatten_outputs(&rec_out));
-        assert!(
-            result.cosine_similarity > 1.0 - 1e-4,
-            "single-chunk case: {result}"
+        assert_matches(
+            &flatten_outputs(&chunk_out),
+            &flatten_outputs(&rec_out),
+            &Tolerance::gdn_chunk_vs_recurrent(),
         );
     }
 
@@ -318,10 +312,10 @@ mod tests {
         let (rec_out, _) = recurrent_forward(head_dim, &q, &k, &v, &log_decay, &beta, None);
         let (chunk_out, _) = chunked_forward(head_dim, 1, &q, &k, &v, &log_decay, &beta, None);
 
-        let result = compare(&flatten_outputs(&chunk_out), &flatten_outputs(&rec_out));
-        assert!(
-            result.cosine_similarity > 1.0 - 1e-4,
-            "chunk_len=1 case: {result}"
+        assert_matches(
+            &flatten_outputs(&chunk_out),
+            &flatten_outputs(&rec_out),
+            &Tolerance::gdn_chunk_vs_recurrent(),
         );
     }
 
@@ -353,16 +347,13 @@ mod tests {
             Some(&initial_state),
         );
 
-        let result = compare(&flatten_outputs(&chunk_out), &flatten_outputs(&rec_out));
-        assert!(
-            result.cosine_similarity > 1.0 - 1e-3,
-            "nonzero initial state: {result}"
+        let tol = Tolerance::gdn_chunk_vs_recurrent();
+        assert_matches(
+            &flatten_outputs(&chunk_out),
+            &flatten_outputs(&rec_out),
+            &tol,
         );
-        let state_result = compare(&chunk_state, &rec_state);
-        assert!(
-            state_result.cosine_similarity > 1.0 - 1e-3,
-            "final state: {state_result}"
-        );
+        assert_matches(&chunk_state, &rec_state, &tol);
     }
 
     /// The equivalence test at Qwen3.6's actual Gated DeltaNet shape
@@ -384,16 +375,12 @@ mod tests {
             chunked_forward(head_dim, chunk_len, &q, &k, &v, &log_decay, &beta, None);
 
         let tol = Tolerance::gdn_chunk_vs_recurrent();
-        let out_result = compare(&flatten_outputs(&chunk_out), &flatten_outputs(&rec_out));
-        assert!(
-            out_result.cosine_similarity >= tol.min_cosine_similarity,
-            "Qwen3.6 GDN shape (head_dim={head_dim}, chunk_len={chunk_len}) output mismatch: {out_result}"
+        assert_matches(
+            &flatten_outputs(&chunk_out),
+            &flatten_outputs(&rec_out),
+            &tol,
         );
-        let state_result = compare(&chunk_state, &rec_state);
-        assert!(
-            state_result.cosine_similarity >= tol.min_cosine_similarity,
-            "Qwen3.6 GDN shape final-state mismatch: {state_result}"
-        );
+        assert_matches(&chunk_state, &rec_state, &tol);
     }
 
     #[test]
@@ -409,14 +396,10 @@ mod tests {
         let (out_a, _) = chunked_forward(head_dim, 16, &q, &k, &v, &log_decay, &beta, None);
         let (out_b, _) = chunked_forward(head_dim, 7, &q, &k, &v, &log_decay, &beta, None);
 
-        let result = compare(&flatten_outputs(&out_a), &flatten_outputs(&out_b));
-        assert!(
-            result.cosine_similarity > 1.0 - 1e-4,
-            "chunk-size independence: {result}"
-        );
-        assert!(
-            result.max_abs_error < 1e-2,
-            "chunk-size independence: {result}"
+        assert_matches(
+            &flatten_outputs(&out_a),
+            &flatten_outputs(&out_b),
+            &Tolerance::gdn_chunk_vs_recurrent(),
         );
     }
 }
