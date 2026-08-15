@@ -181,13 +181,38 @@ expert-activation density allows. The 1.77× it achieves at c=3 is not
 This **contradicts the strategic hypothesis** as posed. There is no
 "llama.cpp batches poorly" headroom to harvest. The two real openings are:
 
-1. **More slots.** llama.cpp was benchmarked at `-np 3`. The roofline at
-   N=16 is 683.7 tok/s and at N=32 is 867.4 tok/s. At llama.cpp's own 41%
-   efficiency those become 280 and 356 tok/s — **1.7× to 2.2× over the
-   measured 162.4** with no kernel work at all. **But llama.cpp can also be
-   run at `-np 16`.** Whether it holds 41% there is *unmeasured*, and that
-   measurement is the single highest-value action available
-   ([§10](#10-suggested-experiments), E1).
+1. ~~**More slots.**~~ **MEASURED, AND THIS OPENING IS CLOSED.** E1 has been
+   run. llama.cpp does not merely hold its efficiency as slots rise — it
+   scales well past what the `-np 3` extrapolation predicted:
+
+   ```
+   llama-batched-bench -c 32768 -npp 128 -ntg 128 -npl 1,2,4,8,16 -ngl 99
+   Quadro RTX 8000, build fd6863a69 (10456), same model file
+
+   |  B | S_TG t/s | vs B=1 | aggregate t/s |
+   |----|----------|--------|---------------|
+   |  1 |   105.09 |  1.00x |        189.65 |
+   |  2 |   159.63 |  1.52x |        287.68 |
+   |  4 |   219.64 |  2.09x |        396.37 |
+   |  8 |   262.08 |  2.49x |        464.34 |
+   | 16 |   382.02 |  3.64x |        637.42 |
+   ```
+
+   **llama.cpp gains 3.64× on decode from 1 to 16 concurrent sequences.**
+   The predicted "280 tok/s at N=16 if it holds 41%" was too pessimistic by
+   36%: it actually reaches 382.02.
+
+   So the bar for any concurrency claim is **382 tok/s decode at 16
+   concurrent, per card** — not the 104.74 single-stream figure, and not the
+   162.4 at `-np 3`. That is a 3.65× higher bar than the number this
+   document was originally ranked against, and every projection in
+   [§7](#7-aggregate-concurrency) must be read against it.
+
+   This does not make concurrency worthless — llmxabe's three-worker
+   architecture still multiplies whatever per-card figure it achieves, and
+   so would three llama.cpp instances. It removes the *asymmetry*. There is
+   no batching deficit in llama.cpp to exploit; there is only the kernel
+   deficit, which is opening 2.
 2. **Efficiency above 41%.** The KV path already reaches ~80%. Every point
    of weight-path efficiency is a point of throughput at every concurrency
    simultaneously. This is the kernel program.
@@ -1257,13 +1282,32 @@ final wall is made of: **not weights, not experts — recurrent state.**
 The practical ceiling is VRAM (§6, Program B): about 16–32 concurrent
 sequences at realistic depth.
 
-### 8.4 The condition under which the whole goal fails
+### 8.4 The condition under which the whole goal fails — RESOLVED
 
-**If llama.cpp at `-np 16` holds ~41% efficiency, then llmxabe's only path
-to a win is R3 — raising bandwidth efficiency above 44.5% — and nothing
-else in this document matters.** Everything else is a capability llama.cpp
-already has or can be configured into. That single measurement (E1) decides
-whether the project has a concurrency story or only a kernel story.
+This section originally read: *"If llama.cpp at `-np 16` holds ~41%
+efficiency, then llmxabe's only path to a win is R3 — raising bandwidth
+efficiency above 44.5% — and nothing else in this document matters."*
+
+**E1 has been run, and the answer is worse than that condition.** llama.cpp
+at 16 concurrent sequences does not merely hold its efficiency; it reaches
+**382.02 tok/s decode, 3.64× its single-stream 105.09** (§2.7). It scales
+better than this document projected, not worse.
+
+So the conclusion stands in its strong form: **this project has a kernel
+story, not a concurrency story.** Concurrency is table stakes — llmxabe
+needs batched decode to be in the same conversation at all, and it does not
+have it — but building it buys parity with a capability llama.cpp already
+ships, not an advantage over it.
+
+Every path to actually winning runs through R3 and the tiling program:
+raising the weight path above its measured 6.47% of bandwidth peak. The MoE
+GEMM is 67–77% of every pass, and the same codebase already reaches 88.98%
+in the LM head, so the deficit is the kernel and nothing else. Concurrency
+then multiplies whatever efficiency that program achieves — for llmxabe and
+for llama.cpp equally.
+
+The honest summary: **there is no shortcut here.** The gap must be closed
+where it is, in the grouped GEMM.
 
 ---
 
