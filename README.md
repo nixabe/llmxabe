@@ -3,13 +3,21 @@
 A single-process CUDA inference engine for `Qwen3.6-35B-A3B` on 3× Quadro
 RTX 8000, written in Rust.
 
-> **Status: kernels in progress.** The host-side engine — GGUF loading,
-> hybrid cache, scheduler, CPU reference kernels — is implemented and tested.
-> The model now becomes **resident on a GPU** (733 tensors, 29.65 GiB, read
-> back bit-identical), and three device kernels exist: Q8_0 and Q6_K
-> dequantization, and the Gated DeltaNet decode step. There is still no
-> forward pass, so **this does not yet run a model**. See
-> [Milestones](#milestones) for exactly what is and is not done.
+> **Status: the forward pass runs and is correct; there is no decode loop
+> yet.** The model is resident on one GPU (733 tensors, 29.65 GiB, read back
+> bit-identical) and a full 40-block forward pass runs entirely on the
+> device — Gated DeltaNet, gated attention, and the 256-expert MoE. Against
+> golden data captured from llama.cpp it produces **the same argmax token**
+> (25358, `' Tokyo'`) at logit 19.936268.
+>
+> What it cannot do: **there is no KV cache and no carried recurrent state**,
+> so every pass is a cold full forward and the engine cannot generate a
+> second token. There is no HTTP surface. See [Milestones](#milestones) for
+> the itemized state.
+>
+> Measured prefill is **200.87 ± 0.75 tok/s** at 512 tokens against
+> llama.cpp's 2,070.50 on the same card — **10.3× slower**. See
+> [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why this exists
 
@@ -55,6 +63,15 @@ design plan expected. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 This project does not claim it will be faster than llama.cpp. That backend has
 years of CUDA tuning behind it, and the benchmarks make that concrete.
+
+**Where it actually stands.** Prefill went from 29.6× slower to **10.3×
+slower** when the MoE grouped GEMM and shared expert were tiled; the
+single-pass latency floor went from 3.9× to **1.90×**. Both remain losses.
+The tiled kernel reaches 13.3% of fp32 peak against a ~50% structural
+ceiling for its instruction mix, so roughly 2× of that gap is still
+unattributed — and `ncu` cannot read performance counters on this host
+(`ERR_NVGPUCTRPERM`), so attributing it needs a different machine or a
+different method.
 
 ## Target hardware and model
 
@@ -150,12 +167,12 @@ Numbering follows the design plan. "Gate" is the condition for calling it done.
 | # | Milestone | Gate | Status |
 | --- | --- | --- | --- |
 | 00 | Toolchain spike | Inline PTX confirmed, or cudarc chosen | done |
-| 01 | GDN kernel prototype | Cosine ≥ 1e-3 vs reference | **decode form done** — max_abs 2.98e-8, cosine 1.000000000 over 512 tokens at the real geometry. Chunked prefill form not started |
+| 01 | GDN kernel prototype | Cosine ≥ 1e-3 vs reference | **done** — decode form max_abs 2.98e-8, cosine 1.000000000 over 512 tokens; chunked prefill form landed and matched against golden data |
 | 02 | Differential harness | Per-tensor max-abs + cosine thresholds | done |
-| 03 | FP16 dense forward | Correct logits, any speed | not started |
-| 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | **dequant done** — bit-identical to the reference over 8.4 M elements of real weights. Grouped GEMM not started |
-| 05 | Flash attention port, sm_75 | Correct at 128K | not started |
-| 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started |
+| 03 | FP16 dense forward | Correct logits, any speed | **done** (fp32, not fp16) — full 40-block pass, argmax 25358 matching llama.cpp |
+| 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | **done** — dequant bit-identical over 8.4 M elements; grouped GEMM tiled, 9.3× on the MoE path, expert ids exact on all 37 tokens × top-8 |
+| 05 | Flash attention port, sm_75 | Correct at 128K | **done at batch scale, unverified at 128K** — scalar fp32, `BM = 1`, no tensor cores; correctness checked against golden data at 19 and 512 tokens only |
+| 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started; launch overhead measured at ~0.4% at n=512, so it is no longer a gate |
 | 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done |
 | 08 | Multi-worker + router + shared cache | Hit rate ≥ llama.cpp baseline | host side done |
 | 09 | MTP speculative decode | Accept rate vs n-gram baseline | not started |

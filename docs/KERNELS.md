@@ -7,7 +7,7 @@
 | Gated DeltaNet, recurrent (decode) | 30 | **critical** | Delta rule, one token at a time | **sm_75 kernel, max_abs 2.98e-8 vs reference** |
 | Gated DeltaNet, chunked (prefill) | 30 | **critical** | Forward substitution per chunk, not explicit inverses | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
 | GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
-| MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference** |
+| MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference; tiled, 9.3× at 512 tokens** |
 | Flash attention (GQA 16:2, head 256) | 10 | medium | Online softmax, `BM = 1`, scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window** |
 | LM head GEMV (2048 × 248,320) | 1 | medium | ~~split-K~~ — one warp per row; dominates weight bandwidth | **sm_75 kernel, argmax exact, 81–89% of roofline** |
 | `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | **sm_75 kernel, tables exact vs reference** |
@@ -40,9 +40,10 @@ into the delta rule; see [MODEL.md](MODEL.md).
 
 ### What the landed kernels do not yet do
 
-Every kernel above is gated on **correctness against the CPU reference**, and
-none of them has been tuned. Three limits are worth stating so the numbers
-above are not read as more than they are:
+Every kernel above is gated on **correctness against the CPU reference**. Only
+the MoE path has been tuned (see [As landed](#as-landed-2026-08-16-and-where-the-plan-above-was-wrong));
+the rest are correct and untouched. Three limits are worth stating so the
+numbers above are not read as more than they are:
 
 - **No tensor cores anywhere.** Attention is the scalar fp32 path. The
   `m16n8k8` MMA family that `compute_75` makes reachable runs at roughly 8×
@@ -52,8 +53,10 @@ above are not read as more than they are:
   is gated on. The re-tiling that unlocks MMA is the same change that raises
   arithmetic intensity, and at ~0.5 FLOP/byte attention is bandwidth-bound, so
   the intensity is the half that pays.
-- **The MoE dispatch kernel is single-block.** Correct and deterministic, fine
-  at decode shapes, not tuned for large prefill batches.
+- ~~**The MoE dispatch kernel is single-block.**~~ Fixed: dispatch is now
+  parallelized across `num_experts` blocks in two launches
+  (`moe_align_count`, then `moe_align_block_size`). It was worth **0.12% of
+  runtime** — the single-block scan was a real fact and never a real cost.
 - **Graph capture is argued, not demonstrated.** The MoE path has fixed grids,
   fixed buffers and a device-side token count precisely so it can be captured,
   but no capture has been performed yet. That is milestone 06's gate, and
@@ -193,6 +196,58 @@ decode batch of three.
 - **Weights stay in Q6_K.** vLLM's grouped-GEMM paths assume fp8 or bf16; here
   dequantization fuses into the kernel prologue instead. Take llama.cpp's
   K-quant superblock unpacking for that, not vLLM's quantization path.
+
+### As landed (2026-08-16), and where the plan above was wrong
+
+`crates/xabe-cuda/src/kernels/moe.rs`. Four entry points: route, dispatch,
+routed grouped GEMM, shared expert. Measured at 9.3× over the untiled
+version at 512 tokens; see
+[BENCHMARKS.md](BENCHMARKS.md#the-moe-path-in-isolation).
+
+**The tiling.** One block owns one dispatch block and a band of
+`MOE_ROWS = 8` output rows, one warp per row, with the block's slot
+activations staged in shared memory. An expert's weight stack is read once
+per (block, row band) rather than once per (token, row) — that reuse is the
+entire win. The Q6_K superblock header is hoisted out of the inner loop:
+each lane takes 4 consecutive elements, which is exactly one superblock
+half, so the scale and high-bit byte resolve once per lane. K-loop is
+hand-double-buffered; tile height is specialized for `{2, 8, 16}` live slots.
+
+**New geometry restriction:** `hidden` and `intermediate` must be multiples
+of 128. Validated at construction, reported as `MoeError::UnsupportedGeometry`.
+
+Corrections to the plan above:
+
+- **SplitK was not used and is not needed.** The predicted decode-shape
+  problem does not bind here: at n=1 the tiled kernel is 0.174 ms per layer
+  against 0.774 untiled, and the parallelism shortfall the 20%-from-SplitK
+  figure addresses is supplied by the 256-expert grid, not by splitting K.
+- **"Size the grid from a typical-case hint" was rejected.** The grid is a
+  fixed function of the geometry alone — that is what keeps the path
+  graph-capturable under design rule 5, and the over-provisioning it costs
+  was measured at 0.12% of runtime, far below the risk of a
+  content-dependent launch shape. Test
+  `every_grid_dimension_is_a_function_of_the_geometry_alone` asserts every
+  grid and block dimension against the geometry with the token count varied.
+- **"Hoist the shared expert out" was right, and insufficient.** It was
+  hoisted, and it was still re-reading its whole 2.7 MiB stack once per
+  token. Tiling it was worth **9.9×** on its own at 512 tokens — the second
+  largest single item in the change, and one this section did not predict.
+- **Dequantization cost was overweighted.** Ablating all weight loads *and*
+  all dequant entirely bought 6%. The K-quant unpacking is not the problem;
+  reuse was.
+
+What did not help, with numbers, so it is not re-attempted: `LDS.128`
+vectorization alone (2%), staging activations without tiling (2.5%), cutting
+shared loads 16→1 per iteration (slower), `MOE_ROWS = 16` (worse
+everywhere). A tile-rounding variant was 24% faster and **wrong** — it drops
+rows for tiles with 5–8 live slots, caught by `moe_differential` on token 36
+of 37.
+
+**Honest limit:** 13.3% of fp32 peak at 512 tokens. `ncu` cannot read
+counters on this host (`ERR_NVGPUCTRPERM`), so the remaining ~2× is
+unattributed. The SASS inner loop is 511 instructions for 128 FFMA — 25%
+density — putting ~50% of fp32 peak as the ceiling for this instruction mix.
 
 ## The LM head
 

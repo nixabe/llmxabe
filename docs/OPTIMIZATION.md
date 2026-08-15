@@ -26,7 +26,57 @@ difference is stated.
 
 ## 1. Where we are
 
-Measured today on this host (release, Quadro RTX 8000 sm_75,
+> **Superseded in part.** [R3](#r3--tile-the-routed-expert-grouped-gemm), the
+> grouped-GEMM tiling, has since landed and been measured. §1.0 is the
+> current state; the tables that follow it are the pre-tiling baseline the
+> rest of the document reasons from, kept because §2–§9's arithmetic is
+> calibrated against them. Where a later section quotes 69.84 t/s or a 29.6×
+> ratio, read it as "before R3".
+
+### 1.0 Current state (2026-08-16, after R3 landed)
+
+Release build, Quadro RTX 8000 sm_75, `Qwen3.6-35B-A3B-UD-Q6_K_XL`, 5 timed
+repetitions after 2 discarded warmups, stream synchronized inside the timed
+region:
+
+| | llmxabe | llama.cpp | ratio | was |
+| --- | ---: | ---: | ---: | ---: |
+| `pp512` (prefill) | **200.87 ± 0.75 t/s** | 2,070.50 t/s | **10.3× slower** | 29.6× |
+| decode floor, n=1 | **55.07 ± 0.04 t/s** | 104.74 t/s | **1.90× slower** | 3.9× |
+| fraction of fp32 peak at 512 | 13.3% | | | 4.6% |
+
+Intermediate batch sizes, for the shape of the curve:
+
+| tokens | ms/pass | tok/s | was |
+| ---: | ---: | ---: | ---: |
+| 1 | 18.16 ± 0.01 | 55.07 ± 0.04 | 26.80 |
+| 19 | 123.01 ± 0.10 | 154.46 ± 0.12 | 37.16 |
+| 128 | 665.18 ± 1.53 | 192.43 ± 0.44 | 60.53 |
+| 512 | 2548.90 ± 9.50 | 200.87 ± 0.75 | 69.84 |
+
+Peak VRAM 31.002 GiB of 47.27 GiB. The same argmax token 25358 (' Tokyo')
+comes out at logit 19.936268 against 19.936270 before — a 2e-6 move
+consistent with reassociation in the dot product and nothing else.
+
+**What this does and does not close.** The prefill gap is now 10.3×, not
+29.6×, and the n=1 floor is 1.90×, not 3.9×. Neither axis is won. The
+remaining prefill distance is the tensor-core gap analysed in §7 plus the
+~2× of unlocalized latency inside the tiled kernel itself (§1.0 note below);
+the remaining decode distance is the missing KV cache and recurrent-state
+carry (G007), which is a structural absence, not a tuning gap.
+
+The tiled grouped GEMM reaches **13.3% of fp32 peak** at 512 tokens against
+the 25% §2.7 targeted. That shortfall could not be attributed, because `ncu`
+cannot read counters on this host (`ERR_NVGPUCTRPERM`); the analysis behind
+it is `nsys`, an offline SASS dump, and ablation only. The SASS inner loop
+is 511 instructions for 128 FFMA — 25% instruction density — which puts
+roughly **50% of fp32 peak** as the structural ceiling for this instruction
+mix, so 13.3% is about half of what this kernel shape can reach, not half of
+what the card can.
+
+### 1.1 Baseline the rest of this document reasons from
+
+Measured on this host before R3 landed (release, Quadro RTX 8000 sm_75,
 `Qwen3.6-35B-A3B-UD-Q6_K_XL`):
 
 | | llmxabe | llama.cpp | ratio |
@@ -728,6 +778,26 @@ fatal.
 
 ### R3 — Tile the routed-expert grouped GEMM
 
+> **DONE (2026-08-16).** Landed and measured; see §1.0 for the end-to-end
+> figures. What follows is the pre-landing analysis, kept because the
+> outcome checks it. **Where the prediction held:** this was indeed the
+> largest single item, and tiling was indeed the mechanism — ablating all
+> weight loads and dequant entirely bought only 6%, which is what proved the
+> cost was reuse rather than bandwidth or dequant ALU. **Where it did not:**
+> the predicted "74.2% of the n=1 pass" recovery assumed 25% of fp32 peak;
+> the landed kernel reaches 13.3% at 512 tokens, so the n=1 pass went 32.61
+> → 18.16 ms (44.3% recovered, not 74.2%) and 55.07 tok/s, not the 207
+> tok/s projected here. The projection was optimistic by roughly the ratio
+> of the peak fractions, which is the honest reading: the model of *what*
+> was slow was right, the model of *how fast the fix would be* was not.
+>
+> Two things the analysis below did not anticipate. The **shared expert**
+> had the same defect and was 9.9× on its own — it is not mentioned anywhere
+> in this section. And **grid over-provisioning turned out to be a minor
+> term**: the dispatch parallelization it motivated was worth 0.12% of
+> runtime when finally measured. The redundant-read half of the diagnosis
+> carried essentially all of the win.
+
 **This should probably be done first**, before R1 and R2. It is ranked third
 only because R1 and R2 are prerequisites for *measuring* concurrency at all.
 By measured headroom it is the largest single item in the project, and unlike
@@ -779,6 +849,12 @@ survives.
 tensor-core attention, dispatch parallelism, dequant micro-optimization, graph
 capture, elementwise fusion — should not be touched before this lands.
 
+> **The corollary has expired, and its percentages with it.** Now that R3 has
+> landed, every one of those items is a larger share of a smaller pass and
+> must be re-profiled before being ranked. Dispatch parallelism was done
+> anyway (it was cheap) and measured at 0.12%; the rest are unmeasured
+> against the new profile.
+
 ---
 
 ### R4 — Chunked prefill mixed with decode, wired to the device
@@ -828,6 +904,14 @@ The 10–20% figure that circulates for vLLM (secondary sources, and I could
 not trace it to a primary benchmark) does not transfer to our shapes. **It
 becomes relevant only after R3 makes the kernels roughly 10× faster**, at
 which point it must be re-measured rather than assumed.
+
+> **That condition is now partly met.** R3 landed at 9.3× on the MoE path
+> and 2.05× on the n=1 pass overall (§1.0). Launch count per pass is
+> unchanged at 1,053, so the same ~1,053 launches now hide behind 18.16 ms
+> instead of 32.61 ms — launch overhead has roughly doubled as a *fraction*
+> of the pass without changing in absolute terms. It is still not measured
+> to be non-zero. **Re-measure before building capture**; do not carry the
+> "approximately zero" verdict forward on the strength of the old numbers.
 
 llama.cpp already captures graphs, so even at its best this closes a gap
 rather than opening one — a point [ARCHITECTURE.md](ARCHITECTURE.md) already

@@ -334,6 +334,13 @@ this section is the arithmetic of *why*, measured rather than guessed.
 
 ## Head to head
 
+> **Superseded by [the re-measurement below](#head-to-head-after-the-moe-tiling).**
+> Everything in this section, and every per-stage figure that follows it, was
+> measured *before* the grouped-GEMM tiling landed. It is kept because the
+> per-stage breakdown is what identified the defect, and because the
+> after-figures are only meaningful against it. **Do not quote 73.48 tok/s or
+> 27.9× as current.**
+
 Both sides measured on **GPU 2** of this host on 2026-08-16, one process on the
 card at a time.
 
@@ -383,6 +390,96 @@ decode moves the necessary weight bytes at **47.4% of peak** and llmxabe's
 n = 1 pass at **13.9%** — a figure derived below from the tensor sizes, and one
 that lands within a percentage point of the independent two-term fit earlier in
 this document (299 GB/s, 44.5%).
+
+## Head to head, after the MoE tiling
+
+The grouped GEMM and the shared expert were tiled on 2026-08-16
+(`perf(moe): tile the grouped GEMM and the shared expert`). Re-measured:
+
+| | llama.cpp | llmxabe | position | was |
+| --- | ---: | ---: | --- | ---: |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | n = 512, **200.87 ± 0.75 tok/s** | **10.3× slower** | 29.6× |
+| Cost of one token's worth of work, best case | 9.55 ms (warm decode step) | 18.16 ms (cold n = 1 pass) | **1.90× slower** | 3.9× |
+
+| tokens | ms/pass | tok/s | before | speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 18.16 ± 0.01 | 55.07 ± 0.04 | 26.80 | 2.05× |
+| 19 | 123.01 ± 0.10 | 154.46 ± 0.12 | 37.16 | 4.16× |
+| 128 | 665.18 ± 1.53 | 192.43 ± 0.44 | 60.53 | 3.18× |
+| 512 | 2,548.90 ± 9.50 | 200.87 ± 0.75 | 69.84 | 2.88× |
+
+Peak VRAM 31.002 GiB of 47.27 GiB.
+
+**Two caveats on comparing these tables.** This sweep ran on **GPU 0** with
+`LLMXABE_BENCH_REPS=5`; the superseded one ran on GPU 2 with 10 repetitions.
+The cards are identical models on the same host and the run-to-run spread is
+under 0.4% at every batch size, so the comparison is sound, but it is not a
+same-configuration A/B. The "before" column is the GPU-0, 5-repetition
+baseline measured immediately prior to the change on the same card, not the
+GPU-2 numbers in the superseded table — which is why it reads 69.84 rather
+than 73.48.
+
+**The n = 1 row is still a latency floor, not a decode rate.** Nothing about
+the MoE tiling added a KV cache or a carried recurrent state; every pass is
+still a cold full forward. The 1.90× figure remains the charitable reading of
+the gap, for exactly the reasons given above.
+
+### The MoE path in isolation
+
+From `bench_moe`, per layer, on a Quadro RTX 8000 (before → after, ms):
+
+| tokens | route | dispatch | grouped GEMM | shared | MoE total | speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.022 → 0.022 | 0.011 → 0.016 | 0.774 → **0.174** | 0.034 → 0.035 | 0.841 → 0.247 | **3.4×** |
+| 19 | 0.017 → 0.022 | 0.015 → 0.016 | 10.482 → **2.036** | 0.410 → **0.071** | 10.920 → 2.150 | **5.1×** |
+| 128 | 0.018 → 0.018 | 0.053 → 0.017 | 36.545 → **5.357** | 2.746 → **0.304** | 39.360 → 5.700 | **6.9×** |
+| 512 | 0.033 → 0.033 | 0.185 → 0.035 | 110.932 → **11.895** | 11.233 → **1.132** | 122.400 → 13.100 | **9.3×** |
+
+The shared expert is 9.9× on its own at 512 tokens. It had been re-reading
+its entire 2.7 MiB weight stack once per token, a defect the pre-tiling
+analysis in this document never named — finding 3 below, which diagnosed the
+routed GEMM correctly, does not mention the shared expert at all.
+
+Routing and dispatch are, as the earlier profile said, negligible: the
+dispatch parallelization is worth 0.12% of runtime. It was done because it
+was cheap, not because it mattered.
+
+### Correctness across the change
+
+Not "the tests still pass". The golden-data forward pass yields the same
+argmax token **25358 (' Tokyo')** at logit **19.936268** against
+**19.936270** before — a 2e-6 move, consistent with reassociation in the dot
+product and nothing else. Dispatch tables are bit-exact including their
+padding sentinels, and expert ids are exact on all 37 tokens × top-8. No
+tolerance was loosened. Full workspace: 35 test binaries, 445 passed, 0
+failed, 0 ignored.
+
+### Against the roofline, after
+
+13.3% of fp32 peak at 512 tokens, against the 25% the plan targeted. The
+shortfall could not be attributed: `ncu` cannot read counters on this host
+(`ERR_NVGPUCTRPERM`), so the analysis behind it is `nsys`, an offline SASS
+dump, and ablation only. The SASS inner loop is **511 instructions for 128
+FFMA — 25% instruction density** — which puts roughly **50% of fp32 peak** as
+the structural ceiling for this instruction mix. 13.3% is therefore about
+half of what this kernel shape can reach, not half of what the card can.
+
+### What did not work, with numbers
+
+Recorded so it is not re-attempted:
+
+| Attempt | Effect |
+| --- | --- |
+| `LDS.128` vectorization of weight loads, alone | 2% |
+| Staging activations without tiling | 2.5% |
+| Ablating **all** weight loads and dequant entirely | 6% |
+| Cutting shared-memory loads from 16 to 1 per iteration | **slower** |
+| `MOE_ROWS = 16` instead of 8 | worse at every batch size; reverted |
+| Tile rounding `bm > 2 -> CALL(4)` | 24% faster and **wrong** — drops rows for tiles with 5–8 live slots; `moe_differential` caught it on token 36 of 37; discarded |
+
+The 6% ablation row is the load-bearing one: it is what showed the cost was
+neither DRAM bandwidth nor dequant ALU, and redirected the work to weight
+reuse.
 
 ## How the breakdown was measured
 
