@@ -83,6 +83,15 @@ figure is per-SM; a block reaches it only by opting in through
 (attention at 1,088 B and the chunked GDN solve at 33 KiB) are sized against
 48 KiB and need no opt-in.
 
+> **Correction (2026-08-16).** "cudarc does not expose it" was true of
+> `LaunchConfig` and false of the crate. cudarc 0.19.9 ships a safe
+> `CudaFunction::set_attribute(attribute, value)`
+> (`driver/safe/core.rs:2446`) wrapping `cuFuncSetAttribute`, so the opt-in is
+> one call with no `unsafe` block and no new dependency. Verified against the
+> vendored source. Nothing in this repo calls it yet, and the sentence above
+> had been read as a blocker on any kernel wanting more than 48 KiB — which
+> it is not.
+
 ## Order of work
 
 **Gated DeltaNet is the critical path, not attention.** It covers 30 of 40

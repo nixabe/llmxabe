@@ -1298,6 +1298,83 @@ three `llama-server` processes cannot replicate
 
 ---
 
+## 6b. Tensor cores and TensorRT: what was actually checked (2026-08-16)
+
+Prompted by "try AMP for FP32, or maybe TensorRT if they're reachable". Both
+were investigated on this host. Claims below are marked by how they are known.
+
+### TensorRT — not installed, and not applicable if it were
+
+**VERIFIED.** No `libnvinfer*` anywhere on the filesystem, nothing in
+`ldconfig -p`, no `tensorrt` Python module, no Rust bindings vendored, and no
+`onnx` string anywhere in this repo.
+
+More important than the absence: **it is not a drop-in even installed.**
+TensorRT consumes ONNX or its network-definition API. This engine loads GGUF
+Q6_K/Q8_0 directly and implements Gated DeltaNet over 30 of 40 layers plus a
+256-expert MoE on every layer. Q6_K's two-level superblock scales are not a
+TensorRT weight format and GDN is not a builtin layer, so adopting it means
+writing an ONNX exporter *and* plugins that reimplement the kernels this
+project already has. It subtracts nothing. **Do not pursue it.**
+
+### "AMP" is the wrong frame; the right one is operand precision
+
+Autocast and loss scaling are training concepts and irrelevant here. The
+inference equivalent is narrower operands with fp32 accumulate.
+
+**VERIFIED by compiling to SASS on this host:**
+
+- `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` compiles for `sm_75` and
+  lowers to a genuine **`HMMA.1688.F32`** instruction. The tensor-core path is
+  real and reachable through inline PTX in the NVRTC source, which is the
+  mechanism cudarc leaves available and which `dequant.rs` already uses for
+  `cvt.f32.f16`.
+- **`m16n8k16` is a trap.** NVRTC *accepts* it at `compute_75` and emits PTX;
+  **ptxas then rejects it** — `Feature '.m16n8k16' requires .target sm_80 or
+  higher`. NVRTC success is therefore not proof of reachability; only
+  PTX→SASS is. Any MMA work must hand-decompose to `m16n8k8`.
+
+**MEASURED in-session, harness not committed — re-measure before relying on
+it.** A microbenchmark on GPU 0 reported: fp32 FMA 17.90 TFLOP/s; `m16n8k8`
+with fp32 accumulate **99.46 TFLOP/s**; with fp16 accumulate 104.76; int8
+`m8n8k16` s8→s32 **198.80 TOP/s**; `__dp4a` 50.92 TOP/s.
+
+Two consequences, if those hold up:
+
+1. **§7's open question "whether Quadro RTX 8000 runs fp32-accumulate MMA at
+   full rate" appears to be answered yes** — 99.46 vs 104.76 is a ~5% gap, not
+   the 2× halving GeForce 20-series suffers. fp32 accumulation would be
+   essentially free, which matters because it confines any accuracy loss to
+   operand rounding.
+2. **The fp16:fp32 ratio is ~5.6×, not the 8× claimed** in `attention.rs` and
+   `KERNELS.md`. Those figures are optimistic by ~1.4×.
+
+### int8, not fp16, is the target
+
+The weights are already Q6_K/Q8_0. int8 MMA measured 2× the fp16 rate and is
+the *native* format rather than a precision downgrade imposed on a quantized
+model — and it is what llama.cpp's MMQ already uses on this same card. So
+tensor cores in the **MoE GEMM are not parity, they are the thing llama.cpp
+has and this engine does not**, which is consistent with §8.1's conclusion
+that a perfect fp32 kernel still loses at prefill.
+
+Note the asymmetry with decode: §8.2 says decode compute is 7.8% of fp32
+peak, so **no MMA work addresses the 1.61× decode gap** — that one is
+bandwidth efficiency, and R10 (flash-decoding) is its item.
+
+### The cost this understates
+
+`AGENTS.md` requires a differential test per kernel. fp16 or int8 operands
+would force `moe_differential.rs`'s `ROUTED_GATE` from `max_abs 5e-7` to
+roughly `5e-2` — a **100,000× loosening** — and `attention_differential.rs`
+already warns that anything near `reduced_precision_gpu()` "would be a
+formulation error hiding behind a loose threshold". That gate is the best
+defense against exactly the bug class hand-written MMA fragment indexing
+produces. A replacement strategy — matching llama.cpp's quantized arithmetic
+bit-for-bit, per §8.1 — needs to exist **before** the first MMA line, not
+after. The exact-gated items that are pure data movement (partial-rotary
+tail, query/gate deinterleave, causal mask) survive untouched.
+
 ## 7. What is reachable on sm_75
 
 ### Not available — do not plan around any of these
