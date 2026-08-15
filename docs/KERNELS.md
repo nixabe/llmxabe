@@ -6,7 +6,7 @@
 | --- | --- | --- | --- | --- |
 | Gated DeltaNet, recurrent (decode) | 30 | **critical** | Delta rule, one token at a time | **sm_75 kernel, max_abs 2.98e-8 vs reference** |
 | Gated DeltaNet, chunked (prefill) | 30 | **critical** | Forward substitution per chunk, not explicit inverses | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
-| GDN short convolution (depthwise, width 4) | 30 | medium | Write; causal depthwise conv over the fused qkv stream, before the delta rule | in progress |
+| GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
 | MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference** |
 | Flash attention (GQA 16:2, head 256) | 10 | medium | Online softmax, `BM = 1`, scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window** |
 | LM head GEMV (2048 × 248,320) | 1 | medium | Write; split-K, dominates weight bandwidth | not started |
@@ -14,7 +14,7 @@
 | mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | **sm_75 kernel, tail bit-identical** |
 | Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | **sm_75 kernel, bit-identical to reference** |
 | Router top-k over 256 experts | 40 | low | Write; warp-level bitonic | **sm_75 kernel, expert IDs exact vs reference** |
-| RMSNorm, SwiGLU, residual | all | low | Write | CPU reference |
+| RMSNorm, SwiGLU, residual | all | low | Write; RMSNorm runs at three widths (2048, 256, 128) | **sm_75 kernels, max_abs 3.10e-6 vs reference** |
 | Vision encoder | — | deferred | Out of scope — images stay on llama.cpp | n/a |
 
 "CPU reference" means a scalar fp32 implementation exists in `xabe-kernels`
@@ -26,6 +26,17 @@ The short convolution was missing from this table entirely until the weight
 schema made it visible — `qwen35moe.ssm.conv_kernel = 4`, one
 `ssm_conv1d.weight` per GDN layer. It is not optional and it is not folded
 into the delta rule; see [MODEL.md](MODEL.md).
+
+> **A SiLU follows the convolution, and it is a separate op.**
+> `src/models/qwen35moe.cpp:422` applies `ggml_silu` to the convolution output
+> *before* q, k and v are sliced apart and L2-normalized. Both this table and
+> [MODEL.md](MODEL.md) previously described only the convolution, so anyone
+> wiring a GDN layer from the docs alone would have dropped the activation and
+> produced a plausible, wrong model.
+>
+> `xabe_kernels::conv::causal_depthwise_conv1d` is deliberately the pure
+> convolution, matching `ggml_ssm_conv`'s boundary exactly; the caller applies
+> the SiLU. Whoever assembles the GDN block owns that step.
 
 ### What the landed kernels do not yet do
 
