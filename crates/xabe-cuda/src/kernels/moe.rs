@@ -15,12 +15,15 @@
 //!    renormalization. **On the device.** A host round-trip here would cost
 //!    a synchronization per layer per token; at 40 layers that dominates
 //!    decode latency regardless of how fast the GEMM is.
-//! 2. `moe_align_block_size` — the sorted-token indirection, ported from
-//!    `xabe_kernels::moe::dispatch`. Built into **fixed-size** buffers
-//!    allocated once, because `AGENTS.md` rule 5 forbids anything sized by a
-//!    host-side value on this path: a host-sized allocation cannot be inside
-//!    a captured CUDA graph, and graph capture over this indirection is the
-//!    project's single largest expected win.
+//! 2. `moe_align_count` + `moe_align_block_size` — the sorted-token
+//!    indirection, ported from `xabe_kernels::moe::dispatch`. Built into
+//!    **fixed-size** buffers allocated once, because `AGENTS.md` rule 5
+//!    forbids anything sized by a host-side value on this path: a host-sized
+//!    allocation cannot be inside a captured CUDA graph, and graph capture
+//!    over this indirection is the project's single largest expected win.
+//!    Two launches, one block per expert each, because a 256-bin histogram
+//!    with no atomics is a scan per bin and running all 256 of them in one
+//!    block used one SM of 72.
 //! 3. `moe_expert_ffn` / `moe_expert_down` — the grouped GEMM proper, with
 //!    **Q6_K / Q8_0 dequantization in the prologue**. Materializing all 256
 //!    experts in fp32 would turn one layer's 630 MiB of quantized expert
@@ -28,6 +31,40 @@
 //!    dequantized instead, and nothing is written back in fp32.
 //! 4. `moe_reduce` — the fp32 weighted sum of each token's 8 routed
 //!    contributions.
+//!
+//! ## How the grouped GEMM is tiled, and why each choice
+//!
+//! One block owns one **dispatch block** — a `block_size` run of slots that
+//! by construction belongs to one expert — and a band of `TILE_ROWS` output
+//! rows, one warp each. The slots' activations are staged in shared memory,
+//! and every dequantized weight element is multiplied into all of the tile's
+//! accumulators before being dropped. That is the whole point: an expert's
+//! stack is read once per *tile of tokens*, not once per token.
+//!
+//! The first version gave each `(output row, slot)` pair its own block and so
+//! re-read the whole stack for every token routed to an expert. Measured on
+//! this card at Qwen3.6's geometry, `grouped_forward` ms per layer:
+//!
+//! ```text
+//!                             1 tok   19 tok   128 tok   512 tok
+//!   one block per (row,slot)   0.774   10.48     36.55    110.93
+//!   tiled (this module)        0.174    2.00      5.37     11.92
+//! ```
+//!
+//! Four things had to be true for the tiled form to be worth it, and only
+//! three of them turned out to matter — see the comments at each site:
+//!
+//! - a warp owns a whole output row, so the dot product reduces in shuffles
+//!   and never crosses a warp boundary (no block-wide reduction, no barrier
+//!   in the epilogue);
+//! - each lane takes four *consecutive* contraction elements, which makes the
+//!   Q6_K superblock header a once-per-tile read and the staged activations a
+//!   single `LDS.128`;
+//! - the staging is double-buffered by hand through registers, because
+//!   Turing has no `cp.async` and the barrier otherwise exposed a full global
+//!   round trip on every pass;
+//! - the tile height is specialized to the number of *live* rows, because a
+//!   decode step puts one token in a 16-slot block.
 //!
 //! The **shared expert is hoisted out** into `moe_shared_ffn` /
 //! `moe_shared_down`: it is active for every token unconditionally, so it
@@ -83,11 +120,41 @@ const QK_K: usize = 256;
 const BLOCK_Q8_0_BYTES: usize = 34;
 const BLOCK_Q6_K_BYTES: usize = 210;
 
-/// Threads per block for every kernel in this module.
+/// Threads per block for the routing, dispatch and reduction kernels.
 ///
-/// A power of two, because the routing reductions are plain shared-memory
-/// tree reductions that halve the active range each round.
+/// A power of two, because their reductions are plain shared-memory tree
+/// reductions that halve the active range each round.
 const THREADS: u32 = 256;
+
+/// Token slots one weight read is amortized over in the grouped GEMM.
+///
+/// This is the whole reason the tiled form is faster: a weight element is
+/// dequantized once and multiplied into `TILE_M` tokens' accumulators, so an
+/// expert's stack is read once per *tile of tokens* instead of once per
+/// token. At Qwen3.6's `block_size` of 16 one tile is exactly one dispatch
+/// block, which is why 16 and not 8 or 32 — a tile must never straddle two
+/// experts, and a tile smaller than `block_size` gives up reuse for nothing.
+const TILE_M: usize = 16;
+
+/// Contraction elements staged into shared memory per pass.
+///
+/// 128 is forced by the Q6_K prologue, not chosen for occupancy: 128
+/// consecutive elements are exactly one *half* of a 256-element superblock,
+/// so the fp16 delta, the half's scale pointer and the `ql`/`qh` byte for a
+/// lane are read **once** for the four elements that lane unpacks. A tile
+/// that straddled a superblock boundary would have to re-read the header.
+const TILE_K: usize = 128;
+
+/// Output rows a grouped-GEMM block computes, one warp each.
+///
+/// Each warp owns a whole output row and reduces its dot product with warp
+/// shuffles, so nothing crosses a warp boundary and the only `__syncthreads`
+/// is the activation staging. Eight warps is the largest that keeps the
+/// `TILE_M` gate and up accumulators in registers at 256 threads.
+const TILE_ROWS: u32 = 8;
+
+/// Threads per grouped-GEMM block.
+const GEMM_THREADS: u32 = TILE_ROWS * 32;
 
 /// Storage format of one expert weight stack.
 ///
@@ -151,7 +218,23 @@ impl QuantTensor<'_> {
 }
 
 const MOE_SRC: &str = r#"
-extern "C" {
+// Tile shape. Mirrored by `TILE_M` / `TILE_K` / `TILE_ROWS` on the Rust side,
+// which size the shared memory and the grid; `tile_shape_is_mirrored_in_rust`
+// asserts the two never drift.
+#define MOE_TM   16
+#define MOE_TK   128
+#define MOE_TN   4
+#define MOE_ROWS 8
+
+// Derived: activation floats each thread stages per pass, and the tile-row
+// stride between the rows one thread owns. Both are compile-time so the
+// staging loops unroll and hold their prefetch in registers.
+#define MOE_MSTEP ((MOE_ROWS * 32) / MOE_TK)
+#define MOE_STAGE (MOE_TM / MOE_MSTEP)
+
+// The device helpers below are C++ templates, so they cannot live inside the
+// `extern "C"` block the kernels need — a template cannot have C linkage.
+// The `__global__` entry points start further down.
 
 // Reinterpret two little-endian bytes as an IEEE half and widen to float.
 //
@@ -166,89 +249,330 @@ __device__ __forceinline__ float load_half_le(const unsigned char* p) {
     return f;
 }
 
-// One Q6_K element, addressed by its flat index in the dequantized tensor.
-//
-// The standalone kernel in `kernels/dequant.rs` assigns one thread to four
-// outputs at flat offsets l, l+32, l+64, l+96 within a 128-element half.
-// Inverting that mapping: flat index r within a superblock decomposes as
-// half = r/128, group = (r%128)/32, l = r%32 — which is what lets a GEMM
-// walk a weight row in natural order and still land on the right nibble.
-//
-// The multiply order `(d * scale) * q` is load-bearing and matches the
-// scalar reference; reassociating to `d * (scale * q)` is mathematically
-// equal, rounds differently, and would cost bit-identical weights.
-__device__ __forceinline__ float q6k_element(const unsigned char* src, long long i) {
-    long long sb = i >> 8;
-    int r    = (int)(i & 255);
-    int half = r >> 7;
-    int hr   = r & 127;
-    int grp  = hr >> 5;
-    int l    = hr & 31;
+// The Q6_K reconstruction, written once so there is one place to get it
+// wrong. The multiply order `(d * scale) * q` is load-bearing and matches
+// the scalar reference operand for operand; reassociating to
+// `d * (scale * q)` is mathematically equal, rounds differently, and would
+// cost bit-identical weights.
+__device__ __forceinline__ float q6k_value(float d, const signed char* sc, int si, int raw) {
+    return d * (float)sc[si] * (float)(raw - 32);
+}
 
-    const unsigned char* base = src + sb * 210;
+// The Q8_0 reconstruction, same reasoning.
+__device__ __forceinline__ float q8_0_value(signed char q, float d) {
+    return (float)q * d;
+}
+
+// Unpack the MOE_TK consecutive Q6_K elements starting at `i0`. Warp lane L
+// owns the **four consecutive** elements 4L .. 4L+3.
+//
+// Two things ride on "consecutive" rather than the stride-32 assignment the
+// standalone dequant kernel uses:
+//
+// 1. **The superblock header is hoisted.** Addressing an element by its flat
+//    index alone — the shape the first version of this kernel used — re-reads
+//    the fp16 delta and re-derives the scale pointer for *every* element,
+//    2,048 redundant header loads per weight row per token. `i0` is a
+//    multiple of 128, so the tile lies inside one 128-element half of one
+//    superblock: `half`, `sc` and `d` are read once, and because four
+//    consecutive `l` values never cross a 16-element scale boundary, the
+//    group index `si` is constant across all four too.
+// 2. **The four activations the lane needs are then contiguous in shared
+//    memory**, which is what lets the inner product load them as one
+//    `LDS.128` instead of four `LDS.32`. Shared-load issue, not arithmetic,
+//    was the measured limiter of the stride-32 form.
+//
+// The mapping is `kernels/dequant.rs`'s, read backwards: a flat index r
+// within a superblock decomposes as half = r/128, group = (r%128)/32 and
+// l = r%32. Over this tile half is fixed, group is `lane / 8`, and l runs
+// 4*(lane%8) .. +3.
+__device__ __forceinline__ void dequant_tile_q6k(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    const unsigned char* base = src + (i0 >> 8) * 210;
+    int half = (int)((i0 >> 7) & 1);
     const unsigned char* ql = base + half * 64;
     const unsigned char* qh = base + 128 + half * 32;
     const signed char*   sc = (const signed char*)(base + 192 + half * 8);
     float d = load_half_le(base + 208);
 
-    int is = l >> 4;
-    unsigned char h = qh[l];
-    int raw, si;
-    if (grp == 0)      { raw = (ql[l]      & 0xF) | ((h & 3) << 4);        si = is;     }
-    else if (grp == 1) { raw = (ql[l + 32] & 0xF) | (((h >> 2) & 3) << 4); si = is + 2; }
-    else if (grp == 2) { raw = (ql[l]      >> 4)  | (((h >> 4) & 3) << 4); si = is + 4; }
-    else               { raw = (ql[l + 32] >> 4)  | (((h >> 6) & 3) << 4); si = is + 6; }
+    int grp = wlane >> 3;
+    int l   = (wlane * 4) & 31;
+    int si  = (l >> 4) + 2 * grp;
+    // Groups 1 and 3 live in the second 32 bytes of the half's `ql`; groups
+    // 2 and 3 take the high nibble rather than the low one.
+    const unsigned char* qlp = ql + ((grp & 1) ? l + 32 : l);
+    int shift = 2 * grp;
 
-    return d * (float)sc[si] * (float)(raw - 32);
+    #pragma unroll
+    for (int t = 0; t < MOE_TN; ++t) {
+        int low = (grp < 2) ? (int)(qlp[t] & 0xF) : (int)(qlp[t] >> 4);
+        int raw = low | (int)(((qh[l + t] >> shift) & 3) << 4);
+        out[t] = q6k_value(d, sc, si, raw);
+    }
 }
 
-// One Q8_0 element. Reading the code as `signed char` is load-bearing: the
-// quants are int8 on disk, and reading them unsigned flips the sign of
-// roughly half of every tensor while leaving magnitudes plausible.
-__device__ __forceinline__ float q8_0_element(const unsigned char* src, long long i) {
-    long long block = i >> 5;
-    int lane = (int)(i & 31);
-    const unsigned char* base = src + block * 34;
-    float d = load_half_le(base);
-    signed char q = (signed char)base[2 + lane];
-    return (float)q * d;
-}
-
-// The GEMM prologue: unpack exactly the weight element about to be
-// multiplied. Nothing is materialized in fp32.
-__device__ __forceinline__ float dequant_element(
-    const unsigned char* src, int quant, long long i
+// The same tile in Q8_0. A Q8_0 block *is* 32 elements, so a lane's four
+// consecutive elements always share one block and its fp16 delta is read
+// once for all four.
+//
+// Reading the code as `signed char` is load-bearing: the quants are int8 on
+// disk, and reading them unsigned flips the sign of roughly half of every
+// tensor while leaving magnitudes plausible.
+__device__ __forceinline__ void dequant_tile_q8_0(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
 ) {
-    return quant == 0 ? q6k_element(src, i) : q8_0_element(src, i);
+    const unsigned char* base = src + ((i0 >> 5) + (wlane >> 3)) * 34;
+    float d = load_half_le(base);
+    int first = (wlane * 4) & 31;
+
+    #pragma unroll
+    for (int t = 0; t < MOE_TN; ++t) {
+        int lane = first + t;
+        signed char q = (signed char)base[2 + lane];
+        out[t] = q8_0_value(q, d);
+    }
+}
+
+// The GEMM prologue: unpack exactly the weight tile about to be multiplied.
+// Nothing is materialized in fp32 beyond the four values in registers.
+__device__ __forceinline__ void dequant_tile(
+    const unsigned char* __restrict__ src, int quant, long long i0, int wlane, float* out
+) {
+    if (quant == 0) dequant_tile_q6k(src, i0, wlane, out);
+    else            dequant_tile_q8_0(src, i0, wlane, out);
+}
+
+// Stage MOE_TM rows x MOE_TK columns of activations into shared memory, in
+// two halves so the global read of one pass overlaps the arithmetic of the
+// previous one.
+//
+// **Turing has no `cp.async`, so the double buffer is by hand** — the buffer
+// is the `pf` register array, not a second shared tile. `prefetch_tile`
+// issues the loads for pass j+1 immediately after pass j's tile becomes
+// visible; `commit_tile` writes them to shared at the top of pass j+1. With
+// the two fused into one `stage` call the block stalled on a full global
+// round trip at every one of the 16 barriers per row, which measured as the
+// single largest remaining cost.
+//
+// `rows[m]` is the flat element offset of tile row m's source row, or
+// negative for a row that contributes nothing — a padding slot, or a token
+// past `valid_tokens`. Those rows are **zeroed rather than skipped**, which
+// makes their contribution exactly zero and lets the inner product run an
+// unconditional, fully unrolled MOE_TM-wide accumulate.
+//
+// The thread -> (row, column) map is deliberately rigid: a thread's column is
+// `threadIdx.x % MOE_TK` for the whole kernel and only its row advances, so
+// both halves are a compile-time-bounded unrolled loop over MOE_STAGE
+// elements. An earlier version indexed the tile linearly and recovered the
+// row and column with a division, which cost a *software integer division*
+// (`flat / top_k` divides by a runtime value — twenty-odd instructions on
+// sm_75) on every staged float. The row offsets are divided once per tile row
+// instead, by the MOE_TM threads that fill `rows`.
+//
+// `TM` is the *live* tile height, which is not always MOE_TM — see
+// `moe_rounded_rows`.
+template<int TM>
+__device__ __forceinline__ void prefetch_tile(
+    const float* __restrict__ src, const long long* rows, int j0, float* pf
+) {
+    int k = threadIdx.x & (MOE_TK - 1);
+    int m0 = threadIdx.x / MOE_TK;
+    #pragma unroll
+    for (int i = 0; i < TM / MOE_MSTEP; ++i) {
+        long long row = rows[m0 + i * MOE_MSTEP];
+        pf[i] = row < 0 ? 0.0f : src[row + j0 + k];
+    }
+}
+
+template<int TM>
+__device__ __forceinline__ void commit_tile(const float* pf, float* xs) {
+    int k = threadIdx.x & (MOE_TK - 1);
+    int m0 = threadIdx.x / MOE_TK;
+    #pragma unroll
+    for (int i = 0; i < TM / MOE_MSTEP; ++i) {
+        xs[(m0 + i * MOE_MSTEP) * MOE_TK + k] = pf[i];
+    }
+}
+
+// How many of a tile's MOE_TM rows carry a real token, and the compile-time
+// tile height that covers them.
+//
+// A dispatch block holds `block_size` slots but only its leading `count %
+// block_size` are real at the end of an expert's run, and at decode a whole
+// block holds **one** token: the tile is 16 rows wide and 15 of them are the
+// padding sentinel. Multiplying those rows anyway costs a 16x arithmetic
+// overhead on exactly the shape where the MoE is 77% of the step. `rows[m]`
+// is negative for a row that contributes nothing, so the live height is one
+// past the last non-negative entry — computed rather than assumed to be a
+// prefix, so a dispatch defect cannot silently drop tokens.
+//
+// The result is uniform across the block (every warp sees the same slots), so
+// selecting a specialization on it never diverges.
+__device__ __forceinline__ int live_tile_rows(const long long* rows) {
+    int bm = 0;
+    #pragma unroll
+    for (int m = 0; m < MOE_TM; ++m) {
+        if (rows[m] >= 0) bm = m + 1;
+    }
+    return bm;
+}
+
+// The four staged activations lane `wlane` needs from tile row `m`, as one
+// 128-bit shared load. `xabe_shared` is 16-byte aligned and the row stride is
+// MOE_TK floats, so both the base and the `4 * wlane` offset are multiples of
+// 16 bytes; consecutive lanes then cover all 32 banks exactly once.
+__device__ __forceinline__ float4 tile_row4(const float* xs, int m, int wlane) {
+    return *(const float4*)(xs + m * MOE_TK + 4 * wlane);
 }
 
 // Shared-memory pool. One declaration, one type, for every kernel below:
 // two `extern __shared__` arrays of different element types in the same
-// translation unit is a redeclaration error, so integer users cast.
-extern __shared__ float xabe_shared[];
+// translation unit is a redeclaration error, so integer users cast. The
+// explicit alignment is what makes `tile_row4`'s 128-bit load legal.
+extern __shared__ __align__(16) float xabe_shared[];
 
-// Sum across a block of up to 1024 threads. Warp shuffles first, then one
-// round through shared memory. The tree order differs from the reference's
-// sequential sum, which is the dominant source of disagreement between this
-// kernel and the CPU; see the module docs.
-__device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffff, v, offset);
+// Sum TM independent accumulators across a warp, leaving the totals in every
+// lane. Replaces the old block-wide reduction: a warp now owns a whole output
+// row, so nothing has to cross a warp boundary and the epilogue needs no
+// `__syncthreads` at all.
+template<int TM>
+__device__ __forceinline__ void warp_reduce_tile(float* acc) {
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[m] += __shfl_xor_sync(0xffffffff, acc[m], off);
+        }
     }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    if (lane == 0) scratch[warp] = v;
-    __syncthreads();
-
-    int n_warps = (blockDim.x + 31) >> 5;
-    float total = 0.0f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < n_warps; ++w) total += scratch[w];
-        scratch[0] = total;
-    }
-    __syncthreads();
-    return scratch[0];
 }
+
+// The gate/up half of one expert's FFN for a TM-row tile: contract two weight
+// rows against the staged activations and leave the two dot products in every
+// lane of the owning warp.
+//
+// The staging is double-buffered by hand — `prefetch_tile` issues pass j+1's
+// global loads *before* pass j's arithmetic, so the round trip overlaps the
+// multiply-adds instead of stalling the block at the barrier.
+template<int TM>
+__device__ __forceinline__ void tile_gemm_pair(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ src, const long long* rows, float* xs,
+    long long wrow, int k_len, int lane, int live, float* ag, float* au
+) {
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) { ag[m] = 0.0f; au[m] = 0.0f; }
+
+    float pf[TM / MOE_MSTEP];
+    prefetch_tile<TM>(src, rows, 0, pf);
+
+    for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
+        __syncthreads();
+        commit_tile<TM>(pf, xs);
+        __syncthreads();
+        if (j0 + MOE_TK < k_len) prefetch_tile<TM>(src, rows, j0 + MOE_TK, pf);
+        if (live) {
+            float wg[MOE_TN];
+            float wu[MOE_TN];
+            dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
+            dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+            #pragma unroll
+            for (int m = 0; m < TM; ++m) {
+                float4 xv = tile_row4(xs, m, lane);
+                ag[m] += wg[0] * xv.x;  au[m] += wu[0] * xv.x;
+                ag[m] += wg[1] * xv.y;  au[m] += wu[1] * xv.y;
+                ag[m] += wg[2] * xv.z;  au[m] += wu[2] * xv.z;
+                ag[m] += wg[3] * xv.w;  au[m] += wu[3] * xv.w;
+            }
+        }
+    }
+    warp_reduce_tile<TM>(ag);
+    warp_reduce_tile<TM>(au);
+}
+
+// As above for a single weight matrix: the down projection.
+template<int TM>
+__device__ __forceinline__ void tile_gemm_single(
+    const unsigned char* __restrict__ w_q, int w_quant,
+    const float* __restrict__ src, const long long* rows, float* xs,
+    long long wrow, int k_len, int lane, int live, float* ad
+) {
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) ad[m] = 0.0f;
+
+    float pf[TM / MOE_MSTEP];
+    prefetch_tile<TM>(src, rows, 0, pf);
+
+    for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
+        __syncthreads();
+        commit_tile<TM>(pf, xs);
+        __syncthreads();
+        if (j0 + MOE_TK < k_len) prefetch_tile<TM>(src, rows, j0 + MOE_TK, pf);
+        if (live) {
+            float wd[MOE_TN];
+            dequant_tile(w_q, w_quant, wrow + j0, lane, wd);
+            #pragma unroll
+            for (int m = 0; m < TM; ++m) {
+                float4 xv = tile_row4(xs, m, lane);
+                ad[m] += wd[0] * xv.x;
+                ad[m] += wd[1] * xv.y;
+                ad[m] += wd[2] * xv.z;
+                ad[m] += wd[3] * xv.w;
+            }
+        }
+    }
+    warp_reduce_tile<TM>(ad);
+}
+
+// Dispatch the two workhorses on the live tile height, rounded **up** to the
+// nearest specialization.
+//
+// Rounding up is not a preference. Picking a `TM` below `bm` silently drops
+// the rows past it, and the failure is invisible at small batches: an earlier
+// try at `bm > 2 -> CALL(4)` was the fastest variant measured and was wrong
+// for every tile with five to eight live rows. `tests/moe_differential.rs`
+// caught it on token 36 of 37. Every threshold below is `bm > TM_lower`.
+//
+// **Three instantiations, and the count is measured rather than assumed.**
+// Each one is a full copy of the inner loop and ptxas budgets registers for
+// the widest, so a fourth costs occupancy on every path including the narrow
+// ones. Measured at Qwen3.6's geometry, `grouped_forward` ms per layer:
+//
+// ```text
+//   specializations   1 tok   19 tok   128 tok   512 tok
+//   {16} only         0.405    4.53      8.68     13.29
+//   {2,16}            0.172    2.03      7.59     12.70
+//   {2,4,16}          0.172    1.87      6.05     12.04
+//   {2,8,16}          0.174    2.00      5.37     11.92   <- this
+//   {2,4,8,16}        0.415    4.72      8.68     13.29   <- register cliff
+// ```
+//
+// The last row is not a typo: the fourth copy pushed `moe_expert_ffn` past
+// the register count that fits three blocks on an sm_75 SM, and the occupancy
+// loss ate the entire arithmetic saving — it is no better than no
+// specialization at all.
+#define MOE_TILE_DISPATCH(CALL)        \
+    if      (bm > 8) { CALL(16); }     \
+    else if (bm > 2) { CALL(8);  }     \
+    else             { CALL(2);  }
+
+// Write one slot's weighted contribution, or nothing at all if the slot is
+// padding.
+//
+// The sentinel is exactly `valid_tokens * top_k`
+// (`xabe_kernels::moe::dispatch::padding_sentinel`), so `flat >= numel` is
+// the padding test and `flat` is a valid index into `topk_weights` whenever
+// it passes.
+__device__ __forceinline__ void store_slot_contribution(
+    float* __restrict__ partial, const float* __restrict__ topk_weights,
+    int flat, int numel, int hidden, int h, float s
+) {
+    if (flat >= numel) return;
+    partial[(long long)flat * hidden + h] = topk_weights[flat] * s;
+}
+
+extern "C" {
 
 // -------------------------------------------------------------------------
 // 1. Routing: softmax over all experts, top-k, renormalize.
@@ -387,20 +711,18 @@ __global__ void moe_route(
 // 2. Sorted-token indirection, into fixed-size buffers.
 // -------------------------------------------------------------------------
 //
-// One block, THREADS threads, one owning thread per expert (strided if there
-// are more experts than threads). Single-block on purpose: the exclusive
-// prefix sum over per-expert padded counts is a global dependency, and at
-// 256 experts a device-wide multi-pass scan costs more in launches than the
-// scan costs in arithmetic.
+// Two launches, both at grids fixed by `MoeGeometry`: **one block per
+// expert**, THREADS threads. The first version ran the whole thing in a
+// single block — one SM of 72 — and its own docs admitted it was "not tuned
+// for large prefill batches". Both phases are `O(num_experts * numel)` in
+// total work (a 256-bin histogram with no atomics is a scan per bin), so on
+// one block that is 8,192 serial iterations at a 512-token step; spread one
+// expert per block it is 32.
 //
-// **The ordering guarantee is why the cursor is not an atomic counter.**
-// The reference places an expert's tokens in ascending flat `(token, k)`
-// index. A cursor bumped atomically gives whatever order the warps happened
-// to arrive in, which is not reproducible run to run and would make an exact
-// comparison against the reference impossible. Instead each expert's owning
-// thread scans the flat array once in ascending order and appends. That
-// costs `num_experts / blockDim * numel` iterations per thread — 296 at the
-// decode shapes this is written for.
+// Phase 1 counts and fills; phase 2 scans and scatters. The split is a
+// launch rather than a grid-wide barrier because the exclusive prefix sum
+// over per-expert padded counts is a genuine global dependency and Turing
+// has no device-wide sync inside a kernel.
 //
 // `numel = valid_tokens * top_k` is simultaneously the number of valid flat
 // indices and the padding sentinel (`padding_sentinel` in the reference is
@@ -409,10 +731,60 @@ __global__ void moe_route(
 // The sentinel and INACTIVE_EXPERT fills cover the **whole capacity**, not
 // just `num_tokens_post_pad`. Filling only the live prefix would leave a
 // previous, longer step's entries visible past it — tokens that no longer
-// exist, pointing into a token array that has since shrunk.
+// exist, pointing into a token array that has since shrunk. They ride on
+// phase 1 because they depend on nothing phase 1 computes, and spreading
+// them over `num_experts` blocks costs nothing.
+//
+// grid: (num_experts, 1, 1). Block `e` owns expert `e`.
+__global__ void moe_align_count(
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int sorted_capacity,
+    int expert_capacity,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ expert_ids,
+    int* __restrict__ counts
+) {
+    int* scratch = (int*)xabe_shared;
+    int numel = (*valid_tokens) * top_k;
+    int e = blockIdx.x;
+    int tid = threadIdx.x;
+
+    int gtid = blockIdx.x * blockDim.x + tid;
+    int gstride = gridDim.x * blockDim.x;
+    for (int s = gtid; s < sorted_capacity; s += gstride) sorted_token_ids[s] = numel;
+    for (int b = gtid; b < expert_capacity; b += gstride) expert_ids[b] = -1;
+
+    int c = 0;
+    for (int i = tid; i < numel; i += blockDim.x) {
+        if (topk_ids[i] == e) ++c;
+    }
+    scratch[tid] = c;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) scratch[tid] += scratch[tid + s];
+        __syncthreads();
+    }
+    // Integer addition is associative, so the tree order here cannot change
+    // the count the way it would change a float sum.
+    if (tid == 0) counts[e] = scratch[0];
+}
+
+// grid: (num_experts, 1, 1). Block `e` places expert `e`'s tokens.
+//
+// **The ordering guarantee is why the cursor is not an atomic counter.**
+// The reference places an expert's tokens in ascending flat `(token, k)`
+// index. A cursor bumped atomically gives whatever order the warps happened
+// to arrive in, which is not reproducible run to run and would make an exact
+// comparison against the reference impossible. Instead the block walks the
+// flat array in ascending tiles and a per-tile exclusive scan hands each hit
+// its rank — the same placement the reference's sequential append produces,
+// arrived at in parallel.
 __global__ void moe_align_block_size(
     const int* __restrict__ topk_ids,
     const int* __restrict__ valid_tokens,
+    const int* __restrict__ counts,
     int top_k,
     int num_experts,
     int block_size,
@@ -422,61 +794,96 @@ __global__ void moe_align_block_size(
     int* __restrict__ expert_ids,
     int* __restrict__ num_tokens_post_pad
 ) {
-    int* cumsum = (int*)xabe_shared;
+    int* cumsum = (int*)xabe_shared;              // num_experts + 1
+    int* scan   = cumsum + num_experts + 1;       // blockDim.x
+
     int numel = (*valid_tokens) * top_k;
+    int e = blockIdx.x;
     int tid = threadIdx.x;
 
     // 1. per-expert counts, padded up to a whole number of blocks. An expert
     //    with no tokens gets *zero* blocks, not a padded-empty one — the
     //    reference's `CEILDIV(0, block_size) == 0`.
-    for (int e = tid; e < num_experts; e += blockDim.x) {
-        int c = 0;
-        for (int i = 0; i < numel; ++i) {
-            if (topk_ids[i] == e) ++c;
-        }
-        cumsum[e + 1] = ((c + block_size - 1) / block_size) * block_size;
+    for (int i = tid; i < num_experts; i += blockDim.x) {
+        int c = counts[i];
+        cumsum[i + 1] = ((c + block_size - 1) / block_size) * block_size;
     }
     __syncthreads();
 
-    // 2. exclusive prefix sum. Sequential in one thread: 256 iterations,
-    //    and it is the only ordering the whole kernel depends on.
+    // 2. exclusive prefix sum, recomputed identically in every block rather
+    //    than read from a third launch: 256 integer adds against a kernel
+    //    launch is not a close call, and integer addition is associative so
+    //    every block lands on the same cumsum.
     if (tid == 0) {
         cumsum[0] = 0;
-        for (int e = 0; e < num_experts; ++e) cumsum[e + 1] += cumsum[e];
-        *num_tokens_post_pad = cumsum[num_experts];
+        for (int i = 0; i < num_experts; ++i) cumsum[i + 1] += cumsum[i];
+        if (e == 0) *num_tokens_post_pad = cumsum[num_experts];
     }
     __syncthreads();
 
-    // 3. sentinel / inactive fill over the fixed capacity.
-    for (int s = tid; s < sorted_capacity; s += blockDim.x) sorted_token_ids[s] = numel;
-    for (int b = tid; b < expert_capacity; b += blockDim.x) expert_ids[b] = -1;
-    __syncthreads();
-
-    // 4. scatter in ascending flat index, then claim this expert's blocks.
-    for (int e = tid; e < num_experts; e += blockDim.x) {
-        int slot = cumsum[e];
-        for (int i = 0; i < numel; ++i) {
-            if (topk_ids[i] == e) {
-                if (slot < sorted_capacity) sorted_token_ids[slot] = i;
-                ++slot;
-            }
+    // 3. scatter in ascending flat index.
+    int base = cumsum[e];
+    int written = 0;
+    for (int o = 0; o < numel; o += blockDim.x) {
+        int i = o + tid;
+        int hit = (i < numel && topk_ids[i] == e) ? 1 : 0;
+        scan[tid] = hit;
+        __syncthreads();
+        for (int d = 1; d < blockDim.x; d <<= 1) {
+            int v = tid >= d ? scan[tid - d] : 0;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
         }
-        int first = cumsum[e] / block_size;
-        int last  = cumsum[e + 1] / block_size;
-        for (int b = first; b < last && b < expert_capacity; ++b) expert_ids[b] = e;
+        int rank  = scan[tid] - hit;
+        int total = scan[blockDim.x - 1];
+        if (hit) {
+            int slot = base + written + rank;
+            if (slot < sorted_capacity) sorted_token_ids[slot] = i;
+        }
+        written += total;
+        __syncthreads();
     }
+
+    // 4. claim this expert's blocks.
+    int first = cumsum[e] / block_size;
+    int last  = cumsum[e + 1] / block_size;
+    for (int b = first + tid; b < last && b < expert_capacity; b += blockDim.x) expert_ids[b] = e;
 }
 
 // -------------------------------------------------------------------------
 // 3. Grouped GEMM: gate/up + SwiGLU, then down.
 // -------------------------------------------------------------------------
 //
-// grid: (intermediate, sorted_capacity). One block per (output row, slot).
-// The grid is the *capacity*, never `num_tokens_post_pad` — that value lives
-// only on the device. Slots past the live region carry INACTIVE_EXPERT and
-// slots inside it that are padding carry the sentinel; both exit after one
-// or two loads. The predicate is uniform across the block, so the early
-// `return` never strands a `__syncthreads()`.
+// grid: (ceil(intermediate / MOE_ROWS), expert_block_capacity). One block per
+// (band of MOE_ROWS output rows, dispatch block). The grid is the fixed
+// *capacity*, never `num_tokens_post_pad` — that value lives only on the
+// device. Blocks past the live region carry INACTIVE_EXPERT and exit after
+// one load. The predicate is uniform across the block, so the early `return`
+// never strands a `__syncthreads()`.
+//
+// ## Why one block per dispatch block and not one per slot
+//
+// The first version gave every (row, slot) pair its own block, so the tokens
+// sharing an expert each re-read that expert's whole weight stack: at a
+// 512-token step that is 16x the traffic a tiled form needs, and the measured
+// result was 6.5 GB/s against a 672 GB/s card. Here a block owns a whole
+// `block_size` run — which by construction belongs to *one* expert — stages
+// those slots' activations in shared memory, and multiplies each dequantized
+// weight into all MOE_TM accumulators before dropping it. The stack is then
+// read once per dispatch block instead of once per token, and the dequant
+// work falls by the same factor.
+//
+// One warp per output row, MOE_TM accumulators per lane, contraction split
+// across the warp's 32 lanes: consecutive lanes read consecutive weight
+// elements, which is what makes the Q6_K `ql`/`qh` loads coalesce into whole
+// sectors, and no partial sum ever has to cross a warp boundary.
+//
+// Padding slots are *not* branched around; their staged activation row is
+// zeroed, which makes their contribution exactly zero and keeps the
+// MOE_TM-wide accumulate unconditional and fully unrolled. Branching per slot
+// would put a runtime index on the accumulator array and spill it to local
+// memory, which costs far more than the wasted multiply-adds.
 __global__ void moe_expert_ffn(
     const unsigned char* __restrict__ gate_q, int gate_quant,
     const unsigned char* __restrict__ up_q,   int up_quant,
@@ -490,48 +897,71 @@ __global__ void moe_expert_ffn(
     int intermediate,
     float* __restrict__ inter
 ) {
-    int r    = blockIdx.x;
-    int slot = blockIdx.y;
+    float*     xs   = xabe_shared;                              // [MOE_TM][MOE_TK]
+    long long* rows = (long long*)(xs + MOE_TM * MOE_TK);       // [MOE_TM]
 
-    int e = expert_ids[slot / block_size];
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
     if (e < 0) return;
-    int numel = (*valid_tokens) * top_k;
-    int flat = sorted_token_ids[slot];
-    if (flat >= numel) return;
 
-    int token = flat / top_k;
-    const float* x = hidden_states + (long long)token * hidden;
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    int live = r < intermediate;
     // Both projections are [intermediate x hidden] per expert, stacked over
     // experts — the GGUF layout `[hidden, intermediate, experts]` with
     // dims[0] fastest-varying.
-    long long base = ((long long)e * intermediate + r) * hidden;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
 
-    float sg = 0.0f;
-    float su = 0.0f;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        float xv = x[j];
-        sg += dequant_element(gate_q, gate_quant, base + j) * xv;
-        su += dequant_element(up_q,   up_quant,   base + j) * xv;
-    }
-    sg = block_reduce_sum(sg, xabe_shared);
-    __syncthreads();
-    su = block_reduce_sum(su, xabe_shared);
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        __syncthreads();
+        if (threadIdx.x < MOE_TM) {
+            int m = m0 + threadIdx.x;
+            int flat = m < block_size
+                ? sorted_token_ids[(long long)blk * block_size + m]
+                : numel;
+            rows[threadIdx.x] =
+                flat < numel ? (long long)(flat / top_k) * hidden : -1;
+        }
+        __syncthreads();
 
-    if (threadIdx.x == 0) {
-        // SwiGLU, written exactly as `xabe_kernels::norm::silu`:
-        // x / (1 + exp(-x)), not the algebraically equal x * sigmoid(x).
-        float act = sg / (1.0f + expf(-sg));
-        inter[(long long)slot * intermediate + r] = act * su;
+        int bm = live_tile_rows(rows);
+        float ag[MOE_TM];
+        float au[MOE_TM];
+#define MOE_FFN_TILE(TM) tile_gemm_pair<TM>(                                  \
+            gate_q, gate_quant, up_q, up_quant, hidden_states, rows, xs,      \
+            wrow, hidden, lane, live, ag, au)
+        MOE_TILE_DISPATCH(MOE_FFN_TILE)
+#undef MOE_FFN_TILE
+
+        if (live && lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (m < bm) {
+                    // SwiGLU, written exactly as `xabe_kernels::norm::silu`:
+                    // x / (1 + exp(-x)), not the algebraically equal
+                    // x * sigmoid(x).
+                    float act = ag[m] / (1.0f + expf(-ag[m]));
+                    inter[((long long)blk * block_size + m0 + m) * intermediate + r] =
+                        act * au[m];
+                }
+            }
+        }
     }
 }
 
-// grid: (hidden, sorted_capacity).
+// grid: (ceil(hidden / MOE_ROWS), expert_block_capacity). The same tiling as
+// above with the contraction running over `intermediate` instead of `hidden`.
 //
 // Writes each (token, k) contribution to its own slice of `partial` rather
 // than accumulating into the output with atomics. Two reasons: atomicAdd
 // makes the summation order non-deterministic, so the same input would give
 // bit-different output run to run; and the deterministic reduction below can
 // then sum in ascending k, matching the reference's per-token loop.
+//
+// Padding slots read `inter` as zero rather than as whatever the previous
+// step left there, and `store_slot_contribution` drops their output entirely.
 __global__ void moe_expert_down(
     const unsigned char* __restrict__ down_q, int down_quant,
     const float* __restrict__ inter,
@@ -545,27 +975,53 @@ __global__ void moe_expert_down(
     int intermediate,
     float* __restrict__ partial
 ) {
-    int h    = blockIdx.x;
-    int slot = blockIdx.y;
+    float*     xs        = xabe_shared;                          // [MOE_TM][MOE_TK]
+    long long* rows      = (long long*)(xs + MOE_TM * MOE_TK);   // [MOE_TM]
+    int*       slot_flat = (int*)(rows + MOE_TM);                // [MOE_TM]
 
-    int e = expert_ids[slot / block_size];
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
     if (e < 0) return;
+
     int numel = (*valid_tokens) * top_k;
-    int flat = sorted_token_ids[slot];
-    if (flat >= numel) return;
-
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    int live = h < hidden;
     // [hidden x intermediate] per expert — GGUF `[intermediate, hidden, experts]`.
-    long long base = ((long long)e * hidden + h) * intermediate;
-    const float* a = inter + (long long)slot * intermediate;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
 
-    float s = 0.0f;
-    for (int j = threadIdx.x; j < intermediate; j += blockDim.x) {
-        s += dequant_element(down_q, down_quant, base + j) * a[j];
-    }
-    s = block_reduce_sum(s, xabe_shared);
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        __syncthreads();
+        if (threadIdx.x < MOE_TM) {
+            int m = m0 + threadIdx.x;
+            int flat = m < block_size
+                ? sorted_token_ids[(long long)blk * block_size + m]
+                : numel;
+            slot_flat[threadIdx.x] = flat;
+            rows[threadIdx.x] = flat < numel
+                ? ((long long)blk * block_size + m) * intermediate
+                : -1;
+        }
+        __syncthreads();
 
-    if (threadIdx.x == 0) {
-        partial[(long long)flat * hidden + h] = topk_weights[flat] * s;
+        int bm = live_tile_rows(rows);
+        float ad[MOE_TM];
+#define MOE_DOWN_TILE(TM) tile_gemm_single<TM>(                               \
+            down_q, down_quant, inter, rows, xs,                              \
+            wrow, intermediate, lane, live, ad)
+        MOE_TILE_DISPATCH(MOE_DOWN_TILE)
+#undef MOE_DOWN_TILE
+
+        if (live && lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (m < bm) {
+                    store_slot_contribution(
+                        partial, topk_weights, slot_flat[m], numel, hidden, h, ad[m]);
+                }
+            }
+        }
     }
 }
 
@@ -597,7 +1053,14 @@ __global__ void moe_reduce(
 // -------------------------------------------------------------------------
 //
 // No routing, no sorting, no indirection, no routing weight: one expert
-// applied to every token unconditionally. grid: (intermediate, max_tokens).
+// applied to every token unconditionally.
+//
+// It is tiled over tokens for the same reason the routed path is, and the
+// payoff is larger: the shared expert's stack is *one* expert, so before
+// tiling a 512-token step re-read the same 2.7 MiB 512 times. grid:
+// (ceil(intermediate / MOE_ROWS), ceil(max_tokens / MOE_TM)) — both from the
+// geometry, neither from the live token count, which is still the device
+// scalar the staging gates on.
 __global__ void moe_shared_ffn(
     const unsigned char* __restrict__ gate_q, int gate_quant,
     const unsigned char* __restrict__ up_q,   int up_quant,
@@ -607,31 +1070,46 @@ __global__ void moe_shared_ffn(
     int intermediate,
     float* __restrict__ inter
 ) {
-    int r     = blockIdx.x;
-    int token = blockIdx.y;
-    if (token >= *valid_tokens) return;
+    float*     xs   = xabe_shared;                              // [MOE_TM][MOE_TK]
+    long long* rows = (long long*)(xs + MOE_TM * MOE_TK);       // [MOE_TM]
 
-    const float* x = hidden_states + (long long)token * hidden;
-    long long base = (long long)r * hidden;
+    int nvalid = *valid_tokens;
+    int t0 = blockIdx.y * MOE_TM;
+    if (t0 >= nvalid) return;
 
-    float sg = 0.0f;
-    float su = 0.0f;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        float xv = x[j];
-        sg += dequant_element(gate_q, gate_quant, base + j) * xv;
-        su += dequant_element(up_q,   up_quant,   base + j) * xv;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    int live = r < intermediate;
+    long long wrow = (long long)r * hidden;
+
+    if (threadIdx.x < MOE_TM) {
+        int token = t0 + threadIdx.x;
+        rows[threadIdx.x] = token < nvalid ? (long long)token * hidden : -1;
     }
-    sg = block_reduce_sum(sg, xabe_shared);
     __syncthreads();
-    su = block_reduce_sum(su, xabe_shared);
 
-    if (threadIdx.x == 0) {
-        float act = sg / (1.0f + expf(-sg));
-        inter[(long long)token * intermediate + r] = act * su;
+    int bm = live_tile_rows(rows);
+    float ag[MOE_TM];
+    float au[MOE_TM];
+#define MOE_SHARED_FFN_TILE(TM) tile_gemm_pair<TM>(                           \
+        gate_q, gate_quant, up_q, up_quant, hidden_states, rows, xs,          \
+        wrow, hidden, lane, live, ag, au)
+    MOE_TILE_DISPATCH(MOE_SHARED_FFN_TILE)
+#undef MOE_SHARED_FFN_TILE
+
+    if (live && lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            if (m < bm) {
+                float act = ag[m] / (1.0f + expf(-ag[m]));
+                inter[(long long)(t0 + m) * intermediate + r] = act * au[m];
+            }
+        }
     }
 }
 
-// grid: (hidden, max_tokens).
+// grid: (ceil(hidden / MOE_ROWS), ceil(max_tokens / MOE_TM)).
 __global__ void moe_shared_down(
     const unsigned char* __restrict__ down_q, int down_quant,
     const float* __restrict__ inter,
@@ -640,20 +1118,39 @@ __global__ void moe_shared_down(
     int intermediate,
     float* __restrict__ out
 ) {
-    int h     = blockIdx.x;
-    int token = blockIdx.y;
-    if (token >= *valid_tokens) return;
+    float*     xs   = xabe_shared;                              // [MOE_TM][MOE_TK]
+    long long* rows = (long long*)(xs + MOE_TM * MOE_TK);       // [MOE_TM]
 
-    long long base = (long long)h * intermediate;
-    const float* a = inter + (long long)token * intermediate;
+    int nvalid = *valid_tokens;
+    int t0 = blockIdx.y * MOE_TM;
+    if (t0 >= nvalid) return;
 
-    float s = 0.0f;
-    for (int j = threadIdx.x; j < intermediate; j += blockDim.x) {
-        s += dequant_element(down_q, down_quant, base + j) * a[j];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    int live = h < hidden;
+    long long wrow = (long long)h * intermediate;
+
+    if (threadIdx.x < MOE_TM) {
+        int token = t0 + threadIdx.x;
+        rows[threadIdx.x] = token < nvalid ? (long long)token * intermediate : -1;
     }
-    s = block_reduce_sum(s, xabe_shared);
+    __syncthreads();
 
-    if (threadIdx.x == 0) out[(long long)token * hidden + h] = s;
+    int bm = live_tile_rows(rows);
+    float ad[MOE_TM];
+#define MOE_SHARED_DOWN_TILE(TM) tile_gemm_single<TM>(                        \
+        down_q, down_quant, inter, rows, xs,                                  \
+        wrow, intermediate, lane, live, ad)
+    MOE_TILE_DISPATCH(MOE_SHARED_DOWN_TILE)
+#undef MOE_SHARED_DOWN_TILE
+
+    if (live && lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            if (m < bm) out[(long long)(t0 + m) * hidden + h] = ad[m];
+        }
+    }
 }
 
 }
@@ -828,6 +1325,11 @@ pub struct MoeBuffers {
     topk_weights: CudaSlice<f32>,
     sorted_token_ids: CudaSlice<i32>,
     expert_ids: CudaSlice<i32>,
+    /// Per-expert selection counts, handed from the dispatch kernel's
+    /// counting pass to its scatter pass. Device-side only: no host ever
+    /// reads it, which is what lets the two passes be separate launches
+    /// without breaking graph capture.
+    expert_counts: CudaSlice<i32>,
     num_tokens_post_pad: CudaSlice<i32>,
     valid_tokens: CudaSlice<i32>,
     inter: CudaSlice<f32>,
@@ -872,6 +1374,7 @@ impl MoeBuffers {
         (self.topk_ids.len()
             + self.sorted_token_ids.len()
             + self.expert_ids.len()
+            + self.expert_counts.len()
             + self.num_tokens_post_pad.len()
             + self.valid_tokens.len())
             * size_of::<i32>()
@@ -886,6 +1389,7 @@ impl MoeBuffers {
 /// Compiled MoE kernels for one fixed geometry.
 pub struct MoeKernels {
     route: CudaFunction,
+    align_count: CudaFunction,
     align: CudaFunction,
     expert_ffn: CudaFunction,
     expert_down: CudaFunction,
@@ -920,9 +1424,25 @@ impl MoeKernels {
         if geometry.hidden == 0 || geometry.intermediate == 0 {
             return Err(bad("hidden and intermediate must be non-zero"));
         }
-        // grid.y is the slot capacity and grid.x an output row; both must fit
-        // the driver's per-dimension limits. x is capped at 2^31-1 but y and
-        // z at 65535, which is the one that can actually bite.
+        // Both contraction lengths are walked in `TILE_K`-wide slices, and
+        // the Q6_K prologue hoists the superblock header on the strength of a
+        // slice never straddling a 128-element half. A row whose length is
+        // not a multiple of `TILE_K` would break that, so it is rejected
+        // rather than silently handled by a slower per-element path: at
+        // Qwen3.6's 2048 x 512 the condition holds with room to spare, and a
+        // geometry where it does not is a design question, not a fallback.
+        if !geometry.hidden.is_multiple_of(TILE_K) {
+            return Err(bad("hidden must be a multiple of the 128-element tile"));
+        }
+        if !geometry.intermediate.is_multiple_of(TILE_K) {
+            return Err(bad(
+                "intermediate must be a multiple of the 128-element tile",
+            ));
+        }
+        // grid.y is the dispatch-block capacity or a token tile, grid.x a
+        // band of output rows; both must fit the driver's per-dimension
+        // limits. x is capped at 2^31-1 but y and z at 65535, which is the
+        // one that can actually bite.
         if geometry.sorted_capacity() > 65_535 || geometry.max_tokens > 65_535 {
             return Err(bad("slot capacity exceeds the 65535 grid.y limit"));
         }
@@ -931,6 +1451,7 @@ impl MoeKernels {
         let module = ctx.load_module(ptx)?;
         Ok(Self {
             route: module.load_function("moe_route")?,
+            align_count: module.load_function("moe_align_count")?,
             align: module.load_function("moe_align_block_size")?,
             expert_ffn: module.load_function("moe_expert_ffn")?,
             expert_down: module.load_function("moe_expert_down")?,
@@ -954,6 +1475,7 @@ impl MoeKernels {
             topk_weights: stream.alloc_zeros::<f32>(g.max_flat_pairs())?,
             sorted_token_ids: stream.alloc_zeros::<i32>(g.sorted_capacity())?,
             expert_ids: stream.alloc_zeros::<i32>(g.expert_block_capacity())?,
+            expert_counts: stream.alloc_zeros::<i32>(g.num_experts)?,
             num_tokens_post_pad: stream.alloc_zeros::<i32>(1)?,
             valid_tokens: stream.alloc_zeros::<i32>(1)?,
             inter: stream.alloc_zeros::<f32>(g.sorted_capacity() * g.intermediate)?,
@@ -1028,6 +1550,13 @@ impl MoeKernels {
     /// Consumes [`Self::route`]'s `topk_ids` and writes `sorted_token_ids`,
     /// `expert_ids` and the device-side `num_tokens_post_pad`. Nothing is
     /// read back.
+    ///
+    /// Two launches, both at `num_experts` blocks — a fixed grid, from the
+    /// geometry. The first counts each expert's selections and lays down the
+    /// sentinel / INACTIVE fill; the second recomputes the shared prefix sum
+    /// and scatters. The intermediate counts live in
+    /// [`MoeBuffers::expert_counts`] on the device, so the pair is still one
+    /// capturable sequence with no host round trip between the passes.
     pub fn build_dispatch(
         &self,
         stream: &Arc<CudaStream>,
@@ -1039,17 +1568,39 @@ impl MoeKernels {
         let block_size = g.block_size as i32;
         let sorted_capacity = g.sorted_capacity() as i32;
         let expert_capacity = g.expert_block_capacity() as i32;
-        let shared = ((g.num_experts + 1) * size_of::<i32>()) as u32;
 
         let cfg = LaunchConfig {
-            grid_dim: (1, 1, 1),
+            grid_dim: (g.num_experts as u32, 1, 1),
             block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: shared,
+            shared_mem_bytes: (THREADS as usize * size_of::<i32>()) as u32,
+        };
+        let mut builder = stream.launch_builder(&self.align_count);
+        builder
+            .arg(&buffers.topk_ids)
+            .arg(&buffers.valid_tokens)
+            .arg(&top_k)
+            .arg(&sorted_capacity)
+            .arg(&expert_capacity)
+            .arg(&mut buffers.sorted_token_ids)
+            .arg(&mut buffers.expert_ids)
+            .arg(&mut buffers.expert_counts);
+        // SAFETY: one block per expert, so `blockIdx.x` is a valid expert id;
+        // the shared array is one int per thread, exactly what the count
+        // reduction indexes, and the two fills are bounded by the capacities
+        // passed in.
+        unsafe { builder.launch(cfg) }?;
+
+        let scatter_shared = ((g.num_experts + 1 + THREADS as usize) * size_of::<i32>()) as u32;
+        let scatter_cfg = LaunchConfig {
+            grid_dim: (g.num_experts as u32, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: scatter_shared,
         };
         let mut builder = stream.launch_builder(&self.align);
         builder
             .arg(&buffers.topk_ids)
             .arg(&buffers.valid_tokens)
+            .arg(&buffers.expert_counts)
             .arg(&top_k)
             .arg(&num_experts)
             .arg(&block_size)
@@ -1058,10 +1609,11 @@ impl MoeKernels {
             .arg(&mut buffers.sorted_token_ids)
             .arg(&mut buffers.expert_ids)
             .arg(&mut buffers.num_tokens_post_pad);
-        // SAFETY: a single block; the shared array is `num_experts + 1`
-        // ints, exactly what the prefix sum indexes, and every global write
-        // is bounds-checked against the capacities passed in.
-        unsafe { builder.launch(cfg) }?;
+        // SAFETY: one block per expert; the shared array is `num_experts + 1`
+        // ints for the prefix sum plus one per thread for the placement scan,
+        // and every global write is bounds-checked against the capacities
+        // passed in.
+        unsafe { builder.launch(scatter_cfg) }?;
         Ok(())
     }
 
@@ -1095,12 +1647,15 @@ impl MoeKernels {
         let gate_code = gate.quant.code();
         let up_code = up.quant.code();
         let down_code = down.quant.code();
-        // One float per warp, which is the most `block_reduce_sum` stores.
-        let shared = ((THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32;
+        let shared = tile_shared_bytes();
 
         let ffn_cfg = LaunchConfig {
-            grid_dim: (g.intermediate as u32, g.sorted_capacity() as u32, 1),
-            block_dim: (THREADS, 1, 1),
+            grid_dim: (
+                (g.intermediate as u32).div_ceil(TILE_ROWS),
+                g.expert_block_capacity() as u32,
+                1,
+            ),
+            block_dim: (GEMM_THREADS, 1, 1),
             shared_mem_bytes: shared,
         };
         let mut builder = stream.launch_builder(&self.expert_ffn);
@@ -1118,11 +1673,13 @@ impl MoeKernels {
             .arg(&hidden)
             .arg(&intermediate)
             .arg(&mut buffers.inter);
-        // SAFETY: grid.y is the slot capacity, which is exactly what
-        // `sorted_token_ids` holds and `block_size` times what `expert_ids`
-        // holds; `inter` is `sorted_capacity * intermediate` floats, the
-        // range `(slot, r)` covers. Weight indexing is bounded by the
-        // element-count check above.
+        // SAFETY: grid.y is the dispatch-block capacity, exactly what
+        // `expert_ids` holds and `block_size` times fewer than what
+        // `sorted_token_ids` holds; `inter` is `sorted_capacity *
+        // intermediate` floats, the range `(blk * block_size + m, r)`
+        // covers. Shared memory covers the activation tile plus one slot id
+        // per tile row. Weight indexing is bounded by the element-count
+        // check above.
         unsafe { builder.launch(ffn_cfg) }?;
 
         // Every valid flat id is written exactly once by the down kernel, so
@@ -1132,8 +1689,12 @@ impl MoeKernels {
         stream.memset_zeros(&mut buffers.partial)?;
 
         let down_cfg = LaunchConfig {
-            grid_dim: (g.hidden as u32, g.sorted_capacity() as u32, 1),
-            block_dim: (THREADS, 1, 1),
+            grid_dim: (
+                (g.hidden as u32).div_ceil(TILE_ROWS),
+                g.expert_block_capacity() as u32,
+                1,
+            ),
+            block_dim: (GEMM_THREADS, 1, 1),
             shared_mem_bytes: shared,
         };
         let mut builder = stream.launch_builder(&self.expert_down);
@@ -1204,11 +1765,12 @@ impl MoeKernels {
         let gate_code = gate.quant.code();
         let up_code = up.quant.code();
         let down_code = down.quant.code();
-        let shared = ((THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32;
+        let shared = tile_shared_bytes();
+        let token_tiles = (g.max_tokens as u32).div_ceil(TILE_M as u32);
 
         let ffn_cfg = LaunchConfig {
-            grid_dim: (g.intermediate as u32, g.max_tokens as u32, 1),
-            block_dim: (THREADS, 1, 1),
+            grid_dim: ((g.intermediate as u32).div_ceil(TILE_ROWS), token_tiles, 1),
+            block_dim: (GEMM_THREADS, 1, 1),
             shared_mem_bytes: shared,
         };
         let mut builder = stream.launch_builder(&self.shared_ffn);
@@ -1228,8 +1790,8 @@ impl MoeKernels {
         unsafe { builder.launch(ffn_cfg) }?;
 
         let down_cfg = LaunchConfig {
-            grid_dim: (g.hidden as u32, g.max_tokens as u32, 1),
-            block_dim: (THREADS, 1, 1),
+            grid_dim: ((g.hidden as u32).div_ceil(TILE_ROWS), token_tiles, 1),
+            block_dim: (GEMM_THREADS, 1, 1),
             shared_mem_bytes: shared,
         };
         let mut builder = stream.launch_builder(&self.shared_down);
@@ -1245,6 +1807,18 @@ impl MoeKernels {
         unsafe { builder.launch(down_cfg) }?;
         Ok(())
     }
+}
+
+/// Dynamic shared memory one grouped-GEMM block needs.
+///
+/// The staged activation tile, then one source-row offset per tile row, then
+/// one flat slot id per tile row (the routed down projection needs it to
+/// address `partial`). 8 KiB and change at Qwen3.6's shape, so several blocks
+/// fit an sm_75 SM's 64 KiB and the limit on occupancy is registers, not
+/// this.
+const fn tile_shared_bytes() -> u32 {
+    (TILE_M * TILE_K * size_of::<f32>() + TILE_M * size_of::<i64>() + TILE_M * size_of::<i32>())
+        as u32
 }
 
 fn check_stack(which: &'static str, t: QuantTensor<'_>, expected: usize) -> Result<(), MoeError> {
@@ -1272,6 +1846,36 @@ mod tests {
 
     fn qwen() -> MoeGeometry {
         MoeGeometry::qwen3_6(16, 64)
+    }
+
+    #[test]
+    fn tile_shape_is_mirrored_in_rust() {
+        // The kernel's `#define`s decide the shared-memory layout and the
+        // per-lane unroll; the Rust constants decide the grid, the block and
+        // the `shared_mem_bytes` handed to the driver. If the two drift, the
+        // symptom is an out-of-bounds shared read, not a compile error.
+        for (name, value) in [
+            ("MOE_TM", TILE_M),
+            ("MOE_TK", TILE_K),
+            // One value per lane per Q6_K group: 128 elements over 32 lanes.
+            ("MOE_TN", TILE_K / 32),
+            ("MOE_ROWS", TILE_ROWS as usize),
+        ] {
+            assert!(
+                MOE_SRC.contains(&format!("#define {name}   {value}"))
+                    || MOE_SRC.contains(&format!("#define {name} {value}")),
+                "{name} is {value} in Rust but not in the kernel source",
+            );
+        }
+        assert_eq!(GEMM_THREADS, TILE_ROWS * 32, "one warp per output row");
+        // A tile is one half of a 256-element Q6_K superblock, which is what
+        // makes the header read once per tile instead of once per element.
+        assert_eq!(TILE_K * 2, 256, "a tile must be one Q6_K superblock half");
+        assert_eq!(
+            tile_shared_bytes(),
+            16 * 128 * 4 + 16 * 8 + 16 * 4,
+            "8 KiB of activation tile plus the row offsets and slot ids",
+        );
     }
 
     #[test]
@@ -1332,6 +1936,34 @@ mod tests {
             !MOE_SRC[start..end].contains("atomic"),
             "the dispatch scatter must not use atomics; ordering is the contract",
         );
+    }
+
+    #[test]
+    fn every_grid_dimension_is_a_function_of_the_geometry_alone() {
+        // The other half of AGENTS.md rule 5: the *buffers* not being sized by
+        // a per-step value is checked above, and this is the launch shapes.
+        // Two geometries differing only in `max_tokens` must still each
+        // produce one fixed grid, and the tiled GEMM's grid must not depend on
+        // `num_tokens_post_pad` — that value exists only in device memory, so
+        // anything reading it would have to synchronize and could not be
+        // captured.
+        for max_tokens in [1usize, 19, 128, 512] {
+            let g = MoeGeometry::qwen3_6(16, max_tokens);
+            // Routed GEMM: (row band, dispatch-block capacity).
+            let routed_y = g.expert_block_capacity() as u32;
+            assert_eq!(routed_y, (g.sorted_capacity() / g.block_size) as u32);
+            // Shared expert: (row band, token-tile count).
+            let shared_y = (g.max_tokens as u32).div_ceil(TILE_M as u32);
+            assert_eq!(shared_y as usize, g.max_tokens.div_ceil(TILE_M));
+            // Both grid.y values must fit the driver's 65535 limit for every
+            // geometry `MoeKernels::new` accepts.
+            assert!(routed_y <= 65_535 && shared_y <= 65_535);
+            // grid.x is a band of output rows, and both contraction lengths
+            // are whole tiles.
+            assert_eq!((g.intermediate as u32).div_ceil(TILE_ROWS), 64);
+            assert_eq!((g.hidden as u32).div_ceil(TILE_ROWS), 256);
+            assert!(g.hidden.is_multiple_of(TILE_K) && g.intermediate.is_multiple_of(TILE_K));
+        }
     }
 
     #[test]
