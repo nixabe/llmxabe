@@ -107,6 +107,19 @@ impl Scheduler {
         full_seq_len.div_ceil(self.config.block_size())
     }
 
+    /// Whether [`Self::admit`] would accept this request, without enqueueing
+    /// it.
+    ///
+    /// The router needs this to score a worker before committing a request to
+    /// it, and it must not be a reimplementation of the rule: admission
+    /// feasibility is AGENTS.md rule 4, and rule 4 lives here. Both this and
+    /// [`Self::admit`] derive from
+    /// [`Self::attention_blocks_needed`] against total capacity, so they
+    /// cannot disagree.
+    pub fn can_admit(&self, req: &NewRequest) -> bool {
+        self.attention_blocks_needed(req.full_seq_len()) <= self.total_attention_blocks
+    }
+
     /// Admit a request into the waiting queue.
     ///
     /// AGENTS.md rule 4: rejects the request if its *full* potential

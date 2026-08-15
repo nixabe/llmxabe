@@ -8,3 +8,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+xabe-model.workspace = true
+xabe-cache.workspace = true
+xabe-sched.workspace = true
