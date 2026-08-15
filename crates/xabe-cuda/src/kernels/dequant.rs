@@ -296,7 +296,7 @@ mod tests {
         // The kernel indexes `ql` at +0, `qh` at +128, `scales` at +192 and
         // the delta at +208. Those must tile 210 bytes exactly; an off-by-one
         // would read a neighbouring field and still produce finite output.
-        assert_eq!(0 + QK_K / 2, 128);
+        assert_eq!(QK_K / 2, 128);
         assert_eq!(128 + QK_K / 4, 192);
         assert_eq!(192 + QK_K / 16, 208);
         assert_eq!(208 + 2, BLOCK_Q6_K_BYTES);

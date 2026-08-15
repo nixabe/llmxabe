@@ -469,7 +469,7 @@ pub fn dequantize_row_q8_0(bytes: &[u8]) -> Result<Vec<f32>, BlockSizeError> {
         });
     }
     let mut out = Vec::with_capacity(bytes.len() / BLOCK_Q8_0_BYTES * QK8_0);
-    for chunk in bytes.chunks_exact(BLOCK_Q8_0_BYTES) {
+    for chunk in bytes.as_chunks::<BLOCK_Q8_0_BYTES>().0 {
         out.extend_from_slice(&dequantize_q8_0(&BlockQ8_0::from_bytes(chunk)?));
     }
     Ok(out)
@@ -485,7 +485,7 @@ pub fn dequantize_row_q6_k(bytes: &[u8]) -> Result<Vec<f32>, BlockSizeError> {
         });
     }
     let mut out = Vec::with_capacity(bytes.len() / BLOCK_Q6_K_BYTES * QK_K);
-    for chunk in bytes.chunks_exact(BLOCK_Q6_K_BYTES) {
+    for chunk in bytes.as_chunks::<BLOCK_Q6_K_BYTES>().0 {
         out.extend_from_slice(&dequantize_q6_k(&BlockQ6K::from_bytes(chunk)?));
     }
     Ok(out)
@@ -494,8 +494,10 @@ pub fn dequantize_row_q6_k(bytes: &[u8]) -> Result<Vec<f32>, BlockSizeError> {
 /// Widen an fp16 row to fp32.
 pub fn dequantize_row_f16(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
-        .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| f16::from_le_bytes(*c).to_f32())
         .collect()
 }
 
@@ -508,8 +510,10 @@ pub fn dequantize_row_f16(bytes: &[u8]) -> Vec<f32> {
 /// weight distribution.
 pub fn dequantize_row_bf16(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
-        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
         .collect()
 }
 
