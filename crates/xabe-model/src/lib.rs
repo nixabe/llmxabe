@@ -9,6 +9,7 @@
 //!
 //! Start at [`ModelConfig`].
 
+pub mod budget;
 pub mod config;
 pub mod verify;
 
