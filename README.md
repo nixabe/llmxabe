@@ -42,9 +42,11 @@ design plan expected. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
   decomposes: the MoE weight path runs at 44.5% of peak bandwidth while flash
   attention streams KV at ~80%. Closing it is worth roughly 1.8× — but it means
   beating an already-fused, already-graphed, already-tuned implementation.
-- **A GPU-side sampler is a newly identified win** the plan missed. With a
-  248,320-token vocabulary, any CPU penalty sampler costs 22–24% of decode
-  throughput.
+- **A GPU-side sampler looked like a win the plan missed** — a 248,320-token
+  vocabulary makes CPU penalty sampling cost 22–24% of decode throughput. On
+  testing, llama.cpp already ships one (`--backend-sampling`, off by default),
+  and enabling it recovers the whole tax (+36%). That is the second identified
+  opportunity to turn out already-implemented upstream.
 - **Compile-time specialization.** Shapes are fixed and known. A
   general-purpose engine cannot assume that; this one can. Still unmeasured.
 
@@ -199,12 +201,14 @@ llama-server -a qwen3.6-35b-a3b -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
   -c 393216 -np 3 -b 4096 -ub 4096 \
   -fa on -ctk f16 -ctv f16 -cram 10240 \
   --jinja --reasoning-preserve \
-  --temp 1.0 --top-p 0.95 --top-k 20
+  -bs \
+  --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5
 ```
 
-Note the absence of `--presence-penalty`: it costs 22–24% of decode throughput
-on this model, because a 248,320-token vocabulary makes the CPU-side penalty
-pass expensive. Enable it only if repetition is actually observed.
+`-bs` (`--backend-sampling`) is off by default and is the largest free win
+measured here. It keeps sampling on the GPU, which makes penalty samplers cost
+nothing — **+36%** on this configuration — so Qwen's published thinking-mode
+defaults, `--presence-penalty 1.5` included, become free.
 
 Measured baseline tuning results need no Rust at all — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#baseline-tuning--now-measured).
 

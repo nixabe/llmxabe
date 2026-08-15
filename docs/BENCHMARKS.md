@@ -130,9 +130,69 @@ published remedy for repetition loops, but it is **not free**, and the ~23%
 cost was not known when it was recommended. It is a quality-versus-throughput
 trade, and it should be made deliberately.
 
-It is also an opportunity. A GPU-side sampler would remove this entirely, and
-it is a differentiator the design plan did not identify — see
-[Implications](#implications-for-this-project).
+It is also fixable **today**, and the fix was tested — see
+[GPU-side sampling](#gpu-side-sampling-recovers-all-of-it) below.
+
+## GPU-side sampling recovers all of it
+
+The previous section identified a GPU-side sampler as a fix. **llama.cpp
+already has one**: `-bs` / `--backend-sampling`, which builds the sampler into
+the compute graph. It is `false` by default (`common/common.h`).
+
+Enabling it removes the penalty tax completely.
+
+| Sampling | CPU (default) | GPU (`-bs`) | Change |
+| --- | ---: | ---: | ---: |
+| `presence_penalty=0.0` (path off) | 98.61 | 103.23 | +4.7% |
+| `presence_penalty=0.1` | 75.12 | 102.93 | **+37.0%** |
+| `presence_penalty=1.5` | 75.53 | 102.85 | **+36.2%** |
+| `repeat_penalty=1.1` | 76.98 | 102.18 | **+32.7%** |
+| `frequency_penalty=0.5` | 77.34 | 102.50 | **+32.5%** |
+
+Throughput becomes flat at 102–103 tok/s regardless of penalty configuration.
+The penalty is no longer a trade at all.
+
+Note the first row: GPU sampling is **4.7% faster even with no penalty
+enabled**. That is the 248,320 × 4 B = 993 KB per-token logits copy back to the
+host that no longer has to happen.
+
+### Verified, not assumed
+
+A sampler that silently collapsed to greedy would look fast and be wrong.
+
+| Check | Result |
+| --- | --- |
+| Three different seeds | 3 distinct outputs — genuinely sampling |
+| Same seed twice | Identical — reproducible |
+| Reasoning (sheep, 137×24) | **9** and **3,288**, both correct, at 102.6 tok/s *with* `presence_penalty=1.5` |
+| 25K needle retrieval | **4471**, correct |
+
+### In the production configuration
+
+With `-np 3 -c 393216 --backend-sampling`, penalties enabled throughout:
+
+| Sampling | tok/s |
+| --- | ---: |
+| `presence_penalty=1.5` | 102.34 |
+| `repeat_penalty=1.1` | 101.67 |
+| `frequency_penalty=0.5` | 101.93 |
+
+| Concurrency | Per-request | Aggregate |
+| ---: | ---: | ---: |
+| 1 | 102.29 | 82.96 |
+| 2 | 77.08 | 129.54 |
+| 3 | 62.97 | **160.93** |
+
+That c=3 aggregate is measured **with penalties on**. The earlier 162.4 figure
+was measured with penalties *off* and CPU sampling, so backend sampling buys
+Qwen's recommended sampling configuration for essentially nothing.
+
+Long context is unaffected: 82.36 tok/s at 25K depth with penalties, against
+80.07 without `-bs` and without penalties.
+
+**Recommendation: add `-bs` to the serving configuration.** It is the largest
+free win found in this exercise — roughly **+36% on the recommended sampling
+configuration** — and it requires no code.
 
 ### 3. llama.cpp already implements the plan's three performance bets
 
@@ -241,10 +301,18 @@ than against "does graph capture help".
 32× TTFT improvement that is currently confined to one process. That remains
 the project's one structural, non-speculative advantage.
 
-**What is new.** The penalty-sampler measurement identifies a differentiator the
-plan missed. A 248,320-token vocabulary makes CPU-side sampling cost 22–24% of
-decode throughput, and a GPU-side sampler would recover it. That is a larger,
-better-evidenced, and far cheaper win than anything in the current kernel plan.
+**What was new, and then wasn't.** The penalty-sampler measurement looked like a
+differentiator the plan had missed: a 248,320-token vocabulary makes CPU-side
+sampling cost 22–24% of decode throughput. Testing it showed llama.cpp already
+ships the fix (`--backend-sampling`), merely disabled by default, and enabling
+it recovers the entire tax.
+
+That is the second time an identified opportunity turned out to be already
+implemented upstream — graph capture was the first. The pattern is worth
+naming: **this baseline is more complete than the design plan assumed, and
+candidate differentiators should be tested against it before being planned
+around.** The remaining genuinely-unclaimed items are the shared prefix cache
+and compile-time shape specialization.
 
 **The real headroom** is the 44.5% weight-path efficiency. It is genuine, and
 it is worth about 1.8× if fully captured — but capturing it means beating an
@@ -265,6 +333,8 @@ llama-bench -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
 
 - Multi-GPU aggregate throughput under real routed traffic (single-card figures
   extrapolated).
+- Whether `--backend-sampling` changes output *quality* over long runs; it was
+  verified correct and diverse over short samples only.
 - MTP speculative decode acceptance rate against the n-gram baseline.
 - Any effect of `-b`/`-ub` tuning.
 - The `mmproj` vision encoder's resident VRAM cost.

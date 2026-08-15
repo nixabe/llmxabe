@@ -88,6 +88,13 @@ llama-server -a qwen3.6-35b-a3b \
   --temp 1.0 --top-p 0.95 --min-p 0.0
 ```
 
+The tuned form of this, after the measurements below, adds `-bs` and Qwen's
+sampling defaults:
+
+```sh
+  ... -bs --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5
+```
+
 `-sm none` gives one full model instance per card rather than splitting one
 model across three, which is correct here: the model fits, and splitting would
 put PCIe on the decode path. `-t 4 -tb 4` partitions 12 vCPU across three
@@ -98,31 +105,39 @@ replicas, and `--poll 0` avoids three spinning pollers competing for them.
 These have been benchmarked on this host. Full data in
 [BENCHMARKS.md](BENCHMARKS.md).
 
-1. **Add `--top-k 20`. Add penalties only deliberately.** `top_k 20` is free
-   (−1%). But **any** penalty sampler — `presence_penalty`, `repeat_penalty`,
-   `frequency_penalty` — costs **22–24% of decode throughput**, and the cost is
-   binary rather than proportional: `presence_penalty=0.1` costs the same as
-   `1.5`. With a 248,320-token vocabulary, the penalty pass runs over every
-   logit on the CPU each step.
+1. **Add `-bs` (`--backend-sampling`). This is the largest free win available.**
+   It moves sampling into the compute graph and is `false` by default.
 
-   Qwen publishes `presence_penalty 1.5` as their remedy for repetition loops,
-   so this is a real quality-versus-throughput trade — but it is a trade, not a
-   free improvement, which is how an earlier revision of this document
-   described it. Turn it on if repetition is actually observed, not by default.
+   Without it, **any** penalty sampler — `presence_penalty`, `repeat_penalty`,
+   `frequency_penalty` — costs 22–24% of decode throughput, binary rather than
+   proportional (`0.1` costs the same as `1.5`), because a 248,320-token
+   vocabulary is processed on the CPU every step. With `-bs`, that cost is
+   **zero**: throughput stays flat at 102–103 tok/s whatever the penalty
+   settings, a **+36%** improvement on Qwen's recommended configuration. It is
+   also 4.7% faster with no penalty at all, because the 993 KB per-token logits
+   copy back to the host disappears.
 
-2. **Keep `-ctk f16 -ctv f16`. Do not switch to `q8_0`.** This was predicted to
+   Verified sampling correctly, not collapsing to greedy: three seeds give
+   three distinct outputs, one seed reproduces exactly, and reasoning and
+   long-context retrieval both stay correct.
+
+2. **Then add `--top-k 20` and `--presence-penalty 1.5`.** With `-bs` enabled
+   these are effectively free, so Qwen's published thinking-mode defaults —
+   including their stated remedy for repetition loops — cost nothing.
+
+3. **Keep `-ctk f16 -ctv f16`. Do not switch to `q8_0`.** This was predicted to
    be the highest-value experiment available; it is measurably worse at every
    depth and dramatically worse where it was supposed to help most: −15.5% at
    32K and **−35.8% at 128K**. The KV path already runs at ~80% of peak
    bandwidth, so there was little to buy, and Turing dequantization inside the
    attention kernel costs more than the saving.
 
-3. **Choose `-np` deliberately.** Three slots buy 1.77× aggregate throughput
+4. **Choose `-np` deliberately.** Three slots buy 1.77× aggregate throughput
    and cost 41% per-request latency, plus a further ~9.5% per-request
    throughput at depth versus `-np 1`. Latency-sensitive, rarely-concurrent
    workloads are measurably better served by `-np 1`.
 
-4. **A/B n-gram speculation against MTP.** Still unmeasured. The baseline uses
+5. **A/B n-gram speculation against MTP.** Still unmeasured. The baseline uses
    `--spec-type ngram-map-k4v`; n-gram wins on repetitive spans, but this model
    ships a *trained* MTP head and both the vLLM and SGLang recipes recommend
    2–3 speculative tokens for it. llama.cpp master supports MTP for this
