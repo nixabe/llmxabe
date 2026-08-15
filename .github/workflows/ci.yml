@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The host-side crates are the ones that must stay buildable and testable
+  # without a GPU or the CUDA toolkit. That is a design property worth
+  # enforcing, not just a convenience: the correctness work that matters most
+  # (kernel references, cache geometry, scheduler invariants) must never be
+  # gated on device access.
+  host:
+    name: host-side crates (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: |
+          cargo clippy \
+            -p xabe-gguf -p xabe-model -p xabe-cache \
+            -p xabe-sched -p xabe-kernels \
+            --all-targets -- -D warnings
+
+      - name: Tests
+        run: |
+          cargo test \
+            -p xabe-gguf -p xabe-model -p xabe-cache \
+            -p xabe-sched -p xabe-kernels
+        # Tests that need the 32 GB model file skip themselves and say so.
+        # A skip is not a pass; see CONTRIBUTING.md.
+
+      - name: Docs build without warnings
+        run: |
+          cargo doc --no-deps \
+            -p xabe-gguf -p xabe-model -p xabe-cache \
+            -p xabe-sched -p xabe-kernels
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # xabe-cuda needs the CUDA toolkit to build, but not a device: cudarc is
+  # built with fallback-dynamic-loading, so it links against whatever driver
+  # exists at runtime. The milestone-00 spike inside it skips without a GPU.
+  cuda:
+    name: xabe-cuda (build only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda
+        with:
+          cuda: "12.4.0"
+          method: network
+          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev"]'
+
+      - name: Clippy
+        run: cargo clippy -p xabe-cuda --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build -p xabe-cuda
+
+  # The design plan is a local draft and must never enter the tree; likewise
+  # model weights, which are 32 GB.
+  hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No design plan committed
+        run: |
+          if git ls-files --error-unmatch qwen36-rust-engine-plan.md 2>/dev/null; then
+            echo "::error::qwen36-rust-engine-plan.md is tracked; it is a local draft (see AGENTS.md)"
+            exit 1
+          fi
+          echo "ok: design plan is not tracked"
+
+      - name: No model weights or goldens committed
+        run: |
+          offenders=$(git ls-files | grep -E '\.(gguf|safetensors)$' || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::model weights are tracked:"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "ok: no weights tracked"
