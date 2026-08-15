@@ -435,13 +435,81 @@ are bit-identical over all 248,320 entries.
 Stated because they were discovered while doing this, and each one could
 silently produce a wrong implementation.
 
+0. **llama.cpp's matmuls quantize the *activations* to `q8_1`. It is measurably
+   less accurate than an exact fp32 path, and this accounts for essentially
+   every residual gap against this oracle.**
+
+   This is the single most important entry here, because without it every
+   block workstream independently concludes its own matmul is slightly wrong.
+   Three did, and all three arrived at the same cause.
+
+   With 19 tokens, `ggml_cuda_mul_mat` routes a Q8_0 `src0` past MMVF/MMVQ to
+   **MMQ**, which quantizes the activation into `q8_1` blocks of 32
+   (`d = amax/127`, `roundf`) and does the dot in int8. Reproducing that
+   quantization on the host recovers llama.cpp's own output almost exactly,
+   which is what makes this a demonstration rather than a hypothesis:
+
+   | projection | exact fp32 vs golden | same matmul, `q8_1` activations | ratio |
+   | --- | --- | --- | --- |
+   | `Qcur_full-3` | 7.00e-2 | 2.05e-5 | 3,421× |
+   | `Kcur-3` | 5.49e-2 | 9.06e-6 | 6,069× |
+   | `Vcur-3` | 3.71e-2 | 3.58e-6 | 10,384× |
+   | `attn_output-3` | 7.79e-4 | 3.28e-7 | 2,379× |
+   | `Qcur_full-39` | 7.38e-2 | 2.19e-5 | 3,361× |
+   | `Vcur-39` | 3.49e-2 | 1.62e-5 | 2,154× |
+
+   The scale is **fp32**, not fp16: an fp16 scale (what the non-MMQ
+   `quantize_q8_1` stores) does *not* reproduce it (8.0e-2 / 1.6e-2 / 3.2e-2).
+
+   Corroborated independently against an f64 host reference from the same
+   weights and the same captured input:
+
+   ```
+   attn_qkv:  llmxabe vs f64  1.907e-6   |  llama.cpp vs f64  7.059e-2   (37,000x)
+   ssm_out:   llmxabe vs f64  2.235e-8   |  llama.cpp vs f64  1.629e-3   (73,000x)
+   control (ssm_alpha, f32 weights, llama.cpp's unquantized path):  2.384e-6
+   ```
+
+   And in the MoE, where device and the structurally unrelated CPU reference
+   agree to 4.47e-8 while *both* sit the same 2.6997e-4 away from llama.cpp —
+   agreeing to six significant figures on the distance.
+
+   **Consequences.** A tolerance against this oracle at a quantized matmul is
+   bounded below by llama.cpp's error, not ours, and is therefore loose for a
+   reason that has nothing to do with our kernel. Any test relying on that
+   should assert the explanation — that a `q8_1` reconstruction is orders
+   closer than the exact one — so the loose bound stops being justified the
+   moment the explanation stops holding. Tightening the *measured* agreement
+   would require adopting `q8_1` activation quantization ourselves, which is an
+   engine-wide accuracy decision and a deliberate loss of precision.
+
+   Elementwise ops are unaffected; they are not matmuls and should agree at the
+   fp32 rounding floor.
+
 1. **`q_conv_predelta` / `k_conv_predelta` are *not* broadcast to 32 heads.**
    They stay at `[128, 16, 19]` — 16 qk heads — while `v_conv_predelta` is
    `[128, 32, 19]`. `build_layer_attn_linear` only emits the
    `ggml_repeat_4d` to 32 heads when the fused GDN path is off
    (`cparams.fused_gdn_ar`/`fused_gdn_ch`), and this build has it on. Anything
-   comparing against these tensors must do the 2-value-heads-per-qk-head
-   broadcast itself.
+   comparing against these tensors must do the broadcast itself.
+
+   **The broadcast is `qk_head = v_head % n_qk_heads`, not
+   `v_head / heads_per_kv`.** `ggml_repeat_4d` tiles; it does not block.
+   `ggml/src/ggml-cuda/gated_delta_net.cu:37` computes
+   `fastmodulo(h_idx, neqk1_magic)` directly. An earlier revision of this
+   document said only "do the broadcast yourself" without stating the
+   direction, and two landed kernels got it backwards as a result —
+   discriminated numerically against `final_output-N`:
+
+   | block | `h % 16` (correct) | `h / 2` (wrong) |
+   | --- | --- | --- |
+   | 0 | max_abs 7.15e-7, cosine 1.000000 | max_abs 5.59e-1, cosine 0.974880 |
+   | 4 | max_abs 1.19e-7, cosine 1.000000 | max_abs 5.66e-1, cosine 0.467691 |
+   | 20 | max_abs 1.04e-7, cosine 1.000000 | max_abs 5.24e-1, cosine 0.622903 |
+
+   A differential test against a single-head CPU reference **cannot** catch
+   this: the caller does the broadcast, so a test that uses the same wrong
+   convention as the kernel sees perfect agreement. Only the oracle catches it.
 
 2. **`ssm_a` is stored already negated.** `blk.0.ssm_a` begins
    `[-0.03642, -0.03116, -0.13747, …]` and every one of its 32 entries is
