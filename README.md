@@ -90,9 +90,9 @@ Three consequences drive most of the design:
    not the 30 GiB a full-attention 35B would need. The other 30 layers hold
    fixed-size recurrent state — ~60 MiB per sequence, constant regardless of
    position.
-2. **Long-context decode is KV-bound, not weight-bound.** At 128K, KV reads
-   (2.68 GB/token) exceed weight reads (2.24 GB/token) despite only a quarter
-   of layers holding any KV at all.
+2. **Long-context decode becomes KV-bound**, despite only a quarter of layers
+   holding any KV at all. KV reads overtake weight reads at about 139K tokens;
+   at 128K the split is 2.68 GB/token of KV against 2.86 GB/token of weights.
 3. **The LM head alone costs 540 MB/token** — roughly 58% of what all forty MoE
    layers read combined — because the vocabulary is 248,320 and untied.
 
