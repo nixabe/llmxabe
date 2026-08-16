@@ -190,7 +190,7 @@ const SOLVE_TT: u32 = 8;
 const STATE_VB: u32 = 32;
 /// State columns one state-update block owns. Mirrors `STATE_JB`; the block
 /// is `STATE_VB * STATE_JB` threads.
-const STATE_JB: u32 = 4;
+const STATE_JB: u32 = 8;
 
 const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
@@ -652,7 +652,22 @@ __global__ void gdn_chunk_solve_and_apply(
 // splitting the fused multiply-add into a scale pass and an accumulate pass
 // would round differently on a value that is carried into every later chunk.
 #define STATE_VB 32
-#define STATE_JB 4
+// `j` indices one block owns.
+//
+// The staged `su` tile is indexed by `vl` alone, so it is read once and used
+// by all STATE_JB of the block's `j` lanes -- and `grid.z` is
+// `head_dim / STATE_JB`, so every block in `z` stages the tile again. At 4
+// that was 32 passes over `uprime` per launch and the kernel was 6% of
+// prefill moving 32 MiB to read a 1 MiB tensor. Eight halves it.
+//
+//   4   1,705.97 tok/s
+//   8   1,727.74
+//   16  1,721.89
+//   32  1,710.30
+//
+// Past eight the block is 512 threads and more and the grid stops covering
+// the card: 32 leaves four blocks in `z` and 512 in total.
+#define STATE_JB 8
 
 __global__ void gdn_chunk_state_update(
     float* __restrict__ state,

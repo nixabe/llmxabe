@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,710**, 1,706–1,722 | **1.21× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,725**, 1,718–1,728 | **1.20× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1306,8 +1306,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | four keys per warp between attention barriers | 1,644.10 | 1.01× |
 | eight tokens at once in the GDN solve's output | 1,708.06 | 1.04× |
 | eight experts per router block instead of four | 1,721.84 | 1.02× |
+| eight `j` lanes per state-update block instead of four | 1,727.74 | 1.01× |
 
-**8.57× overall.** No single change is more than 1.81×; the result is
+**8.60× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1457,6 +1458,37 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### Two tiles that were re-reading their own input
+
+Both were the same shape of mistake and both were found by asking one
+question of every kernel: *how many times does the grid read the same bytes?*
+
+**The router GEMM** moves `(ET + TT) * hidden` floats to do `ET * TT * hidden`
+multiply-adds, so its arithmetic intensity is the harmonic mean of the two
+tile widths — 2.7 MAC/byte at 4 experts by 8 tokens. Eight experts makes it 4:
+**1,693 → 1,722 tok/s.** Sixteen is past the knee at 128 accumulators a
+thread, and widening the token side instead lands in the same place while
+doubling the staged activation tile.
+
+**The chunk-end state update** stages `uprime` into `su[c][STATE_VB]`, indexed
+by the value lane alone — so the tile is read once and used by all `STATE_JB`
+of the block's `j` lanes. But `grid.z` is `head_dim / STATE_JB`, so every
+block in `z` stages it again: at `STATE_JB = 4` that is **32 passes over
+`uprime` per launch**, 32 MiB of traffic to read a 1 MiB tensor. Eight halves
+it: **1,706 → 1,728 tok/s.**
+
+| `STATE_JB` | tok/s |
+| --- | ---: |
+| 4 | 1,705.97 |
+| **8** | **1,727.74** |
+| 16 | 1,721.89 |
+| 32 | 1,710.30 |
+
+Past eight the block passes 512 threads and the grid stops covering the card —
+32 leaves four blocks in `z` and 512 in total, against 72 SMs.
+
+Neither changes a summation order.
 
 ### Half the GDN solve was parallel and did not say so
 
