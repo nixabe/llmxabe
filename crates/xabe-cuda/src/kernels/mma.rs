@@ -277,6 +277,25 @@ __global__ void mma_q8_0_proj(
 //
 //   quants: int8  [n_rows][k]
 //   scales: fp32  [n_rows][k / 32]
+// Split a Q8_0 tensor into aligned quants and fp32 scales.
+//
+// One warp per 32-element block: each lane moves one quant, lane 0 writes the
+// scale. Run once at load; see `mma_q8_0_proj_split` for why the on-disk
+// layout cannot be read directly at speed.
+__global__ void mma_repack_q8_0(
+    const unsigned char* __restrict__ src,
+    signed char* __restrict__ q,
+    float* __restrict__ scales,
+    long long n_blocks
+) {
+    long long b = (long long)blockIdx.x * blockDim.y + threadIdx.y;
+    if (b >= n_blocks) return;
+    int lane = threadIdx.x;
+    const unsigned char* blk = src + b * 34;
+    q[b * 32 + lane] = (signed char)blk[2 + lane];
+    if (lane == 0) scales[b] = load_half_le_mma(blk);
+}
+
 __global__ void mma_q8_0_proj_split(
     const signed char* __restrict__ wq,
     const float* __restrict__ ws,
@@ -507,6 +526,7 @@ pub struct MmaKernels {
     quantize: CudaFunction,
     proj: CudaFunction,
     proj_split: CudaFunction,
+    repack: CudaFunction,
 }
 
 impl MmaKernels {
@@ -522,6 +542,7 @@ impl MmaKernels {
             quantize: module.load_function("mma_quantize_rows_q8")?,
             proj: module.load_function("mma_q8_0_proj")?,
             proj_split: module.load_function("mma_q8_0_proj_split")?,
+            repack: module.load_function("mma_repack_q8_0")?,
         })
     }
 
@@ -548,9 +569,9 @@ impl MmaKernels {
         if !k.is_multiple_of(32) {
             return Err(MmaError::RaggedContraction { k });
         }
-        expect_len("quantize x", x.len(), rows * k)?;
-        expect_len("quantize q", q.len(), rows * k)?;
-        expect_len("quantize scales", scales.len(), rows * k / 32)?;
+        expect_at_least("quantize x", x.len(), rows * k)?;
+        expect_at_least("quantize q", q.len(), rows * k)?;
+        expect_at_least("quantize scales", scales.len(), rows * k / 32)?;
         if rows == 0 {
             return Ok(());
         }
@@ -567,6 +588,47 @@ impl MmaKernels {
         // SAFETY: one warp per (row, 32-element block) over a grid covering
         // every block and returning above it, so no lane touches an index
         // beyond `rows * k`, which all three buffers were checked against.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Split a Q8_0 tensor into aligned quants and fp32 scales, on device.
+    ///
+    /// `src` is the GGUF byte stream, `q` is `[elements]` int8 and `scales` is
+    /// `[elements / 32]` fp32. Run once at load: the repacked form is what
+    /// [`Self::q8_0_proj_split`] reads, and the difference between the two
+    /// layouts is 3.2x.
+    pub fn repack_q8_0(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &CudaSlice<u8>,
+        q: &mut CudaSlice<i8>,
+        scales: &mut CudaSlice<f32>,
+        elements: usize,
+    ) -> Result<(), MmaError> {
+        if !elements.is_multiple_of(32) {
+            return Err(MmaError::RaggedContraction { k: elements });
+        }
+        let blocks = elements / 32;
+        expect_len("repack src", src.len(), blocks * 34)?;
+        expect_len("repack q", q.len(), elements)?;
+        expect_len("repack scales", scales.len(), blocks)?;
+        if blocks == 0 {
+            return Ok(());
+        }
+
+        const WARPS: u32 = 8;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks.div_ceil(WARPS as usize) as u32, 1, 1),
+            block_dim: (32, WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let n = blocks as i64;
+        let mut builder = stream.launch_builder(&self.repack);
+        builder.arg(src).arg(&mut *q).arg(&mut *scales).arg(&n);
+        // SAFETY: one warp per 32-element block over a grid covering every
+        // block and returning above it; all three buffers were checked against
+        // the block count.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
@@ -595,8 +657,8 @@ impl MmaKernels {
         }
         expect_len("split wq", wq.len(), n_rows * k)?;
         expect_len("split ws", ws.len(), n_rows * k / 32)?;
-        expect_len("split xq", xq.len(), tokens * k)?;
-        expect_len("split xs", xs.len(), tokens * k / 32)?;
+        expect_at_least("split xq", xq.len(), tokens * k)?;
+        expect_at_least("split xs", xs.len(), tokens * k / 32)?;
         expect_len("split out", out.len(), tokens * n_rows)?;
         if tokens == 0 || n_rows == 0 {
             return Ok(());
@@ -735,6 +797,23 @@ impl MmaKernels {
         // loop reads exactly `k` elements per row.
         unsafe { builder.launch(cfg) }?;
         Ok(())
+    }
+}
+
+/// Like [`expect_len`], for buffers a caller is allowed to over-allocate.
+///
+/// The activation scratch is sized once for the largest projection a block
+/// runs and then reused by smaller ones, so "longer than needed" is its
+/// ordinary state. Too small stays fatal: that is the read-past-the-end case.
+fn expect_at_least(what: &'static str, actual: usize, needed: usize) -> Result<(), MmaError> {
+    if actual >= needed {
+        Ok(())
+    } else {
+        Err(MmaError::BufferShape {
+            what,
+            expected: needed,
+            actual,
+        })
     }
 }
 

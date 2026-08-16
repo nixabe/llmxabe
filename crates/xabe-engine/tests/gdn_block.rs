@@ -1128,7 +1128,7 @@ fn the_whole_block_matches_llama_cpp_token_by_token() {
             let d_token = htod(&stream, &input[t * geo.hidden..(t + 1) * geo.hidden]);
             let mut d_out = stream.alloc_zeros::<f32>(geo.hidden).expect("out");
             let mixer = block
-                .forward(&stream, &weights, &mut state, &d_token, &mut d_out)
+                .forward(&stream, &weights, None, &mut state, &d_token, &mut d_out)
                 .expect("forward");
             assert_eq!(
                 mixer,
@@ -1286,6 +1286,7 @@ fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
             .forward(
                 &stream,
                 &weights,
+                None,
                 &mut chunked_state,
                 &d_input,
                 &mut d_chunked,
@@ -1308,6 +1309,7 @@ fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
                 .forward(
                     &stream,
                     &weights,
+                    None,
                     &mut recurrent_state,
                     &d_token,
                     &mut d_out,

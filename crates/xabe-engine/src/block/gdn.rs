@@ -133,6 +133,7 @@ use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::gdn::{GdnError, GdnKernels, GdnScratch};
 use xabe_cuda::kernels::gdn_chunked::{GdnChunkedError, GdnChunkedKernels, GdnChunkedScratch};
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
+use xabe_cuda::kernels::mma::{MMA_SPLIT_TOKENS, MmaError, MmaKernels};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::{Directory, Role};
@@ -532,6 +533,8 @@ __global__ void gdn_add(
 /// Something went wrong building or running a Gated DeltaNet block.
 #[derive(Debug)]
 pub enum GdnBlockError {
+    /// The integer tensor-core kernels failed to build or launch.
+    Mma(MmaError),
     /// NVRTC rejected this module's source, or the module failed to load.
     Compile(String),
     /// The driver failed.
@@ -566,6 +569,7 @@ impl std::fmt::Display for GdnBlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Compile(m) => write!(f, "kernel compilation failed: {m}"),
+            Self::Mma(e) => write!(f, "integer tensor cores: {e}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::LayerOps(e) => write!(f, "{e}"),
             Self::Recurrent(e) => write!(f, "{e}"),
@@ -730,6 +734,36 @@ pub struct GdnLayerWeights {
     pub ssm_norm: CudaSlice<f32>,
     /// `ssm_out.weight`, Q8_0 `[value_dim, hidden]`.
     pub out: CudaSlice<u8>,
+}
+
+/// One layer's Q8_0 projections, repacked for the integer tensor cores.
+///
+/// The same numbers [`GdnLayerWeights`] holds, with the scales lifted out of
+/// the 34-byte blocks so every operand load in `mma_q8_0_proj_split` is
+/// aligned. Reading the on-disk layout directly measured 1% of the tensor
+/// cores' peak — slower than the fp32 kernel — so this repack is what makes
+/// the instruction usable at all. See `docs/BENCHMARKS.md`.
+///
+/// Costs about 37.7 MiB per layer, 1.13 GiB over the 30 Gated DeltaNet
+/// layers, held *in addition* to the arena's copy. That is the price of the
+/// alignment, and it is why this is built once at construction rather than
+/// per pass.
+pub struct GdnLayerInt8 {
+    qkv_q: CudaSlice<i8>,
+    qkv_s: CudaSlice<f32>,
+    gate_q: CudaSlice<i8>,
+    gate_s: CudaSlice<f32>,
+    out_q: CudaSlice<i8>,
+    out_s: CudaSlice<f32>,
+}
+
+impl GdnLayerInt8 {
+    /// Device bytes held.
+    pub fn bytes(&self) -> u64 {
+        let q = self.qkv_q.len() + self.gate_q.len() + self.out_q.len();
+        let s = self.qkv_s.len() + self.gate_s.len() + self.out_s.len();
+        (q + s * size_of::<f32>()) as u64
+    }
 }
 
 impl GdnLayerWeights {
@@ -943,6 +977,10 @@ impl Scratch {
 /// is identical across all 30 of them and 30 NVRTC compiles at startup would
 /// be 30 driver round-trips for the same PTX.
 pub struct GdnBlock {
+    /// Integer tensor cores for the Q8_0 projections at prefill shapes.
+    mma: MmaKernels,
+    /// Quantized activations and their scales, reused every projection.
+    xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
     layer_ops: LayerOpsKernels,
     recurrent: GdnKernels,
     chunked: GdnChunkedKernels,
@@ -1011,7 +1049,50 @@ impl GdnBlock {
             scratch: None,
             mixer: Mixer::Chunked,
             geometry,
+            mma: MmaKernels::new(ctx).map_err(GdnBlockError::Mma)?,
+            xq: None,
         })
+    }
+
+    /// Repack one layer's Q8_0 projections for the integer tensor cores.
+    ///
+    /// Called once per layer at construction. See [`GdnLayerInt8`] for what it
+    /// costs and why it is worth it.
+    pub fn repack(
+        &self,
+        stream: &Arc<CudaStream>,
+        w: &GdnLayerWeights,
+    ) -> Result<GdnLayerInt8, GdnBlockError> {
+        let g = self.geometry;
+        let one = |src: &CudaSlice<u8>, elements: usize| -> Result<_, GdnBlockError> {
+            let mut q = stream.alloc_zeros::<i8>(elements)?;
+            let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
+            self.mma
+                .repack_q8_0(stream, src, &mut q, &mut sc, elements)
+                .map_err(GdnBlockError::Mma)?;
+            Ok((q, sc))
+        };
+        let (qkv_q, qkv_s) = one(&w.qkv, g.hidden * g.conv_dim())?;
+        let (gate_q, gate_s) = one(&w.gate, g.hidden * g.value_dim())?;
+        let (out_q, out_s) = one(&w.out, g.value_dim() * g.hidden)?;
+        Ok(GdnLayerInt8 {
+            qkv_q,
+            qkv_s,
+            gate_q,
+            gate_s,
+            out_q,
+            out_s,
+        })
+    }
+
+    /// Whether a batch of `tokens` should take the integer tensor-core path.
+    ///
+    /// Below a full token tile the MMA kernel runs its guarded path and the
+    /// tensor cores are starved of arithmetic intensity, so the fp32 kernel —
+    /// which has its own tile specialization for small batches — wins. Decode
+    /// is one token and never comes near this.
+    pub fn uses_tensor_cores(tokens: usize) -> bool {
+        tokens >= MMA_SPLIT_TOKENS
     }
 
     /// The geometry this block was compiled for.
@@ -1073,6 +1154,7 @@ impl GdnBlock {
         &mut self,
         stream: &Arc<CudaStream>,
         weights: &GdnLayerWeights,
+        int8: Option<&GdnLayerInt8>,
         state: &mut GdnState,
         hidden: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
@@ -1101,7 +1183,22 @@ impl GdnBlock {
         // kernels are `&`, and the launch helpers below take `&self`.
         let mut scratch = self.scratch.take().expect("scratch was just installed");
 
-        let result = self.run(stream, weights, state, hidden, out, &mut scratch, tokens);
+        // All three Q8_0 projections read the same normed activations, so the
+        // int8 conversion is done once here rather than three times inside
+        // `project`. `None` keeps the fp32 path, which is what decode and
+        // small batches take.
+        let tc = int8.filter(|_| Self::uses_tensor_cores(tokens));
+
+        let result = self.run(
+            stream,
+            weights,
+            tc,
+            state,
+            hidden,
+            out,
+            &mut scratch,
+            tokens,
+        );
         self.scratch = Some(scratch);
         result?;
         Ok(self.mixer)
@@ -1112,6 +1209,7 @@ impl GdnBlock {
         &mut self,
         stream: &Arc<CudaStream>,
         w: &GdnLayerWeights,
+        tc: Option<&GdnLayerInt8>,
         state: &mut GdnState,
         hidden: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
@@ -1132,24 +1230,55 @@ impl GdnBlock {
         )?;
 
         // 2. linear_attn_qkv_mixed-N, and the output gate z-N alongside it.
-        self.project(
-            stream,
-            Projection::Q8_0(&w.qkv),
-            &s.normed,
-            &mut s.qkv,
-            g.hidden,
-            g.conv_dim(),
-            tokens,
-        )?;
-        self.project(
-            stream,
-            Projection::Q8_0(&w.gate),
-            &s.normed,
-            &mut s.z,
-            g.hidden,
-            g.value_dim(),
-            tokens,
-        )?;
+        if let Some(i8w) = tc {
+            self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.qkv_q,
+                    &i8w.qkv_s,
+                    xq,
+                    xs,
+                    &mut s.qkv,
+                    g.hidden,
+                    g.conv_dim(),
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.gate_q,
+                    &i8w.gate_s,
+                    xq,
+                    xs,
+                    &mut s.z,
+                    g.hidden,
+                    g.value_dim(),
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+        } else {
+            self.project(
+                stream,
+                Projection::Q8_0(&w.qkv),
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project(
+                stream,
+                Projection::Q8_0(&w.gate),
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
+        }
 
         // 3/4. conv_output_raw-N, then conv_output_silu-N. The convolution
         // advances the cache, which is why it must run once per batch and not
@@ -1232,16 +1361,80 @@ impl GdnBlock {
         )?;
 
         // 9/10. linear_attn_out-N, then attn_residual-N.
-        self.project(
-            stream,
-            Projection::Q8_0(&w.out),
-            &s.final_output,
-            &mut s.projected,
-            g.value_dim(),
-            g.hidden,
-            tokens,
-        )?;
+        //
+        // This contracts over `value_dim`, not `hidden`, and reads the gated
+        // core output rather than the normed input — so it re-quantizes rather
+        // than reusing what step 2 produced.
+        if let Some(i8w) = tc {
+            self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.out_q,
+                    &i8w.out_s,
+                    xq,
+                    xs,
+                    &mut s.projected,
+                    g.value_dim(),
+                    g.hidden,
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+        } else {
+            self.project(
+                stream,
+                Projection::Q8_0(&w.out),
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
+        }
         self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        Ok(())
+    }
+
+    /// Quantize `x` to int8 for the projections that take the tensor-core path.
+    ///
+    /// Called **twice** per layer, not once. `qkv` and `gate` both read the
+    /// normed activations and contract over `hidden`, so they share a single
+    /// quantization; `out` reads the gated core output and contracts over
+    /// `value_dim`, so it needs its own. Only the first sharing is a saving —
+    /// the second call genuinely re-quantizes different data.
+    ///
+    /// The buffer is allocated once, at the *widest* contraction the block
+    /// runs, and the narrower call reuses the front of it. Sizing it to
+    /// whichever call happens to come first would make the second call
+    /// reallocate mid-pass, which `AGENTS.md` rule 6 forbids.
+    fn quantize_activations(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        tokens: usize,
+        k_dim: usize,
+    ) -> Result<(), GdnBlockError> {
+        let need = tokens * k_dim;
+        let widest = tokens * self.geometry.hidden.max(self.geometry.value_dim());
+        debug_assert!(
+            need <= widest,
+            "a projection contracts over more than the block's widest dimension"
+        );
+        let have = self.xq.as_ref().is_some_and(|(q, _)| q.len() >= need);
+        if !have {
+            self.xq = Some((
+                stream.alloc_zeros::<i8>(widest)?,
+                stream.alloc_zeros::<f32>(widest / QK8_0)?,
+            ));
+        }
+        let (q, sc) = self.xq.as_mut().expect("just allocated");
+        // The buffers are sized for the widest projection this block runs and
+        // reused by the narrower ones, so they are routinely longer than this
+        // call needs; `quantize_rows` checks a lower bound for exactly that.
+        self.mma
+            .quantize_rows(stream, x, q, sc, tokens, k_dim)
+            .map_err(GdnBlockError::Mma)?;
         Ok(())
     }
 

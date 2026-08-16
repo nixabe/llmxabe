@@ -96,7 +96,7 @@ use xabe_model::config::{LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role};
 
 use crate::block::attention::{AttentionBlockError, AttentionKernelSet, GatedAttentionBlock};
-use crate::block::gdn::{GdnBlock, GdnBlockError, GdnGeometry, GdnLayerWeights};
+use crate::block::gdn::{GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights};
 use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
 use crate::state::{SequenceState, StateError};
 use crate::weights::DeviceWeights;
@@ -516,6 +516,12 @@ pub struct Forward {
     w_output_norm: ManuallyDrop<CudaSlice<f32>>,
     w_lm_head: ManuallyDrop<CudaSlice<u8>>,
     gdn_weights: Vec<ManuallyDrop<GdnLayerWeights>>,
+    /// The Q8_0 projections repacked for integer tensor cores, one per Gated
+    /// DeltaNet layer — empty when this shape will not use them.
+    ///
+    /// Built only for shapes above `GdnBlock::uses_tensor_cores`, so a decode
+    /// pass does not pay 1.13 GiB for a path it never takes.
+    gdn_int8: Vec<GdnLayerInt8>,
     /// Shared with every other shape built over the same model.
     ///
     /// At 725 MiB per layer these are 28.3 GiB — the single largest thing on
@@ -679,6 +685,16 @@ impl Forward {
             gdn_weights.push(ManuallyDrop::new(alias_gdn_layer(weights, stream, layer)?));
         }
 
+        // The repack is a one-time cost that makes the tensor-core path
+        // usable; see `GdnLayerInt8`. Skipped entirely for shapes that will
+        // not take that path, which is what keeps a decode pass cheap.
+        let mut gdn_int8 = Vec::new();
+        if GdnBlock::uses_tensor_cores(tokens) {
+            for w in &gdn_weights {
+                gdn_int8.push(gdn.repack(stream, w)?);
+            }
+        }
+
         // --- the 10 Gated Attention layers, which copy --------------------
         let attn_kernels = Arc::new(AttentionKernelSet::new(ctx, &config, tokens)?);
         let mut attention = Vec::new();
@@ -750,6 +766,7 @@ impl Forward {
             w_output_norm,
             w_lm_head,
             gdn_weights,
+            gdn_int8,
             moe_weights,
             d_tokens: stream.alloc_zeros::<i32>(tokens)?,
             hidden_state: stream.alloc_zeros::<f32>(tokens * hidden)?,
@@ -831,6 +848,24 @@ impl Forward {
     /// `result_output`: the logits for the last position, `[vocab]`.
     pub fn logits(&self) -> &CudaSlice<f32> {
         &self.logits
+    }
+
+    /// Drop the repacked int8 weights, forcing every projection back to fp32.
+    ///
+    /// Exists so a differential test can run the *same shape* both ways and
+    /// compare: the tensor-core path changes the numerics (activations are
+    /// quantized to int8), and the golden capture is 19 tokens — below the
+    /// threshold where that path engages — so the oracle gate alone would
+    /// never exercise it. See `tests/int8_forward.rs`.
+    ///
+    /// Frees about 1.13 GiB. Not reversible without rebuilding the pass.
+    pub fn disable_tensor_cores(&mut self) {
+        self.gdn_int8.clear();
+    }
+
+    /// Whether this pass has the repacked int8 weights resident.
+    pub fn tensor_cores_enabled(&self) -> bool {
+        !self.gdn_int8.is_empty()
     }
 
     /// Allocate carried state for one sequence of up to `max_seq` positions.
@@ -923,6 +958,7 @@ impl Forward {
                     self.gdn.forward(
                         stream,
                         &self.gdn_weights[gdn_slot],
+                        self.gdn_int8.get(gdn_slot),
                         state.gdn_mut(gdn_slot),
                         &self.hidden_state,
                         &mut self.mixer_out,
