@@ -703,13 +703,14 @@ __global__ void moe_route(
     for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
         local = fmaxf(local, row[e]);
     }
-    rval[threadIdx.x] = local;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) rval[threadIdx.x] = fmaxf(rval[threadIdx.x], rval[threadIdx.x + s]);
-        __syncthreads();
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        local = fmaxf(local, __shfl_down_sync(0xffffffff, local, off));
     }
+    if ((threadIdx.x & 31) == 0) rval[threadIdx.x >> 5] = local;
+    __syncthreads();
     float max_logit = rval[0];
+    for (int w = 1; w < (int)(blockDim.x >> 5); ++w) max_logit = fmaxf(max_logit, rval[w]);
     __syncthreads();
 
     // --- exp, sum, normalize ---------------------------------------------
@@ -719,6 +720,16 @@ __global__ void moe_route(
         probs[e] = p;
         esum += p;
     }
+    // **This one keeps its shared-memory tree.** The other two reductions in
+    // this kernel were replaced with warp shuffles because `fmaxf` and
+    // "greatest value, lowest index on a tie" are associative *and*
+    // commutative, so their answers do not depend on the shape of the
+    // reduction. A floating-point sum is neither, and this one divides every
+    // probability. Reshaping it moved the renormalized routing weights in
+    // their last bits, which was enough for `tests/forward_pass.rs` to report
+    // a genuine ranking disagreement with llama.cpp at rank 4 of the top 8.
+    //
+    // Nine barriers, against the eighty-one the other two shed between them.
     rval[threadIdx.x] = esum;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
@@ -744,27 +755,33 @@ __global__ void moe_route(
             float p = probs[e];
             if (p > bv || (p == bv && (bi < 0 || e < bi))) { bv = p; bi = e; }
         }
-        rval[threadIdx.x] = bv;
-        ridx[threadIdx.x] = bi;
-        __syncthreads();
-        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-            if (threadIdx.x < s) {
-                float av = rval[threadIdx.x];
-                float cv = rval[threadIdx.x + s];
-                int   ai = ridx[threadIdx.x];
-                int   ci = ridx[threadIdx.x + s];
-                if (cv > av || (cv == av && ci >= 0 && (ai < 0 || ci < ai))) {
-                    rval[threadIdx.x] = cv;
-                    ridx[threadIdx.x] = ci;
-                }
-            }
-            __syncthreads();
+        // Shuffled within the warp, then one pass over the warp winners.
+        // "Greatest value, lowest index on a tie" is associative *and*
+        // commutative, so the answer does not depend on the shape of the
+        // reduction the way a floating-point sum would — which is what makes
+        // it safe to change here, on a quantity that selects experts.
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            float cv = __shfl_down_sync(0xffffffff, bv, off);
+            int   ci = __shfl_down_sync(0xffffffff, bi, off);
+            if (cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi))) { bv = cv; bi = ci; }
         }
+        if ((threadIdx.x & 31) == 0) {
+            rval[threadIdx.x >> 5] = bv;
+            ridx[threadIdx.x >> 5] = bi;
+        }
+        __syncthreads();
         if (threadIdx.x == 0) {
-            int best = ridx[0];
-            topk_ids[(long long)token * top_k + j] = best;
-            topk_weights[(long long)token * top_k + j] = rval[0];
-            probs[best] = -1.0f;
+            float av = rval[0];
+            int   ai = ridx[0];
+            for (int w = 1; w < (int)(blockDim.x >> 5); ++w) {
+                float cv = rval[w];
+                int   ci = ridx[w];
+                if (cv > av || (cv == av && ci >= 0 && (ai < 0 || ci < ai))) { av = cv; ai = ci; }
+            }
+            topk_ids[(long long)token * top_k + j] = ai;
+            topk_weights[(long long)token * top_k + j] = av;
+            probs[ai] = -1.0f;
         }
         __syncthreads();
     }

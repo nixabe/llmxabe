@@ -103,7 +103,7 @@ use xabe_model::weights::{Directory, Role};
 /// Threads per block for the three glue kernels below.
 const THREADS: u32 = 256;
 
-/// Tokens one router block carries. Mirrors the kernel's `ROUTER_TT`.
+/// Tokens the wide router instantiation carries. Mirrors its `TT`.
 const ROUTER_TT: u32 = 8;
 
 /// Token count below which the shared expert stays on the fp32 kernel.
@@ -229,96 +229,97 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
 // accumulators each thread holds. `ROUTER_JC` is the contraction staged per
 // trip and **must equal the block width**, which is what keeps each thread's
 // summation order identical to the untiled kernel's.
-#define ROUTER_TT 8
 #define ROUTER_ET 4
 #define ROUTER_JC 256
 
-__global__ void moe_block_router_logits(
-    const float* __restrict__ w,
-    const float* __restrict__ x,
-    const int* __restrict__ valid_tokens,
-    int hidden,
-    int num_experts,
-    int max_tokens,
-    float* __restrict__ logits
-) {
-    float* sx      = xabe_moe_block_shared;                 // [ROUTER_TT][ROUTER_JC]
-    float* scratch = sx + ROUTER_TT * ROUTER_JC;            // [n_warps][ROUTER_TT*ROUTER_ET]
-
-    int tid  = threadIdx.x;
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int n_warps = (int)(blockDim.x >> 5);
-    int e0 = blockIdx.x * ROUTER_ET;
-    int t0 = blockIdx.y * ROUTER_TT;
-
-    float acc[ROUTER_ET][ROUTER_TT];
-    #pragma unroll
-    for (int el = 0; el < ROUTER_ET; ++el)
-        #pragma unroll
-        for (int u = 0; u < ROUTER_TT; ++u) acc[el][u] = 0.0f;
-
-    for (int jc = 0; jc < hidden; jc += ROUTER_JC) {
-        __syncthreads();
-        int j = jc + tid;
-        #pragma unroll
-        for (int u = 0; u < ROUTER_TT; ++u) {
-            // Clamped rather than branched: a token past the live count is
-            // read — harmlessly, the buffer is `max_tokens` rows — but never
-            // written, exactly as the untiled version left its logits stale.
-            int t = (t0 + u < max_tokens) ? t0 + u : max_tokens - 1;
-            sx[u * ROUTER_JC + tid] = j < hidden ? x[(long long)t * hidden + j] : 0.0f;
-        }
-        __syncthreads();
-        if (j < hidden) {
-            #pragma unroll
-            for (int el = 0; el < ROUTER_ET; ++el) {
-                int e = e0 + el;
-                float wj = e < num_experts ? w[(long long)e * hidden + j] : 0.0f;
-                #pragma unroll
-                for (int u = 0; u < ROUTER_TT; ++u) {
-                    acc[el][u] += wj * sx[u * ROUTER_JC + tid];
-                }
-            }
-        }
-    }
-
-    // `block_reduce_sum`'s reduction, done once for all 32 accumulators
-    // instead of 32 times: shuffle-down within the warp, then one ascending
-    // pass over the warp totals. Same operations in the same order, so the
-    // logits are bit-identical to the untiled kernel's — which matters more
-    // here than anywhere else in the block, because the router's output is
-    // fed to a top-8 selection and a last-bit disagreement between two
-    // adjacent logits does not perturb an answer, it picks a different expert.
-    #pragma unroll
-    for (int el = 0; el < ROUTER_ET; ++el) {
-        #pragma unroll
-        for (int u = 0; u < ROUTER_TT; ++u) {
-            float v = acc[el][u];
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                v += __shfl_down_sync(0xffffffff, v, offset);
-            }
-            if (lane == 0) scratch[warp * (ROUTER_ET * ROUTER_TT) + el * ROUTER_TT + u] = v;
-        }
-    }
-    __syncthreads();
-
-    int live = *valid_tokens;
-    if (tid < ROUTER_ET * ROUTER_TT) {
-        int el = tid / ROUTER_TT;
-        int u  = tid % ROUTER_TT;
-        float total = 0.0f;
-        for (int wv = 0; wv < n_warps; ++wv) {
-            total += scratch[wv * (ROUTER_ET * ROUTER_TT) + el * ROUTER_TT + u];
-        }
-        int e = e0 + el;
-        int t = t0 + u;
-        if (e < num_experts && t < live) {
-            logits[(long long)t * num_experts + e] = total;
-        }
-    }
+// Instantiated at two token tile widths. `ROUTER_JC` equals the block width in
+// both, which is what keeps each thread's summation order identical to the
+// untiled kernel's — and identical *between* the two instantiations, so a
+// decode step and a prefill step agree bit for bit on the logits of any token
+// they share.
+#define ROUTER_LOGITS(NAME, TT)                                                \
+__global__ void NAME(                                                          \
+    const float* __restrict__ w,                                               \
+    const float* __restrict__ x,                                               \
+    const int* __restrict__ valid_tokens,                                      \
+    int hidden,                                                                \
+    int num_experts,                                                           \
+    int max_tokens,                                                            \
+    float* __restrict__ logits                                                 \
+) {                                                                            \
+    float* sx      = xabe_moe_block_shared;                                    \
+    float* scratch = sx + TT * ROUTER_JC;                                      \
+                                                                               \
+    int tid  = threadIdx.x;                                                    \
+    int lane = tid & 31;                                                       \
+    int warp = tid >> 5;                                                       \
+    int n_warps = (int)(blockDim.x >> 5);                                      \
+    int e0 = blockIdx.x * ROUTER_ET;                                           \
+    int t0 = blockIdx.y * TT;                                                  \
+                                                                               \
+    float acc[ROUTER_ET][TT];                                                  \
+    _Pragma("unroll")                                                          \
+    for (int el = 0; el < ROUTER_ET; ++el)                                     \
+        _Pragma("unroll")                                                      \
+        for (int u = 0; u < TT; ++u) acc[el][u] = 0.0f;                        \
+                                                                               \
+    for (int jc = 0; jc < hidden; jc += ROUTER_JC) {                           \
+        __syncthreads();                                                       \
+        int j = jc + tid;                                                      \
+        _Pragma("unroll")                                                      \
+        for (int u = 0; u < TT; ++u) {                                         \
+            int t = (t0 + u < max_tokens) ? t0 + u : max_tokens - 1;           \
+            sx[u * ROUTER_JC + tid] = j < hidden ? x[(long long)t * hidden + j] : 0.0f; \
+        }                                                                      \
+        __syncthreads();                                                       \
+        if (j < hidden) {                                                      \
+            _Pragma("unroll")                                                  \
+            for (int el = 0; el < ROUTER_ET; ++el) {                           \
+                int e = e0 + el;                                               \
+                float wj = e < num_experts ? w[(long long)e * hidden + j] : 0.0f; \
+                _Pragma("unroll")                                              \
+                for (int u = 0; u < TT; ++u) {                                 \
+                    acc[el][u] += wj * sx[u * ROUTER_JC + tid];                \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+                                                                               \
+    _Pragma("unroll")                                                          \
+    for (int el = 0; el < ROUTER_ET; ++el) {                                   \
+        _Pragma("unroll")                                                      \
+        for (int u = 0; u < TT; ++u) {                                         \
+            float v = acc[el][u];                                              \
+            _Pragma("unroll")                                                  \
+            for (int offset = 16; offset > 0; offset >>= 1) {                  \
+                v += __shfl_down_sync(0xffffffff, v, offset);                  \
+            }                                                                  \
+            if (lane == 0) scratch[warp * (ROUTER_ET * TT) + el * TT + u] = v; \
+        }                                                                      \
+    }                                                                          \
+    __syncthreads();                                                           \
+                                                                               \
+    int live = *valid_tokens;                                                  \
+    if (tid < ROUTER_ET * TT) {                                                \
+        int el = tid / TT;                                                     \
+        int u  = tid % TT;                                                     \
+        float total = 0.0f;                                                    \
+        for (int wv = 0; wv < n_warps; ++wv) {                                 \
+            total += scratch[wv * (ROUTER_ET * TT) + el * TT + u];             \
+        }                                                                      \
+        int e = e0 + el;                                                       \
+        int t = t0 + u;                                                        \
+        if (e < num_experts && t < live) {                                     \
+            logits[(long long)t * num_experts + e] = total;                    \
+        }                                                                      \
+    }                                                                          \
 }
+
+// Eight tokens for prefill. One for decode, where seven of the eight
+// accumulators would be a token clamped to the same row — 7/8 of the
+// arithmetic and 7/8 of the staged tile spent recomputing one answer.
+ROUTER_LOGITS(moe_block_router_logits,    8)
+ROUTER_LOGITS(moe_block_router_logits_t1, 1)
 
 // gate[t] = sigmoid(dot(ffn_gate_inp_shexp, normed[t])).
 //
@@ -751,6 +752,7 @@ pub struct MoeBlock {
     moe: MoeKernels,
     layer_ops: LayerOpsKernels,
     router_logits_fn: CudaFunction,
+    router_logits_t1_fn: CudaFunction,
     shared_gate_fn: CudaFunction,
     combine_fn: CudaFunction,
     buffers: MoeBuffers,
@@ -805,6 +807,7 @@ impl MoeBlock {
         let n = geometry.max_tokens * geometry.hidden;
         Ok(Self {
             router_logits_fn: module.load_function("moe_block_router_logits")?,
+            router_logits_t1_fn: module.load_function("moe_block_router_logits_t1")?,
             shared_gate_fn: module.load_function("moe_block_shared_gate")?,
             combine_fn: module.load_function("moe_block_combine")?,
             moe,
@@ -941,19 +944,24 @@ impl MoeBlock {
         let hidden_i32 = g.hidden as i32;
         let experts_i32 = g.num_experts as i32;
         let max_tokens_i32 = g.max_tokens as i32;
+        // One token takes the narrow instantiation; see the kernel.
+        let tt = if g.max_tokens == 1 { 1 } else { ROUTER_TT };
         let cfg = LaunchConfig {
             grid_dim: (
                 (g.num_experts as u32).div_ceil(ROUTER_ET),
-                (g.max_tokens as u32).div_ceil(ROUTER_TT),
+                (g.max_tokens as u32).div_ceil(tt),
                 1,
             ),
             block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: ((ROUTER_TT * ROUTER_JC
-                + THREADS.div_ceil(32) * ROUTER_ET * ROUTER_TT)
-                as usize
+            shared_mem_bytes: ((tt * ROUTER_JC + THREADS.div_ceil(32) * ROUTER_ET * tt) as usize
                 * size_of::<f32>()) as u32,
         };
-        let mut builder = stream.launch_builder(&self.router_logits_fn);
+        let f = if tt == 1 {
+            &self.router_logits_t1_fn
+        } else {
+            &self.router_logits_fn
+        };
+        let mut builder = stream.launch_builder(f);
         builder
             .arg(&w.router)
             .arg(&self.normed)
