@@ -114,6 +114,7 @@ use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels};
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use xabe_cuda::kernels::lm_head::{LmHeadError, LmHeadGeometry, LmHeadKernels};
+use xabe_cuda::kernels::mma::{MMA_SPLIT_TOKENS, MmaError, MmaKernels};
 use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
 use xabe_gguf::GgmlType;
 use xabe_model::config::ModelConfig;
@@ -272,6 +273,9 @@ pub enum AttentionBlockError {
     Arena(ArenaError),
     /// One of the mixer kernels rejected a launch.
     Attention(AttentionError),
+    /// The integer tensor-core path rejected a repack, a quantization, or a
+    /// projection launch.
+    Mma(MmaError),
     /// RMSNorm rejected a launch.
     LayerOps(LayerOpsError),
     /// A projection rejected a launch.
@@ -322,6 +326,7 @@ impl std::fmt::Display for AttentionBlockError {
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Arena(e) => write!(f, "{e}"),
             Self::Attention(e) => write!(f, "{e}"),
+            Self::Mma(e) => write!(f, "{e}"),
             Self::LayerOps(e) => write!(f, "{e}"),
             Self::Projection(e) => write!(f, "{e}"),
             Self::MissingWeight { role, layer } => {
@@ -378,6 +383,12 @@ impl From<ArenaError> for AttentionBlockError {
         Self::Arena(e)
     }
 }
+impl From<MmaError> for AttentionBlockError {
+    fn from(e: MmaError) -> Self {
+        Self::Mma(e)
+    }
+}
+
 impl From<AttentionError> for AttentionBlockError {
     fn from(e: AttentionError) -> Self {
         Self::Attention(e)
@@ -570,6 +581,18 @@ pub struct GatedAttentionBlock {
     w_v: CudaSlice<u8>,
     w_out: CudaSlice<u8>,
 
+    /// The four Q8_0 projections repacked into the split layout the integer
+    /// tensor cores can load, plus the handle that drives them.
+    ///
+    /// `None` below [`MMA_SPLIT_TOKENS`]. The MMA path pays a fixed cost — a
+    /// quantization sweep over the activations and a grid quantized to 8-token
+    /// tiles — that a short batch cannot amortize, and a decode step of one
+    /// token would pay all of it to fill an eighth of a fragment.
+    int8: Option<AttnInt8>,
+    /// Activations quantized once per contraction width and reused by every
+    /// projection that shares it. Allocated on first use, then kept.
+    xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+
     normed: CudaSlice<f32>,
     packed: CudaSlice<f32>,
     query: CudaSlice<f32>,
@@ -586,7 +609,139 @@ pub struct GatedAttentionBlock {
     projected: CudaSlice<f32>,
 }
 
+/// One attention layer's Q8_0 projections in the split int8 layout.
+///
+/// Q8_0 interleaves a 2-byte scale with every 32 quants, so a 34-byte stride
+/// puts every operand load off a 4-byte boundary and the tensor-core fragment
+/// load faults. Splitting the quants from the scales into two arrays is what
+/// makes the load legal, and it is worth about 12x over assembling the
+/// operands byte by byte in place.
+///
+/// Costs about 30.7 MB per layer on top of the Q8_0 the block already holds —
+/// int8 plus one fp32 scale per 32, against Q8_0's fp16 scale per 32.
+struct AttnInt8 {
+    mma: MmaKernels,
+    qgate_q: CudaSlice<i8>,
+    qgate_s: CudaSlice<f32>,
+    k_q: CudaSlice<i8>,
+    k_s: CudaSlice<f32>,
+    v_q: CudaSlice<i8>,
+    v_s: CudaSlice<f32>,
+    out_q: CudaSlice<i8>,
+    out_s: CudaSlice<f32>,
+}
+
+/// Which scratch buffer [`GatedAttentionBlock::quantize_activations`] reads.
+///
+/// The quantizer needs `&mut self` for the destination and `&self` for the
+/// source, and both are fields of the same block. Naming the source instead of
+/// passing it sidesteps the borrow rather than working around it with a clone.
+#[derive(Clone, Copy)]
+enum ScratchPick {
+    /// `normed` — the RMSNormed residual stream, shared by q+gate, k and v.
+    Normed,
+    /// `gated` — the sigmoid-gated core output, read only by the output
+    /// projection, which contracts over `q_dim` rather than `hidden`.
+    Gated,
+}
+
+impl AttnInt8 {
+    /// Repack this layer's four Q8_0 projections into the split layout.
+    ///
+    /// Runs once, at construction. The element counts are passed rather than
+    /// derived because `qgate` is `hidden x 2*q_dim` and `out` is
+    /// `q_dim x hidden` — deriving them here would duplicate the shape
+    /// reasoning that `new` already did against the file's directory.
+    #[allow(clippy::too_many_arguments)]
+    fn repack(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        w_qgate: &CudaSlice<u8>,
+        w_k: &CudaSlice<u8>,
+        w_v: &CudaSlice<u8>,
+        w_out: &CudaSlice<u8>,
+        qgate_elems: usize,
+        kv_elems: usize,
+        out_elems: usize,
+    ) -> Result<Self, AttentionBlockError> {
+        let mma = MmaKernels::new(ctx)?;
+        let one = |src: &CudaSlice<u8>, elements: usize| -> Result<_, AttentionBlockError> {
+            let mut q = stream.alloc_zeros::<i8>(elements)?;
+            let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
+            mma.repack_q8_0(stream, src, &mut q, &mut sc, elements)?;
+            Ok((q, sc))
+        };
+        let (qgate_q, qgate_s) = one(w_qgate, qgate_elems)?;
+        let (k_q, k_s) = one(w_k, kv_elems)?;
+        let (v_q, v_s) = one(w_v, kv_elems)?;
+        let (out_q, out_s) = one(w_out, out_elems)?;
+        Ok(Self {
+            mma,
+            qgate_q,
+            qgate_s,
+            k_q,
+            k_s,
+            v_q,
+            v_s,
+            out_q,
+            out_s,
+        })
+    }
+}
+
 impl GatedAttentionBlock {
+    /// Whether a batch of `tokens` is wide enough to be worth the integer
+    /// tensor-core path. Shared with [`crate::block::gdn::GdnBlock`] so the
+    /// two mixers never disagree about which arithmetic a pass is using.
+    pub fn uses_tensor_cores(tokens: usize) -> bool {
+        tokens >= MMA_SPLIT_TOKENS
+    }
+
+    /// Drop this block's repacked int8 weights, forcing its four projections
+    /// back to the fp32 kernels. See [`crate::forward::Forward::disable_tensor_cores`].
+    pub fn disable_tensor_cores(&mut self) {
+        self.int8 = None;
+        self.xq = None;
+    }
+
+    /// Whether this block has its repacked int8 weights resident.
+    pub fn tensor_cores_enabled(&self) -> bool {
+        self.int8.is_some()
+    }
+
+    /// Quantize one scratch buffer to int8 for the projections that read it.
+    ///
+    /// Called twice per pass: once over `normed` for the three projections
+    /// that contract over `hidden`, once over `gated` for the output
+    /// projection that contracts over `q_dim`. The buffer is allocated once at
+    /// the wider of the two so the second call cannot reallocate mid-pass,
+    /// which `AGENTS.md` rule 6 forbids.
+    fn quantize_activations(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        pick: ScratchPick,
+        tokens: usize,
+        k_dim: usize,
+    ) -> Result<(), AttentionBlockError> {
+        let widest = tokens * self.hidden.max(self.q_heads * self.head_dim);
+        let need = tokens * k_dim;
+        debug_assert!(need <= widest);
+        if !self.xq.as_ref().is_some_and(|(q, _)| q.len() >= need) {
+            self.xq = Some((
+                stream.alloc_zeros::<i8>(widest)?,
+                stream.alloc_zeros::<f32>(widest / 32)?,
+            ));
+        }
+        let src = match pick {
+            ScratchPick::Normed => &self.normed,
+            ScratchPick::Gated => &self.gated,
+        };
+        let i8w = self.int8.as_ref().expect("caller checked");
+        let (q, sc) = self.xq.as_mut().expect("just allocated");
+        i8w.mma.quantize_rows(stream, src, q, sc, tokens, k_dim)?;
+        Ok(())
+    }
+
     /// Resolve layer `layer`'s weights out of `weights` and allocate scratch.
     ///
     /// `rms_eps` is the file's `*.attention.layer_norm_rms_epsilon` and
@@ -627,6 +782,26 @@ impl GatedAttentionBlock {
         let w_v = q8_0_weight(weights, stream, Role::AttnV, layer, &[h, kv_dim as u64])?;
         let w_out = q8_0_weight(weights, stream, Role::AttnOut, layer, &[q_dim as u64, h])?;
 
+        // Repack up front rather than lazily: the alternative is a first pass
+        // that allocates and launches five extra kernels mid-forward, which
+        // `AGENTS.md` rule 6 forbids and which would poison the first timed
+        // repetition of every benchmark.
+        let int8 = if Self::uses_tensor_cores(tokens) {
+            Some(AttnInt8::repack(
+                stream.context(),
+                stream,
+                &w_qgate,
+                &w_k,
+                &w_v,
+                &w_out,
+                hidden * 2 * q_dim,
+                hidden * kv_dim,
+                q_dim * hidden,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             kernels,
             layer,
@@ -645,6 +820,8 @@ impl GatedAttentionBlock {
             w_k,
             w_v,
             w_out,
+            int8,
+            xq: None,
             normed: stream.alloc_zeros::<f32>(tokens * hidden)?,
             packed: stream.alloc_zeros::<f32>(tokens * 2 * q_dim)?,
             query: stream.alloc_zeros::<f32>(tokens * q_dim)?,
@@ -703,7 +880,9 @@ impl GatedAttentionBlock {
     ) -> Result<(), AttentionBlockError> {
         let t = self.tokens;
         let hidden_elems = t * self.hidden;
-        let q_elems = t * self.q_heads * self.head_dim;
+        let q_dim = self.q_heads * self.head_dim;
+        let kv_dim = self.kv_heads * self.head_dim;
+        let q_elems = t * q_dim;
         expect_len("block input", hidden_state.len(), hidden_elems)?;
         expect_len("block output", out.len(), hidden_elems)?;
         if pos_offset + t > cache.max_seq {
@@ -714,7 +893,10 @@ impl GatedAttentionBlock {
             });
         }
 
-        let k = &self.kernels;
+        // Cloned rather than borrowed: `quantize_activations` needs `&mut
+        // self`, and an outstanding `&self.kernels` would make that a conflict
+        // for the whole pass. The clone is one atomic increment on an `Arc`.
+        let k = Arc::clone(&self.kernels);
 
         // 1. RMSNorm over the residual stream.
         k.ops.rms_norm(
@@ -728,16 +910,37 @@ impl GatedAttentionBlock {
         )?;
 
         // 2. The packed query+gate projection.
-        k.qgate.forward(
-            stream,
-            QuantTensor {
-                bytes: &self.w_qgate,
-                quant: ExpertQuant::Q8_0,
-            },
-            &self.normed,
-            t,
-            &mut self.packed,
-        )?;
+        //
+        // Steps 2 and 5 all read `normed` and all contract over `hidden`, so
+        // one quantization serves three projections.
+        if self.int8.is_some() {
+            self.quantize_activations(stream, ScratchPick::Normed, t, self.hidden)?;
+        }
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.qgate_q,
+                &i8w.qgate_s,
+                xq,
+                xs,
+                &mut self.packed,
+                self.hidden,
+                2 * q_dim,
+                t,
+            )?;
+        } else {
+            k.qgate.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_qgate,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &self.normed,
+                t,
+                &mut self.packed,
+            )?;
+        }
 
         // 3. Deinterleave. See the module docs: this is the step that is a
         //    different model if it is done as a halves split.
@@ -755,27 +958,54 @@ impl GatedAttentionBlock {
             self.rms_eps,
         )?;
 
-        // 5. Key and value projections, off the same normed input.
-        k.kv.forward(
-            stream,
-            QuantTensor {
-                bytes: &self.w_k,
-                quant: ExpertQuant::Q8_0,
-            },
-            &self.normed,
-            t,
-            &mut self.key,
-        )?;
-        k.kv.forward(
-            stream,
-            QuantTensor {
-                bytes: &self.w_v,
-                quant: ExpertQuant::Q8_0,
-            },
-            &self.normed,
-            t,
-            &mut self.value,
-        )?;
+        // 5. Key and value projections, off the same normed input — and off
+        //    the same quantization of it that step 2 already paid for.
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = self.xq.as_ref().expect("quantized at step 2");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.k_q,
+                &i8w.k_s,
+                xq,
+                xs,
+                &mut self.key,
+                self.hidden,
+                kv_dim,
+                t,
+            )?;
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.v_q,
+                &i8w.v_s,
+                xq,
+                xs,
+                &mut self.value,
+                self.hidden,
+                kv_dim,
+                t,
+            )?;
+        } else {
+            k.kv.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_k,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &self.normed,
+                t,
+                &mut self.key,
+            )?;
+            k.kv.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_v,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &self.normed,
+                t,
+                &mut self.value,
+            )?;
+        }
 
         // 6. Per-head RMSNorm on the key. The value is not normed.
         k.ops.rms_norm(
@@ -848,17 +1078,37 @@ impl GatedAttentionBlock {
             q_elems,
         )?;
 
-        // 11. Output projection.
-        k.out.forward(
-            stream,
-            QuantTensor {
-                bytes: &self.w_out,
-                quant: ExpertQuant::Q8_0,
-            },
-            &self.gated,
-            t,
-            &mut self.projected,
-        )?;
+        // 11. Output projection. Contracts over `q_dim`, not `hidden`, and
+        //     reads the gated core output — so it re-quantizes rather than
+        //     reusing what step 2 produced.
+        if self.int8.is_some() {
+            self.quantize_activations(stream, ScratchPick::Gated, t, q_dim)?;
+        }
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                xq,
+                xs,
+                &mut self.projected,
+                q_dim,
+                self.hidden,
+                t,
+            )?;
+        } else {
+            k.out.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_out,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &self.gated,
+                t,
+                &mut self.projected,
+            )?;
+        }
 
         // 12. Residual.
         k.elementwise

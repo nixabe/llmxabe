@@ -858,14 +858,23 @@ impl Forward {
     /// threshold where that path engages — so the oracle gate alone would
     /// never exercise it. See `tests/int8_forward.rs`.
     ///
-    /// Frees about 1.13 GiB. Not reversible without rebuilding the pass.
+    /// Frees about 1.43 GiB. Not reversible without rebuilding the pass.
+    ///
+    /// Clears **both** mixers. Clearing only the Gated DeltaNet side would
+    /// leave the ten Gated Attention layers on tensor cores in the supposed
+    /// fp32 twin, and the differential test would silently stop covering them.
     pub fn disable_tensor_cores(&mut self) {
         self.gdn_int8.clear();
+        for block in &mut self.attention {
+            block.disable_tensor_cores();
+        }
     }
 
-    /// Whether this pass has the repacked int8 weights resident.
+    /// Whether this pass has the repacked int8 weights resident, in both
+    /// mixers. A pass with one side repacked and not the other is a bug, so
+    /// this reports the conjunction rather than either half.
     pub fn tensor_cores_enabled(&self) -> bool {
-        !self.gdn_int8.is_empty()
+        !self.gdn_int8.is_empty() && self.attention.iter().all(|b| b.tensor_cores_enabled())
     }
 
     /// Allocate carried state for one sequence of up to `max_seq` positions.
