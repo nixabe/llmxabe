@@ -423,6 +423,69 @@ than 73.48.
 before there was a KV cache. Real decode is measured in the next section, and
 it turns out the floor was the *pessimistic* proxy, not the flattering one.
 
+## Where decode actually goes, and why prefill needs tensor cores (2026-08-16)
+
+Measured with `nsys` over 200 decode steps at a 128-token prompt, GPU 0.
+
+**Decode step: 15.33 ms wall, 14.44 ms GPU busy, 1,097 kernel launches.**
+The 0.89 ms gap is 5.8% — that is the *entire* ceiling for CUDA graph capture
+on a single decode stream, and it is worth knowing before building it. The
+earlier "~0.4% at n = 512" figure was measured at prefill shape, where a pass
+is 40x longer and launch overhead is correspondingly irrelevant.
+
+| | share of GPU time | ms |
+| --- | ---: | ---: |
+| MoE experts (`moe_expert_ffn`/`_down`, `moe_shared_*`) | 39.2% | 5.67 |
+| GDN projections (`gdn_proj_q8_0`/`_f32`) | 30.8% | 4.45 |
+| LM head | 8.5% | 1.23 |
+| MoE dispatch (route, align, reduce) | 7.2% | 1.04 |
+| attention | 2.8% | 0.40 |
+| GDN recurrent step | 2.1% | 0.30 |
+| norms | 1.8% | 0.26 |
+| everything else | 7.6% | 1.10 |
+
+### The two halves of the goal are two different problems
+
+From `bench_moe`, the grouped GEMM against both rooflines:
+
+| tokens | grouped ms | GB/s (unique) | % bandwidth peak | TFLOP/s | % fp32 peak |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.175 | 129.4 | 19.3% | — | — |
+| 512 | 11.814 | 61.4 | 9.1% | **4.4** | **27%** |
+
+**At prefill the MoE GEMM is compute-bound, not bandwidth-bound.** 4.4
+TFLOP/s is 27% of the card's 16.3 TFLOP/s fp32 peak, and §2 of
+[OPTIMIZATION.md](OPTIMIZATION.md) puts the structural ceiling for this
+instruction mix at ~50% of peak (511 SASS instructions per 128 FFMA = 25%
+instruction density). So the kernel is already at roughly **55% of what fp32
+can reach on this part**, and the remaining fp32 headroom is under 2x against
+a 10.3x gap. This is an independent confirmation of §8.1's conclusion:
+**prefill cannot beat llama.cpp without int8 tensor cores.**
+
+**At decode it is bandwidth-bound**, at 19.3% of peak. That one has real
+headroom — `lm_head_gemv_b1` moves 540 MB at 353 GB/s (53% of peak) on the
+same card in the same pass, so ~2.5x on the MoE weight path is not a
+speculative target.
+
+### Requantizing the experts Q6_K -> Q8_0: measured, and not worth it
+
+The hypothesis was that Q6_K's 210-byte superblock — `ql`, `qh` and `scales`
+in disjoint runs — coalesces badly against Q8_0's flat 34-byte block, and
+that widening would pay for its extra bytes. `LLMXABE_MOE_QUANT=q8_0` runs
+the same geometry with the gate and up projections widened:
+
+| tokens | Q6_K | Q8_0 | speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.175 ms | 0.165 ms | 1.06x |
+| 19 | 1.925 | 1.781 | 1.08x |
+| 128 | 5.334 | 5.119 | 1.04x |
+| 512 | 11.814 | 11.266 | 1.05x |
+
+**4-8%, for +30% VRAM** (the MoE stack goes 27.4 -> 35.4 GiB). The
+hypothesis was wrong: the dequantization format is not what limits this
+kernel. Recorded so the requantization pipeline does not get built on the
+strength of the argument, which is plausible and false.
+
 ## NVRTC: 22 of 32 compiles were redundant (2026-08-16)
 
 The `--log-level debug` instrumentation added with the `tracing` migration

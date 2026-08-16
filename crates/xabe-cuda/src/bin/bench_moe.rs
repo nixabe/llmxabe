@@ -155,8 +155,28 @@ fn main() {
         probe.num_experts
     );
     let t0 = Instant::now();
-    let d_gate = stream.clone_htod(&q6_k_stack(stack, 1)).expect("gate");
-    let d_up = stream.clone_htod(&q6_k_stack(stack, 2)).expect("up");
+    // The gate and up projections are Q6_K in the shipped `_XL` mixed quant,
+    // which is what this defaults to. `LLMXABE_MOE_QUANT=q8_0` re-runs the
+    // same geometry with them widened to Q8_0 — 30% more bytes to move, but a
+    // flat 34-byte block instead of Q6_K's 210-byte superblock with its `ql`,
+    // `qh` and `scales` in disjoint runs. Which of those two effects wins is
+    // the question; it is not answerable from the roofline, because the
+    // roofline counts bytes and the difference is in how they are fetched.
+    let gate_up_quant = match std::env::var("LLMXABE_MOE_QUANT").as_deref() {
+        Ok("q8_0") => ExpertQuant::Q8_0,
+        Ok("q6_k") | Err(_) => ExpertQuant::Q6K,
+        Ok(other) => panic!("unknown LLMXABE_MOE_QUANT {other:?}; expected q6_k or q8_0"),
+    };
+    let (d_gate, d_up) = match gate_up_quant {
+        ExpertQuant::Q6K => (
+            stream.clone_htod(&q6_k_stack(stack, 1)).expect("gate"),
+            stream.clone_htod(&q6_k_stack(stack, 2)).expect("up"),
+        ),
+        ExpertQuant::Q8_0 => (
+            stream.clone_htod(&q8_0_stack(stack, 1)).expect("gate"),
+            stream.clone_htod(&q8_0_stack(stack, 2)).expect("up"),
+        ),
+    };
     let d_down = stream.clone_htod(&q8_0_stack(stack, 3)).expect("down");
     let d_sgate = stream
         .clone_htod(&q6_k_stack(one_expert, 4))
@@ -176,11 +196,11 @@ fn main() {
 
     let gate = QuantTensor {
         bytes: &d_gate,
-        quant: ExpertQuant::Q6K,
+        quant: gate_up_quant,
     };
     let up = QuantTensor {
         bytes: &d_up,
-        quant: ExpertQuant::Q6K,
+        quant: gate_up_quant,
     };
     let down = QuantTensor {
         bytes: &d_down,
