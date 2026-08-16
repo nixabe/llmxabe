@@ -226,6 +226,21 @@ const ROPE_TOKENS: u32 = 16;
 /// a compile-time constant and `head_dim` is rejected above `32 * ATTN_MAXD`.
 const ATTN_MAXD: usize = 8;
 
+/// Query rows one GQA-shared block carries. Mirrors `GQA_QT`.
+///
+/// This is exactly the factor by which that kernel divides K/V traffic, so
+/// bigger is better right up to the register wall — see the kernel's own
+/// comment for why 4 is where it stops.
+const GQA_QUERY_TILE: usize = 4;
+
+/// Keys the GQA-shared kernel stages in shared memory per trip. Mirrors
+/// `GQA_KT`.
+///
+/// Sets both the shared footprint (`2 * GQA_KEY_TILE * head_dim` floats) and
+/// how often the running softmax is rescaled. Capped at 32 because the
+/// exponential phase gives one key slot to one lane.
+const GQA_KEY_TILE: usize = 8;
+
 const ATTENTION_SRC: &str = r#"
 extern "C" {
 
@@ -559,6 +574,247 @@ __global__ void NAME(                                                           
 // pre-tiling kernel, unchanged.
 ATTN_FLASH(attn_flash_causal, ATTN_QT)
 
+// ---------------------------------------------------------------------------
+// The same attention, with the KV head — not the query head — on the grid.
+//
+// grid: (n_query / GQA_QT, kv_heads) — one block per (query tile, KV head).
+// block: (q_heads / kv_heads) warps — one warp per query head of that KV head.
+//
+// ## Why this kernel exists
+//
+// `attn_flash_causal` above puts the *query* head on grid.y, so at Qwen3.6's
+// 16:2 grouping the eight query heads sharing a KV head are eight separate
+// blocks, and each one streams the whole K and V window for itself. The work
+// needs one pass over K/V per KV head; the kernel paid one per query head.
+// Measured at the sixteenth chunk of an 8,192-token chunked prefill, that was
+// 16.4 GB moved in 31.65 ms — 77% of this card's 672 GB/s — against a 2.05 GB
+// lower bound. Eight times the traffic, and the kernel was bandwidth-bound, so
+// it was eight times the time.
+//
+// Two cheaper fixes were measured first and both lost; see docs/BENCHMARKS.md.
+// Widening ATTN_QT to 16 halves the block count but doubles `qr` to 128
+// registers and halves resident blocks: 8K prefill 6,004 -> 6,647 ms. Merely
+// swapping the grid axes so the eight siblings are *co-resident* and hit in L2
+// lost 1.7% across three interleaved pairs — sibling blocks start together but
+// drift apart faster than 6 MB of L2 can span, so nothing but an explicit
+// staging barrier actually makes them share.
+//
+// ## The shape, and why GQA_QT is 4 and not 8
+//
+// DRAM traffic here is `(blocks) * (visible K/V)`, and blocks is
+// `n_query/GQA_QT * kv_heads` against the old `n_query/ATTN_QT * q_heads`. The
+// gqa ratio and ATTN_QT are both 8, so the reduction is exactly GQA_QT: four
+// query rows, four times less traffic. Eight would give eight, and cannot be
+// had — a warp now owns a whole head, so a lane carries `head_dim/32`
+// accumulator dimensions per row rather than one, and `qr` plus `acc` is
+// `2 * GQA_QT * ATTN_MAXD` registers. At GQA_QT 4 that is 64 and ptxas keeps
+// two blocks resident; at 8 it is 128, which is the wall the ATTN_QT 16
+// experiment already hit from the other side.
+//
+// ## What moved into shared, and what that costs
+//
+// K and V for GQA_KT keys are staged once per trip and read by all eight
+// warps. The score loop then reads K from shared instead of global, one read
+// feeding GQA_QT multiply-adds. Turing does 128 B/clk of shared against 64
+// fp32 lanes — two warp-FMAs per warp-load — so a 4:1 ratio is still short of
+// the load/store bound, which is why this does not simply move the stall.
+//
+// Consecutive lanes read consecutive words in both `k_sh` and `v_sh`
+// (`lane + 32 * i` with a `head_dim` row stride), so no padding is needed:
+// every access is one conflict-free 128 B phase.
+//
+// ## Softmax
+//
+// A warp owns a head outright, so the per-tile bookkeeping is warp-local and
+// needs `__syncwarp` rather than `__syncthreads` — the only block-wide
+// barriers left are the two that fence the staged tile. The running max and
+// the normalizer stay serial and ascending over the tile, matching
+// `causal_attention_streaming` and the kernel above; only the tile *width*
+// differs (GQA_KT rather than `n_warps * ATTN_KT`), which changes where the
+// rescales land and so is a floating-point difference, not an algebraic one.
+#define GQA_QT 4
+#define GQA_KT 8
+
+__global__ void attn_flash_causal_gqa(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ out,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    const int* __restrict__ key_offset,
+    float scale,
+    int n_query
+) {
+    extern __shared__ float smem[];
+    int gqa = q_heads / kv_heads;
+    int dpt = head_dim >> 5;
+    float* k_sh = smem;                            // GQA_KT * head_dim
+    float* v_sh = k_sh + GQA_KT * head_dim;        // GQA_KT * head_dim
+    float* w_sh = v_sh + GQA_KT * head_dim;        // gqa * GQA_QT * GQA_KT
+
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int nthr = blockDim.x;
+
+    long long qi0 = (long long)blockIdx.x * GQA_QT;
+    int kvh = blockIdx.y;
+    int h   = kvh * gqa + warp;      // this warp's query head
+    float* my_w = w_sh + warp * (GQA_QT * GQA_KT);
+
+    // This warp's query tile in registers. Lane `lane` owns dimensions
+    // `lane, lane + 32, ...` of every row, so the dot product below reduces
+    // over exactly the partition the untiled kernel used.
+    float qr[GQA_QT][ATTN_MAXD];
+    #pragma unroll
+    for (int u = 0; u < GQA_QT; ++u) {
+        long long qrow = qi0 + u;
+        const float* qp = q + (qrow * (long long)q_heads + h) * (long long)head_dim;
+        #pragma unroll
+        for (int i = 0; i < ATTN_MAXD; ++i) {
+            qr[u][i] = (i < dpt && qrow < (long long)n_query) ? qp[lane + 32 * i] : 0.0f;
+        }
+    }
+
+    float acc[GQA_QT][ATTN_MAXD];
+    float m[GQA_QT], ln[GQA_QT];
+    #pragma unroll
+    for (int u = 0; u < GQA_QT; ++u) {
+        m[u] = neg_inf();
+        ln[u] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < ATTN_MAXD; ++i) acc[u][i] = 0.0f;
+    }
+
+    int qt_live = (int)((long long)n_query - qi0);
+    if (qt_live > GQA_QT) qt_live = GQA_QT;
+    long long n_visible = (long long)(*key_offset) + qi0 + qt_live;
+
+    for (long long j0 = 0; j0 < n_visible; j0 += GQA_KT) {
+        // Stage the tile. `n_visible` is block-uniform, so every warp runs the
+        // same trip count and the barriers below are reached by all of them.
+        __syncthreads();
+        for (int jj = 0; jj < GQA_KT; ++jj) {
+            long long key = j0 + jj;
+            bool live = key < n_visible;
+            const float* kp =
+                k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
+            const float* vp =
+                v + (key * (long long)kv_heads + kvh) * (long long)head_dim;
+            for (int d = tid; d < head_dim; d += nthr) {
+                k_sh[jj * head_dim + d] = live ? kp[d] : 0.0f;
+                v_sh[jj * head_dim + d] = live ? vp[d] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Scores. One shared read of a key dimension feeds GQA_QT multiply-adds.
+        #pragma unroll
+        for (int jj = 0; jj < GQA_KT; ++jj) {
+            float part[GQA_QT];
+            #pragma unroll
+            for (int u = 0; u < GQA_QT; ++u) part[u] = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpt) {
+                    float kd = k_sh[jj * head_dim + lane + 32 * i];
+                    #pragma unroll
+                    for (int u = 0; u < GQA_QT; ++u) part[u] += qr[u][i] * kd;
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < GQA_QT; ++u) {
+                float p = part[u];
+                for (int off = 16; off > 0; off >>= 1) {
+                    p += __shfl_xor_sync(0xffffffff, p, off);
+                }
+                if (lane == 0) my_w[u * GQA_KT + jj] = p * scale;
+            }
+        }
+        __syncwarp();
+
+        // The running max, serial and ascending over the tile. Every lane
+        // sweeps it redundantly: that is GQA_KT conflict-free shared
+        // broadcasts, cheaper than serializing onto one lane and broadcasting
+        // the result back. `corr` matches the reference's first-tile guard,
+        // where there is no accumulator to rescale and expf(-inf - -inf) is NaN.
+        float corr[GQA_QT];
+        #pragma unroll
+        for (int u = 0; u < GQA_QT; ++u) {
+            long long limit = (long long)(*key_offset) + qi0 + u;
+            float tmax = neg_inf();
+            for (int w = 0; w < GQA_KT; ++w) {
+                if (j0 + w <= limit) tmax = fmaxf(tmax, my_w[u * GQA_KT + w]);
+            }
+            float m0 = m[u];
+            float nm = fmaxf(m0, tmax);
+            corr[u] = (m0 == neg_inf()) ? 0.0f : expf(m0 - nm);
+            m[u] = nm;
+        }
+
+        // One exponential per slot. Masked slots store a literal zero, which is
+        // what lets a row whose causal bound ended earlier contribute exactly
+        // nothing to the tiles past it: `a += 0.0f * v` and `l += 0.0f` are
+        // both exact. Every read of `my_w` happens before any write to it.
+        float wl[GQA_QT];
+        #pragma unroll
+        for (int u = 0; u < GQA_QT; ++u) {
+            long long limit = (long long)(*key_offset) + qi0 + u;
+            float s = (lane < GQA_KT) ? my_w[u * GQA_KT + lane] : 0.0f;
+            wl[u] = (lane < GQA_KT && j0 + lane <= limit) ? expf(s - m[u]) : 0.0f;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int u = 0; u < GQA_QT; ++u) {
+            if (lane < GQA_KT) my_w[u * GQA_KT + lane] = wl[u];
+        }
+        __syncwarp();
+
+        // The normalizer, serial and ascending like the max above.
+        #pragma unroll
+        for (int u = 0; u < GQA_QT; ++u) {
+            float lsum = 0.0f;
+            for (int w = 0; w < GQA_KT; ++w) lsum += my_w[u * GQA_KT + w];
+            ln[u] = ln[u] * corr[u] + lsum;
+        }
+
+        // The values. One shared read of a value dimension serves GQA_QT rows.
+        #pragma unroll
+        for (int u = 0; u < GQA_QT; ++u) {
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) acc[u][i] *= corr[u];
+        }
+        for (int w = 0; w < GQA_KT; ++w) {
+            if (j0 + w >= n_visible) break;
+            float wu[GQA_QT];
+            #pragma unroll
+            for (int u = 0; u < GQA_QT; ++u) wu[u] = my_w[u * GQA_KT + w];
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpt) {
+                    float vv = v_sh[w * head_dim + lane + 32 * i];
+                    #pragma unroll
+                    for (int u = 0; u < GQA_QT; ++u) acc[u][i] += wu[u] * vv;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int u = 0; u < GQA_QT; ++u) {
+        long long qrow = qi0 + u;
+        if (qrow < (long long)n_query) {
+            float* op = out + (qrow * (long long)q_heads + h) * (long long)head_dim;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpt) op[lane + 32 * i] = acc[u][i] / ln[u];
+            }
+        }
+    }
+}
+
 __global__ void attn_flash_causal_t1(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -798,6 +1054,7 @@ pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
     flash: CudaFunction,
+    flash_gqa: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
     q_heads: usize,
@@ -829,6 +1086,7 @@ impl AttentionKernels {
             split: module.load_function("attn_split_query_gate")?,
             rope: module.load_function("attn_rope_partial_neox")?,
             flash: module.load_function("attn_flash_causal")?,
+            flash_gqa: module.load_function("attn_flash_causal_gqa")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
             q_heads,
@@ -855,6 +1113,28 @@ impl AttentionKernels {
     /// scalars. The query tile itself is in registers. See the module docs.
     pub fn shared_bytes(&self) -> usize {
         (2 * QUERY_TILE * self.keys_per_tile() + 3 * QUERY_TILE) * size_of::<f32>()
+    }
+
+    /// Dynamic shared memory the GQA-shared kernel requests: the staged key
+    /// and value tiles, plus one weight tile per warp. Unlike the kernel above
+    /// it stages K and V rather than only the softmax scratch, which is the
+    /// whole point — see that kernel's comment.
+    pub fn shared_bytes_gqa(&self) -> usize {
+        (2 * GQA_KEY_TILE * self.head_dim + self.gqa_ratio() * GQA_QUERY_TILE * GQA_KEY_TILE)
+            * size_of::<f32>()
+    }
+
+    /// Whether the GQA-shared kernel can service this geometry at all.
+    ///
+    /// Three things have to hold, and none of them do for every model: there
+    /// must be sharing to exploit, one warp per query head has to fit in a
+    /// block, and the staged tiles have to fit in the 48 KiB a block gets
+    /// without opting in. When any fails the launch falls back to
+    /// `attn_flash_causal`, which needs none of them.
+    fn gqa_shared_is_available(&self) -> bool {
+        self.gqa_ratio() >= 2
+            && self.gqa_ratio() * 32 <= 1024
+            && self.shared_bytes_gqa() <= 48 * 1024
     }
 
     /// Dynamic shared memory the one-row kernel requests: `q_sh` plus the two
@@ -1061,14 +1341,49 @@ impl AttentionKernels {
         // the row exists. Decode is `n_query == 1`, where that is seven
         // eighths of the kernel, so below a whole tile the one-row
         // instantiation is launched instead.
-        let (f, qt, shared) = if n_query < QUERY_TILE {
-            (&self.flash_t1, 1usize, self.shared_bytes_t1())
+        // Three shapes, narrowest first.
+        //
+        // Below one query tile the tiled kernels cost their empty rows in full
+        // — the score loop runs a multiply-add and a shuffle reduction per row
+        // per key whether or not the row exists — so decode, which is
+        // `n_query == 1`, takes the one-row instantiation.
+        //
+        // Above it the GQA-shared kernel is the default, because it reads K and
+        // V once per KV head instead of once per query head. It cannot service
+        // every geometry; `attn_flash_causal` can, and is the fallback.
+        let (f, grid, block, shared) = if n_query < GQA_QUERY_TILE {
+            (
+                &self.flash_t1,
+                (n_query as u32, self.q_heads as u32, 1),
+                self.head_dim as u32,
+                self.shared_bytes_t1(),
+            )
+        } else if self.gqa_shared_is_available() {
+            (
+                &self.flash_gqa,
+                (
+                    (n_query as u32).div_ceil(GQA_QUERY_TILE as u32),
+                    self.kv_heads as u32,
+                    1,
+                ),
+                (self.gqa_ratio() * 32) as u32,
+                self.shared_bytes_gqa(),
+            )
         } else {
-            (&self.flash, QUERY_TILE, self.shared_bytes())
+            (
+                &self.flash,
+                (
+                    (n_query as u32).div_ceil(QUERY_TILE as u32),
+                    self.q_heads as u32,
+                    1,
+                ),
+                self.head_dim as u32,
+                self.shared_bytes(),
+            )
         };
         let cfg = LaunchConfig {
-            grid_dim: ((n_query as u32).div_ceil(qt as u32), self.q_heads as u32, 1),
-            block_dim: (self.head_dim as u32, 1, 1),
+            grid_dim: grid,
+            block_dim: (block, 1, 1),
             shared_mem_bytes: shared as u32,
         };
         let q_heads = self.q_heads as i32;
@@ -1088,15 +1403,19 @@ impl AttentionKernels {
             .arg(positions)
             .arg(&scale)
             .arg(&n_query_i32);
-        // SAFETY: the grid is (ceil(n_query / QUERY_TILE), q_heads) with one
-        // thread per head dimension, and `n_query` is passed so the kernel
-        // masks the rows a partial tile does not have — it neither reads `q`
-        // nor writes `out` for them. The deepest key index any block reads is
-        // `positions[0] + n_query - 1`, which the caller promised is below
-        // `max_keys`, and all four buffers were checked against it.
-        // Shared memory covers the two `QUERY_TILE x keys_per_tile` scratch
-        // tiles and the three per-row scalars, which is everything the kernel
-        // indexes; the query tile is in registers.
+        // SAFETY: each of the three shapes covers the whole query range with a
+        // grid and block chosen just above, and every one is passed `n_query`
+        // so the kernel masks the rows a partial tile does not have — it
+        // neither reads `q` nor writes `out` for them. The deepest key index
+        // any block reads is `positions[0] + n_query - 1`, which the caller
+        // promised is below `max_keys`, and all four buffers were checked
+        // against it. Each shape's shared request is computed by the method
+        // named beside it and covers everything that shape indexes: the two
+        // softmax scratch tiles for `flash`, `q_sh` plus scratch for
+        // `flash_t1`, and the staged K/V tiles plus a per-warp weight tile for
+        // `flash_gqa`. `gqa_shared_is_available` has already established that
+        // the GQA block is at most 1024 threads and its shared request at most
+        // the 48 KiB a block gets without opting in.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
