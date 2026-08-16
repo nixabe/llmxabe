@@ -307,8 +307,19 @@ __global__ void mma_q8_0_proj_split(
     int n_tokens
 ) {
     int lane = threadIdx.x;
-    int t0   = blockIdx.y * MMA_TOKS;
-    int n0   = (blockIdx.x * blockDim.y + threadIdx.y) * MMA_ROWS;
+    // The warps of a block walk **the same weight rows** and different tokens,
+    // not the other way round.
+    //
+    // Every block in `y` re-reads the whole weight band -- that is the shape
+    // of this kernel and the reason the token tile was swept end to end rather
+    // than in isolation. What the sweep could not change is that the warps of
+    // a block used to take *different* row bands, so four warps meant four
+    // disjoint weight reads and the block shared nothing. Giving them one row
+    // band and four token tiles makes three of the four reads L1 hits and
+    // divides the band's DRAM traffic by `blockDim.y` -- at 512 tokens, eight
+    // passes over the weights become two.
+    int t0   = (blockIdx.y * blockDim.y + threadIdx.y) * MMA_TOKS;
+    int n0   = blockIdx.x * MMA_ROWS;
     if (t0 >= n_tokens || n0 >= n_rows) return;
 
     int blocks = k_dim / 32;
@@ -714,8 +725,8 @@ impl MmaKernels {
         const WARPS: u32 = 4;
         let cfg = LaunchConfig {
             grid_dim: (
-                (n_rows as u32).div_ceil(WARPS * MMA_ROWS as u32),
-                (tokens as u32).div_ceil(MMA_SPLIT_TOKS as u32),
+                (n_rows as u32).div_ceil(MMA_ROWS as u32),
+                (tokens as u32).div_ceil(WARPS * MMA_SPLIT_TOKS as u32),
                 1,
             ),
             block_dim: (32, WARPS, 1),

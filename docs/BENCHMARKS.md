@@ -1301,8 +1301,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | word-wide Q6_K unpacking in the MoE MMA | 1,365.74 | 1.02× |
 | wider MoE tensor-core block, 32-slot dispatch | 1,380.38 | 1.01× |
 | four staging loads per weight row instead of eight | 1,430.58 | 1.04× |
+| a block's warps share one weight band | 1,440.00 | 1.01× |
 
-**7.12× overall.** No single change is more than 1.81×; the result is
+**7.17× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1452,6 +1453,34 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### The dense projections are not weight-traffic bound either
+
+`mma_q8_0_proj_split` re-reads the whole weight band once per token tile --
+`grid.y` is `tokens / MMA_SPLIT_TOKS`, which is eight passes over the weights
+at 512 tokens. That is documented above as the reason a 16-token tile wins in
+isolation and loses in the engine.
+
+What was *not* deliberate: the warps of a block took **different** row bands,
+so four warps meant four disjoint weight reads and the block shared nothing at
+all. Giving them one row band and four token tiles instead makes three reads in
+four an L1 hit and turns eight DRAM passes over the weights into two.
+
+Measured interleaved against the old mapping, three runs each: **1,426.7 vs
+1,416.4 tok/s.** Real, kept, and 0.7% -- which is the finding. A 4x cut in the
+weight traffic of a kernel that is 15% of the pass is worth 0.7%, so that
+kernel is not weight-traffic bound. It is bound by its register file: 128
+accumulators put it at ptxas's 255-register ceiling and eight warps to an SM,
+and no tile shape in the sweep below improves on 64 x 64 under the new mapping
+either.
+
+| warps x tokens x rows | tok/s |
+| --- | ---: |
+| **4 x 64 x 64** | **1,434.91** |
+| 2 x 64 x 64 | 1,435.78 |
+| 8 x 32 x 64 | 1,369.17 |
+| 4 x 32 x 64 | 1,383.52 |
+| 4 x 64 x 32 | 1,351.86 |
 
 ### Staging was 60% of the MoE GEMM, and it was a load count
 
