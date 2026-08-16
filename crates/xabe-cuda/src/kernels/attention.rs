@@ -233,6 +233,19 @@ const ATTN_MAXD: usize = 8;
 /// comment for why 4 is where it stops.
 const GQA_QUERY_TILE: usize = 4;
 
+/// Key slices flash decoding splits the window into. Mirrors `DEC_SPLITS`.
+///
+/// The split grid is `(DECODE_SPLITS, kv_heads)`, so this times `kv_heads` is
+/// the block count that replaces decode's old sixteen. 64 gives 128 blocks
+/// against 72 SMs, which is where the card stops being the constraint; raising
+/// it further only shortens each slice and lengthens the combine.
+const DECODE_SPLITS: usize = 64;
+
+/// Keys the flash-decoding split pass stages per trip. Mirrors `DEC_KT`.
+///
+/// Capped at 32 because the exponential phase gives one key slot to one lane.
+const DECODE_KEY_TILE: usize = 8;
+
 /// Keys the GQA-shared kernel stages in shared memory per trip. Mirrors
 /// `GQA_KT`.
 ///
@@ -815,6 +828,189 @@ __global__ void attn_flash_causal_gqa(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Flash decoding: one query row, the key range split across blocks.
+//
+// grid: (DEC_SPLITS, kv_heads) for the split pass, (q_heads,) for the combine.
+// block: (q_heads / kv_heads) warps, one warp per query head, as above.
+//
+// ## Why decode needs its own shape
+//
+// `attn_flash_causal_t1` launches `(n_query, q_heads)`, and decode is
+// `n_query == 1`. That is **sixteen blocks on a 72-SM card**: 78% of the
+// machine is idle before the eightfold K/V redundancy is even counted. Nothing
+// about the query tile can fix that, because there is only one query row to
+// tile. The parallelism has to come from the key axis instead.
+//
+// So each block takes a contiguous slice of the key range and runs the same
+// online softmax over just that slice, emitting a partial `(m, l, acc)`. A
+// second pass merges the slices. The merge is exact in exact arithmetic:
+// writing `gm` for `max_s m_s`,
+//
+//     sum_s exp(m_s - gm) * acc_s = sum_s sum_{j in s} exp(s_j - gm) * v_j
+//     sum_s exp(m_s - gm) * l_s   = sum_s sum_{j in s} exp(s_j - gm)
+//
+// which are the numerator and denominator a single pass would have built, and
+// `gm` is the global maximum because the maximum of the slice maxima is it.
+//
+// ## Rule 5
+//
+// `DEC_SPLITS` is a host constant, but no slice boundary is. The slice width is
+// computed on the device from `*key_offset` and rounded up to a whole `DEC_KT`
+// tile, so a tile never straddles a boundary and every block's trip count comes
+// from device state alone. Splits past the end of a short window run zero trips
+// and write the identity partial — `m = -inf`, `l = 0`, `acc = 0` — which the
+// combine folds in as `exp(-inf - gm) = 0`, exactly.
+#define DEC_KT 8
+#define DEC_SPLITS 64
+
+__global__ void attn_flash_decode_split(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* __restrict__ part_acc,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    const int* __restrict__ key_offset,
+    float scale
+) {
+    extern __shared__ float smem[];
+    int gqa = q_heads / kv_heads;
+    int dpt = head_dim >> 5;
+    float* k_sh = smem;                        // DEC_KT * head_dim
+    float* v_sh = k_sh + DEC_KT * head_dim;    // DEC_KT * head_dim
+    float* s_sh = v_sh + DEC_KT * head_dim;    // gqa * DEC_KT
+
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int nthr = blockDim.x;
+    int split = blockIdx.x;
+    int kvh = blockIdx.y;
+    int h = kvh * gqa + warp;
+    float* my_s = s_sh + warp * DEC_KT;
+
+    // Decode's single row sits at absolute position *key_offset and sees keys
+    // [0, *key_offset]. Every quantity below is block-uniform, so the barriers
+    // in the trip loop are reached by every warp the same number of times.
+    long long n_visible = (long long)(*key_offset) + 1;
+    long long per = (n_visible + DEC_SPLITS - 1) / DEC_SPLITS;
+    per = ((per + DEC_KT - 1) / DEC_KT) * DEC_KT;
+    long long begin = (long long)split * per;
+    long long end = begin + per;
+    if (end > n_visible) end = n_visible;
+
+    float qr[ATTN_MAXD];
+    const float* qp = q + (long long)h * (long long)head_dim;
+    #pragma unroll
+    for (int i = 0; i < ATTN_MAXD; ++i) qr[i] = (i < dpt) ? qp[lane + 32 * i] : 0.0f;
+
+    float acc[ATTN_MAXD];
+    #pragma unroll
+    for (int i = 0; i < ATTN_MAXD; ++i) acc[i] = 0.0f;
+    float m = neg_inf();
+    float l = 0.0f;
+
+    for (long long j0 = begin; j0 < end; j0 += DEC_KT) {
+        int n_this = (int)((end - j0) < (long long)DEC_KT ? (end - j0) : (long long)DEC_KT);
+        __syncthreads();
+        for (int jj = 0; jj < DEC_KT; ++jj) {
+            long long key = j0 + jj;
+            bool live = jj < n_this;
+            const float* kp =
+                k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
+            const float* vp =
+                v + (key * (long long)kv_heads + kvh) * (long long)head_dim;
+            for (int d = tid; d < head_dim; d += nthr) {
+                k_sh[jj * head_dim + d] = live ? kp[d] : 0.0f;
+                v_sh[jj * head_dim + d] = live ? vp[d] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int jj = 0; jj < DEC_KT; ++jj) {
+            float part = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpt) part += qr[i] * k_sh[jj * head_dim + lane + 32 * i];
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                part += __shfl_xor_sync(0xffffffff, part, off);
+            }
+            if (lane == 0) my_s[jj] = part * scale;
+        }
+        __syncwarp();
+
+        // Serial and ascending over the tile, like every other form here.
+        float tmax = neg_inf();
+        for (int w = 0; w < n_this; ++w) tmax = fmaxf(tmax, my_s[w]);
+        float nm = fmaxf(m, tmax);
+        float corr = (m == neg_inf()) ? 0.0f : expf(m - nm);
+
+        float wl = (lane < n_this) ? expf(my_s[lane] - nm) : 0.0f;
+        __syncwarp();
+        if (lane < DEC_KT) my_s[lane] = wl;
+        __syncwarp();
+
+        float lsum = 0.0f;
+        for (int w = 0; w < n_this; ++w) lsum += my_s[w];
+        l = l * corr + lsum;
+
+        #pragma unroll
+        for (int i = 0; i < ATTN_MAXD; ++i) acc[i] *= corr;
+        for (int w = 0; w < n_this; ++w) {
+            float ww = my_s[w];
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpt) acc[i] += ww * v_sh[w * head_dim + lane + 32 * i];
+            }
+        }
+        m = nm;
+    }
+
+    float* pa = part_acc + ((long long)split * q_heads + h) * (long long)head_dim;
+    #pragma unroll
+    for (int i = 0; i < ATTN_MAXD; ++i) {
+        if (i < dpt) pa[lane + 32 * i] = acc[i];
+    }
+    if (lane == 0) {
+        part_m[split * q_heads + h] = m;
+        part_l[split * q_heads + h] = l;
+    }
+}
+
+// grid: (q_heads,). block: head_dim threads, one per output dimension.
+__global__ void attn_flash_decode_combine(
+    const float* __restrict__ part_acc,
+    const float* __restrict__ part_m,
+    const float* __restrict__ part_l,
+    float* __restrict__ out,
+    int q_heads,
+    int head_dim
+) {
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+
+    // Split 0 always holds at least key 0, so this is never -inf and the
+    // subtraction below never forms inf - inf.
+    float gm = neg_inf();
+    for (int s = 0; s < DEC_SPLITS; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
+
+    float num = 0.0f;
+    float den = 0.0f;
+    for (int s = 0; s < DEC_SPLITS; ++s) {
+        float ms = part_m[s * q_heads + h];
+        float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
+        num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
+        den += f * part_l[s * q_heads + h];
+    }
+    out[(long long)h * (long long)head_dim + d] = num / den;
+}
+
 __global__ void attn_flash_causal_t1(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -1049,12 +1245,49 @@ impl From<DriverError> for AttentionError {
     }
 }
 
+/// Per-slice partials for the flash-decoding path.
+///
+/// Preallocated because [`AGENTS.md` rule 6] forbids allocating mid-forward,
+/// and shared by every attention layer because they run in sequence on one
+/// stream and nothing crosses a layer boundary. Roughly 1 MiB at this model's
+/// geometry, which is why it is not worth a shape-dependent lifetime.
+pub struct AttnDecodeScratch {
+    /// `[DECODE_SPLITS][q_heads][head_dim]`, each slice's unnormalized sum.
+    acc: CudaSlice<f32>,
+    /// `[DECODE_SPLITS][q_heads]`, each slice's running maximum.
+    m: CudaSlice<f32>,
+    /// `[DECODE_SPLITS][q_heads]`, each slice's softmax normalizer.
+    l: CudaSlice<f32>,
+}
+
+impl AttnDecodeScratch {
+    /// Allocate for one head geometry.
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        q_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, AttentionError> {
+        Ok(Self {
+            acc: stream.alloc_zeros::<f32>(DECODE_SPLITS * q_heads * head_dim)?,
+            m: stream.alloc_zeros::<f32>(DECODE_SPLITS * q_heads)?,
+            l: stream.alloc_zeros::<f32>(DECODE_SPLITS * q_heads)?,
+        })
+    }
+
+    /// Bytes held, for the VRAM accounting the engine prints.
+    pub fn bytes(&self) -> usize {
+        (self.acc.len() + self.m.len() + self.l.len()) * size_of::<f32>()
+    }
+}
+
 /// Compiled Gated Attention kernels for one head geometry.
 pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
     flash: CudaFunction,
     flash_gqa: CudaFunction,
+    decode_split: CudaFunction,
+    decode_combine: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
     q_heads: usize,
@@ -1087,6 +1320,8 @@ impl AttentionKernels {
             rope: module.load_function("attn_rope_partial_neox")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
+            decode_split: module.load_function("attn_flash_decode_split")?,
+            decode_combine: module.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
             q_heads,
@@ -1122,6 +1357,23 @@ impl AttentionKernels {
     pub fn shared_bytes_gqa(&self) -> usize {
         (2 * GQA_KEY_TILE * self.head_dim + self.gqa_ratio() * GQA_QUERY_TILE * GQA_KEY_TILE)
             * size_of::<f32>()
+    }
+
+    /// Dynamic shared memory the flash-decoding split pass requests: the staged
+    /// key and value tiles plus one score tile per warp.
+    pub fn shared_bytes_decode(&self) -> usize {
+        (2 * DECODE_KEY_TILE * self.head_dim + self.gqa_ratio() * DECODE_KEY_TILE)
+            * size_of::<f32>()
+    }
+
+    /// Whether flash decoding can service this geometry.
+    ///
+    /// Same three conditions as the GQA-shared kernel — it is the same block
+    /// shape with one query row instead of four.
+    fn decode_split_is_available(&self) -> bool {
+        self.gqa_ratio() >= 2
+            && self.gqa_ratio() * 32 <= 1024
+            && self.shared_bytes_decode() <= 48 * 1024
     }
 
     /// Whether the GQA-shared kernel can service this geometry at all.
@@ -1317,9 +1569,11 @@ impl AttentionKernels {
     /// are indexed by the launch geometry, so a wrong length there is a wrong
     /// launch.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         stream: &Arc<CudaStream>,
+        dec: &mut AttnDecodeScratch,
         q: &CudaSlice<f32>,
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
@@ -1341,6 +1595,13 @@ impl AttentionKernels {
         // the row exists. Decode is `n_query == 1`, where that is seven
         // eighths of the kernel, so below a whole tile the one-row
         // instantiation is launched instead.
+        // Decode gets its own two-pass shape. See the kernel comment: a single
+        // query row cannot be tiled, so `attn_flash_causal_t1` could only ever
+        // launch `q_heads` blocks, and this splits the key axis instead.
+        if n_query == 1 && self.decode_split_is_available() {
+            return self.decode(stream, dec, q, k, v, out, positions);
+        }
+
         // Three shapes, narrowest first.
         //
         // Below one query tile the tiled kernels cost their empty rows in full
@@ -1417,6 +1678,85 @@ impl AttentionKernels {
         // the GQA block is at most 1024 threads and its shared request at most
         // the 48 KiB a block gets without opting in.
         unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// The two-pass decode path: slice the key window, then merge the slices.
+    ///
+    /// Split by [`Self::forward`] rather than inlined there because the two
+    /// passes need a launch each and share none of the single-launch shapes'
+    /// grid arithmetic. Buffer lengths were checked by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn decode(
+        &self,
+        stream: &Arc<CudaStream>,
+        dec: &mut AttnDecodeScratch,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        positions: &CudaSlice<i32>,
+    ) -> Result<(), AttentionError> {
+        let partials = DECODE_SPLITS * self.q_heads;
+        Self::expect_len(
+            "decode partial sums",
+            dec.acc.len(),
+            partials * self.head_dim,
+        )?;
+        Self::expect_len("decode partial maxima", dec.m.len(), partials)?;
+        Self::expect_len("decode partial normalizers", dec.l.len(), partials)?;
+
+        let q_heads = self.q_heads as i32;
+        let kv_heads = self.kv_heads as i32;
+        let head_dim = self.head_dim as i32;
+        let scale = self.scale();
+
+        let split_cfg = LaunchConfig {
+            grid_dim: (DECODE_SPLITS as u32, self.kv_heads as u32, 1),
+            block_dim: ((self.gqa_ratio() * 32) as u32, 1, 1),
+            shared_mem_bytes: self.shared_bytes_decode() as u32,
+        };
+        let mut builder = stream.launch_builder(&self.decode_split);
+        builder
+            .arg(q)
+            .arg(k)
+            .arg(v)
+            .arg(&mut dec.acc)
+            .arg(&mut dec.m)
+            .arg(&mut dec.l)
+            .arg(&q_heads)
+            .arg(&kv_heads)
+            .arg(&head_dim)
+            .arg(positions)
+            .arg(&scale);
+        // SAFETY: the grid is (DECODE_SPLITS, kv_heads) with one warp per query
+        // head under that KV head, so `h` stays below `q_heads` and every
+        // partial index below `DECODE_SPLITS * q_heads`, which the three
+        // `expect_len` calls above sized. The deepest key read is
+        // `positions[0]`, which the caller checked against `max_keys`. Shared
+        // covers the staged tiles and the per-warp scores, and
+        // `decode_split_is_available` established it fits in 48 KiB and that
+        // the block is at most 1024 threads.
+        unsafe { builder.launch(split_cfg) }?;
+
+        let combine_cfg = LaunchConfig {
+            grid_dim: (self.q_heads as u32, 1, 1),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.decode_combine);
+        builder
+            .arg(&dec.acc)
+            .arg(&dec.m)
+            .arg(&dec.l)
+            .arg(out)
+            .arg(&q_heads)
+            .arg(&head_dim);
+        // SAFETY: one block per query head, one thread per head dimension, so
+        // the read of `part_acc` stays inside the buffer sized above and the
+        // write covers `out` exactly once — `out` is `q_heads * head_dim` at
+        // `n_query == 1`, which the caller checked.
+        unsafe { builder.launch(combine_cfg) }?;
         Ok(())
     }
 

@@ -76,7 +76,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_cuda::kernels::attention::{
-    AttentionKernels, attn_packed_gate_offset, attn_packed_query_offset,
+    AttentionKernels, AttnDecodeScratch, attn_packed_gate_offset, attn_packed_query_offset,
 };
 use xabe_kernels::attention::{
     causal_attention_naive, causal_attention_streaming, kv_head_for_query_head,
@@ -210,9 +210,10 @@ fn run_device(
     let d_pos = stream
         .clone_htod(&[key_offset as i32])
         .expect("upload key offset");
+    let mut dec = AttnDecodeScratch::new(stream, q_heads, head_dim).expect("decode scratch");
     kernels
         .forward(
-            stream, &d_q, &d_k, &d_v, &mut d_out, n_query, n_keys, &d_pos,
+            stream, &mut dec, &d_q, &d_k, &d_v, &mut d_out, n_query, n_keys, &d_pos,
         )
         .expect("attention launches");
     let out = stream.clone_dtoh(&d_out).expect("read output");
@@ -434,6 +435,71 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
          max_abs={worst_abs:.3e} cosine={worst_cos:.9}",
         g.q_heads,
     );
+}
+
+/// One query row over a deep window — the shape decode actually runs, and the
+/// only shape that reaches the split/combine pair.
+///
+/// `DEPTHS` above includes `n_query == 1`, but only at `key_offset == 0`, where
+/// the window is a single key: 63 of the 64 slices are empty and the merge has
+/// nothing to merge. This runs 4,096 keys, so every slice carries 64 of them
+/// and the combine folds 64 genuine `(m, l, acc)` triples.
+///
+/// The three lengths are deliberate. 4,096 divides `DECODE_SPLITS * DEC_KT`
+/// evenly; 4,097 forces one slice to carry a ragged final tile; and 61 is
+/// shorter than `DECODE_SPLITS * DEC_KT`, so most slices are empty and the
+/// identity partial (`m = -inf`, `l = 0`) has to fold in as exactly zero rather
+/// than as a NaN out of `exp(-inf - -inf)`.
+#[test]
+fn device_decode_matches_the_reference_over_a_deep_window() {
+    let Some(ctx) = setup() else { return };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels = AttentionKernels::new(&ctx, g.q_heads, g.kv_heads, g.head_dim).expect("compiles");
+
+    for n_keys in [4096usize, 4097, 61] {
+        let key_offset = n_keys - 1;
+        let mut rng = Xorshift64Star::new(0x0DEC_0DE0 ^ n_keys as u64);
+        let q_full: Vec<f32> = rng.vec_f32(n_keys * g.q_heads * g.head_dim, -1.0, 1.0);
+        let k: Vec<f32> = rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0);
+        let v: Vec<f32> = rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0);
+        let q_row = &q_full[key_offset * g.q_heads * g.head_dim..];
+
+        let device = run_device(
+            &stream, &kernels, q_row, &k, &v, 1, n_keys, key_offset, g.q_heads, g.head_dim,
+        );
+
+        let mut worst_abs = 0.0f32;
+        let mut worst_cos = 1.0f32;
+        for h in 0..g.q_heads {
+            let kvh =
+                kv_head_for_query_head(h as u32, g.q_heads as u32, g.kv_heads as u32) as usize;
+            let q_h = head_rows(&q_full, n_keys, g.q_heads, g.head_dim, h);
+            let k_h = head_rows(&k, n_keys, g.kv_heads, g.head_dim, kvh);
+            let v_h = head_rows(&v, n_keys, g.kv_heads, g.head_dim, kvh);
+            let full = causal_attention_streaming(&q_h, &k_h, &v_h);
+
+            let reference = &full[key_offset];
+            let base = h * g.head_dim;
+            let candidate = &device[base..base + g.head_dim];
+            let result = compare(candidate, reference);
+            worst_abs = worst_abs.max(result.max_abs_error);
+            worst_cos = worst_cos.min(result.cosine_similarity);
+            assert!(
+                candidate.iter().all(|x| x.is_finite()),
+                "head {h} at {n_keys} keys produced a non-finite output; an empty \
+                 slice's identity partial reached the merge as something other \
+                 than zero",
+            );
+            assert_relative_error_is_a_floor_artefact(&result, reference, &format!("head {h}"));
+            assert_matches(candidate, reference, &GATE);
+        }
+        println!(
+            "decode over {n_keys} keys x {} heads: max_abs={worst_abs:.3e} \
+             cosine={worst_cos:.9}",
+            g.q_heads,
+        );
+    }
 }
 
 // --------------------------------------------------------------------------

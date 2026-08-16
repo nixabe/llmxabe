@@ -110,7 +110,7 @@ use cudarc::driver::{
 };
 
 use xabe_cuda::arena::ArenaError;
-use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels};
+use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use xabe_cuda::kernels::lm_head::{LmHeadError, LmHeadGeometry, LmHeadKernels};
@@ -624,6 +624,11 @@ pub struct AttnScratch {
     /// Activations quantized once per contraction width and reused by every
     /// projection that shares it. Allocated on first use, then kept.
     xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+    /// Per-slice partials for the flash-decoding path. Sized by the head
+    /// geometry rather than by `tokens`, and used only at `n_query == 1`, but
+    /// held here because this is the struct with a stream to allocate from and
+    /// the one already shared by all ten attention layers.
+    decode: AttnDecodeScratch,
 }
 
 impl AttnScratch {
@@ -654,6 +659,7 @@ impl AttnScratch {
             gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
             xq: None,
+            decode: AttnDecodeScratch::new(stream, a.q_heads as usize, a.head_dim as usize)?,
         })
     }
 
@@ -1171,6 +1177,7 @@ impl GatedAttentionBlock {
         //    longer and the kernel reads none of the tail.
         k.mixer.forward(
             stream,
+            &mut sc.decode,
             &sc.query_roped,
             &cache.k,
             &cache.v,
