@@ -103,6 +103,7 @@
 //! routing decision and the dispatch tables, which have no rounding freedom
 //! in their *discrete* content.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use cudarc::driver::{
@@ -120,6 +121,12 @@ const QK8_0: usize = 32;
 const QK_K: usize = 256;
 const BLOCK_Q8_0_BYTES: usize = 34;
 const BLOCK_Q6_K_BYTES: usize = 210;
+
+/// Bytes per Q6_K superblock once it is on the device.
+///
+/// 224 rather than the file's 210 so that every superblock base, and with it
+/// every field inside one, is 16-byte aligned. See [`ExpertQuant::block_bytes`].
+pub const BLOCK_Q6_K_DEVICE_BYTES: usize = 224;
 
 /// Threads per block for the routing, dispatch and reduction kernels.
 ///
@@ -215,7 +222,7 @@ const MMA_KC: usize = 128;
 /// why it is 112 and not the 96 the payload needs.
 const MMA_WSTRIDE: usize = 112;
 /// Bytes per staged scale row. Mirrors `MOE_MMA_SSTRIDE`.
-const MMA_SSTRIDE: usize = 12;
+const MMA_SSTRIDE: usize = 16;
 
 /// Bytes per staged weight row in the down projection. Mirrors
 /// `MOE_MMA_DSTRIDE`: the quants, then one fp32 scale per 32 of them.
@@ -252,7 +259,7 @@ const fn mma_shared_bytes() -> u32 {
 /// pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpertQuant {
-    /// 256 elements per 210-byte superblock.
+    /// 256 elements per superblock: 210 bytes in the file, 224 on the device.
     Q6K,
     /// 32 elements per 34-byte block.
     Q8_0,
@@ -275,13 +282,78 @@ impl ExpertQuant {
         }
     }
 
-    /// Serialized bytes per block.
-    pub const fn block_bytes(self) -> usize {
+    /// Bytes per block **as the file stores them**.
+    ///
+    /// What a GGUF tensor's length must be a multiple of. Not what the device
+    /// copy is strided by — see [`Self::block_bytes`].
+    pub const fn file_block_bytes(self) -> usize {
         match self {
             Self::Q6K => BLOCK_Q6_K_BYTES,
             Self::Q8_0 => BLOCK_Q8_0_BYTES,
         }
     }
+
+    /// Bytes per block **as the device holds them**.
+    ///
+    /// Q6_K is padded from 210 to 224 on the way in. 210 is even and nothing
+    /// else: `210 * s` is 4-byte aligned only for even `s`, so every load from
+    /// a superblock has to be 16 bits wide, and the grouped GEMM's staging
+    /// loop -- which is a third of the kernel that is a fifth of prefill --
+    /// spends four instructions per weight row moving 106 bytes. 224 is a
+    /// multiple of 16, so every field of every superblock is 16-byte aligned
+    /// and one `int4` load stages eight rows at a time.
+    ///
+    /// The 14 pad bytes are never read; they cost 6.7% more sectors and 1.2
+    /// GiB of the 47 GiB card. See [`to_device_layout`].
+    pub const fn block_bytes(self) -> usize {
+        match self {
+            Self::Q6K => BLOCK_Q6_K_DEVICE_BYTES,
+            Self::Q8_0 => BLOCK_Q8_0_BYTES,
+        }
+    }
+}
+
+/// Rewrite a GGUF expert stack into the layout the device kernels index.
+///
+/// Q6_K superblocks are re-strided from 210 bytes to
+/// [`BLOCK_Q6_K_DEVICE_BYTES`]; the 210 payload bytes are copied unchanged and
+/// the rest is left zero. Q8_0 is returned as-is. Every upload of an
+/// [`ExpertQuant`] tensor must go through this, because the kernels address
+/// superblocks by [`ExpertQuant::block_bytes`].
+pub fn to_device_layout(quant: ExpertQuant, bytes: &[u8]) -> Cow<'_, [u8]> {
+    let src_stride = quant.file_block_bytes();
+    let dst_stride = quant.block_bytes();
+    if src_stride == dst_stride {
+        // Q8_0 is already the layout the kernels index; borrow it rather than
+        // copying 285 MiB per down projection for nothing.
+        return Cow::Borrowed(bytes);
+    }
+    let blocks = bytes.len() / src_stride;
+    let mut out = vec![0u8; blocks * dst_stride];
+
+    // Threaded, because this runs over 17.6 GiB of expert weights at load and
+    // single-threaded it added 28 s to building a shape. The output is split
+    // into disjoint block ranges, so no two threads touch the same byte.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(blocks.max(1));
+    let per = blocks.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for (t, dst) in out.chunks_mut(per * dst_stride).enumerate() {
+            let src = &bytes[t * per * src_stride..];
+            scope.spawn(move || {
+                for (b, chunk) in src
+                    .chunks_exact(src_stride)
+                    .take(dst.len() / dst_stride)
+                    .enumerate()
+                {
+                    dst[b * dst_stride..b * dst_stride + src_stride].copy_from_slice(chunk);
+                }
+            });
+        }
+    });
+    Cow::Owned(out)
 }
 
 /// A quantized weight stack resident on the device, with its format.
@@ -310,6 +382,7 @@ const MOE_SRC: &str = r#"
 // asserts the two never drift.
 // Experts one lane of the routing warp can hold in registers. 16 covers 512
 // experts; the launch path rejects anything wider.
+#define Q6K_SB 224
 #define MOE_SHARED_WARPS 4
 #define MOE_ROUTE_LANE_EXPERTS 16
 #define MOE_TM   16
@@ -392,7 +465,7 @@ __device__ __forceinline__ float q8_0_value(signed char q, float d) {
 __device__ __forceinline__ void dequant_tile_q6k(
     const unsigned char* __restrict__ src, long long i0, int wlane, float* out
 ) {
-    const unsigned char* base = src + (i0 >> 8) * 210;
+    const unsigned char* base = src + (i0 >> 8) * Q6K_SB;
     int half = (int)((i0 >> 7) & 1);
     const unsigned char* ql = base + half * 64;
     const unsigned char* qh = base + 128 + half * 32;
@@ -407,19 +480,18 @@ __device__ __forceinline__ void dequant_tile_q6k(
     const unsigned char* qlp = ql + ((grp & 1) ? l + 32 : l);
     int shift = 2 * grp;
 
-    // Two 16-bit loads rather than eight 8-bit ones. A Q6_K superblock is 210
-    // bytes and the tensor base is 256-aligned, so `qlp` and `qh + l` are both
-    // even — `l` is a multiple of 4 — and 16 bits is the widest load the
-    // format permits without a shift.
+    // One 32-bit load each, which the *device* superblock stride is what makes
+    // legal. The file's 210 bytes are even and nothing more, so `210 * s` is
+    // 4-byte aligned only for even `s` and this had to be two 16-bit loads
+    // assembled with a shift. `Q6K_SB` is 224, a multiple of 16, so every
+    // superblock base is word-aligned and so is every field inside one --
+    // `l` is a multiple of 4 and `half * 64` and `128 + half * 32` both are.
     //
-    // Worth about 0.7% of decode and 0.5% of prefill: small, because these
-    // reads were already coalesced and hitting L1, so what is saved is issue
-    // slots rather than bandwidth. The same widening applied to
-    // `dequant_tile_q8_0` measures as nothing at all, and is not done there.
-    unsigned int qlw = (unsigned int)*(const unsigned short*)(qlp)
-        | ((unsigned int)*(const unsigned short*)(qlp + 2) << 16);
-    unsigned int qhw = (unsigned int)*(const unsigned short*)(qh + l)
-        | ((unsigned int)*(const unsigned short*)(qh + l + 2) << 16);
+    // This is the decode side of the same padding that lets the grouped GEMM
+    // stage eight rows in one `int4`. It halves the load instructions of the
+    // one-token expert GEMV's inner loop, which is 17% of a decode step.
+    unsigned int qlw = *(const unsigned int*)(qlp);
+    unsigned int qhw = *(const unsigned int*)(qh + l);
 
     // Unpack all four codes at word width rather than one byte at a time.
     //
@@ -1505,7 +1577,7 @@ __global__ void moe_expert_down_gemv(
 #define MOE_MMA_WSTRIDE 112
 // Bytes per staged scale row: 8 int8 sub-scales, then the fp32 superblock
 // delta at offset 8 (which is where the 4-byte alignment requirement lands).
-#define MOE_MMA_SSTRIDE 12
+#define MOE_MMA_SSTRIDE 16
 
 __global__ void moe_expert_ffn_mma(
     const unsigned char* __restrict__ gate_q,
@@ -1578,68 +1650,63 @@ __global__ void moe_expert_ffn_mma(
         // thrown away. Here a warp walks one row's bytes contiguously — one
         // sector per 32 lanes — and the scatter happens in shared, which has
         // no coalescing to lose.
+        // Eight rows per instruction, not one row per four.
+        //
+        // A warp stages exactly the eight rows it will compute with, and the
+        // lane split is `row = lane & 7`, `chunk = lane >> 3`. That does two
+        // things at once. The global side becomes `int4`: with the device
+        // stride padded to 224 every field of every superblock is 16-byte
+        // aligned, so 8 rows x 64 bytes of `ql` is one load where the 210-byte
+        // file layout forced 16-bit loads and eight of them. The shared side
+        // becomes conflict-free: a 128-bit store is serviced eight lanes at a
+        // time and those eight lanes hold eight *different* rows, so with a
+        // stride of 28 words -- `28 mod 32 = -4` -- each lane's four banks sit
+        // four along from the last and the eight tile the 32 banks exactly.
+        //
+        // Staging measured 32 ms of this kernel's 62 and stayed that expensive
+        // with every byte already in L1, so what it cost was the count of
+        // loads. Four per row per matrix becomes four per *eight* rows.
         int half = (kc >> 7) & 1;
-        for (int r = warp; r < MOE_MMA_ROWS; r += MOE_MMA_WARPS) {
-            int n = r0 + r;
-            if (n < intermediate) {
-                long long i = ebase + (long long)n * hidden + kc;
-                const unsigned char* gb = gate_q + (i >> 8) * 210;
-                const unsigned char* ub = up_q   + (i >> 8) * 210;
-                // Two bytes per lane, not one. A Q6_K superblock is 210
-                // bytes and the tensor base is 256-aligned, so every address
-                // here is even but nothing is word-aligned — 16-bit is the
-                // widest load the format allows without a shift. It halves
-                // the instructions and doubles the sectors in flight per
-                // instruction, which is what this loop is short of: the
-                // fetches were already perfectly coalesced, so there was no
-                // wasted bandwidth to recover, only latency to hide.
-                unsigned short* dg = (unsigned short*)(swg + r * MOE_MMA_WSTRIDE);
-                unsigned short* du = (unsigned short*)(swu + r * MOE_MMA_WSTRIDE);
-                // The 64 bytes of `ql` this half needs, as one warp-wide
-                // 16-bit load. Two bytes per lane and not four: a Q6_K
-                // superblock is 210 bytes, so the base is even but only
-                // half of them are word-aligned.
-                dg[lane] = *(const unsigned short*)(gb + half * 64 + lane * 2);
-                du[lane] = *(const unsigned short*)(ub + half * 64 + lane * 2);
+        {
+            int jq = lane & 7;
+            int c4 = lane >> 3;
+            int rq = warp * MOE_MMA_N + jq;
+            int nq = r0 + rq;
+            int live = nq < intermediate;
+            long long iq = ebase + (long long)nq * hidden + kc;
+            const unsigned char* gq = gate_q + (iq >> 8) * Q6K_SB;
+            const unsigned char* uq = up_q   + (iq >> 8) * Q6K_SB;
 
-                // Everything else this row needs -- 32 bytes of `qh`, 8 of
-                // sub-scales, and the 2-byte superblock delta -- in **one**
-                // instruction per matrix rather than three.
-                //
-                // `qh` fills 16 lanes, the sub-scales 4 more and the delta a
-                // 21st, so the three reads the loop used to issue separately
-                // fit inside a single warp with 11 lanes to spare. That
-                // matters more than it looks: staging is 60% of this kernel,
-                // it stays that expensive when the bytes are already in L1,
-                // and the reason is the *count* of loads -- eight per row and
-                // per matrix, several of them fetching a 32-byte sector for
-                // two useful bytes -- rather than the bytes themselves. Four
-                // per row is what is left.
-                int off = lane < 16   ? 128 + half * 32 + lane * 2
-                        : lane < 20   ? 192 + half * 8 + (lane - 16) * 2
-                        :               208;
-                unsigned short vg = 0, vu = 0;
-                if (lane < 21) {
-                    vg = *(const unsigned short*)(gb + off);
-                    vu = *(const unsigned short*)(ub + off);
-                }
+            if (live) {
+                *(uint4*)(swg + rq * MOE_MMA_WSTRIDE + c4 * 16) =
+                    *(const uint4*)(gq + half * 64 + c4 * 16);
+                *(uint4*)(swu + rq * MOE_MMA_WSTRIDE + c4 * 16) =
+                    *(const uint4*)(uq + half * 64 + c4 * 16);
                 if (lane < 16) {
-                    dg[32 + lane] = vg;
-                    du[32 + lane] = vu;
-                } else if (lane < 20) {
-                    int at = (lane - 16) * 2;
-                    *(unsigned short*)(ssg + r * MOE_MMA_SSTRIDE + at) = vg;
-                    *(unsigned short*)(ssu + r * MOE_MMA_SSTRIDE + at) = vu;
-                } else if (lane == 20) {
-                    *(float*)(ssg + r * MOE_MMA_SSTRIDE + 8) = half_bits_to_float(vg);
-                    *(float*)(ssu + r * MOE_MMA_SSTRIDE + 8) = half_bits_to_float(vu);
+                    *(uint4*)(swg + rq * MOE_MMA_WSTRIDE + 64 + c4 * 16) =
+                        *(const uint4*)(gq + 128 + half * 32 + c4 * 16);
+                    *(uint4*)(swu + rq * MOE_MMA_WSTRIDE + 64 + c4 * 16) =
+                        *(const uint4*)(uq + 128 + half * 32 + c4 * 16);
                 }
-            } else if (lane == 0) {
-                // A row past `intermediate` contributes nothing, and zeroing
-                // the *scale* is enough to guarantee that without zeroing 96
-                // bytes of quants: every product it feeds is multiplied by it.
-                *(float*)(ssg + r * MOE_MMA_SSTRIDE + 8) = 0.0f;
-                *(float*)(ssu + r * MOE_MMA_SSTRIDE + 8) = 0.0f;
+            }
+            if (lane < 8) {
+                if (live) {
+                    *(uint2*)(ssg + rq * MOE_MMA_SSTRIDE) =
+                        *(const uint2*)(gq + 192 + half * 8);
+                    *(uint2*)(ssu + rq * MOE_MMA_SSTRIDE) =
+                        *(const uint2*)(uq + 192 + half * 8);
+                    *(float*)(ssg + rq * MOE_MMA_SSTRIDE + 8) =
+                        half_bits_to_float(*(const unsigned short*)(gq + 208));
+                    *(float*)(ssu + rq * MOE_MMA_SSTRIDE + 8) =
+                        half_bits_to_float(*(const unsigned short*)(uq + 208));
+                } else {
+                    // A row past `intermediate` contributes nothing, and
+                    // zeroing the *scale* is enough to guarantee that without
+                    // zeroing 96 bytes of quants: every product it feeds is
+                    // multiplied by it.
+                    *(float*)(ssg + rq * MOE_MMA_SSTRIDE + 8) = 0.0f;
+                    *(float*)(ssu + rq * MOE_MMA_SSTRIDE + 8) = 0.0f;
+                }
             }
         }
 
@@ -3912,7 +3979,8 @@ mod tests {
     #[test]
     fn quant_block_geometry_matches_the_ggml_layout() {
         assert_eq!(ExpertQuant::Q6K.block_elements(), 256);
-        assert_eq!(ExpertQuant::Q6K.block_bytes(), 210);
+        assert_eq!(ExpertQuant::Q6K.file_block_bytes(), 210);
+        assert_eq!(ExpertQuant::Q6K.block_bytes(), 224);
         assert_eq!(ExpertQuant::Q8_0.block_elements(), 32);
         assert_eq!(ExpertQuant::Q8_0.block_bytes(), 34);
         assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);

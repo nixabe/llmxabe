@@ -48,7 +48,9 @@ use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_cuda::kernels::moe::{ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor};
+use xabe_cuda::kernels::moe::{
+    ExpertQuant, MoeBuffers, MoeGeometry, MoeKernels, QuantTensor, to_device_layout,
+};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_kernels::compare::{Tolerance, assert_matches, compare};
 use xabe_kernels::moe::dispatch::{INACTIVE_EXPERT, moe_align_block_size, padding_sentinel};
@@ -252,9 +254,14 @@ fn quant_of(ty: GgmlType) -> ExpertQuant {
 }
 
 /// Serialized bytes and elements per block for a GGUF quantized type.
+///
+/// The *file's* stride. The device copy is re-strided on upload -- Q6_K is
+/// padded from 210 to 224 so its superblocks are 16-byte aligned -- so
+/// anything walking GGUF bytes wants this and anything sizing a device buffer
+/// wants `block_bytes`.
 fn block_shape(ty: GgmlType) -> (usize, usize) {
     let q = quant_of(ty);
-    (q.block_bytes(), q.block_elements())
+    (q.file_block_bytes(), q.block_elements())
 }
 
 /// Guard against a tensor that would compare perfectly while proving
@@ -587,9 +594,26 @@ fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
         .collect();
 
     let t0 = Instant::now();
-    let d_gate = stream.clone_htod(bytes[0]).expect("upload gate");
-    let d_up = stream.clone_htod(bytes[1]).expect("upload up");
-    let d_down = stream.clone_htod(bytes[2]).expect("upload down");
+    // Through `to_device_layout`, exactly as `MoeLayerWeights::upload` does:
+    // the kernels index superblocks by the device stride.
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
     stream.synchronize().expect("sync");
     println!(
         "uploaded {:.1} MiB of quantized expert weights in {:.2?}",
@@ -851,9 +875,24 @@ fn the_shared_expert_runs_for_every_token_with_no_routing() {
     };
     assert_carries_signal("shared expert weights", &host.gate);
 
-    let d_gate = stream.clone_htod(bytes[0]).expect("upload");
-    let d_up = stream.clone_htod(bytes[1]).expect("upload");
-    let d_down = stream.clone_htod(bytes[2]).expect("upload");
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload");
 
     let mut rng = Xorshift64Star::new(SHARED_INPUT_SEED);
     let hidden_states: Vec<Vec<f32>> = (0..NUM_TOKENS)

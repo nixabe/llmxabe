@@ -77,9 +77,12 @@ impl Rng {
 fn q6_k_stack(elements: usize, seed: u64) -> Vec<u8> {
     let blocks = elements / 256;
     let mut rng = Rng(seed);
-    let mut out = vec![0u8; blocks * 210];
+    // The device stride, not the file's: this buffer is handed straight to the
+    // kernels, which address superblocks by `ExpertQuant::block_bytes`.
+    let stride = ExpertQuant::Q6K.block_bytes();
+    let mut out = vec![0u8; blocks * stride];
     for b in 0..blocks {
-        let base = b * 210;
+        let base = b * stride;
         for i in 0..192 {
             out[base + i] = rng.byte();
         }

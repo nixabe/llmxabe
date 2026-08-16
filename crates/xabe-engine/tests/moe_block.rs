@@ -1133,14 +1133,20 @@ fn dequant_slice(ty: GgmlType, bytes: &[u8]) -> Vec<f32> {
     }
 }
 
+/// Block stride and element count **in the file**.
+///
+/// `file_block_bytes` and not `block_bytes`: this walks GGUF bytes, and the
+/// device copy is re-strided on upload (Q6_K is padded 210 -> 224 so its
+/// superblocks are 16-byte aligned). Slicing file bytes by the device stride
+/// reads one expert's weights out of another's.
 fn block_shape(ty: GgmlType) -> (usize, usize) {
     match ty {
         GgmlType::Q6K => (
-            ExpertQuant::Q6K.block_bytes(),
+            ExpertQuant::Q6K.file_block_bytes(),
             ExpertQuant::Q6K.block_elements(),
         ),
         GgmlType::Q8_0 => (
-            ExpertQuant::Q8_0.block_bytes(),
+            ExpertQuant::Q8_0.file_block_bytes(),
             ExpertQuant::Q8_0.block_elements(),
         ),
         other => panic!("unexpected expert stack type {}", other.name()),

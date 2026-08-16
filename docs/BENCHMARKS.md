@@ -1630,7 +1630,7 @@ words, `28 mod 32 = -4`, which tiles exactly. Worth about nothing next to the
 activation tile, and taken anyway because it is provably right rather than
 accidentally equal.
 
-### Padding Q6_K to a 16-byte stride: a real trade, taken the other way
+### Padding Q6_K to a 16-byte stride: a real trade, taken
 
 Q6_K's superblock is 210 bytes. `210 * s` is 4-byte aligned only for even `s`,
 so every read of a superblock has to be 16 bits wide and the grouped GEMM's
@@ -1655,11 +1655,32 @@ read, but they are inside the sectors that are, so the traffic grows 6.7% on
 `ffn_gate_exps` and `ffn_up_exps` — and decode is bandwidth-bound where prefill
 is not.
 
-Reverted, because decode is 0.2% ahead of llama.cpp and prefill is 27% behind:
-a trade that spends the goal condition that is met to buy the one that is not
-is the wrong direction. The patch is kept; if decode gains headroom elsewhere —
-flash-decoding over a split KV window is worth about 1.2% and is not done — the
-trade turns positive and it goes back in.
+It was reverted the first time it was measured, on the reasoning that decode
+was 0.2% ahead of llama.cpp and prefill 27% behind, so spending the goal
+condition that is met to buy the one that is not was the wrong direction.
+
+Two things changed that. First, the decode side of the same alignment was left
+on the table: `dequant_tile_q6k` — the one-token expert GEMV's inner loop, 17%
+of a decode step — was still doing two 16-bit loads for `ql` and one for `qh`
+because the *file's* 210 bytes never guaranteed 4-byte alignment. With a
+224-byte device stride every superblock base is word-aligned, so those become
+one 32-bit load each. Re-measured with that in, interleaved three runs each:
+
+| | prefill tok/s | decode tok/s |
+| --- | ---: | ---: |
+| 210-byte stride | 1,732.25 | 104.50 |
+| 224-byte stride | **1,762.46** | 104.13 |
+
+The wider loads halve the decode penalty — 0.7% becomes **0.35%** — but they do
+not erase it, which says the extra 6.7% of sector traffic is the real cost and
+instruction count was never decode's problem. That is the honest version: the
+padding is a bandwidth trade in both directions, and only prefill has spare
+bandwidth.
+
+Second, the target moved. With decode's requirement stated as a floor rather
+than a race — stay near the current value, not below 100 — 104.13 is 4 tok/s of
+headroom, and 0.35% is well inside this card's 1.3% thermal drift, while
+prefill's 1.7% is a repeatable step. Taken.
 
 A 212-byte stride was considered instead: 4-byte aligned, so `int` loads work
 and the padding costs 0.95% rather than 6.7%. It is not equivalent. Most of the

@@ -95,6 +95,7 @@ use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use xabe_cuda::kernels::moe::{
     ExpertQuant, MoeBuffers, MoeError, MoeGeometry, MoeKernels, QuantTensor, SharedExpertInt8,
+    to_device_layout,
 };
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::ModelConfig;
@@ -634,9 +635,9 @@ impl MoeLayerWeights {
         let (sdown_bytes, shared_down_quant) =
             quantized(file, directory, Role::MoeSharedDown, layer, one_expert)?;
 
-        let shared_gate = stream.clone_htod(sgate_bytes)?;
-        let shared_up = stream.clone_htod(sup_bytes)?;
-        let shared_down = stream.clone_htod(sdown_bytes)?;
+        let shared_gate = stream.clone_htod(&*to_device_layout(shared_gate_quant, sgate_bytes))?;
+        let shared_up = stream.clone_htod(&*to_device_layout(shared_up_quant, sup_bytes))?;
+        let shared_down = stream.clone_htod(&*to_device_layout(shared_down_quant, sdown_bytes))?;
         // Repacked here, at upload, rather than lazily on the first pass:
         // `AGENTS.md` rule 6 forbids allocating mid-forward, and a lazy repack
         // would also poison the first timed repetition of every benchmark.
@@ -671,9 +672,11 @@ impl MoeLayerWeights {
             layer,
             post_norm: stream.clone_htod(&post_norm)?,
             router: stream.clone_htod(&router)?,
-            gate_exps: stream.clone_htod(gate_bytes)?,
-            up_exps: stream.clone_htod(up_bytes)?,
-            down_exps: stream.clone_htod(down_bytes)?,
+            // Re-strided on the way in: the kernels index superblocks by
+            // `ExpertQuant::block_bytes`, which is not what the file uses.
+            gate_exps: stream.clone_htod(&*to_device_layout(gate_quant, gate_bytes))?,
+            up_exps: stream.clone_htod(&*to_device_layout(up_quant, up_bytes))?,
+            down_exps: stream.clone_htod(&*to_device_layout(down_quant, down_bytes))?,
             gate_quant,
             up_quant,
             down_quant,
@@ -807,8 +810,9 @@ fn quantized<'f>(
         GgmlType::Q8_0 => ExpertQuant::Q8_0,
         found => return Err(MoeBlockError::UnsupportedExpertType { name, found }),
     };
-    let found = bytes.len() / quant.block_bytes() * quant.block_elements();
-    if !bytes.len().is_multiple_of(quant.block_bytes()) || found != expected {
+    // The *file's* stride, not the device's: this is validating GGUF bytes.
+    let found = bytes.len() / quant.file_block_bytes() * quant.block_elements();
+    if !bytes.len().is_multiple_of(quant.file_block_bytes()) || found != expected {
         return Err(MoeBlockError::ShapeMismatch {
             name,
             expected,
