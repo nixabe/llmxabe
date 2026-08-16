@@ -423,6 +423,70 @@ than 73.48.
 before there was a KV cache. Real decode is measured in the next section, and
 it turns out the floor was the *pessimistic* proxy, not the flattering one.
 
+## Integer tensor cores: measured, 6.8x the fp32 kernel (2026-08-16)
+
+`mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32` is landed and gated
+(`tests/mma_differential.rs`). It is **not yet wired into the engine** — the
+numbers below are the kernel measured on its own against the fp32 kernel it
+would replace.
+
+From `bench_mma`, the Gated DeltaNet projection's real shapes:
+
+| tokens | rows | k | GGUF layout | split layout | % of 198 TOP/s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 8,192 | 2,048 | 2.10 TOP/s | 23.6 | 11.9% |
+| 512 | 8,192 | 2,048 | 2.01 | **31.96** | 16.1% |
+| 512 | 2,048 | 4,096 | 2.87 | 24.9 | 12.6% |
+
+Against the fp32 tiled kernel's 4.67 TFLOP/s at the same shapes, the split
+layout is **6.8x**.
+
+### Two things had to be fixed before the tensor cores did anything
+
+**Reading GGUF Q8_0 in place is fatal.** A Q8_0 block is 34 bytes — a 2-byte
+scale then 32 quants — so a fragment's four bytes are *never* word-aligned. A
+`*(const unsigned int*)` load faults outright with
+`CUDA_ERROR_MISALIGNED_ADDRESS`, and assembling the fragment from four scalar
+byte loads instead costs ~48 memory instructions per 8 MMA instructions. That
+version measured **2.0 TOP/s, 1% of peak — slower than the fp32 kernel it was
+meant to replace.** Splitting the scales out of the quants makes every operand
+load aligned and contiguous and is worth **3.2x** on its own. This is why
+llama.cpp's MMQ, TurboMind and vLLM's Marlin all carry their own packed weight
+layouts instead of reading the on-disk format.
+
+**Arithmetic intensity is the rest of it.** One 8-token MMA tile per warp
+gives 8 x 2 = 16 operations per weight byte, against an int8 ridge point of
+198e12 / 672e9 = **295 OP/byte** — deeply memory-bound, and it measured 3.2% of
+peak. Every extra token tile multiplies the operations per weight byte without
+touching the weight traffic at all, because one B fragment feeds every token
+tile. Sweeping the warp tile at 512x8192x2048:
+
+| rows x tokens | TOP/s |
+| --- | ---: |
+| 32 x 8 | 6.4 |
+| 32 x 32 | 13.3 |
+| 16 x 64 | 12.7 |
+| 64 x 32 | 19.0 |
+| 32 x 64 | 23.6 |
+| **64 x 64** | **31.96** |
+
+At 64x64 the kernel moves 268 MB in 1.288 ms — 208 GB/s, 31% of bandwidth
+peak — so it is no longer bandwidth-bound and 16.1% of compute peak is a
+*latency* ceiling. More is available; a shared-memory staging pipeline of the
+kind Marlin uses is what would reach it.
+
+### What it costs
+
+The activations must be quantized to int8, and that is a real loss the fp32
+path does not have. Measured against the fp32 reference: **cosine
+0.99999, max relative error 4.3e-3** — the 1/127 quantization floor, not a
+formulation defect. It is also precisely the step llama.cpp takes before its
+own int8 matmuls, so it is the accuracy llama.cpp already lives with.
+
+The split-layout kernel is separately gated **exactly** against the in-place
+one: same numbers, same arithmetic, only rearranged in memory, so any
+difference is an indexing defect and no tolerance is allowed to absorb it.
+
 ## The Gated DeltaNet projections were 59% of prefill (2026-08-16)
 
 Profiling prefill at 512 tokens after the MoE tiling showed the bottleneck had

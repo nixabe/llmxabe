@@ -32,6 +32,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_cuda::kernels::mma::{MMA_K, MMA_M, MMA_N, MmaKernels};
 use xabe_kernels::mma::int8_gemm;
+use xabe_kernels::quant::{dequantize_q8_0, quantize_q8_0};
 use xabe_kernels::rng::Xorshift64Star;
 
 /// A context on device 0, or `None` with a printed reason.
@@ -164,4 +165,168 @@ fn a_contraction_that_is_not_a_whole_number_of_steps_is_rejected() {
         .expect_err("a ragged contraction must be rejected");
     let msg = err.to_string();
     assert!(msg.contains("24") && msg.contains("16"), "{msg}");
+}
+
+/// Largest magnitude, the denominator every relative statement is made against.
+fn peak_of(v: &[f32]) -> f32 {
+    v.iter().fold(0f32, |m, x| m.max(x.abs()))
+}
+
+/// A deterministic Q8_0 weight stack and its exact fp32 dequantization.
+///
+/// Built through `xabe_kernels::quant`, the validated reference, rather than
+/// by hand: the byte layout (`{ ggml_half d; int8_t qs[32]; }`) is the thing
+/// the kernel indexes into, so a hand-rolled copy here could agree with a
+/// wrong kernel.
+fn q8_0_rows(rows: usize, k: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+    let mut rng = Xorshift64Star::new(seed);
+    let mut bytes = Vec::with_capacity(rows * k / 32 * 34);
+    let mut deq = Vec::with_capacity(rows * k);
+    for _ in 0..rows * k / 32 {
+        let mut raw = [0f32; 32];
+        for v in raw.iter_mut() {
+            *v = rng.next_f32_range(-1.0, 1.0);
+        }
+        let block = quantize_q8_0(&raw);
+        bytes.extend_from_slice(&block.d.to_le_bytes());
+        bytes.extend(block.qs.iter().map(|&q| q as u8));
+        deq.extend_from_slice(&dequantize_q8_0(&block));
+    }
+    (bytes, deq)
+}
+
+#[test]
+fn the_int8_projection_agrees_with_the_fp32_reference_it_replaces() {
+    // Unlike the exact gate above, this one *must* accept a tolerance: the
+    // activations are quantized to int8, which is a real loss of information
+    // and the entire price of the tensor cores. The question is not whether
+    // it is exact — it cannot be — but whether the error is the ~1/127
+    // quantization floor rather than a formulation defect.
+    //
+    // llama.cpp takes exactly this step before its own int8 matmuls, so the
+    // error accepted here is the error it already lives with.
+    let Some(ctx) = device() else {
+        return;
+    };
+    let stream = ctx.default_stream();
+    let kernels = MmaKernels::new(&ctx).expect("kernels compile");
+
+    println!(
+        "\n{:>6} {:>6} {:>6}   {:>12} {:>12} {:>10}",
+        "tokens", "rows", "k", "cosine", "max_rel", "verdict",
+    );
+
+    // The fp32 reference is a scalar triple loop, so its cost is
+    // `tokens * rows * k` on the host. The two small shapes exercise the
+    // arithmetic; the large one exercises the *tiling* — multiple row bands
+    // and token tiles, and a ragged edge in neither — and is checked against
+    // the in-place kernel on the device instead, which is the comparison that
+    // catches an indexing defect anyway. A 128x8192x2048 host reference is
+    // 2.1 G multiply-adds and took 280 s of a 285 s test run.
+    for (tokens, n_rows, k, host_reference) in [
+        (8usize, 64usize, 256usize, true),
+        (19, 512, 2048, true),
+        (128, 8192, 2048, false),
+    ] {
+        let (w, wf) = q8_0_rows(n_rows, k, 0xC0FFEE ^ (n_rows as u64));
+        let mut rng = Xorshift64Star::new(0xA5A5 ^ (tokens as u64));
+        let x: Vec<f32> = (0..tokens * k)
+            .map(|_| rng.next_f32_range(-2.0, 2.0))
+            .collect();
+
+        // fp32 reference, the arithmetic the tiled kernel performs.
+        let mut want = vec![0f32; tokens * n_rows];
+        if host_reference {
+            for t in 0..tokens {
+                for n in 0..n_rows {
+                    let mut acc = 0f32;
+                    for i in 0..k {
+                        acc += wf[n * k + i] * x[t * k + i];
+                    }
+                    want[t * n_rows + n] = acc;
+                }
+            }
+        }
+
+        let d_w = stream.clone_htod(w.as_slice()).expect("w");
+        let d_x = stream.clone_htod(x.as_slice()).expect("x");
+        let mut d_q = stream.alloc_zeros::<i8>(tokens * k).expect("q");
+        let mut d_s = stream.alloc_zeros::<f32>(tokens * k / 32).expect("s");
+        let mut d_o = stream.alloc_zeros::<f32>(tokens * n_rows).expect("o");
+
+        kernels
+            .quantize_rows(&stream, &d_x, &mut d_q, &mut d_s, tokens, k)
+            .expect("quantize");
+        kernels
+            .q8_0_proj(&stream, &d_w, &d_q, &d_s, &mut d_o, k, n_rows, tokens)
+            .expect("project");
+        let got = stream.clone_dtoh(&d_o).expect("read back");
+        stream.synchronize().expect("sync");
+
+        // The split-layout kernel must agree with the in-place one *exactly*:
+        // it is the same arithmetic over the same numbers, only rearranged in
+        // memory. Any difference is an indexing defect, and it is checked
+        // before the tolerance comparison below so a layout bug cannot hide
+        // inside the quantization error the tolerance is there to allow.
+        let mut wq = Vec::with_capacity(n_rows * k);
+        let mut ws = Vec::with_capacity(n_rows * k / 32);
+        for blk in w.as_chunks::<34>().0 {
+            ws.push(half::f16::from_le_bytes([blk[0], blk[1]]).to_f32());
+            wq.extend(blk[2..34].iter().map(|&b| b as i8));
+        }
+        let d_wq = stream.clone_htod(wq.as_slice()).expect("wq");
+        let d_ws = stream.clone_htod(ws.as_slice()).expect("ws");
+        let mut d_o2 = stream.alloc_zeros::<f32>(tokens * n_rows).expect("o2");
+        kernels
+            .q8_0_proj_split(
+                &stream, &d_wq, &d_ws, &d_q, &d_s, &mut d_o2, k, n_rows, tokens,
+            )
+            .expect("split project");
+        let got_split = stream.clone_dtoh(&d_o2).expect("read back split");
+        stream.synchronize().expect("sync");
+        let scale = peak_of(&got).max(1e-6);
+        let split_diff = got
+            .iter()
+            .zip(&got_split)
+            .filter(|(a, b)| (*a - *b).abs() > 1e-4 * scale)
+            .count();
+        assert_eq!(
+            split_diff, 0,
+            "{tokens}x{n_rows}x{k}: the split layout disagrees with the in-place \
+             one on {split_diff} entries; same numbers, same arithmetic, so this \
+             is an indexing defect",
+        );
+
+        if !host_reference {
+            println!(
+                "{tokens:>6} {n_rows:>6} {k:>6}   {:>12} {:>12} {:>10}",
+                "(vs in-place)", "0 differ", "ok",
+            );
+            continue;
+        }
+
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        let mut max_rel = 0f32;
+        let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        for (g, w) in got.iter().zip(&want) {
+            dot += f64::from(*g) * f64::from(*w);
+            na += f64::from(*g) * f64::from(*g);
+            nb += f64::from(*w) * f64::from(*w);
+            max_rel = max_rel.max((g - w).abs() / peak);
+        }
+        let cosine = (dot / (na.sqrt() * nb.sqrt())) as f32;
+        assert!(got.iter().all(|v| v.is_finite()), "non-finite output");
+
+        println!(
+            "{tokens:>6} {n_rows:>6} {k:>6}   {cosine:>12.9} {max_rel:>12.3e} {:>10}",
+            if cosine > 0.9999 { "ok" } else { "FAIL" },
+        );
+        assert!(
+            cosine > 0.9999,
+            "{tokens}x{n_rows}x{k}: cosine {cosine} against the fp32 reference. \
+             int8 activations cost about 1/127 per element and average down over \
+             k, so anything this far off is a formulation defect and not \
+             quantization noise",
+        );
+    }
 }

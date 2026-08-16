@@ -19,3 +19,4 @@ xabe-sched.workspace = true
 
 [dev-dependencies]
 xabe-kernels.workspace = true
+half.workspace = true
