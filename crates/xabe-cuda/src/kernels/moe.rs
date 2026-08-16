@@ -1709,6 +1709,84 @@ __global__ void moe_swiglu(
     out[i] = (g / (1.0f + expf(-g))) * up[i];
 }
 
+// The shared expert at one token, for the same reason as
+// `moe_expert_ffn_gemv`: at this shape the tiled kernel's staging and barriers
+// buy nothing, because each dequantized weight is multiplied once.
+//
+// Simpler than the routed pair — the shared expert consults no dispatch table
+// and is applied to every token unconditionally, so there is no slot to look
+// up and no routing weight to apply.
+//
+// grid: (ceil(intermediate / MOE_ROWS),). block: MOE_ROWS warps.
+__global__ void moe_shared_ffn_gemv(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    if (*valid_tokens < 1) return;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = (long long)r * hidden;
+
+    float ag[1] = {0.0f};
+    float au[1] = {0.0f};
+    for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
+        float wg[MOE_TN];
+        float wu[MOE_TN];
+        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
+        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+        float4 xv = *(const float4*)(hidden_states + j0 + 4 * lane);
+        ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
+        ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
+        ag[0] += wg[2] * xv.z;  au[0] += wu[2] * xv.z;
+        ag[0] += wg[3] * xv.w;  au[0] += wu[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ag);
+    warp_reduce_tile<1>(au);
+
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[r] = act * au[0];
+    }
+}
+
+// grid: (ceil(hidden / MOE_ROWS),).
+__global__ void moe_shared_down_gemv(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ out
+) {
+    if (*valid_tokens < 1) return;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = (long long)h * intermediate;
+
+    float ad[1] = {0.0f};
+    for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
+        float wd[MOE_TN];
+        dequant_tile(down_q, down_quant, wrow + j0, lane, wd);
+        float4 xv = *(const float4*)(inter + j0 + 4 * lane);
+        ad[0] += wd[0] * xv.x;
+        ad[0] += wd[1] * xv.y;
+        ad[0] += wd[2] * xv.z;
+        ad[0] += wd[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ad);
+
+    if (lane == 0) out[h] = ad[0];
+}
+
 // -------------------------------------------------------------------------
 // 4. fp32 weighted sum of each token's top-k contributions.
 // -------------------------------------------------------------------------
@@ -2189,6 +2267,8 @@ pub struct MoeKernels {
     reduce: CudaFunction,
     shared_ffn: CudaFunction,
     shared_down: CudaFunction,
+    shared_ffn_gemv: CudaFunction,
+    shared_down_gemv: CudaFunction,
     swiglu: CudaFunction,
     geometry: MoeGeometry,
 }
@@ -2270,6 +2350,8 @@ impl MoeKernels {
             reduce: module.load_function("moe_reduce")?,
             shared_ffn: module.load_function("moe_shared_ffn")?,
             shared_down: module.load_function("moe_shared_down")?,
+            shared_ffn_gemv: module.load_function("moe_shared_ffn_gemv")?,
+            shared_down_gemv: module.load_function("moe_shared_down_gemv")?,
             swiglu: module.load_function("moe_swiglu")?,
             geometry,
         })
@@ -2882,6 +2964,48 @@ impl MoeKernels {
         let down_code = down.quant.code();
         let shared = tile_shared_bytes();
         let token_tiles = (g.max_tokens as u32).div_ceil(TILE_M as u32);
+
+        // One token is a GEMV; see `moe_shared_ffn_gemv`.
+        if g.max_tokens == 1 {
+            let ffn_cfg = LaunchConfig {
+                grid_dim: ((g.intermediate as u32).div_ceil(TILE_ROWS), 1, 1),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.shared_ffn_gemv);
+            builder
+                .arg(gate.bytes)
+                .arg(&gate_code)
+                .arg(up.bytes)
+                .arg(&up_code)
+                .arg(hidden_states)
+                .arg(&buffers.valid_tokens)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.shared_inter);
+            // SAFETY: `shared_inter` is `max_tokens * intermediate` floats and
+            // this writes its first `intermediate`; the weight bounds are the
+            // element-count checks above.
+            unsafe { builder.launch(ffn_cfg) }?;
+
+            let down_cfg = LaunchConfig {
+                grid_dim: ((g.hidden as u32).div_ceil(TILE_ROWS), 1, 1),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.shared_down_gemv);
+            builder
+                .arg(down.bytes)
+                .arg(&down_code)
+                .arg(&buffers.shared_inter)
+                .arg(&buffers.valid_tokens)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(out);
+            // SAFETY: as above; `out` is `max_tokens * hidden` floats.
+            unsafe { builder.launch(down_cfg) }?;
+            return Ok(());
+        }
 
         let ffn_cfg = LaunchConfig {
             grid_dim: ((g.intermediate as u32).div_ceil(TILE_ROWS), token_tiles, 1),
