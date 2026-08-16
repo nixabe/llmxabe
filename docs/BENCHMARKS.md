@@ -2793,3 +2793,69 @@ flash-decoding: split the key range across blocks, have each produce a partial
 `(m, l, acc)`, and merge them in a second pass. That recovers both the
 parallelism and the redundancy at once, and it is the largest remaining item on
 the decode side.
+
+## Flash decoding, and the first head-to-head that matters (2026-08-17)
+
+The item the previous section named as decode's largest remaining problem is
+fixed. `attn_flash_causal_t1` launched `(n_query, q_heads)`, and decode is
+`n_query == 1` — sixteen blocks on a 72-SM card, before counting the eightfold
+K/V redundancy. `attn_flash_decode_split` gives each block a slice of the key
+window and `attn_flash_decode_combine` merges the partial `(m, l, acc)` triples,
+so the parallelism comes from the key axis, which is the only axis decode has.
+
+Interleaved, one GPU, 48 timed steps after 4 warmup, winning every pair:
+
+|   ctx | before | after | gain | llama.cpp (1 GPU) | ratio |
+| ----: | -----: | ----: | ---: | ----------------: | ----: |
+|   512 |   98.3 | 104.8 | +6.6% |            104.19 | 1.006 |
+| 2,048 |   78.3 | 101.4 | +29.5% |          103.91 | 0.976 |
+| 4,096 |   61.7 |  98.3 | +59%  |            102.68 | 0.957 |
+| 8,192 |   43.2 |  92.6 | +114% |            100.48 | 0.921 |
+
+The shape of the "before" column is the finding. Decode fell 98.3 -> 43.2 from
+512 to 8,192 — more than halving — and it now falls 104.8 -> 92.6. That decay
+was never arithmetic. A decode step does the same work per key at every depth;
+what changed with depth was how long sixteen blocks took to stream a window that
+each of them read eight times over.
+
+llmxabe is now **ahead of llama.cpp at 512** and within 8% at 8,192, where it
+was at 0.43x before. llama.cpp's own decode is almost perfectly flat
+(104.19 -> 100.48 over the same range), so closing the rest of that gap means
+matching its flatness, not its peak.
+
+### Prefill, same comparison, same card
+
+llama.cpp is run with its default 512-token micro-batch, which is the chunk
+llmxabe uses, so this is like for like:
+
+| tokens | llmxabe | llama.cpp (1 GPU) | ratio |
+| -----: | ------: | ----------------: | ----: |
+|    512 | 2,367.2 |           2,155.8 | 1.098 |
+|  2,048 | 2,122.1 |           2,118.0 | 1.002 |
+|  8,192 | 1,552.2 |           1,978.7 | 0.784 |
+| 32,768 |   737.1 |           1,729.9 | 0.426 |
+| 65,536 |   441.1 |           1,410.4 | 0.313 |
+
+Prefill wins at 512, ties at 2,048, and loses from there. llama.cpp decays only
+8% from 512 to 8,192 where llmxabe decays 34%, and the divergence keeps widening
+— which is the same attention story as decode, but on the side where the fix
+landed only a 4x traffic cut rather than a shape change.
+
+### What is left, and what it is not
+
+It is not memory. A 65,536-position run peaks at 35.316 GiB of 47.27, and the
+KV cache is 40 KiB per token, so 131,072 is about 37.8 GiB — it fits on one card
+with roughly 9 GiB to spare. The 128K target is bounded by throughput, not
+capacity.
+
+It is not the GDN layers, the MoE, or the projections: `nsys` has them flat
+across depth, and 30 of the 40 layers are GDN, whose recurrent state is a fixed
+2 MiB regardless of context.
+
+It is attention's arithmetic efficiency, and specifically the cross-lane
+dot-product reduction, measured at 3.2 of this card's 16.3 fp32 TFLOP/s. The
+lanes-per-dot-product trade tabulated in the previous section has no remaining
+row that fits in the register file. The next lever is fp16 operands on
+`mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`, which does the reduction in
+hardware and raises the ceiling to roughly 65 TFLOP/s; it pairs naturally with
+an fp16 KV cache, which would also halve the 5 GiB the cache costs at 131,072.
