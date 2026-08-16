@@ -196,6 +196,21 @@ const MMA_WSTRIDE: usize = 100;
 /// Bytes per staged scale row. Mirrors `MOE_MMA_SSTRIDE`.
 const MMA_SSTRIDE: usize = 12;
 
+/// Bytes per staged weight row in the down projection. Mirrors
+/// `MOE_MMA_DSTRIDE`: the quants, then one fp32 scale per 32 of them.
+const MMA_DSTRIDE: usize = MMA_KC + (MMA_KC / 32) * 4;
+
+/// Shared bytes the down projection needs: one staged weight tile, the int8
+/// activation tile, its per-32 scales, and one row index plus one slot id per
+/// staged slot.
+const fn mma_down_shared_bytes() -> u32 {
+    (MMA_ROWS as usize * MMA_DSTRIDE
+        + MMA_M * MMA_KC
+        + MMA_M * (MMA_KC / 32) * size_of::<f32>()
+        + MMA_M * size_of::<i64>()
+        + MMA_M * size_of::<i32>()) as u32
+}
+
 /// Shared bytes the tensor-core grouped GEMM needs: two staged weight tiles,
 /// their scale tiles, the int8 activation tile, its per-32 scales, and one
 /// activation row index per staged slot.
@@ -1352,6 +1367,177 @@ __global__ void moe_expert_down(
 }
 
 // -------------------------------------------------------------------------
+// 3c. The down projection on the integer tensor cores.
+// -------------------------------------------------------------------------
+//
+// Same shape of argument as `moe_expert_ffn_mma`, one format down. A Q8_0
+// block is 32 int8 with an fp16 scale, so the scale factors out of *two*
+// consecutive `m8n8k16` contractions rather than one, and the quants need no
+// bit-unpacking at all — the only thing standing between them and a tensor
+// core is the 34-byte block stride, which puts every four-byte operand off a
+// word boundary.
+//
+// `kernels::mma` solves that for the dense projections by repacking the tensor
+// into split quant and scale arrays. That is not affordable here: `ffn_down_
+// exps` is 10.7 G weights across the 40 layers, and a second copy would not
+// fit beside the model. Staging through shared memory solves it for free —
+// the kernel chooses the shared layout, so it can put the quants on a word
+// boundary and the scales somewhere else entirely.
+//
+// grid: (ceil(hidden / MOE_MMA_ROWS), expert_block_capacity). The contraction
+// runs over `intermediate` rather than `hidden`.
+
+// Bytes per staged weight row: MOE_MMA_KC quants, then one fp32 scale per 32
+// at offset MOE_MMA_KC.
+//
+// 144 is 36 words, and the eight rows a warp reads land on banks
+// `4r + (quad/4)` — thirty-two distinct banks across the warp, no conflict.
+#define MOE_MMA_DSTRIDE (MOE_MMA_KC + (MOE_MMA_KC / 32) * 4)
+
+__global__ void moe_expert_down_mma(
+    const unsigned char* __restrict__ down_q,
+    const signed char* __restrict__ iq,
+    const float* __restrict__ iscale,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    unsigned char* sw  = (unsigned char*)xabe_shared;
+    signed char*   sa  = (signed char*)(sw + MOE_MMA_ROWS * MOE_MMA_DSTRIDE);
+    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_KC);
+    long long*     rows = (long long*)(sas + MOE_MMA_M * (MOE_MMA_KC / 32));
+    int*           slot_flat = (int*)(rows + MOE_MMA_M);
+
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+    int numel = (*valid_tokens) * top_k;
+
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int r0   = blockIdx.x * MOE_MMA_ROWS;
+
+    if (tid < MOE_MMA_M) {
+        int m = tid;
+        int flat = m < block_size
+            ? sorted_token_ids[(long long)blk * block_size + m]
+            : numel;
+        slot_flat[m] = flat;
+        // The `inter` row, which is the *slot* index and not the token index:
+        // the ffn kernel wrote one row per dispatch slot.
+        rows[m] = flat < numel ? (long long)blk * block_size + m : -1;
+    }
+    __syncthreads();
+
+    int nload = warp * MOE_MMA_N + (lane >> 2);
+    int arow  = lane >> 2;
+    int quad  = (lane & 3) * 4;
+    int ccol  = warp * MOE_MMA_N + (lane & 3) * 2;
+
+    // [hidden x intermediate] per expert — GGUF `[intermediate, hidden, experts]`.
+    long long ebase = (long long)e * hidden * intermediate;
+    int kblocks = intermediate >> 5;
+
+    float acc[MOE_MMA_MF][2];
+    #pragma unroll
+    for (int mf = 0; mf < MOE_MMA_MF; ++mf) { acc[mf][0] = 0.0f; acc[mf][1] = 0.0f; }
+
+    for (int kc = 0; kc < intermediate; kc += MOE_MMA_KC) {
+        __syncthreads();
+
+        for (int r = warp; r < MOE_MMA_ROWS; r += MOE_MMA_WARPS) {
+            int n = r0 + r;
+            if (n < hidden) {
+                const unsigned char* src =
+                    down_q + ((ebase + (long long)n * intermediate + kc) >> 5) * 34;
+                // Each trip reads 32 bytes contiguous within one block, so the
+                // fetch coalesces even though the block stride does not let it
+                // be a word load.
+                for (int t = lane; t < MOE_MMA_KC; t += 32) {
+                    sw[r * MOE_MMA_DSTRIDE + t] = src[(t >> 5) * 34 + 2 + (t & 31)];
+                }
+                if (lane < (MOE_MMA_KC / 32)) {
+                    *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) =
+                        load_half_le(src + lane * 34);
+                }
+            } else if (lane < (MOE_MMA_KC / 32)) {
+                // Zeroing the scale is enough: every product it feeds is
+                // multiplied by it.
+                *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) = 0.0f;
+            }
+        }
+
+        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 4); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 4);
+            int k4 = (idx % (MOE_MMA_KC / 4)) * 4;
+            long long row = rows[m];
+            unsigned int v = row >= 0
+                ? *(const unsigned int*)(iq + row * intermediate + kc + k4)
+                : 0u;
+            *(unsigned int*)(sa + m * MOE_MMA_KC + k4) = v;
+        }
+        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 32); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 32);
+            int kb = idx % (MOE_MMA_KC / 32);
+            long long row = rows[m];
+            sas[m * (MOE_MMA_KC / 32) + kb] =
+                row >= 0 ? iscale[row * kblocks + (kc >> 5) + kb] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < MOE_MMA_KC; kk += 16) {
+            unsigned int b = *(const unsigned int*)(
+                sw + nload * MOE_MMA_DSTRIDE + kk + quad);
+
+            // One Q8_0 scale spans 32 contraction elements, so it is the same
+            // for this k-step and the next.
+            int sb = kk >> 5;
+            float w0 = *(const float*)(
+                sw + ccol * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+            float w1 = *(const float*)(
+                sw + (ccol + 1) * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+
+            #pragma unroll
+            for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
+                unsigned int a = *(const unsigned int*)(
+                    sa + (mf * 8 + arow) * MOE_MMA_KC + kk + quad);
+                int d0 = 0, d1 = 0;
+                asm volatile(
+                    "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0,%1}, {%2}, {%3}, {%0,%1};"
+                    : "+r"(d0), "+r"(d1) : "r"(a), "r"(b));
+                float dx = sas[(mf * 8 + arow) * (MOE_MMA_KC / 32) + sb];
+                acc[mf][0] += (float)d0 * dx * w0;
+                acc[mf][1] += (float)d1 * dx * w1;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
+        int m = mf * 8 + arow;
+        if (m < block_size) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                int n = r0 + ccol + j;
+                if (n < hidden) {
+                    store_slot_contribution(
+                        partial, topk_weights, slot_flat[m], numel, hidden, n,
+                        (j == 0) ? acc[mf][0] : acc[mf][1]);
+                }
+            }
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
 // 4. fp32 weighted sum of each token's top-k contributions.
 // -------------------------------------------------------------------------
 //
@@ -1672,6 +1858,13 @@ pub struct MoeBuffers {
     /// more traffic than the weights the kernel exists to stream.
     xq: CudaSlice<i8>,
     xq_scales: CudaSlice<f32>,
+    /// The gate/up output quantized to int8 for the down projection.
+    ///
+    /// One row per dispatch *slot*, not per token: the down projection
+    /// contracts a slot's own intermediate vector, and padding slots are
+    /// staged as zero rather than read.
+    iq: CudaSlice<i8>,
+    iq_scales: CudaSlice<f32>,
 }
 
 impl MoeBuffers {
@@ -1734,6 +1927,7 @@ pub struct MoeKernels {
     /// `None` if the integer path is unavailable on this device.
     mma: Option<MmaKernels>,
     expert_down: CudaFunction,
+    expert_down_mma: CudaFunction,
     reduce: CudaFunction,
     shared_ffn: CudaFunction,
     shared_down: CudaFunction,
@@ -1811,6 +2005,7 @@ impl MoeKernels {
             // launch below falls back to it.
             mma: MmaKernels::new(ctx).ok(),
             expert_down: module.load_function("moe_expert_down")?,
+            expert_down_mma: module.load_function("moe_expert_down_mma")?,
             reduce: module.load_function("moe_reduce")?,
             shared_ffn: module.load_function("moe_shared_ffn")?,
             shared_down: module.load_function("moe_shared_down")?,
@@ -1839,6 +2034,8 @@ impl MoeKernels {
             shared_inter: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
             xq: stream.alloc_zeros::<i8>(g.max_tokens * g.hidden)?,
             xq_scales: stream.alloc_zeros::<f32>(g.max_tokens * g.hidden / 32)?,
+            iq: stream.alloc_zeros::<i8>(g.sorted_capacity() * g.intermediate)?,
+            iq_scales: stream.alloc_zeros::<f32>(g.sorted_capacity() * g.intermediate / 32)?,
         })
     }
 
@@ -2119,33 +2316,86 @@ impl MoeKernels {
         // produce a plausible wrong answer instead of an obviously wrong one.
         stream.memset_zeros(&mut buffers.partial)?;
 
-        let down_cfg = LaunchConfig {
-            grid_dim: (
-                (g.hidden as u32).div_ceil(TILE_ROWS),
-                g.expert_block_capacity() as u32,
-                1,
-            ),
-            block_dim: (GEMM_THREADS, 1, 1),
-            shared_mem_bytes: shared,
-        };
-        let mut builder = stream.launch_builder(&self.expert_down);
-        builder
-            .arg(down.bytes)
-            .arg(&down_code)
-            .arg(&buffers.inter)
-            .arg(&buffers.topk_weights)
-            .arg(&buffers.sorted_token_ids)
-            .arg(&buffers.expert_ids)
-            .arg(&buffers.valid_tokens)
-            .arg(&top_k)
-            .arg(&block_size)
-            .arg(&hidden)
-            .arg(&intermediate)
-            .arg(&mut buffers.partial);
-        // SAFETY: as above; `partial` is `max_flat_pairs * hidden` floats and
-        // is indexed by `flat * hidden + h` with `flat < valid_tokens *
-        // top_k <= max_flat_pairs`.
-        unsafe { builder.launch(down_cfg) }?;
+        // The down projection takes the integer path on the same terms, but
+        // gated on its *own* format: `ffn_down_exps` is Q8_0 where gate/up are
+        // Q6_K, so the two halves of the block can legitimately disagree about
+        // which arithmetic they use.
+        let down_mma =
+            self.mma.is_some() && g.max_tokens >= MMA_MIN_TOKENS && down.quant == ExpertQuant::Q8_0;
+
+        if down_mma {
+            let mma = self.mma.as_ref().expect("checked above");
+            // One row per dispatch slot. Padding slots hold whatever the last
+            // step left in `inter` and are quantized along with the rest; the
+            // kernel stages them as zero rather than reading them, so their
+            // contents never reach an accumulator.
+            mma.quantize_rows(
+                stream,
+                &buffers.inter,
+                &mut buffers.iq,
+                &mut buffers.iq_scales,
+                g.sorted_capacity(),
+                g.intermediate,
+            )
+            .map_err(MoeError::Mma)?;
+
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.hidden as u32).div_ceil(MMA_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (MMA_WARPS * 32, 1, 1),
+                shared_mem_bytes: mma_down_shared_bytes(),
+            };
+            let mut builder = stream.launch_builder(&self.expert_down_mma);
+            builder
+                .arg(down.bytes)
+                .arg(&buffers.iq)
+                .arg(&buffers.iq_scales)
+                .arg(&buffers.topk_weights)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.partial);
+            // SAFETY: as for the fp32 launch below, plus: `iq` is
+            // `sorted_capacity * intermediate` int8 and is indexed by
+            // `slot * intermediate + k` with `slot < sorted_capacity` by
+            // construction of the dispatch tables.
+            unsafe { builder.launch(cfg) }?;
+        } else {
+            let down_cfg = LaunchConfig {
+                grid_dim: (
+                    (g.hidden as u32).div_ceil(TILE_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            let mut builder = stream.launch_builder(&self.expert_down);
+            builder
+                .arg(down.bytes)
+                .arg(&down_code)
+                .arg(&buffers.inter)
+                .arg(&buffers.topk_weights)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.partial);
+            // SAFETY: as above; `partial` is `max_flat_pairs * hidden` floats and
+            // is indexed by `flat * hidden + h` with `flat < valid_tokens *
+            // top_k <= max_flat_pairs`.
+            unsafe { builder.launch(down_cfg) }?;
+        }
 
         let reduce_cfg = LaunchConfig {
             grid_dim: (g.max_tokens as u32, 1, 1),

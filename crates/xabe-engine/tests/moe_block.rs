@@ -200,15 +200,21 @@ const GATE_MAX_FIT_RESIDUAL: f32 = 5e-2;
 /// accumulation is exact. All of the error is the activation quantization,
 /// which costs about `1/254` of each 32-element block's largest magnitude.
 ///
-/// Measured at layer 0, 19 tokens, real Q6_K gate/up: `max_abs = 1.43e-4`,
-/// `cosine = 0.999987`. The bound is ~2x that.
+/// The bound is a **fraction of the layer's own output magnitude**, not an
+/// absolute number. Quantization error scales with what is being quantized,
+/// and the two layers this test covers differ by more than an order of
+/// magnitude in output scale: an absolute constant tuned on blk.0 passes there
+/// and fails on blk.39 for no reason except that blk.39's activations are
+/// larger. Measured `max_abs / max|ref|`: blk.0 2.7e-4 over 1.0e-2, blk.39
+/// 5.5e-3 over ~1.0. The bound is 2%.
 ///
 /// What makes this still a real gate is the assertion that follows it, which
 /// is self-calibrating and not widened at all: the device must be no further
 /// from llama.cpp's own `ffn_moe_out` than this scalar fp32 reference is.
-/// Measured, the int8 device is *closer* — 2.53e-4 against the reference's
-/// 2.70e-4 — because llama.cpp quantizes activations for the same matmuls.
-const CPU_MAX_ABS: f32 = 3e-4;
+/// Measured, the int8 device is *closer* on both layers — on blk.0 it is
+/// 5.96e-8 against the reference's 2.70e-4, four orders nearer, because
+/// llama.cpp runs the same integer arithmetic on the same quantized weights.
+const CPU_MAX_ABS_FRACTION: f32 = 2e-2;
 const CPU_MIN_COSINE: f32 = 0.9999;
 
 fn model_path() -> PathBuf {
@@ -1071,11 +1077,18 @@ fn the_routed_path_agrees_with_the_cpu_reference_which_separates_routing_from_th
         println!("  naive_forward vs llama.cpp:           {cpu_vs_llama}");
 
         assert_carries_signal("cpu reference routed output", &reference);
+        let ref_peak = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let budget = CPU_MAX_ABS_FRACTION * ref_peak;
+        println!(
+            "  budget: max_abs {:.3e} against {CPU_MAX_ABS_FRACTION:.0e} x a peak \
+             |ref| of {ref_peak:.4e} = {budget:.3e}",
+            vs_cpu.max_abs_error,
+        );
         assert!(
-            vs_cpu.max_abs_error <= CPU_MAX_ABS && vs_cpu.cosine_similarity >= CPU_MIN_COSINE,
+            vs_cpu.max_abs_error <= budget && vs_cpu.cosine_similarity >= CPU_MIN_COSINE,
             "blk.{layer}: the device grouped GEMM disagrees with the scalar \
              reference on the same routing — this is a GEMM or dispatch fault, \
-             not a routing one: {vs_cpu}",
+             not a routing one: {vs_cpu} against a budget of {budget:.3e}",
         );
         // The point of the whole test: the device is no further from llama.cpp
         // than an independent fp32 implementation of the same routing is. If
