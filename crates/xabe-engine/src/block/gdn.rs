@@ -150,6 +150,16 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 /// Warps per projection block. One warp owns one output row.
 const PROJ_WARPS: u32 = 4;
 
+/// Tokens one warp of the fused alpha/beta gate kernel carries. Mirrors
+/// `GATE_TT`.
+///
+/// `ssm_alpha.weight` and `ssm_beta.weight` are 256 KiB each, and a warp that
+/// owned one (head, token) read all 16 KiB of its two rows to do 4,096
+/// multiply-adds. Carrying a band of tokens reads them once for `GATE_TT`
+/// times the arithmetic, and is bit-identical: the per-thread order over the
+/// contraction and the closing `warp_reduce_sum` are both unchanged.
+const GATE_TT: u32 = 8;
+
 /// Token tile widths the projection is specialized for, ascending.
 ///
 /// Spelled here and in the kernel source, which NVRTC compiles from a string
@@ -523,50 +533,87 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 // and `beta_raw` are still written because the golden capture has a waypoint
 // on each.
 //
-// grid: (ceil(heads / warps), tokens). block: (32, warps).
-__global__ void gdn_alpha_beta_gates(
-    const float* __restrict__ w_alpha,
-    const float* __restrict__ w_beta,
-    const float* __restrict__ x,
-    const float* __restrict__ dt_bias,
-    const float* __restrict__ ssm_a,
-    float* __restrict__ alpha,
-    float* __restrict__ beta_raw,
-    float* __restrict__ a_softplus,
-    float* __restrict__ log_decay,
-    float* __restrict__ beta,
-    int k_dim,
-    int heads
-) {
-    int lane = threadIdx.x;
-    int n    = blockIdx.x * blockDim.y + threadIdx.y;
-    if (n >= heads) return;
-    int t = blockIdx.y;
+// Tokens one warp carries.
+//
+// The two weight matrices are `[hidden, heads]` f32 -- 256 KiB each -- and a
+// warp that owns one (head, token) reads all 16 KiB of its two rows to do
+// 4,096 multiply-adds. That is one and a half memory instructions per
+// multiply-add, and it made a kernel with 2 GFLOP of work in it cost 4.2 ms of
+// a 512-token pass. Carrying GATE_TT tokens reads the same two weight rows
+// once for GATE_TT times the arithmetic.
+//
+// Bit-identical: each (head, token) accumulator still sums `i` lane-strided
+// ascending and still finishes in the same `warp_reduce_sum`.
+#define GATE_TT 8
 
-    const float* ra = w_alpha + (long long)n * k_dim;
-    const float* rb = w_beta  + (long long)n * k_dim;
-    const float* xr = x + (long long)t * k_dim;
-
-    float aa = 0.0f;
-    float bb = 0.0f;
-    for (int i = lane; i < k_dim; i += 32) {
-        float xv = xr[i];
-        aa += ra[i] * xv;
-        bb += rb[i] * xv;
-    }
-    aa = warp_reduce_sum(aa);
-    bb = warp_reduce_sum(bb);
-    if (lane == 0) {
-        long long i = (long long)t * heads + n;
-        alpha[i] = aa;
-        beta_raw[i] = bb;
-        float a = aa + dt_bias[n];
-        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
-        a_softplus[i] = sp;
-        log_decay[i] = sp * ssm_a[n];
-        beta[i] = 1.0f / (1.0f + expf(-bb));
-    }
+#define GDN_GATES(NAME, TT)                                                    \
+__global__ void NAME(                                                           \
+    const float* __restrict__ w_alpha,                                          \
+    const float* __restrict__ w_beta,                                           \
+    const float* __restrict__ x,                                                \
+    const float* __restrict__ dt_bias,                                          \
+    const float* __restrict__ ssm_a,                                            \
+    float* __restrict__ alpha,                                                  \
+    float* __restrict__ beta_raw,                                               \
+    float* __restrict__ a_softplus,                                             \
+    float* __restrict__ log_decay,                                              \
+    float* __restrict__ beta,                                                   \
+    int k_dim,                                                                  \
+    int heads,                                                                  \
+    int tokens                                                                  \
+) {                                                                             \
+    int lane = threadIdx.x;                                                     \
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;                           \
+    if (n >= heads) return;                                                     \
+    int t0 = blockIdx.y * TT;                                                   \
+                                                                                \
+    const float* ra = w_alpha + (long long)n * k_dim;                           \
+    const float* rb = w_beta  + (long long)n * k_dim;                           \
+                                                                                \
+    float aa[TT];                                                               \
+    float bb[TT];                                                               \
+    _Pragma("unroll")                                                           \
+    for (int u = 0; u < TT; ++u) { aa[u] = 0.0f; bb[u] = 0.0f; }                \
+                                                                                \
+    for (int i = lane; i < k_dim; i += 32) {                                    \
+        float av = ra[i];                                                       \
+        float bv = rb[i];                                                       \
+        _Pragma("unroll")                                                       \
+        for (int u = 0; u < TT; ++u) {                                          \
+            int t = t0 + u;                                                     \
+            float xv = t < tokens ? x[(long long)t * k_dim + i] : 0.0f;         \
+            aa[u] += av * xv;                                                   \
+            bb[u] += bv * xv;                                                   \
+        }                                                                       \
+    }                                                                           \
+                                                                                \
+    _Pragma("unroll")                                                           \
+    for (int u = 0; u < TT; ++u) {                                              \
+        float a_sum = warp_reduce_sum(aa[u]);                                   \
+        float b_sum = warp_reduce_sum(bb[u]);                                   \
+        int t = t0 + u;                                                         \
+        if (lane == 0 && t < tokens) {                                          \
+            long long i = (long long)t * heads + n;                             \
+            alpha[i] = a_sum;                                                   \
+            beta_raw[i] = b_sum;                                                \
+            float a = a_sum + dt_bias[n];                                       \
+            float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));                  \
+            a_softplus[i] = sp;                                                 \
+            log_decay[i] = sp * ssm_a[n];                                       \
+            beta[i] = 1.0f / (1.0f + expf(-b_sum));                             \
+        }                                                                       \
+    }                                                                           \
 }
+
+// grid: (ceil(heads / warps), ceil(tokens / TT)). block: (32, warps).
+//
+// Eight tokens per warp for prefill. One for decode, where seven of the eight
+// bands would be masked off and the warp would run eight times the
+// multiply-adds and eight `warp_reduce_sum`s to throw seven of them away.
+// Measured 105.1 -> 99.6 tok/s before this instantiation existed, which is the
+// same trap the flash kernel's query tile set.
+GDN_GATES(gdn_alpha_beta_gates,    8)
+GDN_GATES(gdn_alpha_beta_gates_t1, 1)
 
 __global__ void gdn_proj_f32(
     const float* __restrict__ weight,
@@ -1223,6 +1270,7 @@ pub struct GdnBlock {
     proj_tiled: [CudaFunction; 2],
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
+    alpha_beta_gates_t1: CudaFunction,
     silu: CudaFunction,
     split: CudaFunction,
     silu_split: CudaFunction,
@@ -1280,6 +1328,7 @@ impl GdnBlock {
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
+            alpha_beta_gates_t1: module.load_function("gdn_alpha_beta_gates_t1")?,
             silu: module.load_function("gdn_silu")?,
             split: module.load_function("gdn_split_qkv")?,
             silu_split: module.load_function("gdn_silu_split_qkv")?,
@@ -2076,13 +2125,24 @@ impl GdnBlock {
             return Ok(());
         }
 
+        // A partial token band costs its empty lanes in full, so below a whole
+        // band the one-token instantiation is launched instead. See the kernel.
+        let (f, tt) = if tokens < GATE_TT as usize {
+            (&self.alpha_beta_gates_t1, 1)
+        } else {
+            (&self.alpha_beta_gates, GATE_TT)
+        };
         let cfg = LaunchConfig {
-            grid_dim: ((heads as u32).div_ceil(PROJ_WARPS), tokens as u32, 1),
+            grid_dim: (
+                (heads as u32).div_ceil(PROJ_WARPS),
+                (tokens as u32).div_ceil(tt),
+                1,
+            ),
             block_dim: (32, PROJ_WARPS, 1),
             shared_mem_bytes: 0,
         };
-        let (k_i32, h_i32) = (g.hidden as i32, heads as i32);
-        let mut builder = stream.launch_builder(&self.alpha_beta_gates);
+        let (k_i32, h_i32, t_i32) = (g.hidden as i32, heads as i32, tokens as i32);
+        let mut builder = stream.launch_builder(f);
         builder
             .arg(w_alpha)
             .arg(w_beta)
@@ -2095,10 +2155,12 @@ impl GdnBlock {
             .arg(&mut *log_decay)
             .arg(&mut *beta)
             .arg(&k_i32)
-            .arg(&h_i32);
-        // SAFETY: one warp per (head, token) over a grid that covers both and
-        // returns above `heads`; every buffer was length-checked immediately
-        // above against exactly the extent the kernel indexes, and the two
+            .arg(&h_i32)
+            .arg(&t_i32);
+        // SAFETY: one warp per (head, GATE_TT-wide token band) over a grid
+        // that covers both and returns above `heads`; every buffer was
+        // length-checked immediately above against exactly the extent the
+        // kernel indexes, the band is masked against `tokens`, and the two
         // per-head tables are indexed by `n < heads`.
         unsafe { builder.launch(cfg) }?;
         Ok(())

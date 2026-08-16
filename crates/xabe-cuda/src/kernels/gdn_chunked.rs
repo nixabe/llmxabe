@@ -197,10 +197,21 @@ const SOLVE_VB: u32 = 32;
 /// the per-token output is not, so it runs on all of them.
 const SOLVE_TT: u32 = 8;
 /// Value indices one state-update block owns. Mirrors `STATE_VB`.
-const STATE_VB: u32 = 32;
-/// State columns one state-update block owns. Mirrors `STATE_JB`; the block
-/// is `STATE_VB * STATE_JB` threads.
-const STATE_JB: u32 = 8;
+const STATE_VB: u32 = STATE_VLANES * STATE_VT;
+/// State columns one state-update block owns. Mirrors `STATE_JB`.
+const STATE_JB: u32 = STATE_JLANES * STATE_JT;
+/// Value indices and state columns one state-update *thread* owns. Mirror
+/// `STATE_VT` and `STATE_JT`.
+///
+/// The state update is a rank-`c` outer product, so a thread that owns one
+/// cell spends two memory instructions per multiply-add. A 4x4 tile reads one
+/// `float4` from each operand and does sixteen. See the kernel.
+const STATE_VT: u32 = 4;
+const STATE_JT: u32 = 4;
+/// Threads spanning the block's value band and its column band. Mirror
+/// `STATE_VLANES` and `STATE_JLANES`; the block is their product.
+const STATE_VLANES: u32 = 8;
+const STATE_JLANES: u32 = 32;
 
 const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
@@ -425,18 +436,23 @@ __global__ void gdn_chunk_inter(
     for (int j4 = 0; j4 < nj4; ++j4) {
         float4 sv = row4[j4];
         int j = j4 << 2;
+        // The staged reads are `float4` for the same reason the state read
+        // is: eight scalar shared loads per eight multiply-adds is one memory
+        // instruction per unit of arithmetic. Widening them is a load
+        // widening only — the components are still consumed x, y, z, w, so
+        // each accumulator sums over `j` ascending exactly as before.
         #pragma unroll
         for (int u = 0; u < INTER_TT; ++u) {
-            const float* krow = sk + u * head_dim + j;
-            const float* qrow = sq + u * head_dim + j;
-            acc_k[u] += sv.x * krow[0];
-            acc_q[u] += sv.x * qrow[0];
-            acc_k[u] += sv.y * krow[1];
-            acc_q[u] += sv.y * qrow[1];
-            acc_k[u] += sv.z * krow[2];
-            acc_q[u] += sv.z * qrow[2];
-            acc_k[u] += sv.w * krow[3];
-            acc_q[u] += sv.w * qrow[3];
+            float4 kv = *(const float4*)(sk + u * head_dim + j);
+            float4 qv = *(const float4*)(sq + u * head_dim + j);
+            acc_k[u] += sv.x * kv.x;
+            acc_q[u] += sv.x * qv.x;
+            acc_k[u] += sv.y * kv.y;
+            acc_q[u] += sv.y * qv.y;
+            acc_k[u] += sv.z * kv.z;
+            acc_q[u] += sv.z * qv.z;
+            acc_k[u] += sv.w * kv.w;
+            acc_q[u] += sv.w * qv.w;
         }
     }
 
@@ -569,24 +585,37 @@ __global__ void gdn_chunk_solve_and_apply(
     // so computing it once costs 1/head_dim of the alternative on a kernel
     // whose inner loop is otherwise pure multiply-add.
     for (int t = 0; t < c; ++t) {
-        // The whole block fills `decay`; only the first VB threads consume it
-        // here, but the fill is `t + 1` exponentials and there is no reason to
-        // leave seven eighths of the block out of it.
-        for (int i = threadIdx.x; i <= t; i += blockDim.x) {
-            decay[i] = expf(gcum[t] - gcum[i]);
+        long long ht = (long long)(chunk_start + t) * value_heads + h;
+        float beta_t = beta[ht];
+        const float* kk_row = kk + ((long long)hq * c + t) * c;
+
+        // The whole block fills `decay`, and it fills the *whole* coefficient
+        // rather than the exponential alone.
+        //
+        // `beta_t * kk_row[i] * decay[i]` does not depend on `vl`, so the
+        // inner loop below was making all VB lanes recompute the same two
+        // products and reload the same `kk_row[i]` from global. Hoisting them
+        // here leaves that loop one shared read and one multiply-add, which
+        // matters more than the arithmetic saved: sections 1 and 2 are a
+        // forward substitution, sequential in `t`, running on one VB-wide row
+        // of threads, and they are this kernel's critical path.
+        //
+        // Bit-identical. `acc -= beta_t * kk_row[i] * decay[i] * u[...]`
+        // associates left to right, so `(beta_t * kk_row[i]) * expf(...)` is
+        // the same product in the same order, formed once instead of VB
+        // times.
+        for (int i = threadIdx.x; i < t; i += blockDim.x) {
+            decay[i] = beta_t * kk_row[i] * expf(gcum[t] - gcum[i]);
         }
         __syncthreads();
 
         if (tsub == 0) {
-        long long ht = (long long)(chunk_start + t) * value_heads + h;
-        float beta_t = beta[ht];
         float v_t = v[ht * head_dim + vi];
 
         float acc = beta_t * (v_t - expf(gcum[t]) * sik[((long long)h * c + t) * head_dim + vi]);
 
-        const float* kk_row = kk + ((long long)hq * c + t) * c;
         for (int i = 0; i < t; ++i) {
-            acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];
+            acc -= decay[i] * u[i * VB + vl];
         }
 
         u[t * VB + vl] = acc;
@@ -603,17 +632,21 @@ __global__ void gdn_chunk_solve_and_apply(
         // not overwrite each other's.
         float* dec = decay + tsub * c;
         if (t < c) {
+            // As in sections 1 and 2: `kq_row[i]` does not depend on `vl`, so
+            // it is folded into the row here instead of being reloaded from
+            // global by all VB lanes. `kq_row[i] * dec[i] * u[...]` associates
+            // left to right, so this is the same product in the same order.
+            const float* kq_row = kq + ((long long)hq * c + t) * c;
             for (int i = vl; i <= t; i += VB) {
-                dec[i] = expf(gcum[t] - gcum[i]);
+                dec[i] = kq_row[i] * expf(gcum[t] - gcum[i]);
             }
         }
         __syncthreads();
 
         if (t < c) {
-        const float* kq_row = kq + ((long long)hq * c + t) * c;
         float o_intra = 0.0f;
         for (int i = 0; i <= t; ++i) {
-            o_intra += kq_row[i] * dec[i] * u[i * VB + vl];
+            o_intra += dec[i] * u[i * VB + vl];
         }
         float o_inter = expf(gcum[t]) * oint[((long long)h * c + t) * head_dim + vi];
         long long ht = (long long)(chunk_start + t) * value_heads + h;
@@ -661,23 +694,45 @@ __global__ void gdn_chunk_solve_and_apply(
 // `lambda * S + acc`, both as the solve had them: reassociating the sum or
 // splitting the fused multiply-add into a scale pass and an accumulate pass
 // would round differently on a value that is carried into every later chunk.
-#define STATE_VB 32
-// `j` indices one block owns.
+#define STATE_VT 4
+// State columns one thread owns, and value indices it owns. Both 4, so the
+// two operands of the outer product are one `float4` each and the thread does
+// sixteen multiply-adds with them.
 //
-// The staged `su` tile is indexed by `vl` alone, so it is read once and used
-// by all STATE_JB of the block's `j` lanes -- and `grid.z` is
-// `head_dim / STATE_JB`, so every block in `z` stages the tile again. At 4
-// that was 32 passes over `uprime` per launch and the kernel was 6% of
-// prefill moving 32 MiB to read a 1 MiB tensor. Eight halves it.
+// The first version gave each thread one `(vi, j)` cell and looped `i`:
+//
+//   float kv = k_norm[...j];              // one global load
+//   acc += su[i * STATE_VB + vl] * kv;    // one shared load, one FMA
+//
+// Two memory instructions per multiply-add, on a part that issues 4 of the
+// former and 64 of the latter per SM per clock. The state update is a rank-`c`
+// outer product -- `S[vi][j] += sum_i u[i][vi] * k[i][j]` -- and neither
+// operand depends on the other's index, so a 4x4 register tile reads two
+// `float4`s and does sixteen multiply-adds with them. Sixteen times the
+// arithmetic per instruction.
+#define STATE_JT 4
+// Threads spanning the block's value band and its column band. The `j` lanes
+// are the fast axis so that a warp's 32 `float4` column loads are 512
+// contiguous bytes -- four full transactions -- while its `su` load is one
+// address broadcast to all 32.
+#define STATE_VLANES 8
+#define STATE_JLANES 32
+// The bands themselves. `STATE_VB` is unchanged at 32, so the staged `su`
+// tile is the same 8 KiB it was; `STATE_JB` is now the whole 128-wide state
+// row, which is what removes `grid.z` and with it the repeated staging that
+// the sweep below was working around.
 //
 //   4   1,705.97 tok/s
 //   8   1,727.74
 //   16  1,721.89
 //   32  1,710.30
 //
-// Past eight the block is 512 threads and more and the grid stops covering
-// the card: 32 leaves four blocks in `z` and 512 in total.
-#define STATE_JB 8
+// Those were measured with one cell per thread, where `STATE_JB` traded the
+// number of passes over `uprime` against the block size. With a register tile
+// the block covers 32x128 cells with the same 256 threads and `grid.z` is 1,
+// so `uprime` is staged once per value band and the trade is gone.
+#define STATE_VB (STATE_VLANES * STATE_VT)
+#define STATE_JB (STATE_JLANES * STATE_JT)
 
 __global__ void gdn_chunk_state_update(
     float* __restrict__ state,
@@ -696,31 +751,58 @@ __global__ void gdn_chunk_state_update(
     int j0 = blockIdx.z * STATE_JB;
     int hq = h % qk_heads;
 
-    int vl = threadIdx.x & (STATE_VB - 1);
-    int jl = threadIdx.x / STATE_VB;
-    int vi = v0 + vl;
-    int j  = j0 + jl;
+    // `j` is the fast axis: consecutive threads take consecutive columns, so
+    // a warp's column loads are contiguous and its `su` load is a broadcast.
+    int jl = threadIdx.x & (STATE_JLANES - 1);
+    int vl = threadIdx.x / STATE_JLANES;
+    int vi = v0 + vl * STATE_VT;
+    int j  = j0 + jl * STATE_JT;
 
-    // Staged once per block and read `c` times by every one of the STATE_JB
-    // threads that share a `vi`; consecutive `vl` land in consecutive banks.
+    // Staged once per block and read `c` times by every one of the block's
+    // `j` lanes. A row past `head_dim` stages zeros, which contribute exactly
+    // nothing rather than needing a guard in the inner loop.
     for (int idx = threadIdx.x; idx < c * STATE_VB; idx += blockDim.x) {
         int i = idx / STATE_VB;
         int lv = idx % STATE_VB;
-        su[idx] = uprime[((long long)h * c + i) * head_dim + v0 + lv];
+        su[idx] = v0 + lv < head_dim
+            ? uprime[((long long)h * c + i) * head_dim + v0 + lv]
+            : 0.0f;
     }
     __syncthreads();
 
-    float acc = 0.0f;
-    for (int i = 0; i < c; ++i) {
-        // Uniform across the warp — every thread of a warp shares `j` only
-        // when STATE_JB divides 32, which it does; the divergent case still
-        // reads at most STATE_JB distinct addresses.
-        float kv = k_norm[((long long)(chunk_start + i) * qk_heads + hq) * head_dim + j];
-        acc += su[i * STATE_VB + vl] * kv;
+    // `head_dim` is a multiple of 32 and `vi` and `j` are multiples of 4, so
+    // one bound checked here covers all four cells and both `float4` loads.
+    int live = vi < head_dim && j < head_dim;
+
+    float acc[STATE_VT][STATE_JT];
+    #pragma unroll
+    for (int a = 0; a < STATE_VT; ++a) {
+        #pragma unroll
+        for (int b = 0; b < STATE_JT; ++b) acc[a][b] = 0.0f;
     }
 
-    float* cell = state + ((long long)h * head_dim + vi) * head_dim + j;
-    *cell = lambda_last[h] * *cell + acc;
+    if (live) {
+        for (int i = 0; i < c; ++i) {
+            float4 uu = *(const float4*)(su + i * STATE_VB + vl * STATE_VT);
+            float4 kk = *(const float4*)(
+                k_norm + ((long long)(chunk_start + i) * qk_heads + hq) * head_dim + j);
+            const float* up = (const float*)&uu;
+            const float* kp = (const float*)&kk;
+            #pragma unroll
+            for (int a = 0; a < STATE_VT; ++a) {
+                #pragma unroll
+                for (int b = 0; b < STATE_JT; ++b) acc[a][b] += up[a] * kp[b];
+            }
+        }
+
+        float lam = lambda_last[h];
+        #pragma unroll
+        for (int a = 0; a < STATE_VT; ++a) {
+            float* cell = state + ((long long)h * head_dim + vi + a) * head_dim + j;
+            #pragma unroll
+            for (int b = 0; b < STATE_JT; ++b) cell[b] = lam * cell[b] + acc[a][b];
+        }
+    }
 }
 
 }
@@ -1101,7 +1183,7 @@ impl GdnChunkedKernels {
                     (self.head_dim as u32).div_ceil(STATE_VB),
                     (self.head_dim as u32).div_ceil(STATE_JB),
                 ),
-                block_dim: (STATE_VB * STATE_JB, 1, 1),
+                block_dim: (STATE_VLANES * STATE_JLANES, 1, 1),
                 shared_mem_bytes: (c * STATE_VB as usize * size_of::<f32>()) as u32,
             };
             let mut builder = stream.launch_builder(&self.state_update);
@@ -1176,9 +1258,22 @@ mod tests {
         // order, and both halves are needed: making the solve inclusive
         // double-counts token t's own key, and making the output exclusive is
         // the classic read-before-update bug.
-        assert!(GDN_CHUNKED_SRC.contains("for (int i = 0; i < t; ++i) {\n            acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];"));
         assert!(GDN_CHUNKED_SRC.contains(
-            "for (int i = 0; i <= t; ++i) {\n            o_intra += kq_row[i] * dec[i] * u[i * VB + vl];"
+            "for (int i = 0; i < t; ++i) {\n            acc -= decay[i] * u[i * VB + vl];"
+        ));
+        // And the coefficient that was hoisted into `decay` is still the
+        // exclusive one: the fill runs to `i < t` in the substitution and
+        // `i <= t` in the output, which is where the asymmetry now lives.
+        assert!(
+            GDN_CHUNKED_SRC.contains("for (int i = threadIdx.x; i < t; i += blockDim.x) {"),
+            "the substitution's coefficient row is no longer filled exclusively",
+        );
+        assert!(
+            GDN_CHUNKED_SRC.contains("for (int i = vl; i <= t; i += VB) {"),
+            "the output's coefficient row is no longer filled inclusively",
+        );
+        assert!(GDN_CHUNKED_SRC.contains(
+            "for (int i = 0; i <= t; ++i) {\n            o_intra += dec[i] * u[i * VB + vl];"
         ));
     }
 
@@ -1192,7 +1287,7 @@ mod tests {
         // reciprocal of a cumulative decay that reaches 2.5e-42 on this model,
         // and overflows fp32. See the module docs.
         let rescale = at("float acc = beta_t * (v_t - expf(gcum[t]) * sik[");
-        let subtract = at("acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];");
+        let subtract = at("acc -= decay[i] * u[i * VB + vl];");
         assert!(
             rescale < subtract,
             "the interference sum is subtracted before the carried-in state is decayed",
@@ -1218,7 +1313,13 @@ mod tests {
         }
         // And the positive statement: the cumulative decay stays in log space.
         assert!(GDN_CHUNKED_SRC.contains("gcum[t] = running;"));
-        assert!(GDN_CHUNKED_SRC.contains("decay[i] = expf(gcum[t] - gcum[i]);"));
+        // Both per-token rows now carry a lane-invariant coefficient folded
+        // in, but the exponential itself is still a *difference* of two `gcum`
+        // entries, which is the property this test exists to hold.
+        assert!(
+            GDN_CHUNKED_SRC.contains("decay[i] = beta_t * kk_row[i] * expf(gcum[t] - gcum[i]);")
+        );
+        assert!(GDN_CHUNKED_SRC.contains("dec[i] = kq_row[i] * expf(gcum[t] - gcum[i]);"));
         assert!(GDN_CHUNKED_SRC.contains("decay[i] = expf(gcum[c - 1] - gcum[i]);"));
     }
 
@@ -1254,7 +1355,8 @@ mod tests {
         // asserted: computing it and applying it are in different kernels, so
         // an edit could plausibly drop either.
         assert!(GDN_CHUNKED_SRC.contains("lambda_last[h] = expf(gcum[c - 1]);"));
-        assert!(GDN_CHUNKED_SRC.contains("*cell = lambda_last[h] * *cell + acc;"));
+        assert!(GDN_CHUNKED_SRC.contains("float lam = lambda_last[h];"));
+        assert!(GDN_CHUNKED_SRC.contains("cell[b] = lam * cell[b] + acc[a][b];"));
     }
 
     #[test]
@@ -1305,7 +1407,8 @@ mod tests {
             "U' is published to global before it is solved"
         );
         assert!(
-            GDN_CHUNKED_SRC.contains("acc += su[i * STATE_VB + vl] * kv;"),
+            GDN_CHUNKED_SRC
+                .contains("for (int b = 0; b < STATE_JT; ++b) acc[a][b] += up[a] * kp[b];"),
             "the state update must consume the solved U', not the raw residuals",
         );
     }
