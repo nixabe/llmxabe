@@ -52,12 +52,14 @@ mod golden;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::DeviceWeights;
+use xabe_engine::block::gdn::GdnBlock;
 use xabe_engine::forward::{Forward, arena_holds};
 use xabe_gguf::GgufFile;
 use xabe_model::config::ModelConfig;
@@ -80,6 +82,14 @@ const DEFAULT_MODEL_PATH: &str =
 /// has not been measured, so this is a bound chosen to leave room for
 /// rounding, not one calibrated against a known-bad run.
 const MIN_COSINE: f32 = 0.999;
+
+/// Serializes the tests that make the model resident.
+///
+/// The weights are 29.8 GiB and the card is 47.3, so two of these running at
+/// once is an out-of-memory failure rather than a slow one. `cargo test` runs
+/// a file's tests on separate threads by default, so the exclusion has to be
+/// stated here rather than assumed.
+static RESIDENT_MODEL: Mutex<()> = Mutex::new(());
 
 /// Where the 19-token prompt is split for the multi-step case.
 ///
@@ -175,6 +185,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn decoding_one_token_at_a_time_agrees_with_prefilling_the_whole_prompt() {
+    let _resident = RESIDENT_MODEL.lock().unwrap_or_else(|e| e.into_inner());
     let Some((ctx, file)) = setup() else {
         return;
     };
@@ -381,4 +392,134 @@ fn a_decode_step_cannot_run_past_the_end_of_its_cache() {
     let m = e.to_string();
     assert!(m.contains("4104"), "must name the slot it needed: {m}");
     assert!(m.contains("4096"), "must name the cache it has: {m}");
+}
+
+/// Tokens the chunked-prefill test pushes through, and the chunk it uses.
+///
+/// 256 crosses the Gated DeltaNet's 64-token chunk boundary three times, so the
+/// recurrent handoff is exercised *inside* a pass as well as between passes.
+///
+/// The chunk is 64 and not something smaller for a reason worth stating: the
+/// projections switch from fp32 to the integer tensor cores at
+/// `MMA_SPLIT_TOKENS`, which is 64. A 32-token chunk would take the fp32 path
+/// while the 256-token single pass took the int8 one, and the test would be
+/// comparing two different arithmetics and calling the difference a chunking
+/// bug. Measured: at 32 the two arms disagree by 0.234 on logits peaking near
+/// 9, which is quantization, not carry. Both arms are asserted to be on the
+/// same side of the threshold below.
+const CHUNKED_TOKENS: usize = 256;
+const CHUNKED_CHUNK: usize = 64;
+
+#[test]
+fn prefilling_in_chunks_agrees_with_prefilling_in_one_pass() {
+    let _resident = RESIDENT_MODEL.lock().unwrap_or_else(|e| e.into_inner());
+    // The gate for `bench_forward`'s `LLMXABE_BENCH_CHUNK` mode, and for
+    // chunked prefill generally: a prompt pushed through a narrow pass four
+    // times over one carried state must land where the same prompt lands in a
+    // single wide pass.
+    //
+    // This is not the same claim as the single-token continuation test above.
+    // That one runs the *recurrent* Gated DeltaNet form per step; this one runs
+    // the *chunked* form four times and carries its matrix across, which is the
+    // path a long prompt actually takes and which nothing else here covers.
+    //
+    // Not bit-identical, for the reasons in the module docs: the MoE's grouped
+    // GEMM tiles differently at 128 rows than at 32, and the scan sums the same
+    // terms in a different order. The argmax is the gate.
+    let Some((ctx, file)) = setup() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let stream = ctx.default_stream();
+    assert!(CHUNKED_TOKENS.is_multiple_of(CHUNKED_CHUNK));
+    assert!(
+        CHUNKED_TOKENS > config.gdn.chunk_len as usize,
+        "the prompt must cross a Gated DeltaNet chunk boundary or this proves less",
+    );
+    // Both arms must be on the same side of the fp32/int8 split, or the
+    // comparison measures quantization instead of the carry.
+    assert_eq!(
+        GdnBlock::uses_tensor_cores(CHUNKED_TOKENS),
+        GdnBlock::uses_tensor_cores(CHUNKED_CHUNK),
+        "the wide pass and the chunk must take the same projection path",
+    );
+
+    let ids: Vec<i32> = (0..CHUNKED_TOKENS)
+        .map(|i| ((i * 7919 + 1234) % config.vocab_size as usize) as i32)
+        .collect();
+
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema resolves");
+    let (weights, _) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
+        .expect("weight load");
+
+    let mut full = Forward::new(
+        &ctx,
+        &stream,
+        &file,
+        &directory,
+        &weights,
+        config.clone(),
+        CHUNKED_TOKENS,
+    )
+    .expect("the wide pass builds");
+    let mut piece = full
+        .reshape(&ctx, &stream, &file, &directory, &weights, CHUNKED_CHUNK)
+        .expect("the chunk pass builds");
+
+    let mut state = full
+        .new_state(&stream, CHUNKED_TOKENS)
+        .expect("sequence state allocates");
+
+    // A. One wide pass.
+    full.run(&stream, &mut state, &ids, |_, _| {})
+        .expect("wide prefill runs");
+    assert_eq!(state.position(), CHUNKED_TOKENS);
+    let wide = dtoh(&stream, full.logits());
+
+    // B. The same prompt, four narrow passes over one carried state.
+    state.reset(&stream).expect("back to a cold start");
+    let chunks = CHUNKED_TOKENS / CHUNKED_CHUNK;
+    for c in 0..chunks {
+        assert_eq!(
+            state.position(),
+            c * CHUNKED_CHUNK,
+            "the state must advance exactly one chunk per pass",
+        );
+        piece
+            .run(
+                &stream,
+                &mut state,
+                &ids[c * CHUNKED_CHUNK..(c + 1) * CHUNKED_CHUNK],
+                |_, _| {},
+            )
+            .expect("chunk prefill runs");
+    }
+    assert_eq!(state.position(), CHUNKED_TOKENS);
+    let chunked = dtoh(&stream, piece.logits());
+
+    let (wide_id, wide_logit) = argmax(&wide);
+    let (chunk_id, chunk_logit) = argmax(&chunked);
+    let c = cosine(&wide, &chunked);
+    println!(
+        "\n=== chunked prefill ===\n\
+         \x20 {CHUNKED_TOKENS} tokens in one pass      argmax {wide_id} (logit {wide_logit:.6})\n\
+         \x20 {chunks} x {CHUNKED_CHUNK} over one state    argmax {chunk_id} (logit {chunk_logit:.6})\n\
+         \x20 cosine {c:.9}  max|diff| {:.6}",
+        max_abs_diff(&wide, &chunked),
+    );
+
+    assert!(
+        chunked.iter().all(|v| v.is_finite()),
+        "chunked prefill produced non-finite logits",
+    );
+    assert_eq!(
+        wide_id, chunk_id,
+        "chunked prefill selects a different token than the single pass it replaces",
+    );
+    assert!(
+        c >= MIN_COSINE,
+        "chunked prefill agrees with the single pass only to cosine {c}, below the \
+         {MIN_COSINE} floor",
+    );
 }

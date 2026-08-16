@@ -34,9 +34,10 @@
 //! repetition count.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, CudaStream};
 use tracing::{error, info, warn};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
@@ -44,7 +45,7 @@ use xabe_engine::forward::{Forward, arena_holds};
 use xabe_engine::weights::DeviceWeights;
 use xabe_gguf::GgufFile;
 use xabe_model::config::ModelConfig;
-use xabe_model::weights::WeightSchema;
+use xabe_model::weights::{Directory, WeightSchema};
 
 const DEFAULT_MODEL_PATH: &str =
     "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
@@ -136,6 +137,33 @@ fn main() {
         load.elapsed().as_secs_f64(),
         report.throughput_gb_s(),
     );
+
+    // Chunked prefill: run the prompt through a fixed-shape pass repeatedly,
+    // carrying the KV cache and the recurrent state, instead of building one
+    // pass as wide as the prompt.
+    //
+    // This is what llama.cpp does with `-ub`, and it is the difference between
+    // activation memory that scales with the prompt and activation memory that
+    // is constant. The engine already supports it — `Forward::run` runs
+    // `self.tokens` positions at `state.position()` and advances the state, and
+    // a one-token `Forward` chained this way is exactly what decode is. Only
+    // this harness was missing it.
+    if let Some(chunk) = env_usize("LLMXABE_BENCH_CHUNK") {
+        chunked_prefill(
+            &ctx,
+            &stream,
+            &file,
+            &directory,
+            &weights,
+            &config,
+            &batches,
+            chunk,
+            reps,
+            free_at_start,
+            total,
+        );
+        return;
+    }
 
     info!(
         "{:>7} | {:>9} | {:>16} | {:>14}",
@@ -234,5 +262,129 @@ fn main() {
     info!(
         "NOTE: no KV cache and no carried recurrent state — every pass is a cold full \
          forward. Comparable to llama.cpp `pp`, NOT to `tg`.",
+    );
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// Prefill a prompt as a chain of fixed-shape passes over one sequence state.
+///
+/// The pass is built once at `chunk` positions and reused for every prompt
+/// length, because its shape no longer depends on the prompt — which is the
+/// whole point. What scales with the prompt is the `SequenceState`: the KV
+/// cache for the ten attention layers, and nothing else, since the Gated
+/// DeltaNet's recurrent state is a fixed `[value_heads][head_dim][head_dim]`
+/// per layer however long the sequence gets.
+#[allow(clippy::too_many_arguments)]
+fn chunked_prefill(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    file: &GgufFile,
+    directory: &Directory<'_>,
+    weights: &DeviceWeights,
+    config: &ModelConfig,
+    batches: &[usize],
+    chunk: usize,
+    reps: usize,
+    free_at_start: u64,
+    total: u64,
+) {
+    let max_seq = batches.iter().copied().max().unwrap_or(chunk);
+    let built = Instant::now();
+    let mut forward =
+        match Forward::new(ctx, stream, file, directory, weights, config.clone(), chunk) {
+            Ok(f) => f,
+            Err(e) => {
+                error!("FAILED to build the {chunk}-token pass: {e}");
+                return;
+            }
+        };
+    let build_s = built.elapsed().as_secs_f64();
+
+    let mut state = match forward.new_state(stream, max_seq) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("FAILED to allocate a {max_seq}-position sequence state: {e}");
+            return;
+        }
+    };
+
+    info!(
+        "chunked prefill: {chunk}-token pass built in {build_s:.1} s, state for {max_seq} positions"
+    );
+    info!(
+        "{:>8} | {:>7} | {:>16} | {:>14}",
+        "tokens", "chunks", "ms/prompt", "tok/s"
+    );
+    info!("{:->8}-+-{:->7}-+-{:->16}-+-{:->14}", "", "", "", "");
+
+    let mut peak_used = 0u64;
+    for &n in batches {
+        if !n.is_multiple_of(chunk) {
+            warn!("{n:>8} | skipped: not a multiple of the {chunk}-token chunk");
+            continue;
+        }
+        let chunks = n / chunk;
+        // Ids for the whole prompt, sliced per chunk. Same generator as the
+        // single-pass path so the routing spread is identical.
+        let ids: Vec<i32> = (0..n)
+            .map(|i| ((i * 7919 + 1234) % config.vocab_size as usize) as i32)
+            .collect();
+
+        let mut run_once = |state: &mut _| -> Result<(), String> {
+            for c in 0..chunks {
+                let slice = &ids[c * chunk..(c + 1) * chunk];
+                forward
+                    .run(stream, state, slice, |_, _| {})
+                    .map_err(|e| format!("chunk {c} at position {}: {e}", c * chunk))?;
+            }
+            Ok(())
+        };
+
+        state.reset(stream).expect("reset");
+        if let Err(e) = run_once(&mut state) {
+            error!("{n:>8} | FAILED during warmup: {e}");
+            continue;
+        }
+        stream.synchronize().expect("sync after warmup");
+        let (free_now, _) = memory_info(ctx).expect("memory info");
+        peak_used = peak_used.max(free_at_start.saturating_sub(free_now));
+
+        let mut samples = Vec::with_capacity(reps);
+        let mut failed = false;
+        for _ in 0..reps {
+            let t = Instant::now();
+            state.reset(stream).expect("reset");
+            if let Err(e) = run_once(&mut state) {
+                error!("{n:>8} | FAILED: {e}");
+                failed = true;
+                break;
+            }
+            stream.synchronize().expect("sync");
+            samples.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        if failed {
+            continue;
+        }
+
+        let (mean, sd) = stats(&samples);
+        info!(
+            "{n:>8} | {chunks:>7} | {mean:>9.2} ± {sd:>4.2} | {:>8.2} ± {:>3.2}",
+            n as f64 / (mean / 1e3),
+            n as f64 / (mean / 1e3) * (sd / mean),
+        );
+    }
+
+    info!(
+        "\npeak VRAM {:.3} GiB of {:.2} GiB",
+        peak_used as f64 / (1u64 << 30) as f64,
+        total as f64 / (1u64 << 30) as f64,
+    );
+    info!(
+        "NOTE: one warmup discarded, {reps} timed repetitions. The prompt is prefilled as \
+         {chunk}-token passes over a carried KV cache and recurrent state — the same thing \
+         llama.cpp does with `-ub {chunk}`, and directly comparable to its `S_PP`.",
     );
 }
