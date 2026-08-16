@@ -44,7 +44,7 @@ region:
 | `pp512` (prefill) | **200.87 ± 0.75 t/s** | 2,070.50 t/s | **10.3× slower** | 29.6× |
 
 > **Superseded.** This table is the state at the tiling commit. Prefill is now
-> **1,341.39 ± 5.41 t/s, 1.54× slower**, and decode **64.99 tok/s, 1.61×
+> **1,365.74 ± 6.60 t/s, 1.52× slower**, and decode **94.03 tok/s, 1.11×
 > slower**. See "Integer tensor cores, wired end to end" in
 > [BENCHMARKS.md](BENCHMARKS.md) for the twelve-step arc and where the time
 > goes now. The rest of this section is kept because its *reasoning* — the

@@ -57,7 +57,7 @@ use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_cuda::kernels::lm_head::{LmHeadGeometry, LmHeadKernels, MAX_BATCH_TILE};
+use xabe_cuda::kernels::lm_head::{ARGMAX_BLOCKS, LmHeadGeometry, LmHeadKernels, MAX_BATCH_TILE};
 use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_kernels::compare::{Tolerance, assert_matches, compare};
@@ -609,5 +609,106 @@ fn a_batch_of_tokens_matches_the_reference_and_costs_one_pass_over_the_weights()
         one * MAX_BATCH_TILE as f64 / eight,
         MAX_BATCH_TILE as f64,
         MAX_BATCH_TILE,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the device argmax
+// ---------------------------------------------------------------------------
+
+/// The device reduction against `xabe_kernels::gemv::argmax`, on inputs
+/// chosen for the ways a two-pass reduction can disagree with a sequential
+/// scan.
+///
+/// The GEMV tests above compare the device's *logits* and then argmax them on
+/// the host. This tests the other half: the kernel that turns those logits
+/// into a token id without moving 993 KiB across PCIe first. It needs no
+/// model file — the reduction does not care where the floats came from —
+/// so it runs anywhere a device does.
+///
+/// The cases are the ones a partitioned reduction gets wrong:
+///
+/// - **ties**, which is the whole reason the reference documents a tie-break.
+///   A constant vector must answer 0; a vector whose maximum appears in two
+///   partitions must answer the lower index regardless of which block found
+///   it first.
+/// - **a maximum in the last partition**, and one in the first, so a
+///   grid-stride loop that drops its tail or seeds from the wrong element is
+///   caught in both directions.
+/// - **all-NaN**, where `NaN > NaN` is false and the reference never moves
+///   off index 0. A kernel seeded from a `-INFINITY` sentinel answers
+///   something else, and nothing in a forward pass would show it.
+/// - **lengths that are not multiples of the block or the grid**, including
+///   1, so the bounds are exercised rather than assumed.
+///
+/// SKIPS — reporting that it skipped — without a driver or a supported device.
+#[test]
+fn the_device_argmax_agrees_with_the_scalar_reference() {
+    let Some((ctx, _info)) = device() else {
+        return;
+    };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let kernels = LmHeadKernels::new(&ctx, g).expect("compiles");
+
+    let mut rng = Xorshift64Star::new(0x5EED_A46E_A700_0001);
+    let mut cases: Vec<(String, Vec<f32>)> = Vec::new();
+
+    for n in [1usize, 2, 31, 255, 256, 257, 1023, 4096, 131_073, g.vocab] {
+        cases.push((format!("random n={n}"), rng.vec_f32(n, -8.0, 8.0)));
+    }
+    cases.push(("all equal".into(), vec![0.5f32; g.vocab]));
+    cases.push(("all zero".into(), vec![0.0f32; g.vocab]));
+    cases.push(("all NaN".into(), vec![f32::NAN; 4096]));
+
+    // A tie between the first and last partitions. `ARGMAX_BLOCKS * 256` is
+    // the widest the first pass strides, so these two indices are guaranteed
+    // to land in different blocks at this length.
+    let mut tied = rng.vec_f32(g.vocab, -1.0, 1.0);
+    tied[7] = 9.0;
+    tied[g.vocab - 3] = 9.0;
+    cases.push(("tie across partitions".into(), tied));
+
+    // The maximum alone in the very last element, and alone in the very
+    // first: a dropped tail and a mis-seeded accumulator fail one each.
+    let mut last = rng.vec_f32(g.vocab, -1.0, 1.0);
+    last[g.vocab - 1] = 100.0;
+    cases.push(("max at the end".into(), last));
+    let mut first = rng.vec_f32(g.vocab, -1.0, 1.0);
+    first[0] = 100.0;
+    cases.push(("max at index 0".into(), first));
+
+    // Infinities, which a reduction that sums or averages anything would
+    // turn into NaN and lose.
+    let mut infs = rng.vec_f32(g.vocab, -1.0, 1.0);
+    infs[11] = f32::NEG_INFINITY;
+    infs[g.vocab / 2] = f32::INFINITY;
+    cases.push(("with infinities".into(), infs));
+
+    let mut pv = stream.alloc_zeros::<f32>(ARGMAX_BLOCKS).expect("alloc pv");
+    let mut pi = stream.alloc_zeros::<i32>(ARGMAX_BLOCKS).expect("alloc pi");
+    let mut out = stream.alloc_zeros::<i32>(1).expect("alloc out");
+
+    for (label, values) in &cases {
+        let d = stream.clone_htod(values).expect("upload");
+        kernels
+            .argmax(&stream, &d, values.len(), &mut pv, &mut pi, &mut out)
+            .expect("argmax launches");
+        let got = stream.clone_dtoh(&out).expect("read back")[0];
+        stream.synchronize().expect("sync");
+        let want = argmax(values) as i32;
+        assert_eq!(
+            got,
+            want,
+            "{label} (len {}): device argmax {got}, reference {want}",
+            values.len(),
+        );
+    }
+    println!(
+        "device argmax agrees with the reference on all {} cases, including \
+         ties across partitions, an all-NaN vector, and the full {}-entry \
+         vocabulary",
+        cases.len(),
+        g.vocab,
     );
 }

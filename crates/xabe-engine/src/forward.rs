@@ -89,7 +89,7 @@ use cudarc::driver::{
 use xabe_cuda::kernels::attention::AttentionError;
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
-use xabe_cuda::kernels::lm_head::{LmHeadError, LmHeadGeometry, LmHeadKernels};
+use xabe_cuda::kernels::lm_head::{ARGMAX_BLOCKS, LmHeadError, LmHeadGeometry, LmHeadKernels};
 use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::{LayerKind, ModelConfig};
@@ -539,6 +539,12 @@ pub struct Forward {
     last_hidden: CudaSlice<f32>,
     logits: CudaSlice<f32>,
 
+    /// Scratch for [`Self::sample_argmax`]: the first pass's per-block
+    /// winners, and the single `i32` the second pass reduces them to.
+    argmax_values: CudaSlice<f32>,
+    argmax_indices: CudaSlice<i32>,
+    argmax_out: CudaSlice<i32>,
+
     /// `None` unless [`Self::enable_profiling`] was called. The hot path pays
     /// one always-false branch per stage boundary when it is `None`.
     profile: Option<StageProfile>,
@@ -791,6 +797,9 @@ impl Forward {
             final_norm: stream.alloc_zeros::<f32>(tokens * hidden)?,
             last_hidden: stream.alloc_zeros::<f32>(hidden)?,
             logits: stream.alloc_zeros::<f32>(vocab)?,
+            argmax_values: stream.alloc_zeros::<f32>(ARGMAX_BLOCKS)?,
+            argmax_indices: stream.alloc_zeros::<i32>(ARGMAX_BLOCKS)?,
+            argmax_out: stream.alloc_zeros::<i32>(1)?,
             profile: None,
             report: ForwardReport {
                 arena_bytes: weights.arena().capacity() as u64,
@@ -864,6 +873,34 @@ impl Forward {
     /// `result_output`: the logits for the last position, `[vocab]`.
     pub fn logits(&self) -> &CudaSlice<f32> {
         &self.logits
+    }
+
+    /// Greedy sampling: the id of the largest logit, ties to the lower id.
+    ///
+    /// Synchronizes the stream, because the caller needs the token before it
+    /// can decide what to feed back in — the round-trip is unavoidable in an
+    /// autoregressive loop. What is avoidable is its *width*: reducing on the
+    /// device makes the transfer four bytes instead of the 993 KiB a
+    /// 248,320-entry logit vector occupies, and it moves the scan itself off
+    /// a single CPU core. That was worth about 4% of a decode step.
+    ///
+    /// The tie-break matches [`xabe_kernels::gemv::argmax`] exactly, which is
+    /// what `tests/lm_head_differential.rs` asserts. A near-tie between two
+    /// logits is the one place a kernel can be well inside every tolerance
+    /// and still emit a different token.
+    pub fn sample_argmax(&mut self, stream: &Arc<CudaStream>) -> Result<i32, ForwardError> {
+        let vocab = self.vocab;
+        self.lm_head.argmax(
+            stream,
+            &self.logits,
+            vocab,
+            &mut self.argmax_values,
+            &mut self.argmax_indices,
+            &mut self.argmax_out,
+        )?;
+        let host = stream.clone_dtoh(&self.argmax_out)?;
+        stream.synchronize()?;
+        Ok(host[0])
     }
 
     /// Drop the repacked int8 weights, forcing every projection back to fp32.

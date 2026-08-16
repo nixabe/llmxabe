@@ -1270,8 +1270,8 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,342.71 ± 5.91 tok/s** | **1.54× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **83.68 tok/s**, 11.95 ms/step | **1.25× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,365.74 ± 6.60 tok/s** | **1.52× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **94.03 tok/s**, 10.63 ms/step | **1.11× slower** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1298,8 +1298,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | GDN state update split into its own kernel | 1,155.20 | 1.04× |
 | `float4` GDN row loads | 1,248.27 | 1.08× |
 | int8 MMA on the shared expert | 1,341.39 | 1.07× |
+| word-wide Q6_K unpacking in the MoE MMA | 1,365.74 | 1.02× |
 
-**6.68× overall.** No single change is more than 1.81×; the result is
+**6.80× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1420,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **83.68 tok/s**, 11.95 ms/step | **1.25× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **94.03 tok/s**, 10.63 ms/step | **1.11× slower** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1433,6 +1434,9 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | repacked weights for the GDN projection | 12.18 | 82.11 |
 | 16-bit Q6_K dequant loads | 12.07 | 82.86 |
 | `char4`/`float4` in the GDN decode GEMV | 11.95 | 83.68 |
+| warp-shuffle reductions in the two routing kernels | 11.59 | 86.27 |
+| argmax on the device instead of over PCIe | 11.05 | 90.47 |
+| word-wide Q6_K unpacking | 10.63 | 94.03 |
 
 ### The one idea behind all of it
 
@@ -1457,25 +1461,54 @@ is not why it was built.
 
 ### Where decode time goes now
 
-Per step, from `nsys` over 68 decode steps:
+Per step, from `nsys` over 44 decode steps at a 64-token prompt:
 
 | kernel | ms/step | share | % of streaming roofline |
 | --- | ---: | ---: | ---: |
-| `gdn_proj_split_gemv` | 2.51 | 18.4% | 63% |
-| `moe_expert_ffn_gemv` | 1.90 | 13.9% | 42% |
-| `lm_head_gemv_b1` | 1.51 | 11.0% | 82% |
-| `moe_expert_down_gemv` | 0.84 | 6.2% | 63% |
-| `moe_shared_ffn_gemv` | 0.66 | 4.8% | — |
-| MoE dispatch glue (7 kernels) | 1.75 | 14.5% | — |
-| everything else (~20 kernels) | 2.8 | 23% | — |
+| `gdn_proj_split_gemv` | 2.22 | 20.9% | 71% |
+| `moe_expert_ffn_gemv` | 1.74 | 16.4% | 47% |
+| `lm_head_gemv_b1` | 1.52 | 14.3% | 82% |
+| `moe_expert_down_gemv` | 0.86 | 8.1% | 63% |
+| `moe_shared_ffn_gemv` | 0.67 | 6.3% | — |
+| MoE dispatch glue (7 kernels) | 1.63 | 15.3% | — |
+| everything else (~20 kernels) | 1.4 | 13% | — |
+| **GPU idle** | **0.97** | **9.1%** | — |
 
-Two things stand out. `moe_expert_ffn_gemv` is the weakest streamer left at
-42%, and it is the only one reading Q6_K rather than Q8_0. And the MoE's
-*dispatch* — routing, top-k, block alignment, reduction, gating, combining —
-costs 1.75 ms per step across seven kernels that do almost no arithmetic. A
-decode step issues roughly **1,000 kernel launches**; the GPU is busy for about
-92% of the step, so ~0.97 ms is launch gap. That is the CUDA-graph
-opportunity, and it is smaller than it looks.
+`lm_head_gemv_b1` is 41 launches, not one: the ten Gated Attention layers run
+their four projections through the same kernel. The real LM head is about
+0.9 ms of that row.
+
+`moe_expert_ffn_gemv` is still the weakest streamer at 47%, and it is still
+the only kernel reading Q6_K rather than Q8_0 — but the reason is no longer
+what it looked like. Q6_K's unpacking is **integer** work, and at this shape
+the kernel is bound by the integer pipe rather than by DRAM: the word-wide
+unpack above bought 8% of the whole decode step without touching a single
+byte of traffic.
+
+### The launch gap is bigger than the first measurement said
+
+An earlier version of this section put the GPU at "about 92% busy, so ~0.97 ms
+is launch gap". The number was right by accident. The first pass computed
+idle from the *kernel* timeline alone, and a decode step also issues about 180
+memsets and memcopies; most of what looked like idle was those. Counting all
+three activity kinds:
+
+| | ms/step |
+| --- | ---: |
+| gaps under 1.5 us, one per launch | 0.63 |
+| one long gap per step, host turnaround | 0.31 |
+| everything else | 0.03 |
+| **total idle** | **0.97** |
+
+1,124 device operations per step at about 0.6 us of dead time each is the
+whole first row, and `Forward::run` spends **3.1 ms of host time** issuing
+them — 2.8 us per launch, against kernels that average 8.6 us. The host stays
+ahead, but not by much, and it re-issues an identical sequence 40 times a
+second. That is what a CUDA graph is for, and it is the largest single item
+left on the decode path. It is blocked on one thing: the attention blocks take
+the sequence position as a **host** argument, and one of them uses it as a
+slice offset, so the captured graph would bake in position `n` and replay it
+forever. Making the position a device scalar is `AGENTS.md` rule 5 anyway.
 
 ### A measurement discipline note
 

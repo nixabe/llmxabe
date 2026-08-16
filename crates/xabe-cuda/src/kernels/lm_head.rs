@@ -204,7 +204,21 @@ const WARPS_PER_SM: usize = 32;
 /// 17 KiB of it).
 const STAGE_BLOCKS: usize = 16;
 
+/// Threads per block in both argmax passes.
+const ARGMAX_THREADS: u32 = 256;
+
+/// Upper bound on the first argmax pass's grid, and so the length of the
+/// partial-winner buffers the caller supplies.
+///
+/// 512 blocks of 256 threads is 131,072 lanes over a 248,320-entry vocabulary
+/// — about two entries each, which is enough to saturate a card whose whole
+/// job here is to stream 993 KiB once. Capping it also bounds the second
+/// pass, which is a single block and would rather reduce 512 winners than
+/// 970.
+pub const ARGMAX_BLOCKS: usize = 512;
+
 const LM_HEAD_SRC: &str = r#"
+#define ARGMAX_THREADS 256
 #define LM_HEAD_STAGE_BLOCKS 16
 #define LM_HEAD_STAGE_U4 ((LM_HEAD_STAGE_BLOCKS * 34) / 16)
 #define LM_HEAD_STAGE_PER_LANE ((LM_HEAD_STAGE_U4 + 31) / 32)
@@ -422,6 +436,91 @@ LM_HEAD_ENTRY(lm_head_gemv_b5, 5)
 LM_HEAD_ENTRY(lm_head_gemv_b6, 6)
 LM_HEAD_ENTRY(lm_head_gemv_b7, 7)
 LM_HEAD_ENTRY(lm_head_gemv_b8, 8)
+
+// ---------------------------------------------------------------------------
+// Greatest logit, lowest index on a tie: `xabe_kernels::gemv::argmax`.
+// ---------------------------------------------------------------------------
+//
+// The sampled token is the only part of a 248,320-entry logit vector anybody
+// sees, and getting it to the host used to mean copying all 993 KiB of the
+// vector and scanning it there. That cost 0.5 ms of a 11.6 ms decode step —
+// 4% of the whole model — to move 993 KiB across PCIe and touch every one of
+// a quarter of a million floats on one CPU core, in order to learn four
+// bytes. Reducing on the device and copying the four bytes is the same
+// answer for about 20 us.
+//
+// Two launches rather than one. A single block reading 993 KiB occupies one
+// SM of seventy-two, and this reduction is bandwidth-bound: the first pass
+// spreads the vector over a full grid, and the second reduces the per-block
+// winners, a vector short enough that one block is no longer the wrong shape.
+//
+// Splitting it that way is only safe because of the tie-break. "Greatest
+// value, lowest index" is associative *and* commutative, so the answer does
+// not depend on how the vector is partitioned or in what order the partitions
+// are merged. That is the same argument `moe_route`'s max and argmax
+// reductions rest on — and the same one its softmax denominator cannot make,
+// which is why that one still reduces through shared memory.
+__device__ __forceinline__ void argmax_merge(float& bv, int& bi, float v, int i) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+
+// Reduce one block's per-thread candidate to thread 0.
+//
+// Every thread seeds from element 0 rather than from a -INFINITY sentinel, so
+// a vector that is entirely NaN answers 0 — which is what the scalar
+// reference does, because `NaN > NaN` is false and its running best never
+// moves off index 0. A sentinel would answer "no candidate" instead, and the
+// two would disagree on the one input where disagreement is hardest to spot.
+__device__ __forceinline__ void argmax_reduce_block(float& bv, int& bi) {
+    __shared__ float sv[ARGMAX_THREADS / 32];
+    __shared__ int   si[ARGMAX_THREADS / 32];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffff, bv, off);
+        int   oi = __shfl_down_sync(0xffffffff, bi, off);
+        argmax_merge(bv, bi, ov, oi);
+    }
+    if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < ARGMAX_THREADS / 32; ++w) {
+            argmax_merge(bv, bi, sv[w], si[w]);
+        }
+    }
+}
+
+extern "C" __global__ void argmax_partial(
+    const float* __restrict__ x,
+    int n,
+    float* __restrict__ pv,
+    int* __restrict__ pi
+) {
+    float bv = x[0];
+    int   bi = 0;
+    for (int i = blockIdx.x * ARGMAX_THREADS + threadIdx.x;
+         i < n;
+         i += gridDim.x * ARGMAX_THREADS) {
+        argmax_merge(bv, bi, x[i], i);
+    }
+    argmax_reduce_block(bv, bi);
+    if (threadIdx.x == 0) { pv[blockIdx.x] = bv; pi[blockIdx.x] = bi; }
+}
+
+extern "C" __global__ void argmax_final(
+    const float* __restrict__ pv,
+    const int* __restrict__ pi,
+    int n,
+    int* __restrict__ out
+) {
+    float bv = pv[0];
+    int   bi = pi[0];
+    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
+        argmax_merge(bv, bi, pv[i], pi[i]);
+    }
+    argmax_reduce_block(bv, bi);
+    if (threadIdx.x == 0) out[0] = bi;
+}
 "#;
 
 /// The LM head shape this instance is compiled and sized for.
@@ -588,6 +687,8 @@ impl From<DriverError> for LmHeadError {
 pub struct LmHeadKernels {
     /// Indexed by `tile - 1`, for tiles `1..=MAX_BATCH_TILE`.
     tiles: [CudaFunction; MAX_BATCH_TILE],
+    argmax_partial: CudaFunction,
+    argmax_final: CudaFunction,
     geometry: LmHeadGeometry,
 }
 
@@ -636,6 +737,8 @@ impl LmHeadKernels {
                 module.load_function("lm_head_gemv_b7")?,
                 module.load_function("lm_head_gemv_b8")?,
             ],
+            argmax_partial: module.load_function("argmax_partial")?,
+            argmax_final: module.load_function("argmax_final")?,
             geometry,
         })
     }
@@ -723,6 +826,80 @@ impl LmHeadKernels {
             unsafe { builder.launch(cfg) }?;
             base += tile;
         }
+        Ok(())
+    }
+}
+
+impl LmHeadKernels {
+    /// `out[0] = argmax(values[..n])`, ties going to the lower index.
+    ///
+    /// `partial_values` and `partial_indices` are scratch of exactly
+    /// [`ARGMAX_BLOCKS`] elements each; `out` is one `i32`. All three are
+    /// caller-owned so a decode step allocates nothing — see `AGENTS.md`
+    /// rule 6.
+    ///
+    /// This is the device half of sampling. It exists so the host reads four
+    /// bytes per step instead of the whole logit vector; see the kernel's own
+    /// comment for what that was costing.
+    pub fn argmax(
+        &self,
+        stream: &Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        n: usize,
+        partial_values: &mut CudaSlice<f32>,
+        partial_indices: &mut CudaSlice<i32>,
+        out: &mut CudaSlice<i32>,
+    ) -> Result<(), LmHeadError> {
+        if n == 0 || n > values.len() {
+            return Err(LmHeadError::ShapeMismatch {
+                what: "argmax length",
+                expected: values.len(),
+                got: n,
+            });
+        }
+        check_len("argmax partial values", ARGMAX_BLOCKS, partial_values.len())?;
+        check_len(
+            "argmax partial indices",
+            ARGMAX_BLOCKS,
+            partial_indices.len(),
+        )?;
+        check_len("argmax output", 1, out.len())?;
+
+        // `n >= 1` was checked above, so the ceiling is at least one and there
+        // is no lower bound left to apply.
+        let blocks = n.div_ceil(ARGMAX_THREADS as usize).min(ARGMAX_BLOCKS);
+        let n_i32 = n as i32;
+        let one = LaunchConfig {
+            grid_dim: (blocks as u32, 1, 1),
+            block_dim: (ARGMAX_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.argmax_partial);
+        builder
+            .arg(values)
+            .arg(&n_i32)
+            .arg(&mut *partial_values)
+            .arg(&mut *partial_indices);
+        // SAFETY: the grid-stride loop is bounded by `n`, which was checked
+        // against `values.len()`; `blocks <= ARGMAX_BLOCKS` is the length of
+        // both partial buffers, and each block writes exactly its own slot.
+        unsafe { builder.launch(one) }?;
+
+        let blocks_i32 = blocks as i32;
+        let two = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (ARGMAX_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.argmax_final);
+        builder
+            .arg(&*partial_values)
+            .arg(&*partial_indices)
+            .arg(&blocks_i32)
+            .arg(&mut *out);
+        // SAFETY: reads exactly the `blocks` slots the first pass wrote and
+        // writes the single `i32` checked above.
+        unsafe { builder.launch(two) }?;
         Ok(())
     }
 }

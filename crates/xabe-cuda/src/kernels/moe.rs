@@ -384,12 +384,32 @@ __device__ __forceinline__ void dequant_tile_q6k(
     unsigned int qhw = (unsigned int)*(const unsigned short*)(qh + l)
         | ((unsigned int)*(const unsigned short*)(qh + l + 2) << 16);
 
+    // Unpack all four codes at word width rather than one byte at a time.
+    //
+    // The four elements a lane owns take the *same* field of four different
+    // bytes: the same nibble of `ql`, the same bit pair of `qh`. So one mask
+    // over the whole word does what four shift-and-mask pairs did, and the
+    // per-element work drops to a shift, a mask and the subtraction.
+    //
+    // Both shifts are safe across byte lanes because the field never reaches
+    // the top of its byte: `(qlw >> 4) & 0x0F0F0F0F` takes bits 4..7 of each
+    // byte, and `shift` is 0, 2, 4 or 6 so `(qhw >> shift) & 0x03030303`
+    // takes bits `shift..shift+1` — neither can pull a bit in from the byte
+    // above.
+    //
+    // This is worth doing because the decode-shape kernels that call it are
+    // bound by the **integer pipe**, not by DRAM. `moe_expert_ffn_gemv` moved
+    // its weights at 43% of the card's streaming roofline while the LM head's
+    // own GEMV reached 82% on the same card, and the difference is that Q6_K
+    // costs about nine integer instructions per element to unpack where Q8_0
+    // costs none. Fewer instructions per byte, identical bytes: `raw` is the
+    // same integer, so every reconstructed weight is bit-for-bit what it was.
+    unsigned int lo4 = (grp < 2) ? (qlw & 0x0F0F0F0Fu) : ((qlw >> 4) & 0x0F0F0F0Fu);
+    unsigned int raw4 = lo4 | (((qhw >> shift) & 0x03030303u) << 4);
+
     #pragma unroll
     for (int t = 0; t < MOE_TN; ++t) {
-        int qlb = (int)((qlw >> (8 * t)) & 0xFF);
-        int qhb = (int)((qhw >> (8 * t)) & 0xFF);
-        int low = (grp < 2) ? (qlb & 0xF) : (qlb >> 4);
-        int raw = low | (int)(((qhb >> shift) & 3) << 4);
+        int raw = (int)((raw4 >> (8 * t)) & 0xFFu);
         out[t] = q6k_value(d, sc, si, raw);
     }
 }
@@ -1407,18 +1427,32 @@ __global__ void moe_expert_ffn_mma(
             unsigned int qhu = *(const unsigned int*)(
                 swu + nload * MOE_MMA_WSTRIDE + 64 + l);
 
-            unsigned int bg = 0, bu = 0;
-            #pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                int lg = (grp < 2) ? (int)((qlg >> (8 * t)) & 0xF)
-                                   : (int)((qlg >> (8 * t + 4)) & 0xF);
-                int lu = (grp < 2) ? (int)((qlu >> (8 * t)) & 0xF)
-                                   : (int)((qlu >> (8 * t + 4)) & 0xF);
-                int rg = lg | (int)(((qhg >> (8 * t + shift)) & 3) << 4);
-                int ru = lu | (int)(((qhu >> (8 * t + shift)) & 3) << 4);
-                bg |= ((unsigned int)(rg - 32) & 0xFFu) << (8 * t);
-                bu |= ((unsigned int)(ru - 32) & 0xFFu) << (8 * t);
-            }
+            // Four Q6_K codes to four signed bytes with no per-element work
+            // at all. Every step below acts on all four lanes of the word at
+            // once, and none of them can carry a bit across a byte boundary:
+            //
+            //   nibble   `(q >> 4) & 0x0F0F0F0F` takes bits 4..7 of each byte
+            //   high two `(qh >> shift) & 0x03030303`, shift <= 6, so bits
+            //            shift..shift+1 of each byte and no further
+            //   bias     Q6_K stores `raw - 32` in offset binary, and offset
+            //            binary *is* two's complement with the sign bit
+            //            flipped -- so `^ 0x20` converts all four codes at
+            //            once, leaving a 6-bit signed value per byte
+            //   extend   bit 5 is now the sign; copying it into bits 6 and 7
+            //            with two shifted ORs widens all four to int8
+            //
+            // Nine word operations per matrix where the per-element loop
+            // needed about forty, on the kernel that is 25% of prefill. The
+            // byte patterns are identical, so the MMA sees the same operands
+            // it always did.
+            unsigned int tg = ((((grp < 2) ? qlg : (qlg >> 4)) & 0x0F0F0F0Fu)
+                | (((qhg >> shift) & 0x03030303u) << 4)) ^ 0x20202020u;
+            unsigned int tu = ((((grp < 2) ? qlu : (qlu >> 4)) & 0x0F0F0F0Fu)
+                | (((qhu >> shift) & 0x03030303u) << 4)) ^ 0x20202020u;
+            unsigned int sg = tg & 0x20202020u;
+            unsigned int su = tu & 0x20202020u;
+            unsigned int bg = tg | (sg << 1) | (sg << 2);
+            unsigned int bu = tu | (su << 1) | (su << 2);
 
             int sub = kk >> 4;
             float sg0 = dg0 * (float)(signed char)ssg[ccol * MOE_MMA_SSTRIDE + sub];

@@ -21,13 +21,18 @@
 //! the last decile is much slower than the first, the KV window is what is
 //! costing, and that is a finding rather than noise.
 //!
-//! # What is deliberately not measured
+//! # What is and is not measured
 //!
-//! Sampling. This is greedy argmax on the host, and the token it picks is fed
-//! back in — so the sequence is real and the routing is real, but there is no
-//! top-p, no repetition penalty, and no tokenizer to print what it said.
-//! Sampling is microseconds against a pass measured in milliseconds; leaving
-//! it out changes the throughput figure by less than the run-to-run spread.
+//! Greedy sampling **is** inside the timed region, because an autoregressive
+//! step is not finished until the host knows which token to feed back in.
+//! [`Forward::sample_argmax`] reduces on the device and returns four bytes;
+//! doing it on the host instead moved the whole 993 KiB logit vector across
+//! PCIe every step and cost 4% of the step.
+//!
+//! What is not measured is everything a sampler does past argmax: no top-p,
+//! no repetition penalty, and no tokenizer to print what it said. Those are
+//! host-side work on a 248,320-entry vector and would be a real cost; this
+//! benchmark does not pay it, and neither does `llama-bench -n`.
 //!
 //! Usage:
 //!
@@ -37,10 +42,9 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Instant;
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::CudaContext;
 use tracing::{debug, error, info, warn};
 
 use xabe_cuda::arena::memory_info;
@@ -68,22 +72,6 @@ fn model_path() -> PathBuf {
     std::env::var_os("LLMXABE_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH))
-}
-
-fn dtoh(stream: &Arc<CudaStream>, buf: &CudaSlice<f32>) -> Vec<f32> {
-    let v = stream.clone_dtoh(buf).expect("device read-back");
-    stream.synchronize().expect("sync");
-    v
-}
-
-fn argmax(v: &[f32]) -> i32 {
-    let mut best = 0usize;
-    for i in 1..v.len() {
-        if v[i] > v[best] {
-            best = i;
-        }
-    }
-    best as i32
 }
 
 /// Mean and sample standard deviation.
@@ -205,13 +193,17 @@ fn main() -> ExitCode {
     stream.synchronize().expect("sync");
     let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
 
-    let mut next = argmax(&dtoh(&stream, prefill.logits()));
+    let mut next = prefill.sample_argmax(&stream).expect("prefill argmax");
 
+    // Sampling is on the device and synchronizes there, so the timed region
+    // holds a full autoregressive step: forward, greedy pick, and the four
+    // bytes the host needs to choose the next input. Reducing the 248,320
+    // logits on the host instead moved 993 KiB across PCIe and scanned them
+    // on one core every step, which measured as 0.5 ms of an 11.6 ms step.
     let mut decode_one = |state: &mut _, token: i32| -> Result<i32, String> {
         step.run(&stream, state, &[token], |_, _| {})
             .map_err(|e| e.to_string())?;
-        stream.synchronize().expect("sync");
-        Ok(argmax(&dtoh(&stream, step.logits())))
+        step.sample_argmax(&stream).map_err(|e| e.to_string())
     };
 
     for _ in 0..WARMUP {
