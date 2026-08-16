@@ -159,6 +159,13 @@ pub const fn attn_packed_gate_offset(head: usize, head_dim: usize) -> usize {
     (2 * head + 1) * head_dim
 }
 
+/// Keys one warp scores between barriers in the flash kernel.
+///
+/// Mirrors `ATTN_KT`. The block rescales its running softmax once per
+/// `n_warps * KEYS_PER_WARP` keys, so this trades a little shared memory and a
+/// longer serial sweep per trip against a quarter of the barriers.
+const KEYS_PER_WARP: usize = 4;
+
 const ATTENTION_SRC: &str = r#"
 extern "C" {
 
@@ -259,6 +266,9 @@ __global__ void attn_rope_partial_neox(
 // rather than per key — mathematically identical, and it cuts the number of
 // expf evaluations by the tile width, because otherwise all head_dim threads
 // redundantly evaluate the same two exponentials for every key.
+// Keys one warp scores per trip. See the loop below.
+#define ATTN_KT 4
+
 __global__ void attn_flash_causal(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -272,9 +282,10 @@ __global__ void attn_flash_causal(
 ) {
     extern __shared__ float smem[];
     int n_warps = blockDim.x >> 5;
+    int tile = n_warps * ATTN_KT;              // keys per barrier pair
     float* q_sh     = smem;                    // head_dim floats
-    float* score_sh = smem + head_dim;         // n_warps floats
-    float* w_sh     = score_sh + n_warps;      // n_warps floats
+    float* score_sh = smem + head_dim;         // tile floats
+    float* w_sh     = score_sh + tile;         // tile floats
 
     long long qi = blockIdx.x;
     int h = blockIdx.y;
@@ -295,25 +306,40 @@ __global__ void attn_flash_causal(
     float l = 0.0f;
     float acc = 0.0f;
 
-    for (long long j0 = 0; j0 < n_visible; j0 += n_warps) {
-        long long key = j0 + warp;
-        float partial = 0.0f;
-        if (key < n_visible) {
-            const float* krow = k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
-            // Lane l takes dimensions l, l+32, l+64, ...: consecutive lanes
-            // read consecutive floats, so every load is a full 128 B
-            // transaction, and q_sh[d] with d = lane + 32*i hits a distinct
-            // bank per lane.
-            for (int d = lane; d < head_dim; d += 32) partial += q_sh[d] * krow[d];
+    for (long long j0 = 0; j0 < n_visible; j0 += tile) {
+        // ATTN_KT keys per warp per trip, not one.
+        //
+        // The barrier pair below is per *trip*, and one key per warp made it
+        // one barrier pair per eight keys: a 512-token prefill row crossed 128
+        // of them. The scores of several keys are independent, so a warp can
+        // compute ATTN_KT of them back to back and the block can rescale its
+        // running softmax once for all `tile` of them.
+        //
+        // `key = j0 + warp * ATTN_KT + r` stored at `score_sh[warp * ATTN_KT
+        // + r]` keeps slot `w` holding key `j0 + w`, which is what lets the
+        // value accumulation below stay a single ascending sweep.
+        #pragma unroll
+        for (int r = 0; r < ATTN_KT; ++r) {
+            long long key = j0 + (long long)warp * ATTN_KT + r;
+            float partial = 0.0f;
+            if (key < n_visible) {
+                const float* krow =
+                    k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
+                // Lane l takes dimensions l, l+32, l+64, ...: consecutive lanes
+                // read consecutive floats, so every load is a full 128 B
+                // transaction, and q_sh[d] with d = lane + 32*i hits a distinct
+                // bank per lane.
+                for (int d = lane; d < head_dim; d += 32) partial += q_sh[d] * krow[d];
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                partial += __shfl_xor_sync(0xffffffff, partial, off);
+            }
+            if (lane == 0) score_sh[warp * ATTN_KT + r] = partial * scale;
         }
-        for (int off = 16; off > 0; off >>= 1) {
-            partial += __shfl_xor_sync(0xffffffff, partial, off);
-        }
-        if (lane == 0) score_sh[warp] = partial * scale;
         __syncthreads();
 
         long long remaining = n_visible - j0;
-        int n_this = (int)(remaining < (long long)n_warps ? remaining : (long long)n_warps);
+        int n_this = (int)(remaining < (long long)tile ? remaining : (long long)tile);
 
         float tile_max = neg_inf();
         for (int w = 0; w < n_this; ++w) tile_max = fmaxf(tile_max, score_sh[w]);
@@ -526,7 +552,7 @@ impl AttentionKernels {
     /// Exposed so a test can pick a sequence length that is deliberately not a
     /// multiple of it and exercise the ragged final tile.
     pub fn keys_per_tile(&self) -> usize {
-        self.head_dim / 32
+        (self.head_dim / 32) * KEYS_PER_WARP
     }
 
     /// Dynamic shared memory one block requests: `q_sh` plus the two
@@ -860,7 +886,9 @@ mod tests {
             "the causal window bound changed shape",
         );
         assert!(
-            ATTENTION_SRC.contains("for (long long j0 = 0; j0 < n_visible; j0 += n_warps)"),
+            ATTENTION_SRC.contains("for (long long j0 = 0; j0 < n_visible; j0 += tile)")
+                && ATTENTION_SRC.contains("long long key = j0 + (long long)warp * ATTN_KT + r;")
+                && ATTENTION_SRC.contains("if (key < n_visible) {"),
             "the key loop no longer stops at the causal bound",
         );
     }

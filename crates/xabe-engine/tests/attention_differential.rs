@@ -261,7 +261,14 @@ fn device_attention_matches_the_reference_across_sequence_depths() {
         .expect("kernels must compile for the real geometry");
 
     let tile = kernels.keys_per_tile();
-    assert_eq!(tile, 8, "head_dim 256 gives 8 warps and so an 8-key tile");
+    // head_dim 256 is 8 warps and each warp scores 4 keys between barriers.
+    // The depths below are chosen relative to this, so it is asserted rather
+    // than assumed: if the tile changes, "exactly one tile" and "one past a
+    // tile boundary" stop meaning what the comments below say they mean.
+    assert_eq!(
+        tile, 32,
+        "head_dim 256 gives 8 warps and 4 keys per warp, so a 32-key tile",
+    );
     println!(
         "geometry: q_heads={}, kv_heads={} (GQA {}:1), head_dim={}, key tile={tile}, \
          shared={} B/block",
@@ -272,13 +279,15 @@ fn device_attention_matches_the_reference_across_sequence_depths() {
         kernels.shared_bytes(),
     );
 
-    // 1 is the degenerate single-token case; 8 is exactly one tile; 9, 129,
-    // 511 and 1003 are all ragged against the 8-key tile, so the partial
-    // final tile is exercised at four different remainders (1, 1, 7, 3).
-    const DEPTHS: [usize; 6] = [1, 8, 9, 129, 511, 1003];
+    // 1 is the degenerate single-token case; 32 is exactly one tile; 9, 129,
+    // 511 and 1003 are all ragged against it, so the partial final tile is
+    // exercised at four different remainders (9, 1, 31, 11) -- and 9 and 511
+    // additionally straddle the per-warp inner unroll, which is where a key
+    // past `n_visible` would leak if its guard were dropped.
+    const DEPTHS: [usize; 6] = [1, 32, 9, 129, 511, 1003];
     for d in DEPTHS {
         assert!(
-            d == 8 || !d.is_multiple_of(tile),
+            d == tile || !d.is_multiple_of(tile),
             "depth {d} was meant to be ragged against the {tile}-key tile",
         );
     }

@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,635**, 1,627–1,646 | **1.27× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,644**, 1,639–1,655 | **1.26× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1303,8 +1303,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | four staging loads per weight row instead of eight | 1,430.58 | 1.04× |
 | a block's warps share one weight band | 1,440.00 | 1.01× |
 | pad the staged activation row off a 32-bank stride | 1,630.00 | **1.13×** |
+| four keys per warp between attention barriers | 1,644.10 | 1.01× |
 
-**8.11× overall.** No single change is more than 1.81×; the result is
+**8.18× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1454,6 +1455,40 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### The flash kernel crossed a barrier every eight keys
+
+`attn_flash_causal` gave one key to each warp per trip, so a block of eight
+warps scored eight keys, rescaled its running softmax, and crossed **two
+barriers** — 128 of them for a 512-token prefill row, and the same shape at
+one token.
+
+The scores of different keys are independent, so a warp can compute several
+back to back and the block can rescale once for all of them. With four keys
+per warp the tile is 32 and the barrier count drops fourfold; the serial
+sweeps over the tile (`tile_max`, `lsum`, the value accumulation) get four
+times longer but run four times less often, so their total is unchanged.
+Storing key `j0 + warp * ATTN_KT + r` at slot `warp * ATTN_KT + r` is what
+keeps slot `w` holding key `j0 + w`, and the value accumulation a single
+ascending sweep.
+
+| keys per warp | tok/s |
+| --- | ---: |
+| 1 (before) | 1,620.70 |
+| 2 | 1,628.18 |
+| **4** | **1,644.10** |
+| 8 | 1,639.04 |
+
+**+1.4%**, measured back to back against the old shape. Eight is past the
+knee: the tile's serial sweeps are executed redundantly by all 256 threads, so
+past some width they cost more than the barriers they save.
+
+The online softmax now rescales every 32 keys rather than every 8, which is
+not bit-identical — it is fewer rescalings, so slightly *more* accurate.
+`attention_differential` reports cosine 1.000000000 against the CPU reference
+at every depth it tests, and the depth list moved to 1, 9, 32, 129, 511, 1003
+so that "exactly one tile" and "ragged against the tile" still mean what the
+comments say.
 
 ### The decode margin is smaller than the card's thermal drift
 
