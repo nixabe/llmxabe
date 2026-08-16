@@ -17,9 +17,9 @@ RTX 8000, written in Rust.
 > time — decode steps replay from a captured CUDA graph. See
 > [Milestones](#milestones) for the itemized state.
 >
-> Measured against llama.cpp on the same card: prefill **1,628 tok/s**
-> at 512 tokens against 2,070.50 (**1.27× slower**), decode **105.2 tok/s**
-> against `tg128`'s 104.72 (**1.005× faster**). See
+> Measured against llama.cpp on the same card: prefill **~1,635 tok/s**
+> at 512 tokens against 2,070.50 (**1.27× slower**), decode **104.4–105.8
+> tok/s** against `tg128`'s 104.72 (**level**). See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why this exists
@@ -72,15 +72,16 @@ years of CUDA tuning behind it, and the benchmarks make that concrete.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,628 ± 6** | 1.27× slower |
-| Decode, warm | 104.72 ± 0.36 tok/s | **105.2**, 9.51 ms/step | **1.005× faster** |
+| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,635**, 1,627–1,646 | 1.27× slower |
+| Decode, warm | 104.72 ± 0.36 tok/s | **104.4–105.8** (thermal) | level |
 
 Prefill was 29.6× slower, then 10.3×, and is now 1.27× — **still a loss**, and
 the project does not claim otherwise. Decode was 1.61× slower and is now
-**1.005× faster**: 105.2 tok/s against `tg128`'s 104.72, measured as the mean
-of eight interleaved runs at the context `tg128` covers. That margin is under
-1%, which is smaller than the spread between runs on this card, so read it as
-*level with llama.cpp* rather than as a comfortable win.
+**level**: 104.4–105.8 tok/s against `tg128`'s 104.72 ± 0.36, where the spread
+is this card's own thermal drift — 105.75 cold, 104.45 after an hour of
+benchmarking. The two are inside each other's error bars, so this is a draw
+rather than a win, and every A/B in [BENCHMARKS.md](docs/BENCHMARKS.md) is
+measured interleaved for that reason.
 
 The move that closed most of it was putting every quantized matmul on
 Turing's integer tensor cores — `mma.m8n8k16.s32.s8.s8.s32`, ~198 TOP/s

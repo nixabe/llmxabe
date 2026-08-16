@@ -1270,8 +1270,8 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,628 ± 6 tok/s** | **1.27× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **105.2 tok/s**, 9.51 ms/step | **1.005× faster** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,635**, 1,627–1,646 | **1.27× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1425,7 +1425,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **105.2 tok/s**, 9.51 ms/step | **1.005× faster** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1454,6 +1454,30 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### The decode margin is smaller than the card's thermal drift
+
+Decode was reported above as 105.2 tok/s against llama.cpp's 104.72. That
+number is real but it is not a margin. Measured on this card across one
+session, the *same binary* gives:
+
+| GPU temperature | tok/s |
+| --- | ---: |
+| 33 °C, idle two minutes | 105.75, 105.41, 105.06 |
+| ~44 °C, straight after an hour of benchmarking | 104.41, 104.45, 104.49 |
+
+**1.3% between a cold card and a warm one**, which is larger than the distance
+to llama.cpp. Prefill drifts the same way over three back-to-back runs — 1,646
+then 1,632 then 1,627 — and for the same reason.
+
+So the honest reading of the decode column is **level**, not ahead: the
+engine and llama.cpp are inside each other's spread at this shape, and any
+claim of a win would be a claim about when the measurement was taken. Prefill,
+at 1.27x behind, is outside it by a wide margin and is a real loss.
+
+Every A/B in this document is measured **interleaved** — three runs of each
+arm, alternating — for exactly this reason. A before/after taken an hour apart
+on this card is worth about 1%.
 
 ### One number was a multiple of 32, and it cost 13% of prefill
 
