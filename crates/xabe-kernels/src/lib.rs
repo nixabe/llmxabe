@@ -43,6 +43,7 @@
 pub mod attention;
 pub mod compare;
 pub mod conv;
+pub mod f16;
 pub mod gdn;
 pub mod gemv;
 pub mod mma;

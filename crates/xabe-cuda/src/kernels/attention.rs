@@ -292,6 +292,22 @@ extern "C" {
 // macro is not reachable. `__int_as_float` is a builtin and always is.
 __device__ __forceinline__ float neg_inf() { return __int_as_float(0xff800000); }
 
+// binary16 <-> fp32, by hand because NVRTC has no cuda_fp16.h here. The KV
+// cache stores binary16: it halves the cache (5.06 -> 2.53 GiB at 131,072
+// positions), halves the DRAM traffic attention spends most of its time on,
+// and lets the tensor-core kernel stage K with no conversion at all, since two
+// adjacent dimensions are already the packed operand it wants.
+__device__ __forceinline__ float h2f(unsigned short h) {
+    float f;
+    asm("{ .reg .f16 a; mov.b16 a, %1; cvt.f32.f16 %0, a; }" : "=f"(f) : "h"(h));
+    return f;
+}
+__device__ __forceinline__ unsigned short f2h(float f) {
+    unsigned short h;
+    asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(f));
+    return h;
+}
+
 // Deinterleave the packed query/gate tensor.
 //
 // grid: (n_tokens, q_heads). block: head_dim threads.
@@ -428,8 +444,8 @@ __global__ void attn_rope_partial_neox(
 #define ATTN_FLASH(NAME, QT)                                                  \
 __global__ void NAME(                                                           \
     const float* __restrict__ q,                                                \
-    const float* __restrict__ k,                                                \
-    const float* __restrict__ v,                                                \
+    const unsigned short* __restrict__ k,                                       \
+    const unsigned short* __restrict__ v,                                       \
     float* __restrict__ out,                                                    \
     int q_heads,                                                                \
     int kv_heads,                                                               \
@@ -509,7 +525,7 @@ __global__ void NAME(                                                           
             _Pragma("unroll")                                                   \
             for (int u = 0; u < QT; ++u) part[u] = 0.0f;                        \
             if (key < n_visible) {                                              \
-                const float* krow =                                             \
+                const unsigned short* krow =                                    \
                     k + (key * (long long)kv_heads + kvh) * (long long)head_dim; \
                 /* Lane l takes dimensions l, l+32, l+64, ...: consecutive lanes */ \
                 /* read consecutive floats, so every load is a full 128 B */    \
@@ -517,7 +533,7 @@ __global__ void NAME(                                                           
                 _Pragma("unroll")                                               \
                 for (int i = 0; i < ATTN_MAXD; ++i) {                           \
                     if (i < dpt) {                                              \
-                        float kd = krow[lane + 32 * i];                         \
+                        float kd = h2f(krow[lane + 32 * i]);                    \
                         _Pragma("unroll")                                       \
                         for (int u = 0; u < QT; ++u) part[u] += qr[u][i] * kd;  \
                     }                                                           \
@@ -704,8 +720,8 @@ __device__ __forceinline__ void mma_m16n8k8(
 
 __global__ void attn_flash_causal_mma(
     const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
     float* __restrict__ out,
     int q_heads,
     int kv_heads,
@@ -797,14 +813,16 @@ __global__ void attn_flash_causal_mma(
             int r = t / hd2;
             int c = t - r * hd2;
             long long key = j0 + r;
-            float lo = 0.0f, hi = 0.0f;
+            unsigned word = 0;
             if (key < n_visible) {
-                const float* kp =
-                    k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
-                lo = kp[2 * c];
-                hi = kp[2 * c + 1];
+                // Dimensions 2c and 2c+1 of one key are already adjacent
+                // binary16 in the cache, which is exactly the B operand's
+                // packing -- one aligned 32-bit load, no conversion.
+                const unsigned* kp = (const unsigned*)(
+                    k + (key * (long long)kv_heads + kvh) * (long long)head_dim);
+                word = kp[c];
             }
-            k_sh[r * qstride + c] = pack_h2(lo, hi);
+            k_sh[r * qstride + c] = word;
         }
         // V in the B layout of P V, which contracts over keys: the two halves
         // of a word are two consecutive *keys* at one dimension, so this is the
@@ -815,14 +833,17 @@ __global__ void attn_flash_causal_mma(
             int kk = t / head_dim;
             int d = t - kk * head_dim;
             long long k0 = j0 + 2 * kk;
-            float lo = 0.0f, hi = 0.0f;
+            unsigned short lo = 0, hi = 0;
             if (k0 < n_visible) {
                 lo = v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + d];
             }
             if (k0 + 1 < n_visible) {
                 hi = v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + d];
             }
-            v_sh[d * vstride + kk] = pack_h2(lo, hi);
+            // The two halves are two different *keys*, so unlike K this one
+            // still has to be assembled -- but from binary16 loads, not from
+            // floats needing a convert each.
+            v_sh[d * vstride + kk] = (unsigned)lo | ((unsigned)hi << 16);
         }
         __syncthreads();
 
@@ -995,8 +1016,8 @@ __global__ void attn_flash_causal_mma(
 
 __global__ void attn_flash_causal_gqa(
     const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
     float* __restrict__ out,
     int q_heads,
     int kv_heads,
@@ -1067,8 +1088,8 @@ __global__ void attn_flash_causal_gqa(
                 long long key = j0 + jj;
                 bool live = key < n_visible;
                 long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim + d;
-                kreg[jj] = live ? k[at] : 0.0f;
-                vreg[jj] = live ? v[at] : 0.0f;
+                kreg[jj] = live ? h2f(k[at]) : 0.0f;
+                vreg[jj] = live ? h2f(v[at]) : 0.0f;
             }
             #pragma unroll
             for (int jj = 0; jj < GQA_KT; ++jj) {
@@ -1221,8 +1242,8 @@ __global__ void attn_flash_causal_gqa(
 
 __global__ void attn_flash_decode_split(
     const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
     float* __restrict__ part_acc,
     float* __restrict__ part_m,
     float* __restrict__ part_l,
@@ -1291,8 +1312,8 @@ __global__ void attn_flash_decode_split(
                 long long key = j0 + jj;
                 bool live = jj < n_this;
                 long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim + d;
-                kreg[jj] = live ? k[at] : 0.0f;
-                vreg[jj] = live ? v[at] : 0.0f;
+                kreg[jj] = live ? h2f(k[at]) : 0.0f;
+                vreg[jj] = live ? h2f(v[at]) : 0.0f;
             }
             #pragma unroll
             for (int jj = 0; jj < DEC_KT; ++jj) {
@@ -1384,8 +1405,8 @@ __global__ void attn_flash_decode_combine(
 
 __global__ void attn_flash_causal_t1(
     const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
     float* __restrict__ out,
     int q_heads,
     int kv_heads,
@@ -1438,13 +1459,13 @@ __global__ void attn_flash_causal_t1(
             long long key = j0 + (long long)warp * ATTN_KT + r;
             float partial = 0.0f;
             if (key < n_visible) {
-                const float* krow =
+                const unsigned short* krow =
                     k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
                 // Lane l takes dimensions l, l+32, l+64, ...: consecutive lanes
                 // read consecutive floats, so every load is a full 128 B
                 // transaction, and q_sh[d] with d = lane + 32*i hits a distinct
                 // bank per lane.
-                for (int d = lane; d < head_dim; d += 32) partial += q_sh[d] * krow[d];
+                for (int d = lane; d < head_dim; d += 32) partial += q_sh[d] * h2f(krow[d]);
             }
             for (int off = 16; off > 0; off >>= 1) {
                 partial += __shfl_xor_sync(0xffffffff, partial, off);
@@ -1473,7 +1494,8 @@ __global__ void attn_flash_causal_t1(
 
         float a = acc * corr;
         for (int w = 0; w < n_this; ++w) {
-            a += w_sh[w] * v[((j0 + w) * (long long)kv_heads + kvh) * (long long)head_dim + tid];
+            a += w_sh[w]
+                * h2f(v[((j0 + w) * (long long)kv_heads + kvh) * (long long)head_dim + tid]);
         }
         acc = a;
         m = new_m;
@@ -1504,8 +1526,8 @@ __global__ void attn_flash_causal_t1(
 __global__ void attn_kv_append(
     const float* __restrict__ key,
     const float* __restrict__ value,
-    float* __restrict__ k_cache,
-    float* __restrict__ v_cache,
+    unsigned short* __restrict__ k_cache,
+    unsigned short* __restrict__ v_cache,
     const int* __restrict__ position,
     int span,
     int row
@@ -1516,10 +1538,10 @@ __global__ void attn_kv_append(
     // destination base is one row per position and not one span.
     long long at = (long long)(*position) * (long long)row;
     if (i < span) {
-        k_cache[at + i] = key[i];
+        k_cache[at + i] = f2h(key[i]);
     } else {
         int j = i - span;
-        v_cache[at + j] = value[j];
+        v_cache[at + j] = f2h(value[j]);
     }
 }
 
@@ -1999,8 +2021,8 @@ impl AttentionKernels {
         stream: &Arc<CudaStream>,
         dec: &mut AttnDecodeScratch,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
         out: &mut CudaSlice<f32>,
         n_query: usize,
         max_keys: usize,
@@ -2127,8 +2149,8 @@ impl AttentionKernels {
         stream: &Arc<CudaStream>,
         dec: &mut AttnDecodeScratch,
         q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
+        k: &CudaSlice<u16>,
+        v: &CudaSlice<u16>,
         out: &mut CudaSlice<f32>,
         positions: &CudaSlice<i32>,
     ) -> Result<(), AttentionError> {
@@ -2207,8 +2229,8 @@ impl AttentionKernels {
         stream: &Arc<CudaStream>,
         key: &CudaSlice<f32>,
         value: &CudaSlice<f32>,
-        k_cache: &mut CudaSlice<f32>,
-        v_cache: &mut CudaSlice<f32>,
+        k_cache: &mut CudaSlice<u16>,
+        v_cache: &mut CudaSlice<u16>,
         n_tokens: usize,
         max_keys: usize,
         positions: &CudaSlice<i32>,
@@ -2367,9 +2389,11 @@ mod tests {
         let t1_acc = tail
             .find("float a = acc * corr;")
             .expect("t1 accumulator rescale");
-        let t1_fold = tail
-            .find("a += w_sh[w] * v[")
-            .expect("t1 value accumulation");
+        // Anchored on the prefix rather than the whole expression: the value
+        // load acquired an `h2f(...)` when the cache became binary16, and the
+        // property being checked here is the *order* of the fold against the
+        // rescale, not how the value is read.
+        let t1_fold = tail.find("a += w_sh[w]").expect("t1 value accumulation");
         assert!(t1_acc < t1_fold, "t1 values folded in before rescaling");
         assert!(t1_l < t1_fold, "t1 normalizer updated after the values");
     }

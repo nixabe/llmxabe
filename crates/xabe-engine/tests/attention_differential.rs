@@ -82,6 +82,7 @@ use xabe_kernels::attention::{
     causal_attention_naive, causal_attention_streaming, kv_head_for_query_head,
 };
 use xabe_kernels::compare::{Tolerance, assert_matches, compare};
+use xabe_kernels::f16::{round_through_f16, to_f16_bits};
 use xabe_kernels::rng::Xorshift64Star;
 use xabe_kernels::rope::apply_rope;
 use xabe_model::config::ModelConfig;
@@ -229,6 +230,18 @@ fn head_rows(
         .collect()
 }
 
+/// Round a whole tensor through binary16, which is what storing it in the KV
+/// cache does to it.
+///
+/// Applied to K and V where they are generated, so the device and the scalar
+/// reference are fed the **same** values and the comparison measures the kernel
+/// rather than the cache's dtype. Without it the two differ by an operand
+/// rounding before the kernel does anything, and the only way to pass would be
+/// a tolerance wide enough to stop measuring.
+fn as_cached(v: &[f32]) -> Vec<f32> {
+    v.iter().copied().map(round_through_f16).collect()
+}
+
 /// Run the device kernel over a whole window and bring the output back.
 #[allow(clippy::too_many_arguments)]
 fn run_device(
@@ -244,8 +257,12 @@ fn run_device(
     head_dim: usize,
 ) -> Vec<f32> {
     let d_q = stream.clone_htod(q).expect("upload q");
-    let d_k = stream.clone_htod(k).expect("upload k");
-    let d_v = stream.clone_htod(v).expect("upload v");
+    // The cache is binary16. `k` and `v` have already been rounded to it by
+    // `as_cached`, so this conversion is exact and loses nothing further.
+    let k16: Vec<u16> = k.iter().copied().map(to_f16_bits).collect();
+    let v16: Vec<u16> = v.iter().copied().map(to_f16_bits).collect();
+    let d_k = stream.clone_htod(&k16).expect("upload k");
+    let d_v = stream.clone_htod(&v16).expect("upload v");
     let mut d_out = stream
         .alloc_zeros::<f32>(n_query * q_heads * head_dim)
         .expect("allocate output");
@@ -340,8 +357,8 @@ fn device_attention_matches_the_reference_across_sequence_depths() {
     let mut rng = Xorshift64Star::new(0x0A77_3E47);
     for seq in DEPTHS {
         let q: Vec<f32> = rng.vec_f32(seq * g.q_heads * g.head_dim, -1.0, 1.0);
-        let k: Vec<f32> = rng.vec_f32(seq * g.kv_heads * g.head_dim, -1.0, 1.0);
-        let v: Vec<f32> = rng.vec_f32(seq * g.kv_heads * g.head_dim, -1.0, 1.0);
+        let k = as_cached(&rng.vec_f32(seq * g.kv_heads * g.head_dim, -1.0, 1.0));
+        let v = as_cached(&rng.vec_f32(seq * g.kv_heads * g.head_dim, -1.0, 1.0));
 
         let device = run_device(
             &stream, &kernels, &q, &k, &v, seq, seq, 0, g.q_heads, g.head_dim,
@@ -442,8 +459,8 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
 
     let mut rng = Xorshift64Star::new(0x0FF5_E700);
     let q_full: Vec<f32> = rng.vec_f32(N_KEYS * g.q_heads * g.head_dim, -1.0, 1.0);
-    let k: Vec<f32> = rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0);
-    let v: Vec<f32> = rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0);
+    let k = as_cached(&rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0));
+    let v = as_cached(&rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0));
     // Only the tail rows are launched, but the reference needs the whole
     // sequence, so the query block is a slice of the same buffer.
     let q_block = &q_full[KEY_OFFSET * g.q_heads * g.head_dim..];
@@ -505,8 +522,8 @@ fn device_decode_matches_the_reference_over_a_deep_window() {
         let key_offset = n_keys - 1;
         let mut rng = Xorshift64Star::new(0x0DEC_0DE0 ^ n_keys as u64);
         let q_full: Vec<f32> = rng.vec_f32(n_keys * g.q_heads * g.head_dim, -1.0, 1.0);
-        let k: Vec<f32> = rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0);
-        let v: Vec<f32> = rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0);
+        let k = as_cached(&rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0));
+        let v = as_cached(&rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0));
         let q_row = &q_full[key_offset * g.q_heads * g.head_dim..];
 
         let device = run_device(
@@ -575,8 +592,8 @@ fn a_future_key_cannot_change_an_earlier_output_by_a_single_bit() {
 
     let mut rng = Xorshift64Star::new(0xC0DE_1A5C);
     let q: Vec<f32> = rng.vec_f32(N_QUERY * g.q_heads * g.head_dim, -1.0, 1.0);
-    let k: Vec<f32> = rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0);
-    let v: Vec<f32> = rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0);
+    let k = as_cached(&rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0));
+    let v = as_cached(&rng.vec_f32(N_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0));
 
     let base = run_device(
         &stream, &kernels, &q, &k, &v, N_QUERY, N_KEYS, KEY_OFFSET, g.q_heads, g.head_dim,
@@ -801,9 +818,9 @@ fn device_attention_holds_the_softmax_normalizer_over_128k_dense_keys() {
 
     let mut rng = Xorshift64Star::new(0x0DE5_5E00);
     let q: Vec<f32> = rng.vec_f32(N_QUERY * g.q_heads * g.head_dim, -1.0, 1.0);
-    let k: Vec<f32> = rng.vec_f32(DEEP_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0);
+    let k = as_cached(&rng.vec_f32(DEEP_KEYS * g.kv_heads * g.head_dim, -1.0, 1.0));
 
-    let c: Vec<f32> = rng.vec_f32(g.kv_heads * g.head_dim, -1.0, 1.0);
+    let c = as_cached(&rng.vec_f32(g.kv_heads * g.head_dim, -1.0, 1.0));
     let mut v = vec![0.0f32; DEEP_KEYS * g.kv_heads * g.head_dim];
     for chunk in v.chunks_mut(g.kv_heads * g.head_dim) {
         chunk.copy_from_slice(&c);

@@ -511,8 +511,8 @@ impl AttentionKernelSet {
 /// [`GdnState`](crate::block::gdn::GdnState) holds and why this model's cache does not grow the way a
 /// forty-layer dense model's would.
 pub struct KvCache {
-    k: CudaSlice<f32>,
-    v: CudaSlice<f32>,
+    k: CudaSlice<u16>,
+    v: CudaSlice<u16>,
     kv_dim: usize,
     max_seq: usize,
 }
@@ -531,8 +531,8 @@ impl KvCache {
     ) -> Result<Self, AttentionBlockError> {
         let kv_dim = config.attention.kv_heads as usize * config.attention.head_dim as usize;
         Ok(Self {
-            k: stream.alloc_zeros::<f32>(max_seq * kv_dim)?,
-            v: stream.alloc_zeros::<f32>(max_seq * kv_dim)?,
+            k: stream.alloc_zeros::<u16>(max_seq * kv_dim)?,
+            v: stream.alloc_zeros::<u16>(max_seq * kv_dim)?,
             kv_dim,
             max_seq,
         })
@@ -544,18 +544,24 @@ impl KvCache {
     }
 
     /// Device bytes held, both halves.
+    ///
+    /// binary16, which is 20 KiB per token at this model's geometry rather than
+    /// 40 — 2.53 GiB at 131,072 positions instead of 5.06. It is also the dtype
+    /// llama.cpp's cache uses, and the one `xabe-cache`'s planner has always
+    /// assumed (`DEFAULT_ELEM_SIZE = 2`), which this makes true rather than
+    /// aspirational.
     pub fn bytes(&self) -> u64 {
-        2 * (self.max_seq * self.kv_dim * size_of::<f32>()) as u64
+        2 * (self.max_seq * self.kv_dim * size_of::<u16>()) as u64
     }
 
     /// The cached keys, `[max_seq][kv_heads][head_dim]`, rotary already
     /// applied. Positions at or above the sequence length are zero.
-    pub fn keys(&self) -> &CudaSlice<f32> {
+    pub fn keys(&self) -> &CudaSlice<u16> {
         &self.k
     }
 
     /// The cached values, same layout, not normed and not rotated.
-    pub fn values(&self) -> &CudaSlice<f32> {
+    pub fn values(&self) -> &CudaSlice<u16> {
         &self.v
     }
 }
