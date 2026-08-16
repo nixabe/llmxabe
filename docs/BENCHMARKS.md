@@ -466,16 +466,45 @@ full accumulator array, so the register pressure is paid and the work is not
 done. `proj_tile_for` picks the widest fully-live tile, which beats every
 fixed width at every batch size.
 
+### The activation was being re-read too, and that was the larger term
+
+Tiling over tokens alone left the kernel at **13.2% of fp32 peak** (2.15
+TFLOP/s) against the MoE's 27%. The reason is the other operand: each
+dequantized weight element drove `TT` separate loads of `x`, so a warp re-read
+the activation column once per row it owned. Across the launch that is ~2.1 GB
+per projection call — against a 4 MB activation tensor, so roughly 500x
+re-read, served by L2 rather than DRAM but bounded by L2 all the same.
+
+Loading the activation column into registers once and reusing it across `RR`
+weight rows divides that traffic by `RR`. The two reuses are complementary:
+the token tile amortizes the *weight*, the row band amortizes the
+*activation*.
+
+Sweeping (tile, rows) at 512 tokens:
+
+| (tile, rows) | tok/s | accumulators/thread |
+| --- | ---: | ---: |
+| (32, 2) | 409.42 | 64 |
+| **(16, 4)** | **423.30** | 64 |
+| (16, 8) | 413.19 | 128 |
+
+(32, 2) and (16, 4) cost identical registers and differ only in how traffic
+splits between the two operands — the narrower tile re-reads the weight twice
+as often and the activation four times less, and the activation is the larger
+term. (16, 8) halves activation traffic again and hands it straight back to
+occupancy. So the optimum is interior, and it is not where a
+"bigger tile is better" intuition would have put it.
+
 ### End to end
 
 | tokens | before | after | speedup |
 | ---: | ---: | ---: | ---: |
-| 1 | 55.07 | 67.27 | 1.22x |
-| 19 | 154.46 | 211.24 | 1.37x |
-| 128 | 192.43 | 338.65 | 1.76x |
-| 512 | 200.87 | **362.67 ± 2.97** | **1.81x** |
+| 1 | 55.07 | 68.18 | 1.24x |
+| 19 | 154.46 | 209.33 | 1.36x |
+| 128 | 192.43 | 380.94 | 1.98x |
+| 512 | 200.87 | **419.28 ± 2.37** | **2.09x** |
 
-**Prefill against llama.cpp's `pp512` 2,070.50: 10.3x slower -> 5.71x
+**Prefill against llama.cpp's `pp512` 2,070.50: 10.3x slower -> 4.94x
 slower.** Peak VRAM unchanged at 31.03 GiB.
 
 Decode is **unchanged at ~65 tok/s**, and that is expected rather than

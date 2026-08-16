@@ -154,7 +154,28 @@ const PROJ_WARPS: u32 = 4;
 /// Spelled here and in the kernel source, which NVRTC compiles from a string
 /// with no access to Rust constants;
 /// `the_projection_tiles_match_the_kernel` asserts the two agree.
-const PROJ_TILES: [u32; 3] = [8, 16, 32];
+const PROJ_TILES: [u32; 2] = [8, 16];
+
+/// Output rows each warp accumulates, per tile width above.
+///
+/// A warp loads one activation column into registers once and reuses it across
+/// all of its rows, so this divides the activation traffic directly. It cannot
+/// simply be raised — the accumulator array is `rows * tile` floats per thread,
+/// and the register pressure eventually costs more occupancy than the traffic
+/// saving buys. Measured at 512 tokens, sweeping (tile, rows):
+///
+/// ```text
+///   (32, 2)  409.42 tok/s     64 accumulators
+///   (16, 4)  423.30 tok/s     64 accumulators   <- chosen
+///   (16, 8)  413.19 tok/s    128 accumulators
+/// ```
+///
+/// (32, 2) and (16, 4) cost the same registers and differ only in how the
+/// traffic splits between weight and activation: the narrower tile re-reads
+/// the weight twice as often and the activation four times less, and the
+/// activation is the larger term. (16, 8) halves the activation traffic again
+/// and gives it back to occupancy.
+const PROJ_ROWS: [u32; 2] = [4, 4];
 
 /// Which specialization to launch for `tokens`, and its width.
 ///
@@ -266,9 +287,20 @@ __global__ void gdn_proj_q8_0(
 // consecutive `kidx` so each access is coalesced.
 //
 // grid: (ceil(N / warps), ceil(tokens / PROJ_TILE)). block: (32, warps).
-// The tile width is specialized rather than fixed, because the best width is a
-// function of the batch and the two ends disagree sharply. Measured tok/s end
-// to end, sweeping a *fixed* width:
+// A warp owns RR output rows and TT tokens.
+//
+// Two reuses, and both are load-bearing:
+//
+//   - the dequantized weight element is multiplied into all TT accumulators
+//     before being dropped, so the weight stack is read once per *token tile*
+//     rather than once per token. Without it, 512 tokens re-read 1.07 GiB of
+//     projections 512 times — 59.1% of a prefill pass.
+//   - the activation column is loaded into registers once and reused across
+//     all RR rows. Without it, every weight row re-reads x, which is ~2.1 GB
+//     of L2 traffic per call at 512 tokens.
+//
+// The tile width is specialized rather than fixed, because a fixed width is
+// wrong at one end or the other. Measured tok/s with a fixed width and RR = 1:
 //
 //   tokens    tile 8   tile 16   tile 32   tile 64
 //       19    208.80    208.57    164.52    115.85
@@ -278,8 +310,8 @@ __global__ void gdn_proj_q8_0(
 // A wide tile wins at 512 and collapses at 19. The cause is the guarded path:
 // when fewer tokens are live than the tile is wide, every thread still carries
 // the full accumulator array — the register pressure is paid and the work is
-// not done. Choosing the widest tile that is fully live avoids that.
-#define GDN_PROJ_TILED(NAME, TT)                                              \
+// not done. `proj_tile_for` picks the widest fully-live tile.
+#define GDN_PROJ_TILED(NAME, TT, RR)                                          \
 __global__ void NAME(                                                         \
     const unsigned char* __restrict__ weight,                                 \
     const float* __restrict__ x,                                              \
@@ -289,53 +321,69 @@ __global__ void NAME(                                                         \
     int n_tokens                                                              \
 ) {                                                                           \
     int lane = threadIdx.x;                                                   \
-    int n    = blockIdx.x * blockDim.y + threadIdx.y;                         \
-    if (n >= n_rows) return;                                                  \
+    int n0   = (blockIdx.x * blockDim.y + threadIdx.y) * (RR);                \
+    if (n0 >= n_rows) return;                                                 \
     int t0 = blockIdx.y * (TT);                                               \
     if (t0 >= n_tokens) return;                                               \
                                                                               \
     int blocks = k_dim / 32;                                                  \
-    const unsigned char* row = weight + (long long)n * blocks * 34;           \
+    int live_t = n_tokens - t0; if (live_t > (TT)) live_t = (TT);             \
+    int live_r = n_rows  - n0; if (live_r > (RR)) live_r = (RR);              \
                                                                               \
-    float acc[TT];                                                            \
+    float acc[RR][TT];                                                        \
     _Pragma("unroll")                                                         \
-    for (int i = 0; i < (TT); ++i) acc[i] = 0.0f;                             \
-                                                                              \
-    if (t0 + (TT) <= n_tokens) {                                              \
-        for (int b = 0; b < blocks; ++b) {                                    \
-            const unsigned char* blk = row + (long long)b * 34;               \
-            float w = (float)(signed char)blk[2 + lane] * load_half_le(blk);  \
-            int kidx = b * 32 + lane;                                         \
-            _Pragma("unroll")                                                 \
-            for (int i = 0; i < (TT); ++i) {                                  \
-                acc[i] += w * x[(long long)(t0 + i) * k_dim + kidx];          \
-            }                                                                 \
-        }                                                                     \
+    for (int r = 0; r < (RR); ++r)                                            \
         _Pragma("unroll")                                                     \
-        for (int i = 0; i < (TT); ++i) {                                      \
-            float s = warp_reduce_sum(acc[i]);                                \
-            if (lane == 0) out[(long long)(t0 + i) * n_rows + n] = s;         \
+        for (int i = 0; i < (TT); ++i) acc[r][i] = 0.0f;                      \
+                                                                              \
+    if (live_t == (TT) && live_r == (RR)) {                                   \
+        for (int b = 0; b < blocks; ++b) {                                    \
+            int kidx = b * 32 + lane;                                         \
+            /* One load of the activation column, reused across all RR    */  \
+            /* weight rows. This is the whole point: without it each row   */  \
+            /* re-reads x, and x is re-read ~500 times per pass at 512     */  \
+            /* tokens -- 2.1 GB of L2 traffic per projection call.         */  \
+            float xv[TT];                                                     \
+            _Pragma("unroll")                                                 \
+            for (int i = 0; i < (TT); ++i)                                    \
+                xv[i] = x[(long long)(t0 + i) * k_dim + kidx];                \
+            _Pragma("unroll")                                                 \
+            for (int r = 0; r < (RR); ++r) {                                  \
+                const unsigned char* blk =                                    \
+                    weight + (long long)(n0 + r) * blocks * 34 + b * 34;      \
+                float w = (float)(signed char)blk[2 + lane]                   \
+                        * load_half_le(blk);                                  \
+                _Pragma("unroll")                                             \
+                for (int i = 0; i < (TT); ++i) acc[r][i] += w * xv[i];        \
+            }                                                                 \
         }                                                                     \
     } else {                                                                  \
-        int live = n_tokens - t0;                                             \
         for (int b = 0; b < blocks; ++b) {                                    \
-            const unsigned char* blk = row + (long long)b * 34;               \
-            float w = (float)(signed char)blk[2 + lane] * load_half_le(blk);  \
             int kidx = b * 32 + lane;                                         \
-            for (int i = 0; i < live; ++i) {                                  \
-                acc[i] += w * x[(long long)(t0 + i) * k_dim + kidx];          \
+            float xv[TT];                                                     \
+            for (int i = 0; i < live_t; ++i)                                  \
+                xv[i] = x[(long long)(t0 + i) * k_dim + kidx];                \
+            for (int r = 0; r < live_r; ++r) {                                \
+                const unsigned char* blk =                                    \
+                    weight + (long long)(n0 + r) * blocks * 34 + b * 34;      \
+                float w = (float)(signed char)blk[2 + lane]                   \
+                        * load_half_le(blk);                                  \
+                for (int i = 0; i < live_t; ++i) acc[r][i] += w * xv[i];      \
             }                                                                 \
         }                                                                     \
-        for (int i = 0; i < live; ++i) {                                      \
-            float s = warp_reduce_sum(acc[i]);                                \
-            if (lane == 0) out[(long long)(t0 + i) * n_rows + n] = s;         \
+    }                                                                         \
+                                                                              \
+    for (int r = 0; r < live_r; ++r) {                                        \
+        for (int i = 0; i < live_t; ++i) {                                    \
+            float sum = warp_reduce_sum(acc[r][i]);                           \
+            if (lane == 0)                                                    \
+                out[(long long)(t0 + i) * n_rows + (n0 + r)] = sum;           \
         }                                                                     \
     }                                                                         \
 }
 
-GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8)
-GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16)
-GDN_PROJ_TILED(gdn_proj_q8_0_t32, 32)
+GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8,  4)
+GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
 // out[t][n] = sum_k weight[n][k] * x[t][k], with `weight` an f32 GGUF tensor.
 //
@@ -901,7 +949,7 @@ pub struct GdnBlock {
     recurrent_scratch: GdnScratch,
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
-    proj_tiled: [CudaFunction; 3],
+    proj_tiled: [CudaFunction; 2],
     proj_f32: CudaFunction,
     silu: CudaFunction,
     split: CudaFunction,
@@ -954,7 +1002,6 @@ impl GdnBlock {
             proj_tiled: [
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
-                module.load_function("gdn_proj_q8_0_t32")?,
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
             silu: module.load_function("gdn_silu")?,
@@ -1269,9 +1316,10 @@ impl GdnBlock {
                     unsafe { builder.launch(cfg) }?;
                 } else {
                     let (slot, tile) = proj_tile_for(tokens);
+                    let rows = PROJ_ROWS[slot];
                     let tiled = LaunchConfig {
                         grid_dim: (
-                            (n_rows as u32).div_ceil(PROJ_WARPS),
+                            (n_rows as u32).div_ceil(PROJ_WARPS * rows),
                             (tokens as u32).div_ceil(tile),
                             1,
                         ),
@@ -1559,7 +1607,14 @@ mod tests {
         // written — finite, plausible, wrong.
         for t in PROJ_TILES {
             assert!(
-                GDN_BLOCK_SRC.contains(&format!("GDN_PROJ_TILED(gdn_proj_q8_0_t{t},")),
+                GDN_BLOCK_SRC
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(&format!(
+                        "GDN_PROJ_TILED(gdn_proj_q8_0_t{t}, {t}, {})",
+                        PROJ_ROWS[PROJ_TILES.iter().position(|&w| w == t).unwrap()],
+                    )),
                 "the kernel must instantiate a {t}-wide tile, because \
                  `proj_tile_for` will try to launch one",
             );
@@ -1582,29 +1637,45 @@ mod tests {
         }
         // And it must actually widen as the batch grows, or the whole
         // specialization is dead code that always launches tile 8.
+        assert_eq!(proj_tile_for(8).1, 8);
         assert_eq!(proj_tile_for(19).1, 16);
-        assert_eq!(proj_tile_for(128).1, 32);
-        assert_eq!(proj_tile_for(512).1, 32);
+        assert_eq!(proj_tile_for(512).1, 16);
     }
 
     #[test]
-    fn the_tiled_projection_reads_the_weight_once_per_tile_not_once_per_token() {
-        // The defect this kernel exists to fix is structural, not numeric: the
-        // untiled form indexes the token from `blockIdx.y`, so each token gets
-        // its own pass over the whole weight matrix. The tiled form must load
-        // the weight outside the token loop. Checked on the source because
-        // there is no numeric difference to assert on — both forms compute the
-        // same thing, one of them 8x slower.
+    fn the_tiled_projection_reads_each_operand_once_per_tile() {
+        // Both defects this kernel exists to fix are structural, not numeric —
+        // every version computes the same thing, just at very different cost,
+        // so there is nothing numeric to assert on and the source is the only
+        // place the property is visible.
+        //
+        // 1. The weight must be dequantized outside the *token* loop, or each
+        //    token re-reads the whole weight matrix (the original defect: 59%
+        //    of prefill).
+        // 2. The activation column must be loaded outside the *row* loop, or
+        //    each weight row re-reads x (~2.1 GB of L2 traffic per call).
         let tiled = GDN_BLOCK_SRC
             .split("#define GDN_PROJ_TILED")
             .nth(1)
             .expect("the tiled kernel must exist");
-        let weight_load = tiled
+        let activation_load = tiled
+            .find("xv[i] = x[")
+            .expect("the tiled kernel loads an activation column");
+        let row_loop = tiled
+            .find("for (int r = 0; r < (RR); ++r) {")
+            .expect("the tiled kernel loops over its row band");
+        assert!(
+            activation_load < row_loop,
+            "the activation column must be loaded before the row loop, or every \
+             weight row re-reads x and the row band buys nothing",
+        );
+
+        let weight_load = tiled[row_loop..]
             .find("load_half_le(blk)")
-            .expect("the tiled kernel dequantizes");
-        let token_loop = tiled
-            .find("for (int i = 0; i < (TT); ++i) {")
-            .expect("the tiled kernel loops over its token tile");
+            .expect("the tiled kernel dequantizes inside the row loop");
+        let token_loop = tiled[row_loop..]
+            .find("for (int i = 0; i < (TT); ++i) acc[r][i]")
+            .expect("the tiled kernel accumulates over its token tile");
         assert!(
             weight_load < token_loop,
             "the weight must be dequantized before the token loop, or the tile \

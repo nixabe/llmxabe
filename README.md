@@ -16,8 +16,8 @@ RTX 8000, written in Rust.
 > across sequences, and no CUDA graph capture. It generates token ids for one
 > sequence at a time. See [Milestones](#milestones) for the itemized state.
 >
-> Measured against llama.cpp on the same card: prefill **362.67 ± 2.97 tok/s**
-> at 512 tokens against 2,070.50 (**5.71× slower**), decode **65.0 tok/s**
+> Measured against llama.cpp on the same card: prefill **419.28 ± 2.37 tok/s**
+> at 512 tokens against 2,070.50 (**4.94× slower**), decode **64.1 tok/s**
 > against `tg128`'s 104.72 (**1.61× slower**). See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
