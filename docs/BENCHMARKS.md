@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,691**, 1,689–1,714 | **1.22× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,710**, 1,706–1,722 | **1.21× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1305,8 +1305,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | pad the staged activation row off a 32-bank stride | 1,630.00 | **1.13×** |
 | four keys per warp between attention barriers | 1,644.10 | 1.01× |
 | eight tokens at once in the GDN solve's output | 1,708.06 | 1.04× |
+| eight experts per router block instead of four | 1,721.84 | 1.02× |
 
-**8.50× overall.** No single change is more than 1.81×; the result is
+**8.57× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 

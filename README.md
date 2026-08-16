@@ -17,8 +17,8 @@ RTX 8000, written in Rust.
 > time — decode steps replay from a captured CUDA graph. See
 > [Milestones](#milestones) for the itemized state.
 >
-> Measured against llama.cpp on the same card: prefill **~1,691 tok/s**
-> at 512 tokens against 2,070.50 (**1.22× slower**), decode **104.4–105.8
+> Measured against llama.cpp on the same card: prefill **~1,710 tok/s**
+> at 512 tokens against 2,070.50 (**1.21× slower**), decode **104.4–105.8
 > tok/s** against `tg128`'s 104.72 (**level**). See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
@@ -72,10 +72,10 @@ years of CUDA tuning behind it, and the benchmarks make that concrete.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,691**, 1,689–1,714 | 1.22× slower |
+| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,710**, 1,706–1,722 | 1.21× slower |
 | Decode, warm | 104.72 ± 0.36 tok/s | **104.4–105.8** (thermal) | level |
 
-Prefill was 29.6× slower, then 10.3×, and is now 1.22× — **still a loss**, and
+Prefill was 29.6× slower, then 10.3×, and is now 1.21× — **still a loss**, and
 the project does not claim otherwise. Decode was 1.61× slower and is now
 **level**: 104.4–105.8 tok/s against `tg128`'s 104.72 ± 0.36, where the spread
 is this card's own thermal drift — 105.75 cold, 104.45 after an hour of

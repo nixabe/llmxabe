@@ -143,7 +143,22 @@ const ROUTER_TT: u32 = 8;
 /// read.
 const SHARED_MMA_MIN_TOKENS: usize = 128;
 /// Experts one router block covers. Mirrors `ROUTER_ET`.
-const ROUTER_ET: u32 = 4;
+///
+/// The router GEMM is deeply L2-bound: a block moves
+/// `(ROUTER_ET + ROUTER_TT) * hidden` floats to do `ROUTER_ET * ROUTER_TT *
+/// hidden` multiply-adds, so its arithmetic intensity is the harmonic mean of
+/// the two tile widths and widening the narrower one is what pays.
+///
+/// | experts per block | tok/s |
+/// | --- | ---: |
+/// | 4 | 1,693.17 |
+/// | **8** | **1,721.84** |
+/// | 16 | 1,707.63 |
+///
+/// 16 is past the knee: 128 accumulators per thread. Widening the *token*
+/// tile to 16 instead measured 1,703 — same register wall, and it also
+/// doubles the staged activation tile.
+const ROUTER_ET: u32 = 8;
 /// Contraction the router stages per trip. Mirrors `ROUTER_JC`, and **must**
 /// equal [`THREADS`] — that equality is what preserves the untiled kernel's
 /// per-thread summation order, which the router cannot afford to change.
@@ -245,7 +260,7 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
 // accumulators each thread holds. `ROUTER_JC` is the contraction staged per
 // trip and **must equal the block width**, which is what keeps each thread's
 // summation order identical to the untiled kernel's.
-#define ROUTER_ET 4
+#define ROUTER_ET 8
 #define ROUTER_JC 256
 
 // Instantiated at two token tile widths. `ROUTER_JC` equals the block width in
