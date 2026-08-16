@@ -15,6 +15,7 @@ pub mod gdn;
 pub mod gdn_chunked;
 pub mod layer_ops;
 pub mod lm_head;
+pub mod mma;
 pub mod moe;
 
 use std::collections::HashMap;

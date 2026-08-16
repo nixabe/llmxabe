@@ -45,6 +45,7 @@ pub mod compare;
 pub mod conv;
 pub mod gdn;
 pub mod gemv;
+pub mod mma;
 pub mod moe;
 pub mod norm;
 pub mod quant;
