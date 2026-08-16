@@ -300,10 +300,30 @@ __global__ void gdn_chunk_gram(
     // Sequential ascending accumulation over the head dimension, which is the
     // reference's order too — these two dot products are the one part of the
     // chunked form where the device and the host agree operand for operand.
-    for (int d = 0; d < head_dim; ++d) {
-        float ki = k_norm[base_i + d];
-        dot_kk += ki * sk[d];
-        dot_kq += ki * sq[d];
+    // The `float4` below is a **load** widening and nothing else: the four
+    // components are consumed x, y, z, w, so the additions happen in the same
+    // sequence they did one scalar at a time.
+    //
+    // It is worth widening because thread `i` owns a whole row and consecutive
+    // threads are `qk_heads * head_dim` floats apart, so this read cannot be
+    // coalesced across the warp however it is written. What it can be is
+    // wider: 16 bytes of every 32-byte sector used instead of 4, and a quarter
+    // of the load instructions. `head_dim` is validated to be a multiple of
+    // 32 and every base offset is a multiple of it, so the alignment holds by
+    // construction.
+    const float4* ki4 = (const float4*)(k_norm + base_i);
+    int nd4 = head_dim >> 2;
+    for (int d4 = 0; d4 < nd4; ++d4) {
+        float4 kv = ki4[d4];
+        int d = d4 << 2;
+        dot_kk += kv.x * sk[d];
+        dot_kq += kv.x * sq[d];
+        dot_kk += kv.y * sk[d + 1];
+        dot_kq += kv.y * sq[d + 1];
+        dot_kk += kv.z * sk[d + 2];
+        dot_kq += kv.z * sq[d + 2];
+        dot_kk += kv.w * sk[d + 3];
+        dot_kq += kv.w * sq[d + 3];
     }
 
     long long o = ((long long)hq * c + t) * c + i;
@@ -380,13 +400,26 @@ __global__ void gdn_chunk_inter(
 
     // `s` is loaded once and multiplied into every carried token, which is the
     // whole point: the inner loop is now INTER_TT multiply-adds per state
-    // element instead of one.
-    for (int j = 0; j < head_dim; ++j) {
-        float s = row[j];
+    // element instead of one. The `float4` widens the load only — the four
+    // components are consumed x, y, z, w, so each accumulator still sums over
+    // `j` ascending.
+    const float4* row4 = (const float4*)row;
+    int nj4 = head_dim >> 2;
+    for (int j4 = 0; j4 < nj4; ++j4) {
+        float4 sv = row4[j4];
+        int j = j4 << 2;
         #pragma unroll
         for (int u = 0; u < INTER_TT; ++u) {
-            acc_k[u] += s * sk[u * head_dim + j];
-            acc_q[u] += s * sq[u * head_dim + j];
+            const float* krow = sk + u * head_dim + j;
+            const float* qrow = sq + u * head_dim + j;
+            acc_k[u] += sv.x * krow[0];
+            acc_q[u] += sv.x * qrow[0];
+            acc_k[u] += sv.y * krow[1];
+            acc_q[u] += sv.y * qrow[1];
+            acc_k[u] += sv.z * krow[2];
+            acc_q[u] += sv.z * qrow[2];
+            acc_k[u] += sv.w * krow[3];
+            acc_q[u] += sv.w * qrow[3];
         }
     }
 
