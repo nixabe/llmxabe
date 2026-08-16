@@ -996,10 +996,20 @@ impl MoeBlock {
 
         // 4. the shared expert, ungated — the kernel implements `expert_mlp`
         //    and nothing else.
+        // Gated on **this pass's** token count, not merely on the repacked
+        // weights existing. `Forward::reshape` shares one
+        // `Vec<MoeLayerWeights>` between a wide prefill pass and a one-token
+        // decode pass, so a decode step inherits whatever the prefill upload
+        // repacked. Checking only for the repack sent every decode step down
+        // the six-launch integer path to fill one slot of a 64-token tile, and
+        // cost 57% of decode throughput — 15.39 ms per step became 24.13 —
+        // while `bench_forward`'s n = 1 column, which builds its own weights
+        // and so never repacks, showed nothing wrong.
+        let wide_enough = g.max_tokens >= SHARED_MMA_MIN_TOKENS;
         match w
             .shared_int8
             .as_ref()
-            .filter(|_| self.moe.tensor_cores_enabled())
+            .filter(|_| wide_enough && self.moe.tensor_cores_enabled())
         {
             Some(i8w) => self.moe.shared_expert_mma(
                 stream,
