@@ -423,6 +423,88 @@ than 73.48.
 before there was a KV cache. Real decode is measured in the next section, and
 it turns out the floor was the *pessimistic* proxy, not the flattering one.
 
+## The Gated DeltaNet projections were 59% of prefill (2026-08-16)
+
+Profiling prefill at 512 tokens after the MoE tiling showed the bottleneck had
+**moved**, and the documentation had not:
+
+| kernel | ms/pass | % of a 2,523 ms pass |
+| --- | ---: | ---: |
+| `gdn_proj_q8_0` | **1,491.6** | **59.1%** |
+| `moe_expert_ffn` | 249.8 | 9.9% |
+| `moe_expert_down` | 227.1 | 9.0% |
+| `gdn_chunk_inter` | 147.7 | 5.9% |
+| `lm_head_gemv_b8` | 135.1 | 5.4% |
+
+"The MoE GEMM is 67-77% of every pass" was true before the tiling and is now
+false — the MoE is 18.9%. Anything still reasoning from that number is
+reasoning from a fixed bug.
+
+**The defect was the same one the MoE had.** `gdn_proj_q8_0`'s grid was
+`(N / warps, tokens)` — one warp per *(output row, token)* pair — so the
+weight matrix was re-read once per token. At 512 tokens that is 1.07 GiB read
+512 times: 548 GB per pass, moved at 367 GB/s. The kernel was running at 55%
+of peak bandwidth and doing 512x the necessary work.
+
+Tiling it over tokens — a warp owns one output row and `PROJ_TILE` tokens, and
+each dequantized weight element is multiplied into every accumulator before
+being dropped — takes that kernel from **1,491.6 ms to 479.3 ms**.
+
+### The tile width has to be specialized
+
+A fixed width is wrong at one end or the other:
+
+| tokens | tile 8 | tile 16 | tile 32 | tile 64 |
+| ---: | ---: | ---: | ---: | ---: |
+| 19 | **208.80** | 208.57 | 164.52 | 115.85 |
+| 128 | 319.15 | 324.89 | **332.28** | 328.05 |
+| 512 | 339.94 | 347.20 | 359.18 | **360.12** |
+
+A 32-wide tile costs 21% at 19 tokens. The cause is the guarded path: when
+fewer tokens are live than the tile is wide, every thread still carries the
+full accumulator array, so the register pressure is paid and the work is not
+done. `proj_tile_for` picks the widest fully-live tile, which beats every
+fixed width at every batch size.
+
+### End to end
+
+| tokens | before | after | speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 55.07 | 67.27 | 1.22x |
+| 19 | 154.46 | 211.24 | 1.37x |
+| 128 | 192.43 | 338.65 | 1.76x |
+| 512 | 200.87 | **362.67 ± 2.97** | **1.81x** |
+
+**Prefill against llama.cpp's `pp512` 2,070.50: 10.3x slower -> 5.71x
+slower.** Peak VRAM unchanged at 31.03 GiB.
+
+Decode is **unchanged at ~65 tok/s**, and that is expected rather than
+disappointing: at one token the weight is already read exactly once, so there
+is nothing to tile and the dispatch keeps the untiled kernel. Decode's problem
+is streaming efficiency, not redundant reads.
+
+Correctness is unchanged: `forward_pass` still reproduces llama.cpp's argmax
+25358 with an identical accumulation curve (111.6x absolute, 3.9x relative
+L2), and all three decode paths still agree at cosine 1.000000000.
+
+### What is now the prefill bottleneck
+
+| kernel | ms/pass | % of a 1,490 ms pass |
+| --- | ---: | ---: |
+| `gdn_proj_q8_0_tiled` | 479.3 | 32.2% |
+| `moe_expert_ffn` | 247.0 | 16.6% |
+| `moe_expert_down` | 224.9 | 15.1% |
+| `gdn_chunk_inter` | 141.1 | 9.5% |
+| `lm_head_gemv_b8` | 133.4 | 9.0% |
+
+Still the same kernel, now at a third of the pass rather than three fifths.
+The floor is reading the weight *once* per pass — 1.07 GiB, ~1.6 ms at peak
+bandwidth — against 479.3 ms today, so tiling has taken 3.1x of a possible
+512x and the remaining distance is not more tiling but arithmetic: at 512
+tokens this projection is a dense fp32 GEMM, and fp32 is the ceiling
+[the int8 MMA work](#the-two-halves-of-the-goal-are-two-different-problems)
+exists to break.
+
 ## Where decode actually goes, and why prefill needs tensor cores (2026-08-16)
 
 Measured with `nsys` over 200 decode steps at a 128-token prompt, GPU 0.

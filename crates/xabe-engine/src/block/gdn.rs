@@ -149,6 +149,29 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 /// Warps per projection block. One warp owns one output row.
 const PROJ_WARPS: u32 = 4;
 
+/// Token tile widths the projection is specialized for, ascending.
+///
+/// Spelled here and in the kernel source, which NVRTC compiles from a string
+/// with no access to Rust constants;
+/// `the_projection_tiles_match_the_kernel` asserts the two agree.
+const PROJ_TILES: [u32; 3] = [8, 16, 32];
+
+/// Which specialization to launch for `tokens`, and its width.
+///
+/// The widest tile that is *fully live*. A partial tile takes the guarded
+/// path, where every thread still carries the whole accumulator array and only
+/// part of it does any work; measured, using a 32-wide tile for a 19-token
+/// batch costs 21% (208.8 to 164.5 tok/s).
+fn proj_tile_for(tokens: usize) -> (usize, u32) {
+    let mut chosen = 0;
+    for (i, &t) in PROJ_TILES.iter().enumerate() {
+        if tokens >= t as usize {
+            chosen = i;
+        }
+    }
+    (chosen, PROJ_TILES[chosen])
+}
+
 /// Threads per block for the elementwise kernels.
 const ELEMENTWISE_BLOCK: u32 = 256;
 
@@ -219,6 +242,100 @@ __global__ void gdn_proj_q8_0(
         out[(long long)t * n_rows + n] = acc;
     }
 }
+
+// The same projection, tiled over tokens.
+//
+// `gdn_proj_q8_0` above gives each (output row, token) pair its own warp, so
+// the weight matrix is re-read once per token. That is invisible at decode,
+// where there is one token and the weight is read exactly once — and it is
+// catastrophic at prefill, where 512 tokens re-read 1.07 GiB of Gated
+// DeltaNet projections 512 times. Measured before this kernel existed:
+// `gdn_proj_q8_0` was 1,491.6 ms of a 2,523 ms prefill pass, 59.1%, moving
+// 548 GB at 367 GB/s — an efficient kernel doing 512x the necessary work.
+//
+// Here a warp owns one output row and PROJ_TILE *tokens*. The dequantized
+// weight element is loaded once and multiplied into all PROJ_TILE
+// accumulators before being dropped, so the stack is read once per tile of
+// tokens rather than once per token. This is exactly the transformation that
+// took the MoE grouped GEMM from 110.9 ms to 11.9 ms per layer at 512 tokens.
+//
+// The activations are *not* staged in shared memory. One tile is
+// PROJ_TILE * k_dim * 4 = 64 KiB at k_dim 2048, which does not fit in the
+// 48 KiB a block may request. They do not need to be: every block in a row
+// band reads the same tile, so the 6 MiB L2 serves them, and lanes read
+// consecutive `kidx` so each access is coalesced.
+//
+// grid: (ceil(N / warps), ceil(tokens / PROJ_TILE)). block: (32, warps).
+// The tile width is specialized rather than fixed, because the best width is a
+// function of the batch and the two ends disagree sharply. Measured tok/s end
+// to end, sweeping a *fixed* width:
+//
+//   tokens    tile 8   tile 16   tile 32   tile 64
+//       19    208.80    208.57    164.52    115.85
+//      128    319.15    324.89    332.28    328.05
+//      512    339.94    347.20    359.18    360.12
+//
+// A wide tile wins at 512 and collapses at 19. The cause is the guarded path:
+// when fewer tokens are live than the tile is wide, every thread still carries
+// the full accumulator array — the register pressure is paid and the work is
+// not done. Choosing the widest tile that is fully live avoids that.
+#define GDN_PROJ_TILED(NAME, TT)                                              \
+__global__ void NAME(                                                         \
+    const unsigned char* __restrict__ weight,                                 \
+    const float* __restrict__ x,                                              \
+    float* __restrict__ out,                                                  \
+    int k_dim,                                                                \
+    int n_rows,                                                               \
+    int n_tokens                                                              \
+) {                                                                           \
+    int lane = threadIdx.x;                                                   \
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;                         \
+    if (n >= n_rows) return;                                                  \
+    int t0 = blockIdx.y * (TT);                                               \
+    if (t0 >= n_tokens) return;                                               \
+                                                                              \
+    int blocks = k_dim / 32;                                                  \
+    const unsigned char* row = weight + (long long)n * blocks * 34;           \
+                                                                              \
+    float acc[TT];                                                            \
+    _Pragma("unroll")                                                         \
+    for (int i = 0; i < (TT); ++i) acc[i] = 0.0f;                             \
+                                                                              \
+    if (t0 + (TT) <= n_tokens) {                                              \
+        for (int b = 0; b < blocks; ++b) {                                    \
+            const unsigned char* blk = row + (long long)b * 34;               \
+            float w = (float)(signed char)blk[2 + lane] * load_half_le(blk);  \
+            int kidx = b * 32 + lane;                                         \
+            _Pragma("unroll")                                                 \
+            for (int i = 0; i < (TT); ++i) {                                  \
+                acc[i] += w * x[(long long)(t0 + i) * k_dim + kidx];          \
+            }                                                                 \
+        }                                                                     \
+        _Pragma("unroll")                                                     \
+        for (int i = 0; i < (TT); ++i) {                                      \
+            float s = warp_reduce_sum(acc[i]);                                \
+            if (lane == 0) out[(long long)(t0 + i) * n_rows + n] = s;         \
+        }                                                                     \
+    } else {                                                                  \
+        int live = n_tokens - t0;                                             \
+        for (int b = 0; b < blocks; ++b) {                                    \
+            const unsigned char* blk = row + (long long)b * 34;               \
+            float w = (float)(signed char)blk[2 + lane] * load_half_le(blk);  \
+            int kidx = b * 32 + lane;                                         \
+            for (int i = 0; i < live; ++i) {                                  \
+                acc[i] += w * x[(long long)(t0 + i) * k_dim + kidx];          \
+            }                                                                 \
+        }                                                                     \
+        for (int i = 0; i < live; ++i) {                                      \
+            float s = warp_reduce_sum(acc[i]);                                \
+            if (lane == 0) out[(long long)(t0 + i) * n_rows + n] = s;         \
+        }                                                                     \
+    }                                                                         \
+}
+
+GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8)
+GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16)
+GDN_PROJ_TILED(gdn_proj_q8_0_t32, 32)
 
 // out[t][n] = sum_k weight[n][k] * x[t][k], with `weight` an f32 GGUF tensor.
 //
@@ -784,6 +901,7 @@ pub struct GdnBlock {
     recurrent_scratch: GdnScratch,
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
+    proj_tiled: [CudaFunction; 3],
     proj_f32: CudaFunction,
     silu: CudaFunction,
     split: CudaFunction,
@@ -833,6 +951,11 @@ impl GdnBlock {
             recurrent_scratch,
             chunked_scratch,
             proj_q8_0: module.load_function("gdn_proj_q8_0")?,
+            proj_tiled: [
+                module.load_function("gdn_proj_q8_0_t8")?,
+                module.load_function("gdn_proj_q8_0_t16")?,
+                module.load_function("gdn_proj_q8_0_t32")?,
+            ],
             proj_f32: module.load_function("gdn_proj_f32")?,
             silu: module.load_function("gdn_silu")?,
             split: module.load_function("gdn_split_qkv")?,
@@ -1112,6 +1235,7 @@ impl GdnBlock {
         };
         let k_i32 = k_dim as i32;
         let n_i32 = n_rows as i32;
+        let t_i32 = tokens as i32;
 
         match weight {
             Projection::Q8_0(bytes) => {
@@ -1123,19 +1247,53 @@ impl GdnBlock {
                         got: bytes.len(),
                     });
                 }
-                let mut builder = stream.launch_builder(&self.proj_q8_0);
-                builder
-                    .arg(bytes)
-                    .arg(x)
-                    .arg(&mut *out)
-                    .arg(&k_i32)
-                    .arg(&n_i32);
-                // SAFETY: one warp per output row over a grid covering `n_rows`
-                // rows and returning above it, so the last byte any lane reads
-                // is `(n_rows - 1) * (k_dim/32) * 34 + 33`, which is the length
-                // checked immediately above. `x` and `out` were length-checked
-                // against `tokens * k_dim` and `tokens * n_rows`.
-                unsafe { builder.launch(cfg) }?;
+                // One token has nothing to tile: the weight is already read
+                // exactly once, and the tiled kernel would carry seven unused
+                // accumulators per thread for no benefit. Above one token the
+                // untiled kernel re-reads the whole weight matrix per token,
+                // which was 59.1% of a 512-token prefill pass.
+                if tokens == 1 {
+                    let mut builder = stream.launch_builder(&self.proj_q8_0);
+                    builder
+                        .arg(bytes)
+                        .arg(x)
+                        .arg(&mut *out)
+                        .arg(&k_i32)
+                        .arg(&n_i32);
+                    // SAFETY: one warp per output row over a grid covering
+                    // `n_rows` rows and returning above it, so the last byte
+                    // any lane reads is `(n_rows - 1) * (k_dim/32) * 34 + 33`,
+                    // which is the length checked immediately above. `x` and
+                    // `out` were length-checked against `tokens * k_dim` and
+                    // `tokens * n_rows`.
+                    unsafe { builder.launch(cfg) }?;
+                } else {
+                    let (slot, tile) = proj_tile_for(tokens);
+                    let tiled = LaunchConfig {
+                        grid_dim: (
+                            (n_rows as u32).div_ceil(PROJ_WARPS),
+                            (tokens as u32).div_ceil(tile),
+                            1,
+                        ),
+                        block_dim: (32, PROJ_WARPS, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut builder = stream.launch_builder(&self.proj_tiled[slot]);
+                    builder
+                        .arg(bytes)
+                        .arg(x)
+                        .arg(&mut *out)
+                        .arg(&k_i32)
+                        .arg(&n_i32)
+                        .arg(&t_i32);
+                    // SAFETY: as above for the weight, which is indexed
+                    // identically. The token axis is covered by
+                    // `ceil(tokens / PROJ_TILE)` blocks that return above
+                    // `n_tokens`, and the ragged final tile takes the guarded
+                    // path, so no lane reads `x` or writes `out` past
+                    // `tokens - 1`.
+                    unsafe { builder.launch(tiled) }?;
+                }
             }
             Projection::F32(values) => {
                 check_len("project f32 weight", n_rows * k_dim, values.len())?;
@@ -1393,6 +1551,67 @@ fn check_len(what: &'static str, expected: usize, got: usize) -> Result<(), GdnB
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_projection_tiles_match_the_kernel() {
+        // NVRTC compiles from a string with no access to Rust constants, so
+        // the tile width is spelled twice. If they drift, the launch grid
+        // stops covering the token axis and the tail tokens are silently never
+        // written — finite, plausible, wrong.
+        for t in PROJ_TILES {
+            assert!(
+                GDN_BLOCK_SRC.contains(&format!("GDN_PROJ_TILED(gdn_proj_q8_0_t{t},")),
+                "the kernel must instantiate a {t}-wide tile, because \
+                 `proj_tile_for` will try to launch one",
+            );
+        }
+        // The chooser picks the widest fully-live tile, falling back to the
+        // narrowest available when the batch is smaller than any of them —
+        // 2 tokens must still be projected, and the guarded path handles the
+        // partial tile exactly as the untiled kernel would have.
+        for tokens in [2usize, 8, 15, 16, 31, 32, 128, 512] {
+            let (slot, tile) = proj_tile_for(tokens);
+            assert_eq!(tile, PROJ_TILES[slot]);
+            if tokens >= PROJ_TILES[0] as usize {
+                assert!(
+                    tile as usize <= tokens,
+                    "{tokens} tokens chose a {tile}-wide tile, which is never fully live",
+                );
+            } else {
+                assert_eq!(tile, PROJ_TILES[0], "a sub-tile batch takes the narrowest");
+            }
+        }
+        // And it must actually widen as the batch grows, or the whole
+        // specialization is dead code that always launches tile 8.
+        assert_eq!(proj_tile_for(19).1, 16);
+        assert_eq!(proj_tile_for(128).1, 32);
+        assert_eq!(proj_tile_for(512).1, 32);
+    }
+
+    #[test]
+    fn the_tiled_projection_reads_the_weight_once_per_tile_not_once_per_token() {
+        // The defect this kernel exists to fix is structural, not numeric: the
+        // untiled form indexes the token from `blockIdx.y`, so each token gets
+        // its own pass over the whole weight matrix. The tiled form must load
+        // the weight outside the token loop. Checked on the source because
+        // there is no numeric difference to assert on — both forms compute the
+        // same thing, one of them 8x slower.
+        let tiled = GDN_BLOCK_SRC
+            .split("#define GDN_PROJ_TILED")
+            .nth(1)
+            .expect("the tiled kernel must exist");
+        let weight_load = tiled
+            .find("load_half_le(blk)")
+            .expect("the tiled kernel dequantizes");
+        let token_loop = tiled
+            .find("for (int i = 0; i < (TT); ++i) {")
+            .expect("the tiled kernel loops over its token tile");
+        assert!(
+            weight_load < token_loop,
+            "the weight must be dequantized before the token loop, or the tile \
+             buys nothing",
+        );
+    }
+
     use super::*;
 
     /// Where a snippet starts in the kernel source, or a failure naming it.
