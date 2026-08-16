@@ -2423,3 +2423,119 @@ of three to five.
 
 Decode is unchanged at **104.24 tok/s**, above the 100 tok/s floor the goal
 sets for it. Prefill was the half of the goal that was behind; it no longer is.
+
+## Context sweep and parallel sequences (2026-08-17)
+
+The request was `-np 3` at 32K / 64K / 96K. Two of the three axes are things
+this engine cannot do at all today, and that is the headline rather than a
+footnote.
+
+### llmxabe has no parallel-sequence path, and caps at 6,144 tokens
+
+**`-np 3` does not exist here.** There is no cross-sequence batching and no
+serving surface; every benchmark below is a single sequence. That is the
+already-tracked gap, not a new discovery.
+
+**32K, 64K and 96K are also out of reach.** Two separate limits, found in that
+order:
+
+1. A geometry guard refused any context past about **7,168 tokens** — it
+   compared the dispatch *slot* count against the 65,535 `grid.y` limit when
+   every launch actually puts the dispatch *block* count there, `block_size`
+   times smaller. Fixed; see the commit. It was a real units bug.
+2. Underneath it, **VRAM binds first at 6,144 tokens**, at 45.13 GiB of the
+   card's 47.27. So fixing the guard raised nothing on this hardware today.
+
+The binding constraint is that prefill activations are sized by `max_tokens`
+with no chunked-prefill path: the whole sequence is resident at once. 6,144
+tokens costs about 14 GiB on top of the weights, or ~2.3 MB per token, which
+is far more than the ~8 KB/token a hidden-state row needs — per-layer scratch
+is not being shared across layers. That is the thing to fix before any of the
+requested context lengths are measurable, and it is a memory-model change, not
+a kernel one.
+
+### Where llmxabe actually stands, single sequence
+
+`bench_forward` (cold full forward, no KV cache — comparable to `pp`) and
+`bench_decode` (128 steps at depth), 3 rounds each:
+
+| context | llmxabe prefill tok/s | llmxabe decode tok/s |
+| ---: | ---: | ---: |
+| 128 | 1,298.9 | 102.5 |
+| 512 | 2,339.6 | 96.8 |
+| 2,048 | **2,633.6** | 77.7 |
+| 4,096 | 2,371.3 | — |
+| 6,144 | 1,985.9 | — |
+| 8,192 | out of memory | out of memory |
+
+Prefill **peaks at 2,048 tokens and falls away**: the MoE weight read is a
+fixed cost per pass and amortizes over more tokens up to that point, after
+which quadratic attention and memory pressure take it back. Decode goes the
+other way and degrades monotonically with depth, 102.5 → 77.7 from 128 to
+2,048.
+
+### llama.cpp, same card, `-npl 1` and `-npl 3`
+
+`llama-batched-bench -ntg 128 -fa 1`, 3 rounds at the short depths and 1 at the
+long ones. **llama.cpp defaults to all three GPUs**; the 1-GPU column is the
+like-for-like comparison against llmxabe and was measured with
+`CUDA_VISIBLE_DEVICES=0`.
+
+Prefill tok/s, 3 GPUs:
+
+| context | `-npl 1` | `-npl 3` | batching gain |
+| ---: | ---: | ---: | ---: |
+| 128 | 859.8 | 1,583.5 | 1.84x |
+| 512 | 1,862.9 | 2,515.6 | 1.35x |
+| 2,048 | 3,582.3 | 4,286.5 | 1.20x |
+| 32,768 | 3,686.3 | 3,677.2 | 1.00x |
+| 65,536 | 3,150.8 | 3,125.7 | 0.99x |
+| 98,304 | 2,738.0 | 2,711.9 | 0.99x |
+
+Decode tok/s, 3 GPUs — this is where three sequences pay:
+
+| context | `-npl 1` | `-npl 3` | gain |
+| ---: | ---: | ---: | ---: |
+| 128 | 95.4 | 182.3 | 1.91x |
+| 512 | 98.9 | 191.6 | 1.94x |
+| 2,048 | 104.2 | 189.1 | 1.81x |
+| 32,768 | 81.2 | 121.6 | 1.50x |
+| 65,536 | 80.5 | 123.4 | 1.53x |
+| 98,304 | 73.3 | 110.0 | 1.50x |
+
+**Batching is a decode feature, not a prefill one.** At 32K and beyond a single
+prefill already saturates the card, so three of them together buy nothing;
+decode is latency-bound per step and three sequences share the same weight
+read, which is worth 1.5–1.9x throughout.
+
+### The multi-GPU split is worth nothing at short context and 2.1x at long
+
+| context | llama.cpp 1 GPU | llama.cpp 3 GPUs | ratio |
+| ---: | ---: | ---: | ---: |
+| 512 (`llama-bench pp512`) | 2,069.4 | 2,030.2 | 0.98x |
+| 32,768 (`-npl 1`) | 1,729.9 | 3,686.3 | 2.13x |
+| 65,536 (`-npl 1`) | 1,410.4 | 3,150.8 | 2.23x |
+
+This matters for reading every earlier head-to-head in this document. Layer
+split is a sequential pipeline — it adds capacity, not parallelism — so at 512
+tokens it is worth nothing, and the **1.136x measured against llama.cpp was
+not flattered by the extra cards**: re-measured against a single GPU it is
+2,347.4 against 2,069.4, or **1.134x**. At long context the extra cards
+matter enormously, and llmxabe has no answer at those lengths at all.
+
+### Summary of the standing
+
+| | llmxabe | llama.cpp (1 GPU) |
+| --- | --- | --- |
+| prefill @512 | **2,347** | 2,069 |
+| prefill @2,048 | **2,634** | 3,582 (3 GPU) |
+| prefill @32K+ | cannot run | 1,410–1,730 |
+| decode @2,048 | 77.7 | 104.2 |
+| parallel sequences | none | 1.5–1.9x at `-npl 3` |
+| max context | 6,144 | 98,304+ |
+
+The prefill goal is met and then some at the length it was set at. It is met
+*only* at that length: at 2,048 tokens llmxabe is at 0.74x of llama.cpp, and
+past 6,144 it does not run. Long-context prefill and decode-at-depth are the
+two places the engine is now clearly behind, and both trace to the same
+missing piece — a chunked prefill with a shared activation arena.
