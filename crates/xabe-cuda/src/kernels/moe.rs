@@ -878,6 +878,81 @@ __global__ void moe_route(
 // them over `num_experts` blocks costs nothing.
 //
 // grid: (num_experts, 1, 1). Block `e` owns expert `e`.
+// The whole dispatch table in one block, for a one-token pass.
+//
+// `moe_align_count` and `moe_align_block_size` are shaped for a batch: 256
+// blocks, a block-wide tree reduction to count one expert's selections, a
+// 256-element serial prefix sum recomputed in every block, and a Hillis-Steele
+// scan per 256 flat pairs to place them. At one token there are **eight** flat
+// pairs. Every block was spending sixteen barriers and a 256-add serial scan
+// to discover that seven of its 256 threads had nothing to do, and the pair
+// cost 0.37 ms of a 10.3 ms decode step between them -- more than the shared
+// expert's entire feed-forward.
+//
+// With `numel` at eight, a thread can simply read all eight ids twice: once to
+// count its expert's selections and once to place them in ascending flat
+// order, which is the same order the scan produced. That makes the counts
+// private to a thread, which removes the reduction, the intermediate
+// `counts` array and the second launch along with it.
+//
+// The two barriers that remain are real: the fill must land before the
+// scatter overwrites part of it, and the prefix sum must be complete before
+// any thread reads its base.
+//
+// grid: (1,). block: MOE_THREADS.
+__global__ void moe_dispatch_t1(
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int num_experts,
+    int block_size,
+    int sorted_capacity,
+    int expert_capacity,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ expert_ids,
+    int* __restrict__ num_tokens_post_pad
+) {
+    int* cumsum = (int*)xabe_shared;              // num_experts + 1
+    int tid = threadIdx.x;
+    int numel = (*valid_tokens) * top_k;
+
+    for (int s = tid; s < sorted_capacity; s += blockDim.x) sorted_token_ids[s] = numel;
+    for (int b = tid; b < expert_capacity; b += blockDim.x) expert_ids[b] = -1;
+
+    // An expert with no tokens gets *zero* blocks, not a padded-empty one —
+    // the reference's `CEILDIV(0, block_size) == 0`.
+    for (int e = tid; e < num_experts; e += blockDim.x) {
+        int c = 0;
+        for (int i = 0; i < numel; ++i) {
+            if (topk_ids[i] == e) ++c;
+        }
+        cumsum[e + 1] = ((c + block_size - 1) / block_size) * block_size;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        cumsum[0] = 0;
+        for (int i = 0; i < num_experts; ++i) cumsum[i + 1] += cumsum[i];
+        *num_tokens_post_pad = cumsum[num_experts];
+    }
+    __syncthreads();
+
+    for (int e = tid; e < num_experts; e += blockDim.x) {
+        int base = cumsum[e];
+        int w = 0;
+        for (int i = 0; i < numel; ++i) {
+            if (topk_ids[i] == e) {
+                int slot = base + w;
+                if (slot < sorted_capacity) sorted_token_ids[slot] = i;
+                ++w;
+            }
+        }
+        int first = cumsum[e] / block_size;
+        int last  = cumsum[e + 1] / block_size;
+        for (int b = first; b < last && b < expert_capacity; ++b) expert_ids[b] = e;
+    }
+}
+
 __global__ void moe_align_count(
     const int* __restrict__ topk_ids,
     const int* __restrict__ valid_tokens,
@@ -1908,6 +1983,16 @@ __global__ void moe_shared_down_gemv(
 // -------------------------------------------------------------------------
 //
 // grid: max_tokens. Ascending k, matching the reference's per-token loop.
+// grid: (max_tokens, ceil(hidden / THREADS)).
+//
+// The second grid dimension is the whole point at one token. A block per
+// token means *one block* on a 72-SM card summing eight 2,048-float vectors:
+// 72 KiB of traffic in 5.2 us, which is 14 GB/s and entirely the launch's
+// own latency. Splitting the row gives the same work eight blocks.
+//
+// The k loop stays ascending and stays inside one thread, so the summation
+// order is untouched — the routed contributions of one expert are added in
+// selection order exactly as the reference adds them.
 __global__ void moe_reduce(
     const float* __restrict__ partial,
     const int* __restrict__ valid_tokens,
@@ -1917,13 +2002,13 @@ __global__ void moe_reduce(
 ) {
     int token = blockIdx.x;
     if (token >= *valid_tokens) return;
-    for (int h = threadIdx.x; h < hidden; h += blockDim.x) {
-        float acc = 0.0f;
-        for (int k = 0; k < top_k; ++k) {
-            acc += partial[((long long)token * top_k + k) * hidden + h];
-        }
-        out[(long long)token * hidden + h] = acc;
+    int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    float acc = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        acc += partial[((long long)token * top_k + k) * hidden + h];
     }
+    out[(long long)token * hidden + h] = acc;
 }
 
 // -------------------------------------------------------------------------
@@ -2372,6 +2457,7 @@ impl SharedExpertInt8 {
 
 pub struct MoeKernels {
     route: CudaFunction,
+    dispatch_t1: CudaFunction,
     align_count: CudaFunction,
     align: CudaFunction,
     expert_ffn: CudaFunction,
@@ -2453,6 +2539,7 @@ impl MoeKernels {
         let module = ctx.load_module(ptx)?;
         Ok(Self {
             route: module.load_function("moe_route")?,
+            dispatch_t1: module.load_function("moe_dispatch_t1")?,
             align_count: module.load_function("moe_align_count")?,
             align: module.load_function("moe_align_block_size")?,
             expert_ffn: module.load_function("moe_expert_ffn")?,
@@ -2631,6 +2718,34 @@ impl MoeKernels {
         let block_size = g.block_size as i32;
         let sorted_capacity = g.sorted_capacity() as i32;
         let expert_capacity = g.expert_block_capacity() as i32;
+
+        // One token is eight flat pairs, and one block can place them all —
+        // see `moe_dispatch_t1`.
+        if g.max_tokens == 1 {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: ((g.num_experts + 1) * size_of::<i32>()) as u32,
+            };
+            let mut builder = stream.launch_builder(&self.dispatch_t1);
+            builder
+                .arg(&buffers.topk_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&num_experts)
+                .arg(&block_size)
+                .arg(&sorted_capacity)
+                .arg(&expert_capacity)
+                .arg(&mut buffers.sorted_token_ids)
+                .arg(&mut buffers.expert_ids)
+                .arg(&mut buffers.num_tokens_post_pad);
+            // SAFETY: every write is bounded by `sorted_capacity` or
+            // `expert_capacity`, which are this geometry's own buffer lengths;
+            // `cumsum` holds `num_experts + 1` ints and the shared request
+            // above is exactly that.
+            unsafe { builder.launch(cfg) }?;
+            return Ok(());
+        }
 
         let cfg = LaunchConfig {
             grid_dim: (g.num_experts as u32, 1, 1),
@@ -2953,7 +3068,7 @@ impl MoeKernels {
         }
 
         let reduce_cfg = LaunchConfig {
-            grid_dim: (g.max_tokens as u32, 1, 1),
+            grid_dim: (g.max_tokens as u32, (g.hidden as u32).div_ceil(THREADS), 1),
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: 0,
         };

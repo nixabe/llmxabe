@@ -103,6 +103,13 @@ use xabe_model::weights::{Directory, Role};
 /// Threads per block for the three glue kernels below.
 const THREADS: u32 = 256;
 
+/// Threads in the fused gate-and-combine block.
+///
+/// That kernel is one block per token and its gate is a reduction over the
+/// full hidden dimension, so at one token the only parallelism available is
+/// the block's own width. sm_75's per-block ceiling is 1,024.
+const COMBINE_THREADS: u32 = 1024;
+
 /// Tokens the wide router instantiation carries. Mirrors its `TT`.
 const ROUTER_TT: u32 = 8;
 
@@ -158,6 +165,7 @@ const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
 /// in the same `valid_tokens` device scalar the MoE kernels already gate on,
 /// so adding these does not cost the sequence its capturability.
 const GLUE_SRC: &str = r#"
+#define MOE_GATE_LANES 256
 extern "C" {
 
 extern __shared__ float xabe_moe_block_shared[];
@@ -371,9 +379,24 @@ __global__ void moe_block_gate_and_combine(
     // uses it: that intrinsic's error is relative to the result, not to the
     // exponent. A drift test below asserts the intrinsic's name does not
     // appear anywhere in this kernel, so do not name it here either.
+    // **The dot product runs on the first MOE_GATE_LANES threads only, at
+    // that stride, whatever the block's width is.** The block is 1,024 threads
+    // wide because the combine below is elementwise and the kernel is one
+    // block per token; the gate is a floating-point sum, and widening *it*
+    // from 256 lanes to 1,024 reassociates 2,048 products. That is not a
+    // hypothetical: it moved the gate enough for `tests/forward_pass.rs` to
+    // report block 31's relative error against llama.cpp growing 4.82x with
+    // the absolute error growing too, which is the shape of a real change
+    // rather than a magnitude collapse.
+    //
+    // Threads past MOE_GATE_LANES contribute a literal zero, and adding zeros
+    // to a float sum changes nothing, so the reduction is bit-identical to
+    // the 256-thread block this kernel used to be.
     float s = 0.0f;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        s += w[j] * xs[j];
+    if (threadIdx.x < MOE_GATE_LANES) {
+        for (int j = threadIdx.x; j < hidden; j += MOE_GATE_LANES) {
+            s += w[j] * xs[j];
+        }
     }
     // Returns the total to every thread, which is what makes the barrier it
     // already contains do double duty here.
@@ -1074,10 +1097,16 @@ impl MoeBlock {
         //    computes, so the dependency is a barrier rather than a kernel
         //    boundary. Still `block_reduce_sum`, so it still needs one float
         //    per warp.
+        // A wider block than the rest of this module uses, because this one
+        // runs as a *single block per token*: the gate is a reduction over
+        // the whole hidden dimension, so it cannot be split across blocks
+        // without a second launch, and at one token that leaves one block on
+        // a 72-SM card. 1,024 threads is sm_75's ceiling and the widest that
+        // block can be.
         let cfg = LaunchConfig {
             grid_dim: (g.max_tokens as u32, 1, 1),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: ((THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
+            block_dim: (COMBINE_THREADS, 1, 1),
+            shared_mem_bytes: ((COMBINE_THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
         };
         let mut builder = stream.launch_builder(&self.combine_fn);
         builder

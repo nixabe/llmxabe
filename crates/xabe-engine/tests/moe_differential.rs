@@ -928,3 +928,96 @@ fn the_shared_expert_runs_for_every_token_with_no_routing() {
     );
     println!("shared expert ran for every token with no dispatch table consulted");
 }
+
+/// The one-token dispatch path against the same `moe_align_block_size`
+/// reference the batch path is held to.
+///
+/// A decode step builds its dispatch table with `moe_dispatch_t1`, a
+/// single-block kernel that exists because the batch shape — 256 blocks, a
+/// block-wide count reduction, a 256-add serial prefix sum per block and a
+/// Hillis-Steele scan to place the pairs — spends all of that discovering
+/// that eight flat pairs exist. It is a **different kernel**, and the test
+/// above never runs it: that one builds a 64-token geometry.
+///
+/// The failure it is here to catch is not a wrong answer on average. A
+/// dispatch table that places a pair in the wrong slot, or that leaves a
+/// stale slot from the previous step where the sentinel should be, runs a
+/// different expert for that token and produces fluent, finite, wrong output
+/// — which is why every slot is compared exactly, padding included, rather
+/// than the live prefix.
+///
+/// SKIPS — reporting that it skipped — without a driver or a supported device.
+#[test]
+fn the_one_token_dispatch_matches_the_reference_slot_for_slot() {
+    let Some(ctx) = device() else { return };
+    let mut g = geometry();
+    g.max_tokens = 1;
+    let stream = ctx.default_stream();
+    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+    let mut rng = Xorshift64Star::new(DISPATCH_SEED ^ 0x00D1_5A7C);
+    let live = vec![rng.vec_f32(g.num_experts, -8.0, 8.0)];
+    let d_logits = stream.clone_htod(&live[0]).expect("upload logits");
+    kernels
+        .set_valid_tokens(&stream, &mut buffers, 1)
+        .expect("valid_tokens");
+    let (ids, _) = device_routing(&kernels, &stream, &mut buffers, &d_logits);
+
+    let reference = route_batch(&live, g.experts_per_token);
+    let topk_ids: Vec<Vec<u32>> = reference.iter().map(|d| d.expert_ids.clone()).collect();
+    assert_eq!(
+        &device_ids_for(&ids, 0, g.experts_per_token),
+        &topk_ids[0],
+        "routing diverged before dispatch",
+    );
+
+    kernels
+        .build_dispatch(&stream, &mut buffers)
+        .expect("dispatch");
+    let d_sorted = stream
+        .clone_dtoh(buffers.sorted_token_ids())
+        .expect("sorted back");
+    let d_experts = stream
+        .clone_dtoh(buffers.expert_ids())
+        .expect("expert ids back");
+    let d_post_pad = stream
+        .clone_dtoh(buffers.num_tokens_post_pad())
+        .expect("post-pad back");
+    stream.synchronize().expect("sync");
+
+    let expected = moe_align_block_size(&topk_ids, g.block_size, g.num_experts);
+    let sentinel = padding_sentinel(1, g.experts_per_token);
+    let post_pad = d_post_pad[0] as usize;
+    assert_eq!(
+        post_pad, expected.num_tokens_post_pad,
+        "num_tokens_post_pad"
+    );
+
+    let device_sorted: Vec<u32> = d_sorted[..post_pad].iter().map(|&v| v as u32).collect();
+    assert_eq!(
+        device_sorted, expected.sorted_token_ids,
+        "sorted_token_ids differ — compared exactly, padding slots included",
+    );
+    let num_blocks = post_pad / g.block_size;
+    assert_eq!(
+        &d_experts[..num_blocks],
+        &expected.expert_ids[..],
+        "expert_ids differ",
+    );
+    assert!(
+        d_sorted[post_pad..].iter().all(|&v| v as u32 == sentinel),
+        "capacity past num_tokens_post_pad is not filled with the sentinel",
+    );
+    assert!(
+        d_experts[num_blocks..]
+            .iter()
+            .all(|&v| v == INACTIVE_EXPERT),
+        "capacity past the last active block is not INACTIVE_EXPERT",
+    );
+    println!(
+        "one token, top-{}: {} slots post-pad over {} blocks, every slot equal \
+         to the reference",
+        g.experts_per_token, post_pad, num_blocks,
+    );
+}
