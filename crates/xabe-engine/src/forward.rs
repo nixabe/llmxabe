@@ -748,11 +748,28 @@ impl Forward {
         // Shared through `reshape` like the MoE weights, and for the same
         // reason: a prefill pass and the decode pass driven over the same
         // sequence would otherwise hold two copies of 1.13 GiB.
+        // **Sharing is conditional on the donor having built it.** A pass that
+        // wants neither the tensor cores nor the one-token GEMV builds an
+        // empty vector, and `reshape` hands that empty vector to the shape it
+        // spawns. A decode pass reshaped from a prefill of 4..63 tokens
+        // therefore inherited *nothing* and fell back to the fp32 projection
+        // path, which cost 13% of every decode step — 9.7 ms became 11.0 —
+        // for no reason visible at the call site. Measured across a prompt
+        // sweep: 1, 64 and 128 gave 9.7 ms and 4, 8, 16 and 32 gave 11.0,
+        // because 1 and >=64 are exactly the two prompt lengths that build it.
+        let wants_repack = GdnBlock::uses_tensor_cores(tokens) || tokens == 1;
         let gdn_int8 = match gdn_int8 {
+            Some(shared) if shared.is_empty() && wants_repack => {
+                let mut built = Vec::new();
+                for w in &gdn_weights {
+                    built.push(gdn.repack(stream, w)?);
+                }
+                Arc::new(built)
+            }
             Some(shared) => shared,
             None => {
                 let mut built = Vec::new();
-                if GdnBlock::uses_tensor_cores(tokens) || tokens == 1 {
+                if wants_repack {
                     for w in &gdn_weights {
                         built.push(gdn.repack(stream, w)?);
                     }

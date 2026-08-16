@@ -1271,7 +1271,7 @@ prefill numbers in every section before it.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,361.42 ± 5.52 tok/s** | **1.52× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.00 tok/s**, 9.71 ms/step | **1.02× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.5 tok/s**, 9.66 ms/step | **1.01× slower** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1421,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.00 tok/s**, 9.71 ms/step | **1.02× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.5 tok/s**, 9.66 ms/step | **1.01× slower** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1445,6 +1445,9 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | alpha, beta and the GDN gates in one launch | 9.82 | 101.85 |
 | one-token convolution: output and cache advance fused | 9.76 | 102.46 |
 | routing and dispatch in one launch | 9.71 | 103.00 |
+| GDN output norm and SwiGLU in one launch | 9.67 | 103.45 |
+| residual add folded into the output projection | 9.59 | 104.28 |
+| fix a repack the reshape did not inherit | 9.59 | 104.28 |
 
 ### The one idea behind all of it
 
@@ -1592,6 +1595,36 @@ where it did not:
 - **Fusing the SiLU into the q/k/v split.** One fewer launch, and the same
   three-microsecond kernel — the split's block is half as wide as the SiLU's
   grid-stride shape, so each thread now does three exponentials instead of one.
+
+### Decode depends on the prompt that preceded it, and it should not
+
+A prompt sweep at 96 decode steps, before the fix in this section:
+
+| prompt | ms/step | tok/s |
+| ---: | ---: | ---: |
+| 1 | 9.76 | 102.5 |
+| 4 | 10.90 | 91.8 |
+| 8 | 10.97 | 91.2 |
+| 16 | 11.02 | 90.8 |
+| 32 | 10.98 | 91.1 |
+| 64 | 9.65 | 103.6 |
+| 128 | 9.78 | 102.2 |
+
+**A 13% cliff between 32 and 64, and 1 on the fast side of it.** Those are
+exactly the two prompt lengths that build the repacked int8 Gated DeltaNet
+projections: `tokens == 1` or `tokens >= MMA_SPLIT_TOKENS`, which is 64. A
+prompt of 4..63 builds neither — and `Forward::reshape` shares the repack by
+reference count, so the one-token pass it spawns inherited an **empty vector**
+and fell back to the fp32 projection path. Nothing at the call site says so.
+
+This is the second bug of exactly this shape this session; the first was the
+shared expert inheriting repacked weights it should not have used. Sharing by
+`Arc` between two passes with different needs is the hazard, and "the donor
+built it" is not the same question as "this shape wants it".
+
+Fixed by building the repack when the inherited one is empty and this shape
+wants it. The sweep is flat afterwards, varying only with the KV window:
+9.58 ms at 8 and 32, 9.64 at 64, 9.78 at 128.
 
 ### A measurement discipline note
 

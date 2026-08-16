@@ -247,6 +247,49 @@ __global__ void rope_partial(
 // fast intrinsic is good to ~2 ulp of the *result*, not of the exponent,
 // which on the negative tail is a relative error the tolerance would have to
 // be widened for. This is not a bottleneck.
+// RMSNorm and the SwiGLU multiply that consumes it, in one launch.
+//
+// The Gated DeltaNet's output norm is immediately multiplied by `silu(z)`,
+// and the two kernels cover exactly the same elements: the norm's grid is one
+// block per row of `width`, and the multiply is elementwise over
+// `rows * width`. So the multiply rides along in the norm's second pass, and
+// a decode step loses a launch per Gated DeltaNet layer.
+//
+// The reduction is untouched -- same block, same width, same
+// `block_reduce_sum` -- so `normed` is bit-identical to what `rms_norm_rows`
+// writes, and it is still written: it is an intermediate the block's own
+// differential test compares.
+//
+// grid: (rows,). block: as `rms_norm_rows`.
+__global__ void rms_norm_swiglu_rows(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    const float* __restrict__ gate,
+    float* __restrict__ normed,
+    float* __restrict__ out,
+    int width,
+    float eps
+) {
+    extern __shared__ float scratch[];
+    long long base = (long long)blockIdx.x * width;
+
+    float partial = 0.0f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float v = x[base + j];
+        partial += v * v;
+    }
+    float sum_sq = block_reduce_sum(partial, scratch);
+
+    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
+
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float nv = x[base + j] * inv_rms * weight[j];
+        normed[base + j] = nv;
+        float g = gate[base + j];
+        out[base + j] = (g / (1.0f + expf(-g))) * nv;
+    }
+}
+
 __global__ void swiglu_mul(
     const float* __restrict__ gate,
     const float* __restrict__ up,
@@ -593,6 +636,7 @@ impl GateShape {
 /// The compiled layer-op kernels.
 pub struct LayerOpsKernels {
     rms_norm: CudaFunction,
+    rms_norm_swiglu: CudaFunction,
     rope: CudaFunction,
     swiglu: CudaFunction,
     sigmoid_gate: CudaFunction,
@@ -610,6 +654,7 @@ impl LayerOpsKernels {
         let module = ctx.load_module(ptx)?;
         Ok(Self {
             rms_norm: module.load_function("rms_norm_rows")?,
+            rms_norm_swiglu: module.load_function("rms_norm_swiglu_rows")?,
             rope: module.load_function("rope_partial")?,
             swiglu: module.load_function("swiglu_mul")?,
             sigmoid_gate: module.load_function("sigmoid_gate_mul")?,
@@ -619,6 +664,58 @@ impl LayerOpsKernels {
             conv1d_state: module.load_function("conv1d_update_state")?,
             conv1d_step: module.load_function("conv1d_step")?,
         })
+    }
+
+    /// RMSNorm over `[rows][width]`, then `out = silu(gate) * normed`.
+    ///
+    /// One launch for what `rms_norm` and `swiglu` did in two. The normed
+    /// intermediate is still written; see the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_swiglu(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        gate: &CudaSlice<f32>,
+        normed: &mut CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), LayerOpsError> {
+        if width == 0 {
+            return Err(LayerOpsError::UnsupportedWidth { width });
+        }
+        let n = rows * width;
+        check_len("rms_norm x", n, x.len())?;
+        check_len("rms_norm weight", width, weight.len())?;
+        check_len("swiglu gate", n, gate.len())?;
+        check_len("rms_norm out", n, normed.len())?;
+        check_len("swiglu out", n, out.len())?;
+        if rows == 0 {
+            return Ok(());
+        }
+
+        let block = block_for_width(width);
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block as u32, 1, 1),
+            shared_mem_bytes: (block.div_ceil(32) * size_of::<f32>()) as u32,
+        };
+        let width_i32 = width as i32;
+        let mut builder = stream.launch_builder(&self.rms_norm_swiglu);
+        builder
+            .arg(x)
+            .arg(weight)
+            .arg(gate)
+            .arg(&mut *normed)
+            .arg(&mut *out)
+            .arg(&width_i32)
+            .arg(&eps);
+        // SAFETY: as `rms_norm` below, with `gate` and `out` checked to the
+        // same `rows * width` and indexed by the same expression.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
     }
 
     /// RMSNorm over `rows` independent rows of `width` elements each.

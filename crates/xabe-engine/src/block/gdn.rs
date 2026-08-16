@@ -328,6 +328,61 @@ __global__ void gdn_proj_split_gemv(
     }
 }
 
+// The same projection with the block's residual added on the way out.
+//
+// `linear_attn_out-N` and `attn_residual-N` are the same numbers one add
+// apart, and the add was its own launch over 2,048 floats -- 1.8 us against a
+// decode step where the smallest kernels *are* their launch floor. The warp
+// that produced `acc` is the one that would have read it back, so the add
+// costs one instruction and one store here.
+//
+// `out` is still written: it is a captured waypoint, and a block that got the
+// residual source wrong would otherwise have nothing to fail at before
+// `attn_residual-N`.
+__global__ void gdn_proj_split_gemv_add(
+    const signed char* __restrict__ wq,
+    const float* __restrict__ ws,
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    float* __restrict__ summed,
+    int k_dim,
+    int n_rows
+) {
+    int lane = threadIdx.x;
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;
+    if (n >= n_rows) return;
+
+    int blocks = k_dim / 32;
+    const signed char* row = wq + (long long)n * k_dim;
+    const float* sc = ws + (long long)n * (k_dim / 32);
+
+    // Four quants and four activations per lane per step, so one instruction
+    // moves 128 bytes of weight across the warp instead of 32. The split
+    // layout is what makes this legal: `k_dim` is a multiple of 128 and the
+    // row base a multiple of `k_dim`, so both the `char4` and the `float4` are
+    // aligned by construction.
+    //
+    // A lane's four elements always share a Q8_0 block — they start at a
+    // multiple of 4 and a block is 32 — so one scale covers all four.
+    float acc = 0.0f;
+    for (int c = 0; c < k_dim; c += 128) {
+        int e0 = c + 4 * lane;
+        char4 q = *(const char4*)(row + e0);
+        float4 xv = *(const float4*)(x + e0);
+        float d = sc[e0 >> 5];
+        acc += (float)q.x * d * xv.x;
+        acc += (float)q.y * d * xv.y;
+        acc += (float)q.z * d * xv.z;
+        acc += (float)q.w * d * xv.w;
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        out[n] = acc;
+        summed[n] = acc + residual[n];
+    }
+}
+
 // The same projection, tiled over tokens.
 //
 // `gdn_proj_q8_0` above gives each (output row, token) pair its own warp, so
@@ -1164,6 +1219,7 @@ pub struct GdnBlock {
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
     proj_split_gemv: CudaFunction,
+    proj_split_gemv_add: CudaFunction,
     proj_tiled: [CudaFunction; 2],
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
@@ -1217,6 +1273,7 @@ impl GdnBlock {
             chunked_scratch,
             proj_q8_0: module.load_function("gdn_proj_q8_0")?,
             proj_split_gemv: module.load_function("gdn_proj_split_gemv")?,
+            proj_split_gemv_add: module.load_function("gdn_proj_split_gemv_add")?,
             proj_tiled: [
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
@@ -1543,22 +1600,19 @@ impl GdnBlock {
             tokens,
         )?;
 
-        // 8. final_output-N = ssm_norm(core) * silu(z).
-        self.layer_ops.rms_norm(
+        // 8. final_output-N = ssm_norm(core) * silu(z). One launch: the norm's
+        //    grid is one block per head-row and the multiply is elementwise
+        //    over the same rows, so it rides along in the norm's second pass.
+        self.layer_ops.rms_norm_swiglu(
             stream,
             &s.core,
             &w.ssm_norm,
+            &s.z,
             &mut s.core_norm,
+            &mut s.final_output,
             tokens * g.value_heads,
             g.head_dim,
             g.rms_eps,
-        )?;
-        self.layer_ops.swiglu(
-            stream,
-            &s.z,
-            &s.core_norm,
-            &mut s.final_output,
-            tokens * g.value_dim(),
         )?;
 
         // 9/10. linear_attn_out-N, then attn_residual-N.
@@ -1582,13 +1636,18 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
+            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else if let Some(i8w) = gemv {
-            self.project_split_gemv(
+            // The residual add rides out of the projection's own warp: at one
+            // token it was a 1.8 us launch over 2,048 floats.
+            self.project_split_gemv_add(
                 stream,
                 &i8w.out_q,
                 &i8w.out_s,
                 &s.final_output,
+                hidden,
                 &mut s.projected,
+                out,
                 g.value_dim(),
                 g.hidden,
             )?;
@@ -1602,8 +1661,8 @@ impl GdnBlock {
                 g.hidden,
                 tokens,
             )?;
+            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         }
-        self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         Ok(())
     }
 
@@ -1646,6 +1705,51 @@ impl GdnBlock {
         self.mma
             .quantize_rows(stream, x, q, sc, tokens, k_dim)
             .map_err(GdnBlockError::Mma)?;
+        Ok(())
+    }
+
+    /// The one-token output projection with the block's residual folded in.
+    ///
+    /// See `gdn_proj_split_gemv_add`: `out` is `linear_attn_out-N` and
+    /// `summed` is `attn_residual-N`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_split_gemv_add(
+        &self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        residual: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        summed: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+    ) -> Result<(), GdnBlockError> {
+        check_len("split gemv x", k_dim, x.len())?;
+        check_len("split gemv residual", n_rows, residual.len())?;
+        check_len("split gemv out", n_rows, out.len())?;
+        check_len("split gemv summed", n_rows, summed.len())?;
+        check_len("split gemv wq", n_rows * k_dim, wq.len())?;
+        check_len("split gemv ws", n_rows * k_dim / QK8_0, ws.len())?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_rows as u32).div_ceil(PROJ_WARPS), 1, 1),
+            block_dim: (32, PROJ_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i32, n_i32) = (k_dim as i32, n_rows as i32);
+        let mut builder = stream.launch_builder(&self.proj_split_gemv_add);
+        builder
+            .arg(wq)
+            .arg(ws)
+            .arg(x)
+            .arg(residual)
+            .arg(&mut *out)
+            .arg(&mut *summed)
+            .arg(&k_i32)
+            .arg(&n_i32);
+        // SAFETY: as `project_split_gemv` below, plus `residual` and `summed`
+        // checked to `n_rows` and indexed by the same `n` the output is.
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 
