@@ -1159,12 +1159,30 @@ __global__ void moe_expert_ffn_mma(
                 long long i = ebase + (long long)n * hidden + kc;
                 const unsigned char* gb = gate_q + (i >> 8) * 210;
                 const unsigned char* ub = up_q   + (i >> 8) * 210;
-                for (int t = lane; t < 64; t += 32) {
-                    swg[r * MOE_MMA_WSTRIDE + t] = gb[half * 64 + t];
-                    swu[r * MOE_MMA_WSTRIDE + t] = ub[half * 64 + t];
+                // Two bytes per lane, not one. A Q6_K superblock is 210
+                // bytes and the tensor base is 256-aligned, so every address
+                // here is even but nothing is word-aligned — 16-bit is the
+                // widest load the format allows without a shift. It halves
+                // the instructions and doubles the sectors in flight per
+                // instruction, which is what this loop is short of: the
+                // fetches were already perfectly coalesced, so there was no
+                // wasted bandwidth to recover, only latency to hide.
+                {
+                    const unsigned short* g16 = (const unsigned short*)(gb + half * 64);
+                    const unsigned short* u16 = (const unsigned short*)(ub + half * 64);
+                    unsigned short* dg = (unsigned short*)(swg + r * MOE_MMA_WSTRIDE);
+                    unsigned short* du = (unsigned short*)(swu + r * MOE_MMA_WSTRIDE);
+                    dg[lane] = g16[lane];
+                    du[lane] = u16[lane];
+                    if (lane < 16) {
+                        const unsigned short* gh =
+                            (const unsigned short*)(gb + 128 + half * 32);
+                        const unsigned short* uh =
+                            (const unsigned short*)(ub + 128 + half * 32);
+                        dg[32 + lane] = gh[lane];
+                        du[32 + lane] = uh[lane];
+                    }
                 }
-                swg[r * MOE_MMA_WSTRIDE + 64 + lane] = gb[128 + half * 32 + lane];
-                swu[r * MOE_MMA_WSTRIDE + 64 + lane] = ub[128 + half * 32 + lane];
                 if (lane < 8) {
                     ssg[r * MOE_MMA_SSTRIDE + lane] = gb[192 + half * 8 + lane];
                     ssu[r * MOE_MMA_SSTRIDE + lane] = ub[192 + half * 8 + lane];
@@ -1460,8 +1478,13 @@ __global__ void moe_expert_down_mma(
                 // Each trip reads 32 bytes contiguous within one block, so the
                 // fetch coalesces even though the block stride does not let it
                 // be a word load.
-                for (int t = lane; t < MOE_MMA_KC; t += 32) {
-                    sw[r * MOE_MMA_DSTRIDE + t] = src[(t >> 5) * 34 + 2 + (t & 31)];
+                // Two bytes per lane. The quants of a Q8_0 block start at
+                // byte 2 of a 34-byte block, so they are even-aligned and
+                // never word-aligned; 16-bit is the widest legal load, and it
+                // halves the instructions this copy costs.
+                for (int t = lane * 2; t < MOE_MMA_KC; t += 64) {
+                    *(unsigned short*)(sw + r * MOE_MMA_DSTRIDE + t) =
+                        *(const unsigned short*)(src + (t >> 5) * 34 + 2 + (t & 31));
                 }
                 if (lane < (MOE_MMA_KC / 32)) {
                     *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) =
