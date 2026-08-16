@@ -1018,6 +1018,133 @@ __global__ void moe_expert_ffn(
 }
 
 // -------------------------------------------------------------------------
+// 3a. The same two projections when there is exactly one token.
+// -------------------------------------------------------------------------
+//
+// A decode step routes one token to `top_k` distinct experts, so every
+// dispatch block holds exactly one live slot and fifteen of padding. The
+// kernel above still runs its whole GEMM apparatus for that: it stages an
+// activation tile in shared memory, crosses two `__syncthreads()` per
+// 128-element slice of the contraction, and dispatches on a tile height that
+// is always one. None of it buys anything when the weight is multiplied by a
+// single token — there is no reuse to capture, because each dequantized value
+// is used once and dropped.
+//
+// What is left after removing it is a GEMV: one warp per output row, streaming
+// its weights and dotting them against an activation vector every warp in the
+// grid shares. Measured against the tiled kernel it replaces, the MoE at one
+// token goes from 27% of the card's streaming roofline toward what the LM
+// head's own GEMV already reaches on the same card (54%).
+//
+// The per-lane accumulation and the `__shfl_xor` reduction are the tiled
+// kernel's, operand for operand, so this is not a different summation order —
+// only a different way of arriving at it.
+//
+// grid: (ceil(intermediate / MOE_ROWS), expert_block_capacity).
+__global__ void moe_expert_ffn_gemv(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    // Slot 0 and no other: the Rust side launches this only when the pass is
+    // one token wide, and one token cannot fill a second slot of a block that
+    // belongs to a single expert.
+    int flat = sorted_token_ids[(long long)blk * block_size];
+    if (flat >= (*valid_tokens) * top_k) return;
+    const float* xs = hidden_states + (long long)(flat / top_k) * hidden;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+
+    float ag[1] = {0.0f};
+    float au[1] = {0.0f};
+    for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
+        float wg[MOE_TN];
+        float wu[MOE_TN];
+        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
+        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+        // `hidden` is a multiple of MOE_TK and the row base of a multiple of
+        // it, so this 16-byte load is aligned by construction.
+        float4 xv = *(const float4*)(xs + j0 + 4 * lane);
+        ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
+        ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
+        ag[0] += wg[2] * xv.z;  au[0] += wu[2] * xv.z;
+        ag[0] += wg[3] * xv.w;  au[0] += wu[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ag);
+    warp_reduce_tile<1>(au);
+
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[(long long)blk * block_size * intermediate + r] = act * au[0];
+    }
+}
+
+// The down projection of the same step. Contracts over `intermediate` and
+// writes through `store_slot_contribution`, exactly as the tiled kernel does.
+//
+// grid: (ceil(hidden / MOE_ROWS), expert_block_capacity).
+__global__ void moe_expert_down_gemv(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int flat = sorted_token_ids[(long long)blk * block_size];
+    if (flat >= numel) return;
+    const float* xs = inter + (long long)blk * block_size * intermediate;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+
+    float ad[1] = {0.0f};
+    for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
+        float wd[MOE_TN];
+        dequant_tile(down_q, down_quant, wrow + j0, lane, wd);
+        float4 xv = *(const float4*)(xs + j0 + 4 * lane);
+        ad[0] += wd[0] * xv.x;
+        ad[0] += wd[1] * xv.y;
+        ad[0] += wd[2] * xv.z;
+        ad[0] += wd[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ad);
+
+    if (lane == 0) {
+        store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, ad[0]);
+    }
+}
+
+// -------------------------------------------------------------------------
 // 3b. The same gate/up projection on the integer tensor cores.
 // -------------------------------------------------------------------------
 //
@@ -2051,6 +2178,8 @@ pub struct MoeKernels {
     align_count: CudaFunction,
     align: CudaFunction,
     expert_ffn: CudaFunction,
+    expert_ffn_gemv: CudaFunction,
+    expert_down_gemv: CudaFunction,
     expert_ffn_mma: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
     /// `None` if the integer path is unavailable on this device.
@@ -2128,6 +2257,8 @@ impl MoeKernels {
             align_count: module.load_function("moe_align_count")?,
             align: module.load_function("moe_align_block_size")?,
             expert_ffn: module.load_function("moe_expert_ffn")?,
+            expert_ffn_gemv: module.load_function("moe_expert_ffn_gemv")?,
+            expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
             expert_ffn_mma: module.load_function("moe_expert_ffn_mma")?,
             // Compiled eagerly so a device that cannot reach the integer
             // tensor cores fails here, at construction, rather than mid-pass.
@@ -2360,6 +2491,11 @@ impl MoeKernels {
         let down_code = down.quant.code();
         let shared = tile_shared_bytes();
 
+        // One token is a GEMV, not a GEMM, and gets its own pair of kernels.
+        // See `moe_expert_ffn_gemv` on why the tiled kernel's staging and
+        // barriers are pure overhead at this shape.
+        let gemv = g.max_tokens == 1;
+
         // The integer path applies only when both projections it fuses are
         // Q6_K. `ffn_down` is Q8_0 in this file and stays on the fp32 kernel
         // either way, so this is a property of the gate/up pair alone.
@@ -2368,7 +2504,37 @@ impl MoeKernels {
             && gate.quant == ExpertQuant::Q6K
             && up.quant == ExpertQuant::Q6K;
 
-        if use_mma {
+        if gemv {
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.intermediate as u32).div_ceil(TILE_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.expert_ffn_gemv);
+            builder
+                .arg(gate.bytes)
+                .arg(&gate_code)
+                .arg(up.bytes)
+                .arg(&up_code)
+                .arg(hidden_states)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.inter);
+            // SAFETY: the same bounds as the tiled launch below, minus the
+            // shared memory it does not use. The kernel reads slot 0 of its
+            // dispatch block only, which is in range because
+            // `sorted_token_ids` holds `expert_block_capacity * block_size`.
+            unsafe { builder.launch(cfg) }?;
+        } else if use_mma {
             let mma = self.mma.as_ref().expect("checked above");
             let rows = g.max_tokens;
             mma.quantize_rows(
@@ -2451,14 +2617,47 @@ impl MoeKernels {
         // produce a plausible wrong answer instead of an obviously wrong one.
         stream.memset_zeros(&mut buffers.partial)?;
 
+        if gemv {
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.hidden as u32).div_ceil(TILE_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.expert_down_gemv);
+            builder
+                .arg(down.bytes)
+                .arg(&down_code)
+                .arg(&buffers.inter)
+                .arg(&buffers.topk_weights)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.partial);
+            // SAFETY: as above.
+            unsafe { builder.launch(cfg) }?;
+        }
+
         // The down projection takes the integer path on the same terms, but
         // gated on its *own* format: `ffn_down_exps` is Q8_0 where gate/up are
         // Q6_K, so the two halves of the block can legitimately disagree about
         // which arithmetic they use.
-        let down_mma =
-            self.mma.is_some() && g.max_tokens >= MMA_MIN_TOKENS && down.quant == ExpertQuant::Q8_0;
+        let down_mma = !gemv
+            && self.mma.is_some()
+            && g.max_tokens >= MMA_MIN_TOKENS
+            && down.quant == ExpertQuant::Q8_0;
 
-        if down_mma {
+        if gemv {
+            // Launched above, alongside its gate/up half. Falls through to the
+            // reduction the other two paths also reach.
+        } else if down_mma {
             let mma = self.mma.as_ref().expect("checked above");
             // One row per dispatch slot. Padding slots hold whatever the last
             // step left in `inter` and are quantized along with the rest; the
