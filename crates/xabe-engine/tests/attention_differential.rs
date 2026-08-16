@@ -129,6 +129,50 @@ const GATE: Tolerance = Tolerance {
     allow_non_finite: false,
 };
 
+/// Half an ulp of fp16, relative. fp16 carries an 11-bit significand, so
+/// round-to-nearest costs at most `2^-11 / 2` — but the operands here are
+/// rounded, not the result, so the useful figure is the full `2^-11`.
+const F16_HALF_ULP: f32 = 1.0 / 2048.0;
+
+/// Tolerance for the tensor-core path, which is what `forward` takes at any
+/// query count from [`MMA_QUERY_TILE`] up.
+///
+/// `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` accumulates in fp32; only
+/// its **operands** are fp16. Four of them are rounded on the way in — Q and K
+/// before `Q K^T`, then P and V before `P V` — and attention's output is a
+/// convex combination of V, so with `|v| <= 1` in every case here the absolute
+/// error is bounded by a small multiple of `4 * 2^-11`. The gate is `8 *
+/// 2^-11 = 3.9e-3`, which is 2.1x the worst measured (1.88e-3, on the dense
+/// 128K normalizer test) and derived rather than invented.
+///
+/// **This is a wider gate than [`GATE`] and that is the point, not a
+/// concession.** The scalar kernels stay on `GATE`; this applies only where the
+/// arithmetic genuinely changed. And the change is not a quality regression:
+/// llama.cpp runs the same fp16 tensor-core attention on this card, so matching
+/// its arithmetic moved this engine's *model output* closer to llama.cpp's, not
+/// further — `forward_pass` measures the top-8 ranking agreement going from 4
+/// of 8 to 7 of 8 and the winning logit's gap from +0.070 to -0.0007. The error
+/// against a scalar fp32 host reference rose; the error against the thing being
+/// reproduced fell.
+const MMA_GATE: Tolerance = Tolerance {
+    max_abs_error: 8.0 * F16_HALF_ULP,
+    max_rel_error: 8.0 * F16_HALF_ULP / 1e-6,
+    min_cosine_similarity: 1.0 - 1e-6,
+    allow_non_finite: false,
+};
+
+/// The gate the device path at `n_query` actually warrants.
+///
+/// Asks the kernels which arithmetic they will use rather than hardcoding the
+/// dispatch rule, so this cannot drift away from it.
+fn gate_for(kernels: &AttentionKernels, n_query: usize) -> &'static Tolerance {
+    if kernels.uses_tensor_cores(n_query) {
+        &MMA_GATE
+    } else {
+        &GATE
+    }
+}
+
 fn setup() -> Option<Arc<CudaContext>> {
     if !driver_available() {
         println!("SKIPPED: no CUDA driver present");
@@ -333,7 +377,7 @@ fn device_attention_matches_the_reference_across_sequence_depths() {
                 &reference,
                 &format!("seq {seq} head {h}"),
             );
-            assert_matches(&candidate, &reference, &GATE);
+            assert_matches(&candidate, &reference, gate_for(&kernels, seq));
         }
         println!(
             "seq={seq:5} x {} heads: max_abs={worst_abs:.3e} max_rel={worst_rel:.3e} \
@@ -428,7 +472,7 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
         worst_abs = worst_abs.max(result.max_abs_error);
         worst_cos = worst_cos.min(result.cosine_similarity);
         assert_relative_error_is_a_floor_artefact(&result, &reference, &format!("head {h}"));
-        assert_matches(&candidate, &reference, &GATE);
+        assert_matches(&candidate, &reference, gate_for(&kernels, n_query));
     }
     println!(
         "key_offset={KEY_OFFSET} n_query={n_query} n_keys={N_KEYS} x {} heads: \
@@ -715,7 +759,7 @@ fn device_attention_matches_the_reference_at_a_128k_window() {
         worst_cos = worst_cos.min(result.cosine_similarity);
         worst_rel = worst_rel.max(result.max_rel_error);
         assert_relative_error_is_a_floor_artefact(&result, &reference, &format!("head {h}"));
-        assert_matches(&candidate, &reference, &GATE);
+        assert_matches(&candidate, &reference, gate_for(&kernels, DEEP_QUERY));
     }
 
     // The justification for comparing against a 1,280-row problem, asserted
@@ -803,10 +847,23 @@ fn device_attention_holds_the_softmax_normalizer_over_128k_dense_keys() {
     // *linear* error bound `n * eps = 1.6e-2` that a systematically biased
     // accumulation would approach. A kernel that rescaled the accumulator but
     // not the normalizer misses by O(1) and fails this by five orders.
+    //
+    // On the tensor-core path there is a second, larger term that has nothing
+    // to do with depth: P and V are rounded to fp16 before `P V`, and this
+    // oracle divides an fp16-weighted numerator by an fp32 normalizer, so the
+    // roundings do not cancel the way the score error does. That term is
+    // `O(2^-11)` and swamps `sqrt(n) * f32::EPSILON` at every depth, which is
+    // why the model below is a sum and not a max: both are real, and reporting
+    // their ratio is what keeps the accumulation claim checkable.
     let random_walk_bound = (DEEP_KEYS as f32).sqrt() * f32::EPSILON;
+    let operand_bound = if kernels.uses_tensor_cores(N_QUERY) {
+        MMA_GATE.max_abs_error
+    } else {
+        0.0
+    };
     let deep_gate = Tolerance {
-        max_abs_error: 4.0 * random_walk_bound,
-        max_rel_error: 4.0 * random_walk_bound / 1e-6,
+        max_abs_error: 4.0 * random_walk_bound + operand_bound,
+        max_rel_error: (4.0 * random_walk_bound + operand_bound) / 1e-6,
         min_cosine_similarity: 1.0 - 1e-6,
         allow_non_finite: false,
     };
@@ -830,7 +887,7 @@ fn device_attention_holds_the_softmax_normalizer_over_128k_dense_keys() {
     // meaningfully past the random-walk model, the model has stopped
     // describing the kernel and the loosening is no longer justified.
     assert!(
-        result.max_abs_error < 4.0 * random_walk_bound,
+        result.max_abs_error < 4.0 * random_walk_bound + operand_bound,
         "measured error {:.3e} is {:.1}x the sqrt(n)*eps accumulation model \
          ({random_walk_bound:.3e}) — that is no longer accumulation noise",
         result.max_abs_error,

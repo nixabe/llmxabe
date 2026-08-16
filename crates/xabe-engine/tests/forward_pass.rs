@@ -736,6 +736,13 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
 
     let ours_top = top_k(&logits, 8);
     let theirs_top = top_k(logits_ref, 8);
+    // One rank deeper on the reference side only. The separation check below
+    // needs the candidate llama.cpp would place *after* the first disagreement,
+    // and when that disagreement lands on the last compared rank -- which is
+    // what happens once agreement reaches 7 of 8 -- that candidate is outside
+    // the top 8. Reading it from a 9-deep reference list keeps the assertion
+    // live at the best case instead of skipping it exactly there.
+    let theirs_top_ext = top_k(logits_ref, 9);
     let agreeing = ours_top
         .iter()
         .zip(&theirs_top)
@@ -781,21 +788,22 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
     // keeps `MIN_TOP_K_PREFIX` honest: if the swap ever moves to a pair that
     // is genuinely separated, this fails even though the prefix length did
     // not change.
-    if agreeing < theirs_top.len() {
+    if agreeing < theirs_top.len() && agreeing + 1 < theirs_top_ext.len() {
         let noise = ours_top
             .iter()
             .chain(&theirs_top)
             .filter(|&&t| ours_top.contains(&t) && theirs_top.contains(&t))
             .map(|&t| (logits[t] - logits_ref[t]).abs())
             .fold(0.0f32, f32::max);
-        let separation = logits_ref[theirs_top[agreeing]] - logits_ref[theirs_top[agreeing + 1]];
+        let separation =
+            logits_ref[theirs_top_ext[agreeing]] - logits_ref[theirs_top_ext[agreeing + 1]];
         println!(
             "  first disagreement at rank {agreeing}: llama.cpp separates {} from {} by \
              {separation:.6}, and the two implementations differ by up to {noise:.6} on a \
              single logit — so the order of that pair is below both implementations' \
              own precision. The argmax leads by {:.6}, {:.0}x that noise.",
-            theirs_top[agreeing],
-            theirs_top[agreeing + 1],
+            theirs_top_ext[agreeing],
+            theirs_top_ext[agreeing + 1],
             logits_ref[theirs_top[0]] - logits_ref[theirs_top[1]],
             (logits_ref[theirs_top[0]] - logits_ref[theirs_top[1]]) / noise,
         );

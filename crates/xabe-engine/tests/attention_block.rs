@@ -188,6 +188,36 @@ const DEVICE_VS_HOST: Gate = Gate {
     min_cosine: 1.0 - 1e-7,
 };
 
+/// Device against host for the steps the flash kernel produces, which is
+/// everything from `attn_pregate` onwards.
+///
+/// The prefill flash kernel runs on the tensor cores:
+/// `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` accumulates in fp32 but
+/// **rounds its operands to fp16**, and four of them are rounded on the way in
+/// — Q and K before `Q K^T`, then P and V before `P V`. The host reference does
+/// none of that, so this comparison now measures fp16 operand rounding and not
+/// reduction order.
+///
+/// fp16 carries an 11-bit significand, so four roundings bound the output's
+/// *relative* error near `8 * 2^-11 = 3.9e-3`. This gate is stated over the
+/// reference RMS rather than its peak, and these tensors run about 5x peak to
+/// RMS, which puts the expected figure near 2e-2. Worst measured: **4.72e-3**
+/// (`attn_pregate-3`), so the bound is 4.2x the observation — the same headroom
+/// [`DEVICE_VS_HOST`] carries over its own.
+///
+/// The cosine floor is deliberately *not* widened: operand rounding is
+/// unbiased, so it moves magnitudes and not direction. `attn_pregate-3`
+/// measures 0.9999999719 against the same 1 - 1e-7 floor.
+///
+/// This is not a quality regression. llama.cpp runs the same fp16 tensor-core
+/// attention on this card, so the `dev|gold` comparison in this file — device
+/// against llama.cpp's own capture — is what actually tracks fidelity, and it
+/// did not move.
+const DEVICE_VS_HOST_TENSOR_CORE: Gate = Gate {
+    abs_over_rms: 2e-2,
+    min_cosine: 1.0 - 1e-7,
+};
+
 /// End-to-end agreement with llama.cpp for the steps that are downstream of
 /// at least one int8 projection.
 ///
@@ -680,6 +710,11 @@ struct DeviceStep<'a> {
     host: &'a [f32],
     gold: &'a [f32],
     gate: Gate,
+    /// Bound for the `dev|host` comparison. Defaults to [`DEVICE_VS_HOST`];
+    /// the steps the flash kernel produces override it with
+    /// [`DEVICE_VS_HOST_TENSOR_CORE`], because on those the host reference and
+    /// the device no longer run the same arithmetic.
+    host_gate: Gate,
     /// RMS to normalize the `dev|gold` absolute bound by, when the step's own
     /// output does not set the scale of its error. See [`assert_gate`].
     scale: Option<(f64, &'static str)>,
@@ -712,6 +747,7 @@ fn dev_step<'a>(
         host,
         gold,
         gate,
+        host_gate: DEVICE_VS_HOST,
         scale: None,
     }
 }
@@ -1274,13 +1310,16 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 &gold_kr,
                 PROJECTION_VS_GOLDEN,
             ),
-            dev_step(
-                "attn_pregate",
-                read(&stream, scratch.pregate()),
-                &host.pregate,
-                &gold_pre,
-                PROJECTION_VS_GOLDEN,
-            ),
+            DeviceStep {
+                host_gate: DEVICE_VS_HOST_TENSOR_CORE,
+                ..dev_step(
+                    "attn_pregate",
+                    read(&stream, scratch.pregate()),
+                    &host.pregate,
+                    &gold_pre,
+                    PROJECTION_VS_GOLDEN,
+                )
+            },
             DeviceStep {
                 // sigmoid(x) is in (0, 1) whatever x is, so an error in this
                 // tensor is bounded by 1, not by its own RMS — which is
@@ -1300,6 +1339,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 // sigmoid factor is at most 1, so the error this step carries
                 // is `attn_pregate`'s error — not something its own
                 // (suppressed) magnitude can normalize.
+                host_gate: DEVICE_VS_HOST_TENSOR_CORE,
                 scale: Some((pregate_rms, "attn_pregate's RMS")),
                 ..dev_step(
                     "attn_gated",
@@ -1315,6 +1355,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 // so its own magnitude is not the scale at which its error
                 // matters. The scale that does is the stream it is added
                 // into, which is the next step's tensor.
+                host_gate: DEVICE_VS_HOST_TENSOR_CORE,
                 scale: Some((
                     rms_of(&gold_res),
                     "the residual stream this block writes into",
@@ -1327,13 +1368,16 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                     PROJECTION_VS_GOLDEN,
                 )
             },
-            dev_step(
-                "attn_residual",
-                dev_out.clone(),
-                &host.residual,
-                &gold_res,
-                PROJECTION_VS_GOLDEN,
-            ),
+            DeviceStep {
+                host_gate: DEVICE_VS_HOST_TENSOR_CORE,
+                ..dev_step(
+                    "attn_residual",
+                    dev_out.clone(),
+                    &host.residual,
+                    &gold_res,
+                    PROJECTION_VS_GOLDEN,
+                )
+            },
         ];
 
         println!("-- device block, chained from l_out-{} --", layer - 1);
@@ -1350,11 +1394,21 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                     vs_gold.max_abs / scale,
                 ),
             }
+            // Normalized by the same RMS the `dev|gold` bound uses, and for
+            // the same reason [`assert_gate`] gives: a step whose output is a
+            // product with a small factor inherits its predecessor's absolute
+            // error while having an RMS of its own that is far smaller, so its
+            // own RMS is not what sets the scale of the error. `attn_gated-3`
+            // is the case in point -- RMS 8.8e-3 carrying `attn_pregate-3`'s
+            // error at RMS 3.8e-1. Only `dev|gold` did this before, which was
+            // an asymmetry rather than a decision; it went unnoticed while the
+            // device and the host ran identical arithmetic and the error was
+            // three orders below either bound.
             assert_gate(
                 &format!("{}-{layer} dev|host", s.name),
                 &vs_host,
-                &DEVICE_VS_HOST,
-                vs_host.rms_ref,
+                &s.host_gate,
+                s.scale.map_or(vs_host.rms_ref, |(scale, _)| scale),
             );
             assert_gate(
                 &format!("{}-{layer} dev|gold", s.name),
