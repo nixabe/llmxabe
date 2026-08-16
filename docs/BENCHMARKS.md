@@ -2348,3 +2348,49 @@ prints the full comparison when it does not, so an argmax flip reports *why* it
 flipped instead of asserting on rounding. The cosine floor (`0.999`) is
 unconditional and is what actually gates the distribution: it reads `0.999681`
 with the scan against `0.999843` without, both far above the bound.
+
+### Asking ptxas for a third resident block on the MoE GEMM (2026-08-16)
+
+With the DeltaNet scan landed the two MoE expert GEMMs are 46% of the pass, and
+the profile says they are memory-side: `moe_expert_ffn_mma` moves 470 MB of
+Q6_K per layer at about **45% of the 672 GB/s peak**, while issuing roughly
+**5% of the card's int8 throughput** doing it. Its staging loads are already
+`uint4` — that was fixed earlier and is documented above — so what was left was
+loads in flight, which is warps resident.
+
+The shared footprint is 21,760 bytes: two `MOE_MMA_ROWS x MOE_MMA_WSTRIDE`
+weight tiles, two scale tiles, the int8 activation tile, its per-32 scales, and
+a row index per slot. Turing's SM has 65,536 bytes of shared to give, so
+**three blocks fit with 256 bytes to spare** — but ptxas had no reason to size
+the register allocation for three, and nothing in the source asked it to.
+`__launch_bounds__(MOE_MMA_WARPS * 32, 3)` asks. The Q8_0 down projection
+stages one weight tile rather than two, is 14,720 bytes, and asks for four.
+
+Five interleaved pairs, `bench_forward` n=512, 4 reps each:
+
+| round | without | with |
+| --- | ---: | ---: |
+| 1 | 218.12 | 217.57 |
+| 2 | 219.77 | 218.67 |
+| 3 | 220.02 | 218.68 |
+| 4 | 220.91 | 219.41 |
+| 5 | 221.38 | 219.70 |
+| **mean ms/pass** | **220.04** | **218.81** |
+
+**−1.23 ms, +0.56%.** That is under this card's 1.3% thermal drift taken alone,
+which is exactly why it was measured five times alternating rather than twice:
+the change wins **every pair**, and five for five is a one-in-thirty-two
+coincidence. The drift moves both arms of a pair together; it does not order
+them.
+
+It is a small win and it is worth being clear about why it is not a large one.
+Occupancy was the cheap half of the diagnosis — two resident blocks to three is
+50% more latency to hide with — and it bought half a percent. The expensive
+half is still open: 45% of peak on a kernel whose loads are already vectorised
+and whose shared layout is already conflict-free points at the access
+*pattern*, not the instruction mix. Each warp reads eight rows `hidden` elements
+apart, 64 contiguous bytes from each, so DRAM sees 64 interleaved streams per
+block and hundreds across the card. Widening `MOE_MMA_KC` from 128 to 256 would
+double each row's contiguous run from 112 bytes to a full 224-byte superblock
+at the cost of a wider staged tile; that is the next thing to try, and it is a
+real change to the fragment and scale indexing rather than a hint.

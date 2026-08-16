@@ -1589,7 +1589,22 @@ __global__ void moe_expert_down_gemv(
 // delta at offset 8 (which is where the 4-byte alignment requirement lands).
 #define MOE_MMA_SSTRIDE 16
 
-__global__ void moe_expert_ffn_mma(
+// Three blocks per SM, asked for explicitly.
+//
+// This kernel is bandwidth-bound, not compute-bound: at 512 tokens it moves
+// 470 MB of Q6_K per layer and issues about 5% of the card's int8 throughput
+// doing it, so what it needs from the scheduler is loads in flight, and what
+// puts loads in flight is resident warps. Its shared footprint is 21,760 bytes
+// and Turing's SM has 65,536 to give, so three blocks fit with 256 bytes to
+// spare -- but only if the register allocation also fits three, and ptxas has
+// no reason to aim for that unless told.
+//
+// The second argument is the one that matters. The first is redundant with the
+// launch's `block_dim` and is stated so the pair cannot drift apart silently.
+#define MOE_MMA_BLOCKS_PER_SM 3
+
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_MMA_BLOCKS_PER_SM)
+moe_expert_ffn_mma(
     const unsigned char* __restrict__ gate_q,
     const unsigned char* __restrict__ up_q,
     const signed char* __restrict__ xq,
@@ -1985,7 +2000,13 @@ __global__ void moe_expert_down(
 // `4r + (quad/4)` — thirty-two distinct banks across the warp, no conflict.
 #define MOE_MMA_DSTRIDE (MOE_MMA_KC + (MOE_MMA_KC / 32) * 4)
 
-__global__ void moe_expert_down_mma(
+// Four blocks per SM, for the same reason the gate/up kernel asks for three.
+// Q8_0 stages one weight tile rather than two, so this kernel's footprint is
+// 14,720 bytes and four of them fit in 65,536 with room left.
+#define MOE_DOWN_BLOCKS_PER_SM 4
+
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_DOWN_BLOCKS_PER_SM)
+moe_expert_down_mma(
     const unsigned char* __restrict__ down_q,
     const signed char* __restrict__ iq,
     const float* __restrict__ iscale,
