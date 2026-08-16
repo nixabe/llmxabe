@@ -1260,7 +1260,8 @@ mod tests {
         // Every buffer and every grid comes from this, so it has to be an
         // upper bound rather than a typical value.
         assert_eq!(g.max_flat_pairs(), 256);
-        assert!(g.sorted_capacity() <= 65_535, "grid.y limit");
+        // grid.y takes the dispatch-*block* capacity, not the slot count.
+        assert!(g.expert_block_capacity() <= 65_535, "grid.y limit");
     }
 
     #[test]

@@ -3036,8 +3036,28 @@ impl MoeKernels {
         // band of output rows; both must fit the driver's per-dimension
         // limits. x is capped at 2^31-1 but y and z at 65535, which is the
         // one that can actually bite.
-        if geometry.sorted_capacity() > 65_535 || geometry.max_tokens > 65_535 {
-            return Err(bad("slot capacity exceeds the 65535 grid.y limit"));
+        //
+        // The quantity to bound is `expert_block_capacity`, which is what every
+        // dispatch launch actually puts in grid.y. This used to bound
+        // `sorted_capacity` — the *slot* count, `block_size` times larger — and
+        // so refused geometries the hardware has no objection to. At the real
+        // geometry that capped the model at about 7,168 tokens of context when
+        // grid.y at that point is 2,040 of an available 65,535. Nothing else
+        // depends on the slot count fitting a grid dimension: it is a loop
+        // bound inside the dispatch kernels and a length for `sorted_token_ids`
+        // and `inter`, both indexed by `int`, which 65,535 * `block_size`
+        // cannot overflow.
+        if geometry.expert_block_capacity() > 65_535 {
+            return Err(bad(
+                "dispatch-block capacity exceeds the 65535 grid.y limit",
+            ));
+        }
+        // grid.x takes `max_tokens` directly in the quantize and reduce
+        // launches. The driver allows 2^31-1 there, but a token count that
+        // large is a sizing mistake somewhere upstream rather than a workload,
+        // and every `sorted_capacity`-sized allocation would be terabytes.
+        if geometry.max_tokens > 65_535 {
+            return Err(bad("max_tokens exceeds the 65535 grid limit"));
         }
 
         let ptx = compile(MOE_SRC, "moe").map_err(MoeError::Compile)?;
@@ -4068,6 +4088,26 @@ mod tests {
         assert!(
             !MOE_SRC[start..end].contains("atomic"),
             "the dispatch scatter must not use atomics; ordering is the contract",
+        );
+    }
+
+    #[test]
+    fn the_grid_guard_bounds_the_block_count_and_not_the_slot_count() {
+        // These differ by `block_size`, and guarding the wrong one cost this
+        // model a factor of `block_size` in supported context. At 32,768
+        // tokens and 16 slots to a block the dispatch needs 16,624 blocks of
+        // an available 65,535 — comfortable — while the slot count is 265,984,
+        // which the old guard compared against 65,535 and rejected.
+        let g = MoeGeometry::qwen3_6(16, 32_768);
+        assert_eq!(g.sorted_capacity(), 265_984);
+        assert_eq!(g.expert_block_capacity(), 16_624);
+        assert!(
+            g.expert_block_capacity() <= 65_535,
+            "32K tokens must be inside the grid.y limit, not outside it",
+        );
+        assert!(
+            g.sorted_capacity() > 65_535,
+            "this test is only meaningful while the two quantities disagree",
         );
     }
 
