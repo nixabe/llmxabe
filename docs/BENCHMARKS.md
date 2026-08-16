@@ -1270,8 +1270,11 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,341.39 ± 5.41 tok/s** | **1.54× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **64.99 tok/s**, 15.39 ms/step | **1.61× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,342.71 ± 5.91 tok/s** | **1.54× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **83.68 tok/s**, 11.95 ms/step | **1.25× slower** |
+
+Decode is treated separately at the end of this document; the sections between
+here and there are all prefill.
 
 Prefill started this session at 200.87 tok/s and 10.3× slower.
 
@@ -1409,6 +1412,91 @@ it runs a different expert, and everything downstream is a different model. It
 is the one matmul in this engine that cannot afford a reassociation. The
 shipped version stages a contraction width equal to the block width, which
 reproduces the untiled per-thread index order exactly. Correctness cost 1.1%.
+
+## Decode: the same exercise, one token at a time (2026-08-16)
+
+Prefill and decode turned out to be different problems with almost no
+overlap in their fixes. Everything above is prefill. This is decode.
+
+| | llama.cpp | llmxabe | position |
+| --- | ---: | ---: | --- |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **83.68 tok/s**, 11.95 ms/step | **1.25× slower** |
+
+Decode began this session at 65.03 tok/s and 1.61× slower.
+
+| change | ms/step | tok/s |
+| --- | ---: | ---: |
+| baseline | 15.38 | 65.03 |
+| fix the shared-expert decode regression | 15.30 | 65.37 |
+| GEMV path for the routed experts | 13.38 | 74.73 |
+| GEMV path for the shared expert | 12.99 | 76.98 |
+| repacked weights for the GDN projection | 12.18 | 82.11 |
+| 16-bit Q6_K dequant loads | 12.07 | 82.86 |
+| `char4`/`float4` in the GDN decode GEMV | 11.95 | 83.68 |
+
+### The one idea behind all of it
+
+**At one token every kernel in the model is a GEMV, and three of them were
+still running a GEMM's machinery.** The MoE experts staged an activation tile
+in shared memory and crossed two barriers per 128 elements of contraction, to
+multiply each dequantized weight exactly once. There is no reuse to capture at
+this shape — a weight is read, used, and dropped — so all of that apparatus is
+overhead. `nsys` put the two routed-expert kernels at 28.9% of decode moving
+their weights at 27% of the card's streaming roofline, against the 82% the LM
+head's own GEMV reaches on the same card. Removing the tiling closed most of
+that.
+
+The other half is a layout accident. Q8_0 places a row's quants at byte
+`b * 34 + 2`, so a warp reading 32 contiguous quants is 32-byte aligned only
+when `b == 15 (mod 16)`. **Fifteen blocks in sixteen straddle a sector
+boundary**, and half of every fetch is discarded. The repacked split layout
+built for the tensor cores fixes it for free — it separates quants from scales,
+so a row's quants are contiguous from an aligned base. That repack turns out to
+be worth having for its *alignment* even where the arithmetic stays fp32, which
+is not why it was built.
+
+### Where decode time goes now
+
+Per step, from `nsys` over 68 decode steps:
+
+| kernel | ms/step | share | % of streaming roofline |
+| --- | ---: | ---: | ---: |
+| `gdn_proj_split_gemv` | 2.51 | 18.4% | 63% |
+| `moe_expert_ffn_gemv` | 1.90 | 13.9% | 42% |
+| `lm_head_gemv_b1` | 1.51 | 11.0% | 82% |
+| `moe_expert_down_gemv` | 0.84 | 6.2% | 63% |
+| `moe_shared_ffn_gemv` | 0.66 | 4.8% | — |
+| MoE dispatch glue (7 kernels) | 1.75 | 14.5% | — |
+| everything else (~20 kernels) | 2.8 | 23% | — |
+
+Two things stand out. `moe_expert_ffn_gemv` is the weakest streamer left at
+42%, and it is the only one reading Q6_K rather than Q8_0. And the MoE's
+*dispatch* — routing, top-k, block alignment, reduction, gating, combining —
+costs 1.75 ms per step across seven kernels that do almost no arithmetic. A
+decode step issues roughly **1,000 kernel launches**; the GPU is busy for about
+92% of the step, so ~0.97 ms is launch gap. That is the CUDA-graph
+opportunity, and it is smaller than it looks.
+
+### A measurement discipline note
+
+One entry above — the 16-bit dequant widening — was first recorded in a commit
+message as a **57% regression** and listed as a rejected idea. It was measured
+while an unrelated decode bug was live, so both its before and after numbers
+were that bug. Against a clean baseline it is a small improvement. A negative
+result taken during an unrelated regression is not a measurement, and it was
+recorded as one. The correction is in commit `6faaa99`.
+
+The same session produced two other results that reversed under measurement,
+both kept because they are cheap to rediscover:
+
+- **Shrinking the MMA tile.** Faster on all four shapes in isolation, 8% slower
+  in the engine. The token tile divides `grid.y`, every block in `y` re-reads
+  the weight band, and a microbenchmark measures cache residency the kernel
+  will not have in situ.
+- **Widening the MoE dispatch block from 16 slots to 32.** Doubles what each
+  staged fragment buys and halves the dispatch-block count, and at 512 tokens
+  an expert averages 16 tokens so the two cancel exactly. Everything narrower
+  regressed hard.
 
 ## Reproducing
 

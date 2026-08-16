@@ -71,11 +71,12 @@ years of CUDA tuning behind it, and the benchmarks make that concrete.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,341.39 ± 5.41** | 1.54× slower |
-| Decode, warm | 104.72 ± 0.36 tok/s | **64.99**, 15.39 ms/step | 1.61× slower |
+| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,342.71 ± 5.91** | 1.54× slower |
+| Decode, warm | 104.72 ± 0.36 tok/s | **83.68**, 11.95 ms/step | 1.25× slower |
 
-Prefill was 29.6× slower, then 10.3×, and is now 1.54×. **Both are still
-losses**, and the project does not claim otherwise.
+Prefill was 29.6× slower, then 10.3×, and is now 1.54×. Decode was 1.61× and
+is now 1.25×. **Both are still losses**, and the project does not claim
+otherwise.
 
 The move that closed most of it was putting every quantized matmul on
 Turing's integer tensor cores — `mma.m8n8k16.s32.s8.s8.s32`, ~198 TOP/s
@@ -85,7 +86,13 @@ declining to convert integers into floats in order to multiply them more
 slowly. Roughly half the remaining gain, though, came not from arithmetic but
 from finding kernels that re-read the same bytes — the recurrent state read
 once per token instead of once per chunk, the router's weight row read once
-per (expert, token) pair. See [BENCHMARKS.md](docs/BENCHMARKS.md).
+per (expert, token) pair.
+
+Decode needed almost none of that. At one token every matmul is a GEMV, and
+the wins were removing GEMM machinery that had nothing to do at that shape,
+plus one layout accident: Q8_0 puts a row's quants at byte `b * 34 + 2`, so
+fifteen warp reads in sixteen straddle a 32-byte sector boundary and half of
+every fetch is discarded. See [BENCHMARKS.md](docs/BENCHMARKS.md).
 
 `ncu` still cannot read performance counters on this host
 (`ERR_NVGPUCTRPERM`), so every attribution above is from `nsys` kernel
