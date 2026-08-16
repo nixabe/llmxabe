@@ -66,14 +66,30 @@ design plan expected. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 This project does not claim it will be faster than llama.cpp. That backend has
 years of CUDA tuning behind it, and the benchmarks make that concrete.
 
-**Where it actually stands.** Prefill went from 29.6× slower to **10.3×
-slower** when the MoE grouped GEMM and shared expert were tiled; the
-single-pass latency floor went from 3.9× to **1.90×**. Both remain losses.
-The tiled kernel reaches 13.3% of fp32 peak against a ~50% structural
-ceiling for its instruction mix, so roughly 2× of that gap is still
-unattributed — and `ncu` cannot read performance counters on this host
-(`ERR_NVGPUCTRPERM`), so attributing it needs a different machine or a
-different method.
+**Where it actually stands** (2026-08-16, `bench_forward` n = 512 and
+`bench_decode` on one card):
+
+| | llama.cpp | llmxabe | position |
+| --- | ---: | ---: | --- |
+| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,341.39 ± 5.41** | 1.54× slower |
+| Decode, warm | 104.72 ± 0.36 tok/s | **64.99**, 15.39 ms/step | 1.61× slower |
+
+Prefill was 29.6× slower, then 10.3×, and is now 1.54×. **Both are still
+losses**, and the project does not claim otherwise.
+
+The move that closed most of it was putting every quantized matmul on
+Turing's integer tensor cores — `mma.m8n8k16.s32.s8.s8.s32`, ~198 TOP/s
+against fp32's 16.3 TFLOP/s. Q6_K and Q8_0 weights are *already integers*,
+so this is not a precision downgrade imposed on float weights; it is
+declining to convert integers into floats in order to multiply them more
+slowly. Roughly half the remaining gain, though, came not from arithmetic but
+from finding kernels that re-read the same bytes — the recurrent state read
+once per token instead of once per chunk, the router's weight row read once
+per (expert, token) pair. See [BENCHMARKS.md](docs/BENCHMARKS.md).
+
+`ncu` still cannot read performance counters on this host
+(`ERR_NVGPUCTRPERM`), so every attribution above is from `nsys` kernel
+timings and arithmetic, not from hardware counters.
 
 ## Target hardware and model
 

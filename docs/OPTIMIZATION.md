@@ -42,6 +42,14 @@ region:
 | | llmxabe | llama.cpp | ratio | was |
 | --- | ---: | ---: | ---: | ---: |
 | `pp512` (prefill) | **200.87 ± 0.75 t/s** | 2,070.50 t/s | **10.3× slower** | 29.6× |
+
+> **Superseded.** This table is the state at the tiling commit. Prefill is now
+> **1,341.39 ± 5.41 t/s, 1.54× slower**, and decode **64.99 tok/s, 1.61×
+> slower**. See "Integer tensor cores, wired end to end" in
+> [BENCHMARKS.md](BENCHMARKS.md) for the twelve-step arc and where the time
+> goes now. The rest of this section is kept because its *reasoning* — the
+> roofline arithmetic and the structural fp32 ceiling — is what motivated the
+> integer path, and that reasoning held.
 | decode floor, n=1 | **55.07 ± 0.04 t/s** | 104.74 t/s | **1.90× slower** | 3.9× |
 | fraction of fp32 peak at 512 | 13.3% | | | 4.6% |
 

@@ -569,7 +569,8 @@ occupancy. So the optimum is interior, and it is not where a
 | 512 | 200.87 | **419.28 ± 2.37** | **2.09x** |
 
 **Prefill against llama.cpp's `pp512` 2,070.50: 10.3x slower -> 4.94x
-slower.** Peak VRAM unchanged at 31.03 GiB.
+slower.** Peak VRAM unchanged at 31.03 GiB. *(Superseded: see "Integer tensor
+cores, wired end to end" at the end of this document, where it reaches 1.54x.)*
 
 Decode is **unchanged at ~65 tok/s**, and that is expected rather than
 disappointing: at one token the weight is already read exactly once, so there
@@ -1258,6 +1259,156 @@ yet. The continue/stop gate needs restating around the grouped GEMM.
 - **Anything past `89a38ba`.** A concurrent workstream is rewriting the very
   kernel this section identifies as dominant. The ranked list is a statement
   about that commit; the first thing to do with it is re-measure.
+
+## Integer tensor cores, wired end to end (2026-08-16)
+
+The `mma.m8n8k16` primitive measured in isolation above is now the arithmetic
+of **every quantized matmul in the model**. This section supersedes the
+prefill numbers in every section before it.
+
+### Where prefill stands
+
+| | llama.cpp | llmxabe | position |
+| --- | ---: | ---: | --- |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,341.39 ± 5.41 tok/s** | **1.54× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **64.99 tok/s**, 15.39 ms/step | **1.61× slower** |
+
+Prefill started this session at 200.87 tok/s and 10.3× slower.
+
+### The arc, one measurement per change
+
+Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
+5 timed repetitions, stream synchronized inside the timed region.
+
+| change | tok/s | vs previous |
+| --- | ---: | ---: |
+| baseline | 200.87 | — |
+| token tiling in the GDN projection | 362.67 | 1.81× |
+| activation reuse in the same kernel | 419.28 | 1.16× |
+| int8 MMA on the GDN projections | 513.17 | 1.22× |
+| int8 MMA on the Gated Attention projections | 582.46 | 1.14× |
+| int8 MMA on the MoE Q6_K gate/up | 679.12 | 1.17× |
+| int8 MMA on the MoE Q8_0 down | 847.71 | 1.25× |
+| eight tokens per `gdn_chunk_inter` block | 1,008.51 | 1.19× |
+| tiled MoE router | 1,075.60 | 1.07× |
+| 16-bit MoE weight staging | 1,110.95 | 1.03× |
+| GDN state update split into its own kernel | 1,155.20 | 1.04× |
+| `float4` GDN row loads | 1,248.27 | 1.08× |
+| int8 MMA on the shared expert | 1,341.39 | 1.07× |
+
+**6.68× overall.** No single change is more than 1.81×; the result is
+compounding, and roughly half of it is not arithmetic at all — it is fixing
+kernels that re-read the same bytes.
+
+### What the wins actually were
+
+Only five of the twelve changes are about the tensor cores. The rest are
+memory-traffic bugs that the profile made visible once the arithmetic stopped
+dominating:
+
+- **`gdn_chunk_inter` re-read the entire recurrent state once per token.** The
+  state does not depend on the token index. 134 MB of loads per chunk to cover
+  2 MB of distinct data.
+- **The MoE router re-read a 2,048-float weight row and activation row per
+  (expert, token) pair.** 131,072 blocks at 512 tokens; 2.1 GB of loads per
+  layer to cover 6 MB. This was 7.6% of the pass for the *smallest* matmul in
+  the layer.
+- **`gdn_chunk_solve_and_apply` ran at ~5% occupancy** because two thirds of
+  its arithmetic — the chunk-end state update — was sharing a launch shape with
+  code parallel over one axis fewer.
+- **`gdn_chunk_gram` and `gdn_chunk_inter` read their rows one float at a
+  time.** Neither read can be coalesced across a warp by construction, but both
+  can be four times wider. That change alone was worth 8% of the pass and
+  altered no arithmetic whatsoever.
+
+### The two ways to reach a tensor core from a quantized weight
+
+Both are in the tree, and the choice is VRAM, not preference:
+
+- **Repack** into split quant and scale arrays, so operand loads are aligned
+  words. Used for the dense projections (1.13 GiB) and the shared expert
+  (3.5 MB per layer). `mma_q8_0_proj_split` measures 27 TOP/s this way against
+  the 2.1 TOP/s the same kernel gets assembling operands byte by byte in place.
+- **Stage through shared memory**, where the kernel picks the layout and can
+  put the quants on a word boundary itself. Used for the routed experts, whose
+  10.7 G weights cannot afford a second copy beside the model.
+
+The first attempt at the routed-expert kernel did neither and read operands
+straight from global. It was **1.5× slower than the fp32 kernel it replaced**:
+an MMA B fragment wants eight different weight rows per warp, and reading those
+from global put consecutive lanes 1,680 bytes apart, so every 4-byte operand
+cost a full 32-byte sector.
+
+### Where the time goes now
+
+`nsys` kernel summary over a full `bench_forward` sweep, so it mixes batch
+sizes; read it as a ranking, not as per-batch shares.
+
+| kernel | % of GPU time |
+| --- | ---: |
+| `moe_expert_ffn_mma` | 25.6% |
+| `moe_expert_down_mma` | 15.8% |
+| `mma_q8_0_proj_split` | 10.5% |
+| `gdn_chunk_solve_and_apply` | 7.5% |
+| shared expert (two kernels, now replaced) | 9.5% |
+| `attn_flash_causal` | 4.0% |
+| `gdn_proj_q8_0_t16` | 4.0% |
+| `gdn_chunk_state_update` | 3.7% |
+| `moe_block_router_logits` | 2.6% |
+| `gdn_chunk_inter` | 2.5% |
+| `gdn_chunk_gram` | 2.1% |
+
+The MoE expert GEMMs are 41% between them and are the next thing to look at.
+`mma_q8_0_proj_split` is at 13.6% of the card's 198 TOP/s int8 peak, so the
+primitive itself has room that has not been touched.
+
+### Correctness
+
+Every step above holds `tests/forward_pass.rs`: argmax 25358 (' Tokyo'), the
+same token llama.cpp decodes. Four of the changes are **bit-identical** — the
+gate reports logit 20.106327 to every digit across the router tiling, the state
+update split, and the `float4` widening.
+
+`tests/int8_forward.rs` runs 128 tokens through the model twice over the same
+weights, once with every integer path resident and once with all of them
+dropped, and requires the argmax to survive. That test had a hole worth
+recording: `Forward::disable_tensor_cores` reached the two mixers but not the
+MoE, so for three commits the "fp32 twin" ran an integer MoE and the test
+reported a pass for a path it never varied. It now covers all three.
+
+### What this cost in correctness debt: nothing, but two tolerances moved
+
+Two differential tests were asserting an fp32-summation-order bound at shapes
+that had started taking the integer path. Both were **retargeted, not
+loosened**:
+
+- `moe_differential.rs` now runs *both* paths and gates each on its own bound,
+  so the tight fp32 gate survives instead of being widened to cover int8.
+- `moe_block.rs`'s CPU-reference bound is now a fraction of each layer's output
+  magnitude. That was a latent flaw: blk.39's activations are two orders larger
+  than blk.0's, so a constant tuned on one gates the other for no reason but
+  scale. Its real assertion — that the device is no further from llama.cpp than
+  the scalar reference is — is untouched, self-calibrating, and passes.
+
+On blk.0 the integer path agrees with llama.cpp's own `ffn_moe_out` to
+**max_abs 5.96e-8** while the scalar fp32 reference is 2.70e-4 away. llama.cpp
+runs the same integer arithmetic over the same quantized weights; against that
+target the fp32 reference is the outlier.
+
+### One thing the router taught
+
+The first tiled router was faster than the one that shipped — 1,087.05 against
+1,075.60 — and wrong. It repartitioned the contraction across threads, the
+logits moved in their last bits, and `forward_pass.rs` caught block 31's
+relative error jumping 5.26×.
+
+That failure is not the usual float-reassociation nuisance. **The router's
+output is consumed by a top-8 argmax over 256 experts.** A last-bit
+disagreement between two adjacent logits does not perturb an answer slightly;
+it runs a different expert, and everything downstream is a different model. It
+is the one matmul in this engine that cannot afford a reassociation. The
+shipped version stages a contraction width equal to the block width, which
+reproduces the untiled per-thread index order exactly. Correctness cost 1.1%.
 
 ## Reproducing
 
