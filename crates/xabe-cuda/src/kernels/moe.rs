@@ -2164,6 +2164,9 @@ pub struct MoeBuffers {
     expert_counts: CudaSlice<i32>,
     num_tokens_post_pad: CudaSlice<i32>,
     valid_tokens: CudaSlice<i32>,
+    /// What `valid_tokens` was last set to. See
+    /// [`MoeKernels::set_valid_tokens`].
+    valid_published: i32,
     inter: CudaSlice<f32>,
     partial: CudaSlice<f32>,
     shared_inter: CudaSlice<f32>,
@@ -2440,6 +2443,7 @@ impl MoeKernels {
             expert_counts: stream.alloc_zeros::<i32>(g.num_experts)?,
             num_tokens_post_pad: stream.alloc_zeros::<i32>(1)?,
             valid_tokens: stream.alloc_zeros::<i32>(1)?,
+            valid_published: 0,
             inter: stream.alloc_zeros::<f32>(g.sorted_capacity() * g.intermediate)?,
             partial: stream.alloc_zeros::<f32>(g.max_flat_pairs() * g.hidden)?,
             shared_inter: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
@@ -2481,6 +2485,13 @@ impl MoeKernels {
     /// This is a data write, not a shape decision: no allocation happens and
     /// no launch geometry changes, which is what keeps the sequence
     /// capturable.
+    /// A repeat with the same count writes nothing. That is not only an
+    /// elided copy — forty layers share one `MoeBuffers`, so a pass used to
+    /// publish the same number forty times — it is what keeps the write out
+    /// of a CUDA graph capture. The source is a host slice, and a copy from
+    /// pageable host memory is not something a capture may contain; hoisting
+    /// it to `Forward::publish_inputs` and making the repeats free is how the
+    /// step below it became recordable.
     pub fn set_valid_tokens(
         &self,
         stream: &Arc<CudaStream>,
@@ -2493,7 +2504,11 @@ impl MoeKernels {
                 max_tokens: self.geometry.max_tokens,
             });
         }
+        if buffers.valid_published == tokens as i32 {
+            return Ok(());
+        }
         stream.memcpy_htod(&[tokens as i32], &mut buffers.valid_tokens)?;
+        buffers.valid_published = tokens as i32;
         Ok(())
     }
 

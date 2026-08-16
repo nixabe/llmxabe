@@ -80,10 +80,11 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
+use cudarc::driver::sys;
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DriverError,
+    LaunchConfig, PushKernelArg,
 };
 
 use xabe_cuda::kernels::attention::AttentionError;
@@ -224,6 +225,23 @@ pub enum ForwardError {
     WrongTokenCount { expected: usize, got: usize },
     /// Sequence state could not be allocated or reset.
     State(StateError),
+    /// [`Forward::capture_step`] was called on a pass with stage profiling on.
+    ///
+    /// The profiler records CUDA events between stages, and an event recorded
+    /// inside a capture belongs to the graph rather than to the wall clock —
+    /// so the two cannot both be true of one pass.
+    CaptureWhileProfiling,
+    /// The driver returned no graph from a capture. Nothing was recorded.
+    EmptyCapture,
+    /// A replayed step would write past the end of the key/value caches.
+    CacheExhausted {
+        /// Position the sequence had reached.
+        position: usize,
+        /// Positions this pass would add.
+        tokens: usize,
+        /// Positions the caches hold.
+        max_seq: usize,
+    },
     /// The state carries a different number of layers than this pass runs.
     ///
     /// A state is indexed by slot inside the pass, so a mismatch would silently
@@ -286,6 +304,20 @@ impl std::fmt::Display for ForwardError {
                 "this pass was built for {expected} tokens and was given {got}",
             ),
             Self::State(e) => write!(f, "{e}"),
+            Self::CaptureWhileProfiling => {
+                write!(f, "cannot capture a step while stage profiling is enabled",)
+            }
+            Self::EmptyCapture => write!(f, "the capture recorded no work"),
+            Self::CacheExhausted {
+                position,
+                tokens,
+                max_seq,
+            } => write!(
+                f,
+                "{tokens} tokens at position {position} would need {} cache slots, \
+                 but the state holds {max_seq}",
+                position + tokens,
+            ),
             Self::StateShape {
                 expected_gdn,
                 expected_attention,
@@ -550,6 +582,18 @@ pub struct Forward {
     profile: Option<StageProfile>,
 
     report: ForwardReport,
+}
+
+/// One decode step, recorded once and launched as a unit.
+///
+/// Built by [`Forward::capture_step`] and launched by
+/// [`Forward::replay_step`]. It holds device pointers into the `Forward` and
+/// the `SequenceState` it was captured from, so replaying it against a
+/// *different* pass or a different state would read and write the wrong
+/// buffers — which is why neither of those is a parameter of the replay and
+/// why this type carries no way to reach one.
+pub struct StepGraph {
+    graph: CudaGraph,
 }
 
 impl Forward {
@@ -889,6 +933,16 @@ impl Forward {
     /// logits is the one place a kernel can be well inside every tolerance
     /// and still emit a different token.
     pub fn sample_argmax(&mut self, stream: &Arc<CudaStream>) -> Result<i32, ForwardError> {
+        self.launch_argmax(stream)?;
+        self.read_sampled(stream)
+    }
+
+    /// The two argmax kernels, without the read-back.
+    ///
+    /// Separate from [`Self::read_sampled`] so the reduction can live inside a
+    /// captured step while the four-byte transfer, which needs host memory and
+    /// a synchronize, stays outside it.
+    fn launch_argmax(&mut self, stream: &Arc<CudaStream>) -> Result<(), ForwardError> {
         let vocab = self.vocab;
         self.lm_head.argmax(
             stream,
@@ -898,9 +952,111 @@ impl Forward {
             &mut self.argmax_indices,
             &mut self.argmax_out,
         )?;
+        Ok(())
+    }
+
+    /// Read the token id the last [`Self::launch_argmax`] chose.
+    ///
+    /// Synchronizes: an autoregressive step is not finished until the host
+    /// knows what to feed back in.
+    fn read_sampled(&self, stream: &Arc<CudaStream>) -> Result<i32, ForwardError> {
         let host = stream.clone_dtoh(&self.argmax_out)?;
         stream.synchronize()?;
         Ok(host[0])
+    }
+
+    /// Record one whole step — embedding, forty blocks, LM head, argmax — as a
+    /// CUDA graph, for [`Self::replay_step`] to launch at every later position.
+    ///
+    /// **Why.** A one-token step issues about 1,100 device operations, and
+    /// `Forward::run` spends roughly 3 ms of host time issuing them against
+    /// kernels that average 8.6 us. The GPU is idle for about 0.6 us between
+    /// consecutive launches, which is ~0.63 ms per step, plus a ~0.31 ms host
+    /// turnaround at the step boundary. A graph is the same sequence submitted
+    /// as one object.
+    ///
+    /// **What made it possible.** Nothing in [`Self::body`] may take a value
+    /// that changes between steps as a host argument, because a recorded
+    /// launch keeps the arguments it was recorded with. The sequence position
+    /// was the last one: the rotary embedding, the causal bound and the
+    /// key/value append all read it from
+    /// [`SequenceState::publish_position`]'s device scalar now.
+    ///
+    /// Capture executes nothing, so the state is not advanced and the caches
+    /// are not written. It does have to run on a stream of its own — capture
+    /// on the legacy default stream is rejected by the driver — so build the
+    /// engine with `CudaContext::new_stream`.
+    ///
+    /// The bounds check that [`GatedAttentionBlock::forward`] makes against
+    /// `max_seq` happens here, at the captured position, and cannot happen
+    /// again inside a replay. [`Self::replay_step`] makes it itself.
+    pub fn capture_step(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+    ) -> Result<StepGraph, ForwardError> {
+        if self.profile.is_some() {
+            return Err(ForwardError::CaptureWhileProfiling);
+        }
+        // The capture must be told about the position and the token count
+        // before it starts, or the calls that publish them are recorded --
+        // and a copy from pageable host memory is not something a graph may
+        // contain.
+        self.publish_inputs(stream, state, &vec![0i32; self.tokens])?;
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+        // Whatever happens, the capture has to be closed before the error is
+        // returned, or the stream stays in capture mode and every later launch
+        // on it fails.
+        let recorded = self
+            .body(stream, state, &mut |_, _| {})
+            .and_then(|()| self.launch_argmax(stream));
+        // The only flag the driver accepts here without a stream parameter.
+        // It concerns memory nodes the graph owns, and this graph allocates
+        // nothing, so it is inert. `UPLOAD` and `USE_NODE_PRIORITY` were both
+        // tried and both return `CUDA_ERROR_INVALID_VALUE` through
+        // `cuGraphInstantiateWithFlags`.
+        let graph = stream.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        recorded?;
+        let graph = graph?.ok_or(ForwardError::EmptyCapture)?;
+        graph.upload()?;
+        Ok(StepGraph { graph })
+    }
+
+    /// Launch a captured step at the state's current position and return the
+    /// sampled token id.
+    ///
+    /// The host work is three things: two small copies in, one graph launch,
+    /// four bytes out.
+    pub fn replay_step(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        graph: &StepGraph,
+        token_ids: &[i32],
+    ) -> Result<i32, ForwardError> {
+        if token_ids.len() != self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: token_ids.len(),
+            });
+        }
+        // The check `GatedAttentionBlock::forward` makes on every ordinary
+        // pass. A replay never enters that function, so this is the only thing
+        // standing between a too-long sequence and a cache overrun.
+        if state.position() + self.tokens > state.max_seq() {
+            return Err(ForwardError::CacheExhausted {
+                position: state.position(),
+                tokens: self.tokens,
+                max_seq: state.max_seq(),
+            });
+        }
+        self.publish_inputs(stream, state, token_ids)?;
+        graph.graph.launch()?;
+        let id = self.read_sampled(stream)?;
+        state.advance(self.tokens);
+        Ok(id)
     }
 
     /// Drop the repacked int8 weights, forcing every projection back to fp32.
@@ -1007,8 +1163,48 @@ impl Forward {
             p.begin(stream)?;
         }
 
-        let pos_offset = state.position();
+        self.publish_inputs(stream, state, token_ids)?;
+        self.body(stream, state, &mut on_waypoint)?;
+        // Last, and only on success: every block has now appended, so the
+        // state's claim about how many positions its caches hold is true.
+        // Advancing earlier would leave a failed pass claiming positions that
+        // no cache was written for, and the next call would read them.
+        state.advance(self.tokens);
+        Ok(())
+    }
+
+    /// The two per-step host inputs: the token ids and the position.
+    ///
+    /// Split out of [`Self::body`] because these are the only two operations
+    /// in a pass that read host memory, and a CUDA graph capture cannot
+    /// contain a copy from a pageable host pointer. They run before the graph
+    /// launches instead, on the same stream, which orders them ahead of
+    /// everything the graph does.
+    fn publish_inputs(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        token_ids: &[i32],
+    ) -> Result<(), ForwardError> {
         stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
+        state
+            .publish_position(stream)
+            .map_err(ForwardError::State)?;
+        self.moe.publish_tokens(stream, self.tokens)?;
+        Ok(())
+    }
+
+    /// Everything from the embedding gather to the LM head: launches only.
+    ///
+    /// Nothing in here reads host memory, allocates, or synchronizes, and
+    /// nothing takes the sequence position as an argument — that is what makes
+    /// it capturable as a CUDA graph and replayable at every later position.
+    fn body(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        on_waypoint: &mut impl FnMut(Option<u32>, &CudaSlice<f32>),
+    ) -> Result<(), ForwardError> {
         self.mark(stream, Stage::Reset)?;
         self.embed(stream)?;
         self.mark(stream, Stage::Embed)?;
@@ -1031,11 +1227,14 @@ impl Forward {
                     gdn_slot += 1;
                 }
                 LayerKind::GatedAttention => {
+                    let pos_offset = state.position();
+                    let (cache, positions) = state.kv_and_position_mut(attn_slot);
                     self.attention[attn_slot].forward(
                         stream,
                         &self.hidden_state,
-                        state.kv_mut(attn_slot),
+                        cache,
                         pos_offset,
+                        positions,
                         &mut self.mixer_out,
                     )?;
                     attn_slot += 1;
@@ -1087,11 +1286,6 @@ impl Forward {
             &mut self.logits,
         )?;
         self.mark(stream, Stage::LmHead)?;
-        // Last, and only on success: every block has now appended, so the
-        // state's claim about how many positions its caches hold is true.
-        // Advancing earlier would leave a failed pass claiming positions that
-        // no cache was written for, and the next call would read them.
-        state.advance(self.tokens);
         Ok(())
     }
 

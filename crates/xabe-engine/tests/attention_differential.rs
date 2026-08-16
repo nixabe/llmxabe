@@ -205,9 +205,14 @@ fn run_device(
     let mut d_out = stream
         .alloc_zeros::<f32>(n_query * q_heads * head_dim)
         .expect("allocate output");
+    // The causal bound is read from device memory now, so the offset this
+    // test varies has to be uploaded rather than passed.
+    let d_pos = stream
+        .clone_htod(&[key_offset as i32])
+        .expect("upload key offset");
     kernels
         .forward(
-            stream, &d_q, &d_k, &d_v, &mut d_out, n_query, n_keys, key_offset,
+            stream, &d_q, &d_k, &d_v, &mut d_out, n_query, n_keys, &d_pos,
         )
         .expect("attention launches");
     let out = stream.clone_dtoh(&d_out).expect("read output");
@@ -789,10 +794,12 @@ fn partial_rotary_rotates_64_dimensions_and_copies_the_other_192_bit_exactly() {
             let mut d_out = stream
                 .alloc_zeros::<f32>(input.len())
                 .expect("allocate output");
+            let d_pos = stream
+                .clone_htod(&[pos_offset as i32])
+                .expect("upload rope position");
             kernels
                 .rope(
-                    &stream, &d_in, &mut d_out, N_TOKENS, n_heads, g.rope_dim, pos_offset,
-                    THETA_BASE,
+                    &stream, &d_in, &mut d_out, N_TOKENS, n_heads, g.rope_dim, &d_pos, THETA_BASE,
                 )
                 .expect("rope launches");
             let device = stream.clone_dtoh(&d_out).expect("read back");

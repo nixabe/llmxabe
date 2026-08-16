@@ -1485,13 +1485,13 @@ the kernel is bound by the integer pipe rather than by DRAM: the word-wide
 unpack above bought 8% of the whole decode step without touching a single
 byte of traffic.
 
-### The launch gap is bigger than the first measurement said
+### The launch gap, and the CUDA graph that did not collect it
 
 An earlier version of this section put the GPU at "about 92% busy, so ~0.97 ms
-is launch gap". The number was right by accident. The first pass computed
-idle from the *kernel* timeline alone, and a decode step also issues about 180
-memsets and memcopies; most of what looked like idle was those. Counting all
-three activity kinds:
+is launch gap". The number was right by accident: the first pass computed idle
+from the *kernel* timeline alone, and a decode step also issues about 180
+memsets and memcopies, so most of what looked like idle was those. Counting
+all three activity kinds gives the same total for better reasons:
 
 | | ms/step |
 | --- | ---: |
@@ -1502,13 +1502,40 @@ three activity kinds:
 
 1,124 device operations per step at about 0.6 us of dead time each is the
 whole first row, and `Forward::run` spends **3.1 ms of host time** issuing
-them — 2.8 us per launch, against kernels that average 8.6 us. The host stays
-ahead, but not by much, and it re-issues an identical sequence 40 times a
-second. That is what a CUDA graph is for, and it is the largest single item
-left on the decode path. It is blocked on one thing: the attention blocks take
-the sequence position as a **host** argument, and one of them uses it as a
-slice offset, so the captured graph would bake in position `n` and replay it
-forever. Making the position a device scalar is `AGENTS.md` rule 5 anyway.
+them — 2.8 us per launch, against kernels that average 8.6 us. So the step
+was recorded as a CUDA graph and replayed.
+
+**It works, and it is worth nothing.** `nsys` confirms the graph does exactly
+what it was supposed to: idle per step falls from 0.97 ms to **0.405 ms**, and
+the host turnaround from 0.31 ms to 0.02 ms. The wall clock does not move —
+10.63 ms without, 10.70 ms with, against a run-to-run spread of 0.05 ms.
+
+The reason is visible in the same profile. Under graph replay every decode
+kernel is **0.3–0.5 us slower**, uniformly, across all 1,100 of them: about
+0.55 ms, which is what the 0.57 ms of recovered idle paid for. On this
+hardware a graph node costs roughly what the launch gap it replaces cost. That
+is a Turing result and should not be generalized — Ampere added hardware
+acceleration for graph node dispatch that this part does not have.
+
+What was kept anyway, and why:
+
+- **The sequence position is a device scalar now.** The rotary embedding, the
+  causal bound and the key/value append all took it as a host argument, and
+  the append used it as a *slice offset* — a host-computed destination
+  address. `AGENTS.md` rule 5 says nothing on the forward path may be sized or
+  indexed by a host-side value, and this was the last place that was not true.
+  The append is also one kernel now instead of two `cuMemcpyDtoDAsync`.
+- **The host cost of a decode step went from 3.1 ms to about 0.05 ms.** That
+  buys nothing in a benchmark whose host does nothing else, and it is most of
+  what a serving surface needs the host for.
+- **`tests/graph_decode.rs` exists**, and it caught a real bug on the first
+  run: `MoeKernels::set_valid_tokens` copied a host `i32` into a device scalar
+  once per layer, inside the capture. A copy from pageable host memory is not
+  something a graph may contain; the driver accepted it in relaxed capture mode
+  and produced a graph that generated `[222543, 20073, 20073, 20073, …]` —
+  fluent, finite, and frozen after one step — against the launch path's
+  `[198, 248045, 74455, 198, …]`. The count is published once per pass now,
+  ahead of the capture, and repeats write nothing.
 
 ### A measurement discipline note
 

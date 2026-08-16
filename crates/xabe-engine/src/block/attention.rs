@@ -876,6 +876,7 @@ impl GatedAttentionBlock {
         hidden_state: &CudaSlice<f32>,
         cache: &mut KvCache,
         pos_offset: usize,
+        positions: &CudaSlice<i32>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), AttentionBlockError> {
         let t = self.tokens;
@@ -1027,7 +1028,7 @@ impl GatedAttentionBlock {
             t,
             self.q_heads,
             self.rope_dim,
-            pos_offset,
+            positions,
             self.rope_theta,
         )?;
         k.mixer.rope(
@@ -1037,22 +1038,26 @@ impl GatedAttentionBlock {
             t,
             self.kv_heads,
             self.rope_dim,
-            pos_offset,
+            positions,
             self.rope_theta,
         )?;
 
         // 8. Append this batch's keys and values to the cache, at the absolute
-        //    positions they belong to. A device-to-device copy rather than a
-        //    kernel: the projections already wrote a contiguous
-        //    `[t][kv_heads][head_dim]` run and the cache is the same layout, so
-        //    this is one `cuMemcpyDtoDAsync` per half on the same stream, which
-        //    orders it after the rope and before the attention read.
-        let span = t * self.kv_heads * self.head_dim;
-        let at = pos_offset * self.kv_heads * self.head_dim;
-        let mut k_slot = cache.k.slice_mut(at..at + span);
-        stream.memcpy_dtod(&self.key_roped, &mut k_slot)?;
-        let mut v_slot = cache.v.slice_mut(at..at + span);
-        stream.memcpy_dtod(&self.value, &mut v_slot)?;
+        //    positions they belong to. One kernel for both halves, reading the
+        //    position from the device — this was two `cuMemcpyDtoDAsync` calls
+        //    into host-computed slices, which is the same traffic but bakes a
+        //    host-chosen destination address into the launch and so cannot be
+        //    replayed from a CUDA graph.
+        k.mixer.append_kv(
+            stream,
+            &self.key_roped,
+            &self.value,
+            &mut cache.k,
+            &mut cache.v,
+            t,
+            cache.max_seq,
+            positions,
+        )?;
 
         // 9. Causal GQA attention over the whole cached window, not just this
         //    batch. `n_keys` is the filled length; the cache buffer itself is
@@ -1064,8 +1069,8 @@ impl GatedAttentionBlock {
             &cache.v,
             &mut self.pregate,
             t,
-            pos_offset + t,
-            pos_offset,
+            cache.max_seq,
+            positions,
         )?;
 
         // 10. The output gate.

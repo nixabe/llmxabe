@@ -986,8 +986,11 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         // A cache sized to this window and written from position 0 makes the
         // pass a cold prefill, which is what the capture recorded.
         let mut cache = KvCache::new(&stream, &config, tokens).expect("kv cache allocates");
+        // The position is a device scalar now, so a cold prefill has to say so
+        // in device memory rather than by passing a host zero.
+        let positions = stream.alloc_zeros::<i32>(1).expect("alloc position");
         block
-            .forward(&stream, &d_in, &mut cache, 0, &mut d_out)
+            .forward(&stream, &d_in, &mut cache, 0, &positions, &mut d_out)
             .expect("block forward launches");
         stream.synchronize().expect("sync after forward");
 

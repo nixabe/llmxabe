@@ -120,7 +120,18 @@ fn main() -> ExitCode {
     }
 
     let config = ModelConfig::qwen3_6_35b_a3b();
-    let stream = ctx.default_stream();
+    // A stream of its own, not the legacy default one: `cuStreamBeginCapture`
+    // rejects the default stream, and the decode loop below captures a step.
+    let stream = ctx.new_stream().expect("create stream");
+    // SAFETY: creating a stream puts cudarc into multi-stream mode, where
+    // every `CudaSlice` records an event on each use and every later use on
+    // another stream waits on it. This process has exactly one stream, so
+    // there is no cross-stream ordering to manage -- and the waits are not
+    // merely wasted: a `cuStreamWaitEvent` on an event recorded outside a
+    // capture is `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`, so tracking and
+    // capture cannot both be on. This must run before the first allocation,
+    // because only slices created afterwards are untracked.
+    unsafe { ctx.disable_event_tracking() };
     let file = GgufFile::open(&path).expect("valid GGUF v3");
     let (free_at_start, total) = memory_info(&ctx).expect("memory info");
 
@@ -200,10 +211,19 @@ fn main() -> ExitCode {
     // bytes the host needs to choose the next input. Reducing the 248,320
     // logits on the host instead moved 993 KiB across PCIe and scanned them
     // on one core every step, which measured as 0.5 ms of an 11.6 ms step.
+    // Capture the step once. Capture executes nothing, so the state is
+    // untouched and the first replay below is the first token generated.
+    let graph = match step.capture_step(&stream, &mut state) {
+        Ok(g) => g,
+        Err(e) => {
+            error!("FAILED to capture a decode step: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut decode_one = |state: &mut _, token: i32| -> Result<i32, String> {
-        step.run(&stream, state, &[token], |_, _| {})
-            .map_err(|e| e.to_string())?;
-        step.sample_argmax(&stream).map_err(|e| e.to_string())
+        step.replay_step(&stream, state, &graph, &[token])
+            .map_err(|e| e.to_string())
     };
 
     for _ in 0..WARMUP {

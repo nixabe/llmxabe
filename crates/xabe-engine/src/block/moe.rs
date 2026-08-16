@@ -902,6 +902,23 @@ impl MoeBlock {
     /// ran on a stale slot would leave a plausible value where the caller left
     /// a zero.
     #[allow(clippy::too_many_arguments)]
+    /// Publish this pass's token count into the device scalar the MoE kernels
+    /// gate on, ahead of the pass.
+    ///
+    /// Idempotent, and the reason it is public: the write reads host memory,
+    /// and a CUDA graph capture may not contain a copy from a pageable host
+    /// pointer. `Forward::publish_inputs` calls this before capturing so that
+    /// the call inside [`Self::forward`] has nothing left to do.
+    pub fn publish_tokens(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        tokens: usize,
+    ) -> Result<(), MoeBlockError> {
+        self.moe
+            .set_valid_tokens(stream, &mut self.buffers, tokens)?;
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         stream: &Arc<CudaStream>,
@@ -923,8 +940,10 @@ impl MoeBlock {
         check_len("ffn_out", n, ffn_out.len())?;
         check_len("l_out", n, l_out.len())?;
 
-        self.moe
-            .set_valid_tokens(stream, &mut self.buffers, tokens)?;
+        // A no-op after the first call at this shape — see
+        // `MoeKernels::set_valid_tokens`. The forward path keeps the call so
+        // a caller that never reaches `publish_tokens` is still correct.
+        self.publish_tokens(stream, tokens)?;
 
         // 1. post-mixer RMSNorm. Every row of the buffer is normalized, not
         //    just the live ones, so the launch shape is the geometry's: a row

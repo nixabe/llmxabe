@@ -125,7 +125,10 @@
 //! Query row `i` of a launch sits at absolute position `key_offset + i` and
 //! attends to keys `[0, key_offset + i]` inclusive — `key_offset + i + 1`
 //! keys. `key_offset` is what makes chunked prefill and decode the same
-//! kernel. The bound appears exactly once, as the loop limit `n_visible`, so
+//! kernel, and it is a **device scalar**: it is the only thing that differs
+//! between two consecutive decode steps, so keeping it out of the launch
+//! arguments is what lets a whole step be recorded once as a CUDA graph.
+//! The bound appears exactly once, as the loop limit `n_visible`, so
 //! there is no separate mask to get off by one against; an off-by-one would
 //! have to be an off-by-one in `+ 1`, and the differential test proves that
 //! `+ 1` is right by perturbing key `t+1` and requiring output row `t` to come
@@ -210,7 +213,7 @@ __global__ void attn_rope_partial_neox(
     int n_heads,
     int head_dim,
     int rope_dim,
-    int pos_offset,
+    const int* __restrict__ pos_offset,
     float theta_base
 ) {
     long long t = blockIdx.x;
@@ -227,7 +230,7 @@ __global__ void attn_rope_partial_neox(
     // Dimensions [half, rope_dim) are written by their partner thread d-half.
     if (d >= half) return;
 
-    double pos = (double)pos_offset + (double)t;
+    double pos = (double)(*pos_offset) + (double)t;
     double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
     double angle = pos * freq;
     float sin_a = (float)sin(angle);
@@ -264,7 +267,7 @@ __global__ void attn_flash_causal(
     int q_heads,
     int kv_heads,
     int head_dim,
-    long long key_offset,
+    const int* __restrict__ key_offset,
     float scale
 ) {
     extern __shared__ float smem[];
@@ -286,7 +289,7 @@ __global__ void attn_flash_causal(
 
     // The causal bound, written once. Query row qi sits at absolute position
     // key_offset + qi and sees keys [0, key_offset + qi] inclusive.
-    long long n_visible = key_offset + qi + 1;
+    long long n_visible = (long long)(*key_offset) + qi + 1;
 
     float m = neg_inf();
     float l = 0.0f;
@@ -341,8 +344,48 @@ __global__ void attn_flash_causal(
     out[qbase + tid] = acc / l;
 }
 
+// Append this batch's roped keys and raw values to the cache, at the absolute
+// position the sequence has reached.
+//
+// This was two `cuMemcpyDtoDAsync` calls into `cache.k.slice_mut(at..)` and
+// `cache.v.slice_mut(at..)`, which is the same traffic and one fewer launch.
+// It is a kernel now for one reason: `at` was computed on the host, so the
+// destination was a **host-chosen address**. A CUDA graph records addresses,
+// so a captured decode step would write position `n` forever. Reading the
+// position from device memory is what makes the step replayable, and it is
+// `AGENTS.md` rule 5 besides.
+//
+// Both halves in one launch: they are the same shape and the same stride, and
+// the copies are independent, so splitting them would only cost a launch.
+//
+// grid: (ceil(2 * span / ATTN_APPEND_THREADS),). block: ATTN_APPEND_THREADS.
+__global__ void attn_kv_append(
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    const int* __restrict__ position,
+    int span,
+    int row
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 2 * span) return;
+    // `span` is `n_tokens * row`; the cache is indexed by *position*, so the
+    // destination base is one row per position and not one span.
+    long long at = (long long)(*position) * (long long)row;
+    if (i < span) {
+        k_cache[at + i] = key[i];
+    } else {
+        int j = i - span;
+        v_cache[at + j] = value[j];
+    }
+}
+
 }
 "#;
+
+/// Threads per block for [`AttentionKernels::append_kv`].
+const APPEND_THREADS: u32 = 256;
 
 /// Something went wrong compiling or launching an attention kernel.
 #[derive(Debug)]
@@ -436,6 +479,7 @@ pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
     flash: CudaFunction,
+    append: CudaFunction,
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -465,6 +509,7 @@ impl AttentionKernels {
             split: module.load_function("attn_split_query_gate")?,
             rope: module.load_function("attn_rope_partial_neox")?,
             flash: module.load_function("attn_flash_causal")?,
+            append: module.load_function("attn_kv_append")?,
             q_heads,
             kv_heads,
             head_dim,
@@ -571,11 +616,18 @@ impl AttentionKernels {
 
     /// Apply partial rotary embedding to `[n_tokens][n_heads][head_dim]`.
     ///
-    /// Token `i` is rotated by position `pos_offset + i`. `n_heads` is
+    /// Token `i` is rotated by position `positions[0] + i`. `n_heads` is
     /// `q_heads` for the query stream and `kv_heads` for the key stream — RoPE
     /// is applied before the GQA broadcast, so the two differ.
     ///
     /// Dimensions `[rope_dim, head_dim)` are copied through unmodified.
+    ///
+    /// **`positions` is a one-element device scalar, not a host number.** The
+    /// position is the only thing that changes between two decode steps, so
+    /// keeping it on the device is what lets a whole step be captured once as
+    /// a CUDA graph and replayed — a host argument would be baked into the
+    /// recorded launch. It is also `AGENTS.md` rule 5: nothing on the forward
+    /// path is sized or indexed by a host-side value.
     #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,
@@ -585,9 +637,10 @@ impl AttentionKernels {
         n_tokens: usize,
         n_heads: usize,
         rope_dim: usize,
-        pos_offset: usize,
+        positions: &CudaSlice<i32>,
         theta_base: f32,
     ) -> Result<(), AttentionError> {
+        Self::expect_len("rope position", positions.len(), 1)?;
         if !rope_dim.is_multiple_of(2) || rope_dim > self.head_dim {
             return Err(AttentionError::UnsupportedRopeDim {
                 rope_dim,
@@ -606,7 +659,6 @@ impl AttentionKernels {
         let n_heads_i = n_heads as i32;
         let head_dim = self.head_dim as i32;
         let rope_dim_i = rope_dim as i32;
-        let pos_offset_i = pos_offset as i32;
         let mut builder = stream.launch_builder(&self.rope);
         builder
             .arg(input)
@@ -614,7 +666,7 @@ impl AttentionKernels {
             .arg(&n_heads_i)
             .arg(&head_dim)
             .arg(&rope_dim_i)
-            .arg(&pos_offset_i)
+            .arg(positions)
             .arg(&theta_base);
         // SAFETY: the grid is (n_tokens, n_heads) with one thread per head
         // dimension; both buffers were checked to hold exactly that many
@@ -628,20 +680,28 @@ impl AttentionKernels {
     /// - `q`, `out`: `[n_query][q_heads][head_dim]`
     /// - `k`, `v`: `[n_keys][kv_heads][head_dim]`
     ///
-    /// Query row `i` sits at absolute position `key_offset + i` and attends to
-    /// keys `[0, key_offset + i]`. `key_offset == 0` with `n_query == n_keys`
-    /// is a full prefill; `key_offset == n_keys - 1` with `n_query == 1` is a
-    /// decode step against a cached window.
+    /// Query row `i` sits at absolute position `positions[0] + i` and attends
+    /// to keys `[0, positions[0] + i]`. A position of 0 with `n_query` equal
+    /// to the filled window is a full prefill; `n_query == 1` at the window's
+    /// last position is a decode step against a cached window.
     ///
-    /// `k` and `v` may be **longer** than the window. A KV cache is allocated
-    /// once for the longest sequence the worker admits and then filled a token
-    /// at a time, so from the second decode step onward the buffer is
-    /// necessarily larger than `n_keys`. The kernel indexes keys by absolute
-    /// position and reads nothing above `key_offset + n_query - 1`, so the
-    /// tail is untouched rather than merely unused. Requiring an exact length
-    /// here would force the cache to be re-sliced per step, and there is
-    /// nothing to gain by it. `q` and `out` stay exact: those are indexed by
-    /// the launch geometry, so a wrong length there is a wrong launch.
+    /// **`positions` is a one-element device scalar** — see [`Self::rope`] for
+    /// why. The consequence here is that the "query rows run past the key
+    /// window" check cannot live in this function any more: the position is
+    /// not a number this side of the launch. `max_keys` is the caller's
+    /// promise about the cache's *capacity*, which is checked against the
+    /// buffers, and the caller owns the promise that the position stays inside
+    /// it. In this engine that is `GatedAttentionBlock::forward`, which holds
+    /// both the host position and `KvCache::max_seq` and returns
+    /// [`AttentionError::QueryPastKeys`] itself.
+    ///
+    /// `k` and `v` may be **longer** than the filled window. A KV cache is
+    /// allocated once for the longest sequence the worker admits and then
+    /// filled a token at a time. The kernel indexes keys by absolute position
+    /// and reads nothing above `positions[0] + n_query - 1`, so the tail is
+    /// untouched rather than merely unused. `q` and `out` stay exact: those
+    /// are indexed by the launch geometry, so a wrong length there is a wrong
+    /// launch.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -651,18 +711,12 @@ impl AttentionKernels {
         v: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         n_query: usize,
-        n_keys: usize,
-        key_offset: usize,
+        max_keys: usize,
+        positions: &CudaSlice<i32>,
     ) -> Result<(), AttentionError> {
-        if key_offset + n_query > n_keys {
-            return Err(AttentionError::QueryPastKeys {
-                key_offset,
-                n_query,
-                n_keys,
-            });
-        }
+        Self::expect_len("attention position", positions.len(), 1)?;
         let q_elems = n_query * self.q_heads * self.head_dim;
-        let kv_elems = n_keys * self.kv_heads * self.head_dim;
+        let kv_elems = max_keys * self.kv_heads * self.head_dim;
         Self::expect_len("query", q.len(), q_elems)?;
         Self::expect_at_least("key", k.len(), kv_elems)?;
         Self::expect_at_least("value", v.len(), kv_elems)?;
@@ -676,7 +730,6 @@ impl AttentionKernels {
         let q_heads = self.q_heads as i32;
         let kv_heads = self.kv_heads as i32;
         let head_dim = self.head_dim as i32;
-        let key_offset_i = key_offset as i64;
         let scale = self.scale();
         let mut builder = stream.launch_builder(&self.flash);
         builder
@@ -687,14 +740,65 @@ impl AttentionKernels {
             .arg(&q_heads)
             .arg(&kv_heads)
             .arg(&head_dim)
-            .arg(&key_offset_i)
+            .arg(positions)
             .arg(&scale);
         // SAFETY: the grid is (n_query, q_heads) with one thread per head
         // dimension. The deepest key index any block reads is
-        // `key_offset + n_query - 1`, which was just checked to be below
-        // `n_keys`, and all four buffers were checked against the geometry.
+        // `positions[0] + n_query - 1`, which the caller promised is below
+        // `max_keys`, and all four buffers were checked against it.
         // Shared memory covers q_sh plus the two `head_dim/32`-wide scratch
         // arrays, which is everything the kernel indexes.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Write this batch's keys and values into the cache at `positions[0]`.
+    ///
+    /// `key` and `value` are `[n_tokens][kv_heads][head_dim]`; the caches are
+    /// the same layout over `max_keys` positions. This replaced two
+    /// device-to-device copies into host-computed slices — see the kernel's
+    /// own comment for why a host-computed destination address had to go.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_kv(
+        &self,
+        stream: &Arc<CudaStream>,
+        key: &CudaSlice<f32>,
+        value: &CudaSlice<f32>,
+        k_cache: &mut CudaSlice<f32>,
+        v_cache: &mut CudaSlice<f32>,
+        n_tokens: usize,
+        max_keys: usize,
+        positions: &CudaSlice<i32>,
+    ) -> Result<(), AttentionError> {
+        Self::expect_len("append position", positions.len(), 1)?;
+        let row = self.kv_heads * self.head_dim;
+        let span = n_tokens * row;
+        Self::expect_len("append key", key.len(), span)?;
+        Self::expect_len("append value", value.len(), span)?;
+        Self::expect_at_least("append key cache", k_cache.len(), max_keys * row)?;
+        Self::expect_at_least("append value cache", v_cache.len(), max_keys * row)?;
+
+        let cfg = LaunchConfig {
+            grid_dim: ((2 * span).div_ceil(APPEND_THREADS as usize) as u32, 1, 1),
+            block_dim: (APPEND_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let span_i = span as i32;
+        let row_i = row as i32;
+        let mut builder = stream.launch_builder(&self.append);
+        builder
+            .arg(key)
+            .arg(value)
+            .arg(&mut *k_cache)
+            .arg(&mut *v_cache)
+            .arg(positions)
+            .arg(&span_i)
+            .arg(&row_i);
+        // SAFETY: every thread past `2 * span` returns, both sources hold
+        // exactly `span` floats, and the deepest destination index is
+        // `positions[0] * row + span - 1` — inside `max_keys * row`, which
+        // both caches were checked to hold, for any position the caller's own
+        // `max_seq` check admits.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
@@ -752,7 +856,7 @@ mod tests {
         // moves aggregate error metrics by almost nothing. It is asserted
         // structurally because no tolerance would catch it reliably.
         assert!(
-            ATTENTION_SRC.contains("long long n_visible = key_offset + qi + 1;"),
+            ATTENTION_SRC.contains("long long n_visible = (long long)(*key_offset) + qi + 1;"),
             "the causal window bound changed shape",
         );
         assert!(

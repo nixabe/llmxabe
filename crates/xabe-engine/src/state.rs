@@ -49,7 +49,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::CudaStream;
+use cudarc::driver::{CudaSlice, CudaStream};
 
 use xabe_model::config::ModelConfig;
 
@@ -103,6 +103,23 @@ pub struct SequenceState {
     gdn: Vec<GdnState>,
     kv: Vec<KvCache>,
     position: usize,
+    /// `position`, on the device, as one `i32`.
+    ///
+    /// The rotary embedding, the causal bound and the cache append all need
+    /// the position, and all three used to take it as a host argument. That
+    /// is exactly what stops a decode step from being captured once as a CUDA
+    /// graph and replayed: a recorded launch keeps the argument it was
+    /// recorded with, so the replay would rotate by, and append at, the
+    /// position of the step that was captured — forever. Holding it here and
+    /// pushing four bytes before each step makes every step the same launch
+    /// sequence. It is also `AGENTS.md` rule 5.
+    ///
+    /// The host copy stays because the bounds checks are still the host's job
+    /// (`position + tokens <= max_seq`); [`Self::publish_position`] is what
+    /// keeps the two in step, and it is called on the forward path rather
+    /// than by [`Self::advance`] so that a failed pass cannot leave the device
+    /// claiming a position no cache was written for.
+    d_position: CudaSlice<i32>,
     max_seq: usize,
 }
 
@@ -133,6 +150,7 @@ impl SequenceState {
             gdn: gdn_states,
             kv,
             position: 0,
+            d_position: stream.alloc_zeros::<i32>(1)?,
             max_seq,
         })
     }
@@ -173,6 +191,7 @@ impl SequenceState {
             stream.memset_zeros(&mut state.recurrent)?;
         }
         self.position = 0;
+        stream.memset_zeros(&mut self.d_position)?;
         Ok(())
     }
 
@@ -191,9 +210,21 @@ impl SequenceState {
         &mut self.gdn[slot]
     }
 
-    /// The `slot`-th key/value cache, counting only attention layers.
-    pub(crate) fn kv_mut(&mut self, slot: usize) -> &mut KvCache {
-        &mut self.kv[slot]
+    /// The `slot`-th key/value cache and the device position together.
+    ///
+    /// Two accessors would be two borrows of `self`, one of them mutable, in
+    /// one expression. They are disjoint fields, so one call that splits them
+    /// is the borrow checker's answer rather than a workaround.
+    pub(crate) fn kv_and_position_mut(&mut self, slot: usize) -> (&mut KvCache, &CudaSlice<i32>) {
+        (&mut self.kv[slot], &self.d_position)
+    }
+
+    /// Copy the host position to the device.
+    ///
+    /// Four bytes, once per pass, before anything reads it.
+    pub(crate) fn publish_position(&mut self, stream: &Arc<CudaStream>) -> Result<(), StateError> {
+        stream.memcpy_htod(&[self.position as i32], &mut self.d_position)?;
+        Ok(())
     }
 
     /// Record that `tokens` more positions have been written.
