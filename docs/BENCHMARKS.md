@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,644**, 1,639–1,655 | **1.26× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,691**, 1,689–1,714 | **1.22× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1304,8 +1304,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | a block's warps share one weight band | 1,440.00 | 1.01× |
 | pad the staged activation row off a 32-bank stride | 1,630.00 | **1.13×** |
 | four keys per warp between attention barriers | 1,644.10 | 1.01× |
+| eight tokens at once in the GDN solve's output | 1,708.06 | 1.04× |
 
-**8.18× overall.** No single change is more than 1.81×; the result is
+**8.50× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1455,6 +1456,38 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### Half the GDN solve was parallel and did not say so
+
+`gdn_chunk_solve_and_apply` ran on `value_heads * head_dim` = 4,096 threads —
+128 warps, about 5% of what 72 SMs hold — and its own comment gave the reason:
+`vi` is the only axis it is parallel over. That is true of the forward
+substitution, which is sequential in `t` because token `t`'s correction reads
+`U'` rows `0..t`. It is **not** true of the section after it.
+
+Section 3 computes each token's output from a `U'` that is already final, so
+every `t` is independent. Section 4a — publishing `U'` with the chunk-end
+decay folded in — is independent per `t` as well. Together they are close to
+half the kernel's arithmetic, and both were running one token at a time.
+
+The block is now `SOLVE_VB * SOLVE_TT` = 32 x 8 threads on the same grid.
+Sections 1 and 2 run on the first 32 and the rest wait at the barriers they
+were going to wait at anyway; sections 3 and 4a use all 256. That is **1,024
+warps instead of 128** for the half that could take them.
+
+| tokens in flight | tok/s |
+| --- | ---: |
+| 1 (before) | 1,644.10 |
+| 4 | 1,691.35 |
+| **8** | **1,708.06** |
+| 16 | 1,693.84 |
+
+**+3.9%.** Sixteen is past the knee: the block becomes 512 threads and its
+shared footprint 18.5 KiB, and each token lane needs a `decay` row of its own.
+
+Every per-thread sum keeps its order — the substitution's `i < t`, the
+output's `i <= t`, the ascending `gcum` — so this is **bit-identical**, and
+the only thing that changed is how many of them run at once.
 
 ### The flash kernel crossed a barrier every eight keys
 

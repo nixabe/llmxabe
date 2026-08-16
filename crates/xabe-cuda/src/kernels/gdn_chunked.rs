@@ -179,6 +179,13 @@ const INTER_TT: u32 = 8;
 
 /// Value indices one solve block owns. Mirrors the kernel's `VB`.
 const SOLVE_VB: u32 = 32;
+
+/// Token positions the solve's output section computes side by side.
+///
+/// Mirrors `SOLVE_TT`. The block is `SOLVE_VB * SOLVE_TT` threads: the forward
+/// substitution is sequential in `t` and runs on the first row of them, and
+/// the per-token output is not, so it runs on all of them.
+const SOLVE_TT: u32 = 8;
 /// Value indices one state-update block owns. Mirrors `STATE_VB`.
 const STATE_VB: u32 = 32;
 /// State columns one state-update block owns. Mirrors `STATE_JB`; the block
@@ -472,6 +479,17 @@ __global__ void gdn_chunk_inter(
 // whose shortest section is 2,016 iterations.
 #define VB 32
 
+// Token positions the block's *output* section works on at once.
+//
+// Sections 1 and 2 are a forward substitution and are sequential in `t`, so
+// they run on one VB-wide row of threads and the rest of the block waits at
+// the barriers. Section 3 is not: every token's output reads a U' that is
+// already final, so `SOLVE_TT` of them can be computed side by side. The block
+// is `VB * SOLVE_TT` threads and the launch grid is unchanged, which takes the
+// kernel from 128 warps -- about 5% of what 72 SMs hold -- to 1,024 for the
+// section that is nearly half its arithmetic.
+#define SOLVE_TT 8
+
 __global__ void gdn_chunk_solve_and_apply(
     float* __restrict__ uprime,
     float* __restrict__ lambda_last,
@@ -493,10 +511,13 @@ __global__ void gdn_chunk_solve_and_apply(
     extern __shared__ float shared[];
     float* u     = shared;                              // [c][VB], holds U'
     float* gcum  = shared + (long long)c * VB;          // [c], log space
-    float* decay = gcum + c;                            // [c], one row at a time
+    float* decay = gcum + c;                            // [SOLVE_TT][c]
 
     int h = blockIdx.x;
-    int vl = threadIdx.x;
+    // `vl` is the value index within the band and `tsub` the output section's
+    // token lane. Sections 1, 2 and 4a use `vl` alone and idle the rest.
+    int vl = threadIdx.x & (VB - 1);
+    int tsub = threadIdx.x / VB;
     int vi = blockIdx.y * VB + vl;
     // Modulo, not division. See `super::gdn`'s module docs.
     int hq = h % qk_heads;
@@ -513,7 +534,7 @@ __global__ void gdn_chunk_solve_and_apply(
     // inf and then NaN. Everything below exponentiates a *difference* of two
     // gcum entries instead, which is bounded above by 1 for non-positive
     // log-decays.
-    if (vl == 0) {
+    if (threadIdx.x == 0) {
         float running = 0.0f;
         for (int t = 0; t < c; ++t) {
             running += log_decay[(long long)(chunk_start + t) * value_heads + h];
@@ -538,11 +559,15 @@ __global__ void gdn_chunk_solve_and_apply(
     // so computing it once costs 1/head_dim of the alternative on a kernel
     // whose inner loop is otherwise pure multiply-add.
     for (int t = 0; t < c; ++t) {
-        for (int i = vl; i <= t; i += blockDim.x) {
+        // The whole block fills `decay`; only the first VB threads consume it
+        // here, but the fill is `t + 1` exponentials and there is no reason to
+        // leave seven eighths of the block out of it.
+        for (int i = threadIdx.x; i <= t; i += blockDim.x) {
             decay[i] = expf(gcum[t] - gcum[i]);
         }
         __syncthreads();
 
+        if (tsub == 0) {
         long long ht = (long long)(chunk_start + t) * value_heads + h;
         float beta_t = beta[ht];
         float v_t = v[ht * head_dim + vi];
@@ -555,26 +580,35 @@ __global__ void gdn_chunk_solve_and_apply(
         }
 
         u[t * VB + vl] = acc;
+        }
         // Publishes row t, and holds every thread until the whole block is
         // done reading `decay` before the next iteration overwrites it.
         __syncthreads();
     }
 
     // --- 3. Per-token output, from the state *including* token t's update. --
-    for (int t = 0; t < c; ++t) {
-        for (int i = vl; i <= t; i += blockDim.x) {
-            decay[i] = expf(gcum[t] - gcum[i]);
+    for (int t0 = 0; t0 < c; t0 += SOLVE_TT) {
+        int t = t0 + tsub;
+        // One `decay` row per token lane, so the SOLVE_TT tokens in flight do
+        // not overwrite each other's.
+        float* dec = decay + tsub * c;
+        if (t < c) {
+            for (int i = vl; i <= t; i += VB) {
+                dec[i] = expf(gcum[t] - gcum[i]);
+            }
         }
         __syncthreads();
 
+        if (t < c) {
         const float* kq_row = kq + ((long long)hq * c + t) * c;
         float o_intra = 0.0f;
         for (int i = 0; i <= t; ++i) {
-            o_intra += kq_row[i] * decay[i] * u[i * VB + vl];
+            o_intra += kq_row[i] * dec[i] * u[i * VB + vl];
         }
         float o_inter = expf(gcum[t]) * oint[((long long)h * c + t) * head_dim + vi];
         long long ht = (long long)(chunk_start + t) * value_heads + h;
         out[ht * head_dim + vi] = o_inter + o_intra;
+        }
         __syncthreads();
     }
 
@@ -593,15 +627,16 @@ __global__ void gdn_chunk_solve_and_apply(
     // update is parallel over (head, vi, j) as well: 524,288 independent
     // outputs. Leaving it here would run two thirds of this kernel's
     // arithmetic at a twentieth of the machine.
-    for (int i = vl; i < c; i += blockDim.x) {
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
         decay[i] = expf(gcum[c - 1] - gcum[i]);
     }
     __syncthreads();
 
-    for (int i = 0; i < c; ++i) {
+    // Every `i` is independent, so this walks the token lanes as well.
+    for (int i = tsub; i < c; i += SOLVE_TT) {
         uprime[((long long)h * c + i) * head_dim + vi] = u[i * VB + vl] * decay[i];
     }
-    if (vl == 0 && blockIdx.y == 0) lambda_last[h] = expf(gcum[c - 1]);
+    if (threadIdx.x == 0 && blockIdx.y == 0) lambda_last[h] = expf(gcum[c - 1]);
 }
 
 // The chunk-end state update, split out of the solve for occupancy:
@@ -1004,7 +1039,7 @@ impl GdnChunkedKernels {
                     (self.head_dim as u32).div_ceil(SOLVE_VB),
                     1,
                 ),
-                block_dim: (SOLVE_VB, 1, 1),
+                block_dim: (SOLVE_VB * SOLVE_TT, 1, 1),
                 shared_mem_bytes: shared_bytes_for_solve(c) as u32,
             };
             let mut builder = stream.launch_builder(&self.solve);
@@ -1074,7 +1109,8 @@ impl GdnChunkedKernels {
 /// materialising the `c x c` inverse, and the same reason the `c x c` decay
 /// mask llama.cpp builds as a tensor is rebuilt here one row at a time.
 fn shared_bytes_for_solve(c: usize) -> usize {
-    (c * SOLVE_VB as usize + 2 * c) * size_of::<f32>()
+    // U', the cumulative log-decays, and one decay row per token lane.
+    (c * SOLVE_VB as usize + c + SOLVE_TT as usize * c) * size_of::<f32>()
 }
 
 #[cfg(test)]
@@ -1117,7 +1153,7 @@ mod tests {
         // the classic read-before-update bug.
         assert!(GDN_CHUNKED_SRC.contains("for (int i = 0; i < t; ++i) {\n            acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];"));
         assert!(GDN_CHUNKED_SRC.contains(
-            "for (int i = 0; i <= t; ++i) {\n            o_intra += kq_row[i] * decay[i] * u[i * VB + vl];"
+            "for (int i = 0; i <= t; ++i) {\n            o_intra += kq_row[i] * dec[i] * u[i * VB + vl];"
         ));
     }
 
@@ -1296,11 +1332,21 @@ mod tests {
 
     #[test]
     fn shared_memory_at_the_real_geometry_fits_a_turing_block() {
-        // chunk_len 64 over a SOLVE_VB-wide band: 8.5 KiB, well inside the
-        // 48 KiB a block gets without the opt-in carve-out. It was 32.5 KiB
-        // when a block owned a whole head.
+        // chunk_len 64 over a SOLVE_VB-wide band, plus one decay row per
+        // token lane: 10.5 KiB, well inside the 48 KiB a block gets without
+        // the opt-in carve-out. It was 32.5 KiB when a block owned a whole
+        // head, and 8.5 KiB when the output section ran one token at a time.
         let needed = shared_bytes_for_solve(64);
-        assert_eq!(needed, (64 * SOLVE_VB as usize + 2 * 64) * 4);
+        assert_eq!(
+            needed,
+            (64 * SOLVE_VB as usize + 64 + SOLVE_TT as usize * 64) * 4,
+        );
+        // The block is this wide, and the decay rows have to keep up with it.
+        assert_eq!(
+            SOLVE_VB * SOLVE_TT,
+            256,
+            "the solve block is SOLVE_VB * SOLVE_TT threads",
+        );
         assert!(needed < MAX_SHARED_BYTES, "{needed} bytes");
         // A 64x64 inverse *would* now fit beside it — 8.5 + 16 KiB — which is
         // why the module docs no longer offer shared memory as a reason to
