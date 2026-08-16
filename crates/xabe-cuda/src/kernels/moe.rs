@@ -239,6 +239,16 @@ const fn mma_down_shared_bytes() -> u32 {
         + MMA_M * size_of::<i32>()) as u32
 }
 
+/// Shared bytes the Q8_0 gate/up tensor-core GEMM needs: two staged weight
+/// tiles in the `MMA_DSTRIDE` layout (quants then fp32 block scales), the int8
+/// activation tile, its per-32 scales, and one activation row index per slot.
+const fn mma_ffn_q8_shared_bytes() -> u32 {
+    (2 * MMA_ROWS as usize * MMA_DSTRIDE
+        + MMA_M * MMA_ASTRIDE
+        + MMA_M * (MMA_KC / 32) * size_of::<f32>()
+        + MMA_M * size_of::<i64>()) as u32
+}
+
 /// Shared bytes the tensor-core grouped GEMM needs: two staged weight tiles,
 /// their scale tiles, the int8 activation tile, its per-32 scales, and one
 /// activation row index per staged slot.
@@ -2129,6 +2139,190 @@ __global__ void moe_expert_down_mma(
     }
 }
 
+// The gate/up half of the grouped GEMM when both stacks are Q8_0.
+//
+// `Qwen3.6-35B-A3B-UD-Q6_K_XL` stores `ffn_gate_exps` and `ffn_up_exps` as
+// Q6_K on every block but **39**, where they are Q8_0. One layer in forty took
+// the fp32 fallback for that, and it cost 5.8 ms of a 246 ms pass against
+// 1.5 ms for a tensor-core layer -- 2.4% of prefill for 2.5% of the model.
+//
+// It is `moe_expert_ffn_mma`'s body with `moe_expert_down_mma`'s operand
+// handling: the same tile shape, the same lane roles, the same SwiGLU
+// epilogue, but a Q8_0 weight tile and an fp32 block scale where Q6_K needed a
+// packed six-bit tile and an int8 sub-scale. The staged layout is
+// `MOE_MMA_DSTRIDE` -- `MOE_MMA_KC` quant bytes then `MOE_MMA_KC / 32` fp32
+// scales -- for both matrices.
+//
+// grid and block are `moe_expert_ffn_mma`'s exactly, so the two are
+// interchangeable at the launch site.
+__global__ void moe_expert_ffn_mma_q8(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xscale,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    unsigned char* swg = (unsigned char*)xabe_shared;
+    unsigned char* swu = swg + MOE_MMA_ROWS * MOE_MMA_DSTRIDE;
+    signed char*   sa  = (signed char*)(swu + MOE_MMA_ROWS * MOE_MMA_DSTRIDE);
+    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_ASTRIDE);
+    long long*     rows = (long long*)(sas + MOE_MMA_M * (MOE_MMA_KC / 32));
+
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+    int numel = (*valid_tokens) * top_k;
+
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int r0   = blockIdx.x * MOE_MMA_ROWS;
+
+    if (tid < MOE_MMA_M) {
+        int flat = tid < block_size
+            ? sorted_token_ids[(long long)blk * block_size + tid]
+            : numel;
+        rows[tid] = flat < numel ? (long long)(flat / top_k) : -1;
+    }
+    __syncthreads();
+
+    int nload = warp * MOE_MMA_N + (lane >> 2);
+    int arow  = lane >> 2;
+    int quad  = (lane & 3) * 4;
+    int ccol  = warp * MOE_MMA_N + (lane & 3) * 2;
+
+    long long ebase = (long long)e * intermediate * hidden;
+    int kblocks = hidden >> 5;
+
+    float accg[MOE_MMA_MF][2];
+    float accu[MOE_MMA_MF][2];
+    #pragma unroll
+    for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
+        accg[mf][0] = 0.0f; accg[mf][1] = 0.0f;
+        accu[mf][0] = 0.0f; accu[mf][1] = 0.0f;
+    }
+
+    for (int kc = 0; kc < hidden; kc += MOE_MMA_KC) {
+        __syncthreads();
+
+        // A warp stages whole rows of both matrices. The quants of a Q8_0
+        // block start at byte 2 of a 34-byte block, so they are even-aligned
+        // and never word-aligned; 16 bits is the widest legal load, and `t` is
+        // even so a pair never straddles a block boundary.
+        for (int r = warp; r < MOE_MMA_ROWS; r += MOE_MMA_WARPS) {
+            int n = r0 + r;
+            if (n < intermediate) {
+                long long off = (ebase + (long long)n * hidden + kc) >> 5;
+                const unsigned char* sg = gate_q + off * 34;
+                const unsigned char* su = up_q   + off * 34;
+                for (int t = lane * 2; t < MOE_MMA_KC; t += 64) {
+                    int at = (t >> 5) * 34 + 2 + (t & 31);
+                    *(unsigned short*)(swg + r * MOE_MMA_DSTRIDE + t) =
+                        *(const unsigned short*)(sg + at);
+                    *(unsigned short*)(swu + r * MOE_MMA_DSTRIDE + t) =
+                        *(const unsigned short*)(su + at);
+                }
+                if (lane < (MOE_MMA_KC / 32)) {
+                    *(float*)(swg + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) =
+                        half_bits_to_float(*(const unsigned short*)(sg + lane * 34));
+                    *(float*)(swu + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) =
+                        half_bits_to_float(*(const unsigned short*)(su + lane * 34));
+                }
+            } else if (lane < (MOE_MMA_KC / 32)) {
+                // A row past `intermediate` contributes nothing, and zeroing
+                // the scale is enough to guarantee it: every product it feeds
+                // is multiplied by it.
+                *(float*)(swg + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) = 0.0f;
+                *(float*)(swu + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) = 0.0f;
+            }
+        }
+
+        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 4); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 4);
+            int k4 = (idx % (MOE_MMA_KC / 4)) * 4;
+            long long row = rows[m];
+            unsigned int v = row >= 0
+                ? *(const unsigned int*)(xq + row * hidden + kc + k4)
+                : 0u;
+            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
+        }
+        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 32); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 32);
+            int kb = idx % (MOE_MMA_KC / 32);
+            long long row = rows[m];
+            sas[m * (MOE_MMA_KC / 32) + kb] =
+                row >= 0 ? xscale[row * kblocks + (kc >> 5) + kb] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < MOE_MMA_KC; kk += 16) {
+            unsigned int bg = *(const unsigned int*)(
+                swg + nload * MOE_MMA_DSTRIDE + kk + quad);
+            unsigned int bu = *(const unsigned int*)(
+                swu + nload * MOE_MMA_DSTRIDE + kk + quad);
+
+            // One Q8_0 scale spans 32 contraction elements, so it is the same
+            // for this k-step and the next.
+            int sb = kk >> 5;
+            float wg0 = *(const float*)(
+                swg + ccol * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+            float wg1 = *(const float*)(
+                swg + (ccol + 1) * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+            float wu0 = *(const float*)(
+                swu + ccol * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+            float wu1 = *(const float*)(
+                swu + (ccol + 1) * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+
+            #pragma unroll
+            for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
+                float dx = sas[(mf * 8 + arow) * (MOE_MMA_KC / 32) + sb];
+                unsigned int a = *(const unsigned int*)(
+                    sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + quad);
+                int g0 = 0, g1 = 0, u0 = 0, u1 = 0;
+                asm volatile(
+                    "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0,%1}, {%2}, {%3}, {%0,%1};"
+                    : "+r"(g0), "+r"(g1) : "r"(a), "r"(bg));
+                asm volatile(
+                    "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0,%1}, {%2}, {%3}, {%0,%1};"
+                    : "+r"(u0), "+r"(u1) : "r"(a), "r"(bu));
+                accg[mf][0] += (float)g0 * dx * wg0;
+                accg[mf][1] += (float)g1 * dx * wg1;
+                accu[mf][0] += (float)u0 * dx * wu0;
+                accu[mf][1] += (float)u1 * dx * wu1;
+            }
+        }
+    }
+
+    // SwiGLU, written exactly as `xabe_kernels::norm::silu`, and padding slots
+    // dropped rather than written -- both as `moe_expert_ffn_mma` has them.
+    #pragma unroll
+    for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
+        int m = mf * 8 + arow;
+        if (m < block_size && rows[m] >= 0) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                int n = r0 + ccol + j;
+                if (n < intermediate) {
+                    float g = (j == 0) ? accg[mf][0] : accg[mf][1];
+                    float u = (j == 0) ? accu[mf][0] : accu[mf][1];
+                    float act = g / (1.0f + expf(-g));
+                    inter[((long long)blk * block_size + m) * intermediate + n] = act * u;
+                }
+            }
+        }
+    }
+}
+
+
 // SwiGLU for the shared expert's tensor-core path.
 //
 // The fp32 shared-expert kernel fuses this into its epilogue; the tensor-core
@@ -2753,6 +2947,7 @@ pub struct MoeKernels {
     expert_ffn_gemv: CudaFunction,
     expert_down_gemv: CudaFunction,
     expert_ffn_mma: CudaFunction,
+    expert_ffn_mma_q8: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
     /// `None` if the integer path is unavailable on this device.
     mma: Option<MmaKernels>,
@@ -2836,6 +3031,7 @@ impl MoeKernels {
             expert_ffn_gemv: module.load_function("moe_expert_ffn_gemv")?,
             expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
             expert_ffn_mma: module.load_function("moe_expert_ffn_mma")?,
+            expert_ffn_mma_q8: module.load_function("moe_expert_ffn_mma_q8")?,
             // Compiled eagerly so a device that cannot reach the integer
             // tensor cores fails here, at construction, rather than mid-pass.
             // A failure is not fatal: the fp32 path stays available and the
@@ -3187,13 +3383,16 @@ impl MoeKernels {
         // barriers are pure overhead at this shape.
         let gemv = g.max_tokens == 1;
 
-        // The integer path applies only when both projections it fuses are
-        // Q6_K. `ffn_down` is Q8_0 in this file and stays on the fp32 kernel
-        // either way, so this is a property of the gate/up pair alone.
-        let use_mma = self.mma.is_some()
-            && g.max_tokens >= MMA_MIN_TOKENS
-            && gate.quant == ExpertQuant::Q6K
-            && up.quant == ExpertQuant::Q6K;
+        // The integer path needs both projections it fuses to be the *same*
+        // format, and there is a kernel for each: Q6_K for blocks 0-38 and 40,
+        // Q8_0 for block 39. A mixed pair has no kernel and takes the fp32
+        // fallback, which no shipping file has ever produced.
+        let mma_quant = match (gate.quant, up.quant) {
+            (ExpertQuant::Q6K, ExpertQuant::Q6K) => Some(ExpertQuant::Q6K),
+            (ExpertQuant::Q8_0, ExpertQuant::Q8_0) => Some(ExpertQuant::Q8_0),
+            _ => None,
+        };
+        let use_mma = self.mma.is_some() && g.max_tokens >= MMA_MIN_TOKENS && mma_quant.is_some();
 
         if gemv {
             let cfg = LaunchConfig {
@@ -3238,6 +3437,7 @@ impl MoeKernels {
             )
             .map_err(MoeError::Mma)?;
 
+            let q8 = mma_quant == Some(ExpertQuant::Q8_0);
             let cfg = LaunchConfig {
                 grid_dim: (
                     (g.intermediate as u32).div_ceil(MMA_ROWS),
@@ -3245,9 +3445,18 @@ impl MoeKernels {
                     1,
                 ),
                 block_dim: (MMA_WARPS * 32, 1, 1),
-                shared_mem_bytes: mma_shared_bytes(),
+                shared_mem_bytes: if q8 {
+                    mma_ffn_q8_shared_bytes()
+                } else {
+                    mma_shared_bytes()
+                },
             };
-            let mut builder = stream.launch_builder(&self.expert_ffn_mma);
+            let f = if q8 {
+                &self.expert_ffn_mma_q8
+            } else {
+                &self.expert_ffn_mma
+            };
+            let mut builder = stream.launch_builder(f);
             builder
                 .arg(gate.bytes)
                 .arg(up.bytes)
