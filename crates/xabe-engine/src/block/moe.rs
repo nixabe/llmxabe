@@ -1025,8 +1025,8 @@ impl MoeBlock {
         // shared memory.
         unsafe { builder.launch(cfg) }?;
 
-        self.moe.route(stream, &mut self.buffers, &self.logits)?;
-        self.moe.build_dispatch(stream, &mut self.buffers)?;
+        self.moe
+            .route_and_dispatch(stream, &mut self.buffers, &self.logits)?;
 
         // 3. the routed experts.
         self.moe.grouped_forward(

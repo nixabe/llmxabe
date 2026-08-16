@@ -454,6 +454,65 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 // `ssm_alpha.weight` and `ssm_beta.weight` are f32 in this file, and are only
 // [2048, 32], so they get the simple strided form rather than the block-wise
 // one above.
+// alpha-N / beta-N and the three gate quantities they feed, in one launch.
+//
+// `ssm_alpha.weight` and `ssm_beta.weight` are both f32 `[hidden, heads]`,
+// both contract the same `normed` activations, and `gdn_gates` reads nothing
+// but their two outputs. That was three launches per layer to produce 32
+// numbers each -- 0.32 ms of a 10 ms decode step spent on three kernel
+// floors, for 131,072 multiply-adds that take microseconds.
+//
+// Both dot products keep `warp_reduce_sum` and the same lane-strided order
+// `gdn_proj_f32` used, so the projections are bit-identical to the kernel
+// they replace; the gate arithmetic is elementwise and unchanged. `alpha`
+// and `beta_raw` are still written because the golden capture has a waypoint
+// on each.
+//
+// grid: (ceil(heads / warps), tokens). block: (32, warps).
+__global__ void gdn_alpha_beta_gates(
+    const float* __restrict__ w_alpha,
+    const float* __restrict__ w_beta,
+    const float* __restrict__ x,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float* __restrict__ alpha,
+    float* __restrict__ beta_raw,
+    float* __restrict__ a_softplus,
+    float* __restrict__ log_decay,
+    float* __restrict__ beta,
+    int k_dim,
+    int heads
+) {
+    int lane = threadIdx.x;
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;
+    if (n >= heads) return;
+    int t = blockIdx.y;
+
+    const float* ra = w_alpha + (long long)n * k_dim;
+    const float* rb = w_beta  + (long long)n * k_dim;
+    const float* xr = x + (long long)t * k_dim;
+
+    float aa = 0.0f;
+    float bb = 0.0f;
+    for (int i = lane; i < k_dim; i += 32) {
+        float xv = xr[i];
+        aa += ra[i] * xv;
+        bb += rb[i] * xv;
+    }
+    aa = warp_reduce_sum(aa);
+    bb = warp_reduce_sum(bb);
+    if (lane == 0) {
+        long long i = (long long)t * heads + n;
+        alpha[i] = aa;
+        beta_raw[i] = bb;
+        float a = aa + dt_bias[n];
+        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+        a_softplus[i] = sp;
+        log_decay[i] = sp * ssm_a[n];
+        beta[i] = 1.0f / (1.0f + expf(-bb));
+    }
+}
+
 __global__ void gdn_proj_f32(
     const float* __restrict__ weight,
     const float* __restrict__ x,
@@ -515,6 +574,60 @@ __global__ void gdn_silu(
 // grid: (value_heads, tokens). block: head_dim threads. Blocks with
 // `h < qk_heads` write q and k as well as v, so the two ranges are covered by
 // one launch and the low 16 heads do the extra pair of stores.
+// conv_output_silu-N and the q/k/v split, in one launch.
+//
+// `gdn_silu` wrote one buffer that `gdn_split_qkv` immediately read, and the
+// split touches every element of it exactly once -- the value part once, and
+// the query and key parts once each -- so the nonlinearity can be applied on
+// the way through. `silu` is still written because the golden capture has a
+// waypoint on it, and because a block that got the split wrong would
+// otherwise have no intermediate to fail at.
+//
+// `v / (1 + exp(-v))` is the same expression `gdn_silu` used, in the same
+// order, so this is bit-identical to the pair it replaces.
+//
+// grid: (value_heads, tokens). block: head_dim.
+__global__ void gdn_silu_split_qkv(
+    const float* __restrict__ conv,
+    float* __restrict__ silu,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int head_dim,
+    int qk_heads,
+    int value_heads
+) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int d = threadIdx.x;
+
+    int key_dim  = qk_heads * head_dim;
+    int conv_dim = 2 * key_dim + value_heads * head_dim;
+
+    const float* c  = conv + (long long)t * conv_dim;
+    float*       sr = silu + (long long)t * conv_dim;
+
+    int iv = 2 * key_dim + h * head_dim + d;
+    float vv = c[iv];
+    vv = vv / (1.0f + expf(-vv));
+    sr[iv] = vv;
+    v[((long long)t * value_heads + h) * head_dim + d] = vv;
+
+    if (h < qk_heads) {
+        int iq = h * head_dim + d;
+        int ik = key_dim + h * head_dim + d;
+        float qv = c[iq];
+        float kv = c[ik];
+        qv = qv / (1.0f + expf(-qv));
+        kv = kv / (1.0f + expf(-kv));
+        sr[iq] = qv;
+        sr[ik] = kv;
+        long long o = ((long long)t * qk_heads + h) * head_dim + d;
+        q[o] = qv;
+        k[o] = kv;
+    }
+}
+
 __global__ void gdn_split_qkv(
     const float* __restrict__ conv,
     float* __restrict__ q,
@@ -1053,8 +1166,10 @@ pub struct GdnBlock {
     proj_split_gemv: CudaFunction,
     proj_tiled: [CudaFunction; 2],
     proj_f32: CudaFunction,
+    alpha_beta_gates: CudaFunction,
     silu: CudaFunction,
     split: CudaFunction,
+    silu_split: CudaFunction,
     gates: CudaFunction,
     add: CudaFunction,
     scratch: Option<Scratch>,
@@ -1107,8 +1222,10 @@ impl GdnBlock {
                 module.load_function("gdn_proj_q8_0_t16")?,
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
+            alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
             silu: module.load_function("gdn_silu")?,
             split: module.load_function("gdn_split_qkv")?,
+            silu_split: module.load_function("gdn_silu_split_qkv")?,
             gates: module.load_function("gdn_gates")?,
             add: module.load_function("gdn_add")?,
             scratch: None,
@@ -1382,36 +1499,31 @@ impl GdnBlock {
             g.conv_dim(),
             g.conv_kernel,
         )?;
-        self.silu(stream, &s.conv_raw, &mut s.conv_silu, tokens * g.conv_dim())?;
-
-        // 5. q/k/v, with q and k broadcast to the value heads by modulo.
-        self.split_qkv(stream, &s.conv_silu, &mut s.q, &mut s.k, &mut s.v, tokens)?;
+        // 5. conv_output_silu-N and q/k/v in one launch: the split reads every
+        //    element of the SiLU's output exactly once, so it can apply the
+        //    nonlinearity on the way through.
+        self.silu_split_qkv(
+            stream,
+            &s.conv_raw,
+            &mut s.conv_silu,
+            &mut s.q,
+            &mut s.k,
+            &mut s.v,
+            tokens,
+        )?;
 
         // 6. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N.
-        self.project(
+        //    One launch: both projections read the same `normed` and the
+        //    gates read nothing but their outputs.
+        self.alpha_beta_gates(
             stream,
-            Projection::F32(&w.alpha),
+            &w.alpha,
+            &w.beta,
             &s.normed,
-            &mut s.alpha,
-            g.hidden,
-            g.value_heads,
-            tokens,
-        )?;
-        self.project(
-            stream,
-            Projection::F32(&w.beta),
-            &s.normed,
-            &mut s.beta_raw,
-            g.hidden,
-            g.value_heads,
-            tokens,
-        )?;
-        self.gates(
-            stream,
-            &s.alpha,
-            &s.beta_raw,
             &w.dt_bias,
             &w.a,
+            &mut s.alpha,
+            &mut s.beta_raw,
             &mut s.a_softplus,
             &mut s.log_decay,
             &mut s.beta,
@@ -1715,6 +1827,56 @@ impl GdnBlock {
         Ok(())
     }
 
+    /// SiLU and the q/k/v split, in one launch.
+    ///
+    /// `silu` is `conv_output_silu-N` and is still produced; see the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_split_qkv(
+        &self,
+        stream: &Arc<CudaStream>,
+        conv: &CudaSlice<f32>,
+        silu: &mut CudaSlice<f32>,
+        q: &mut CudaSlice<f32>,
+        k: &mut CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let narrow = tokens * g.key_dim();
+        let wide = tokens * g.value_dim();
+        check_len("split conv", tokens * g.conv_dim(), conv.len())?;
+        check_len("split silu", tokens * g.conv_dim(), silu.len())?;
+        check_len("split q", narrow, q.len())?;
+        check_len("split k", narrow, k.len())?;
+        check_len("split v", wide, v.len())?;
+        if tokens == 0 {
+            return Ok(());
+        }
+
+        let cfg = LaunchConfig {
+            grid_dim: (g.value_heads as u32, tokens as u32, 1),
+            block_dim: (g.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (head_dim, qk_heads, value_heads) =
+            (g.head_dim as i32, g.qk_heads as i32, g.value_heads as i32);
+        let mut builder = stream.launch_builder(&self.silu_split);
+        builder
+            .arg(conv)
+            .arg(&mut *silu)
+            .arg(&mut *q)
+            .arg(&mut *k)
+            .arg(&mut *v)
+            .arg(&head_dim)
+            .arg(&qk_heads)
+            .arg(&value_heads);
+        // SAFETY: as `split_qkv` below, with the addition that `silu` is
+        // written at the same `conv`-shaped indices it is read from, and both
+        // were checked to hold `tokens * conv_dim`.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
     /// Slice the convolved stream into q, k and v.
     ///
     /// `q` and `k` come out `[tokens][qk_heads][head_dim]` and `v`
@@ -1722,6 +1884,11 @@ impl GdnBlock {
     /// the shapes both mixer kernels want now that they index the query/key
     /// head as `h % qk_heads` themselves. This used to broadcast q and k up to
     /// `value_heads` because they did not.
+    ///
+    /// Superseded on the forward path by [`Self::silu_split_qkv`]. Kept
+    /// because `tests/gdn_block.rs` runs it on the golden capture's own
+    /// `conv_output_silu-N`, which checks the split without the nonlinearity
+    /// in front of it.
     pub fn split_qkv(
         &self,
         stream: &Arc<CudaStream>,
@@ -1767,7 +1934,79 @@ impl GdnBlock {
         Ok(())
     }
 
+    /// alpha, beta, and the three gate quantities, in one launch.
+    ///
+    /// Replaces two `gdn_proj_f32` launches and a `gdn_gates` launch. See the
+    /// kernel for why three launches for 32 output rows each was the cost
+    /// rather than the arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn alpha_beta_gates(
+        &self,
+        stream: &Arc<CudaStream>,
+        w_alpha: &CudaSlice<f32>,
+        w_beta: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        a: &CudaSlice<f32>,
+        alpha: &mut CudaSlice<f32>,
+        beta_raw: &mut CudaSlice<f32>,
+        a_softplus: &mut CudaSlice<f32>,
+        log_decay: &mut CudaSlice<f32>,
+        beta: &mut CudaSlice<f32>,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let heads = g.value_heads;
+        let n = tokens * heads;
+        check_len("alpha weight", heads * g.hidden, w_alpha.len())?;
+        check_len("beta weight", heads * g.hidden, w_beta.len())?;
+        check_len("alpha-beta x", tokens * g.hidden, x.len())?;
+        check_len("gates dt_bias", heads, dt_bias.len())?;
+        check_len("gates ssm_a", heads, a.len())?;
+        check_len("gates alpha", n, alpha.len())?;
+        check_len("gates beta_raw", n, beta_raw.len())?;
+        check_len("gates a_softplus", n, a_softplus.len())?;
+        check_len("gates log_decay", n, log_decay.len())?;
+        check_len("gates beta", n, beta.len())?;
+        if n == 0 {
+            return Ok(());
+        }
+
+        let cfg = LaunchConfig {
+            grid_dim: ((heads as u32).div_ceil(PROJ_WARPS), tokens as u32, 1),
+            block_dim: (32, PROJ_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i32, h_i32) = (g.hidden as i32, heads as i32);
+        let mut builder = stream.launch_builder(&self.alpha_beta_gates);
+        builder
+            .arg(w_alpha)
+            .arg(w_beta)
+            .arg(x)
+            .arg(dt_bias)
+            .arg(a)
+            .arg(&mut *alpha)
+            .arg(&mut *beta_raw)
+            .arg(&mut *a_softplus)
+            .arg(&mut *log_decay)
+            .arg(&mut *beta)
+            .arg(&k_i32)
+            .arg(&h_i32);
+        // SAFETY: one warp per (head, token) over a grid that covers both and
+        // returns above `heads`; every buffer was length-checked immediately
+        // above against exactly the extent the kernel indexes, and the two
+        // per-head tables are indexed by `n < heads`.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
     /// The decay and write gates: `a_softplus`, the log-decay, and `beta`.
+    ///
+    /// Superseded on the forward path by [`Self::alpha_beta_gates`], which
+    /// folds it into the two projections that feed it. Kept because
+    /// `tests/gdn_block.rs` runs it on the golden capture's own `alpha-N` and
+    /// `beta-N` to check the gate arithmetic on its own, which the fused
+    /// kernel cannot be asked to do.
     #[allow(clippy::too_many_arguments)]
     pub fn gates(
         &self,

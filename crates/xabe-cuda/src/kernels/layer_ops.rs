@@ -410,6 +410,56 @@ __global__ void conv1d_causal_depthwise(
     out[(long long)t * channels + ch] = acc;
 }
 
+// The whole convolution for a one-token step: output and cache advance in
+// one launch.
+//
+// `conv1d_causal_depthwise` and `conv1d_update_state` are two kernels because
+// a batch's cache advance depends on the *last* `conv_kernel - 1` inputs of
+// the whole batch, which the per-token blocks of the first kernel cannot see.
+// At one token there is no batch: the window is the cache plus this token,
+// and the new cache is the old one shifted by one with this token appended.
+// A thread owns its channel's whole cache row, so the shift is safe in place
+// once the row is staged in registers -- the same argument
+// `conv1d_update_state` already makes, with `seq_len` pinned to 1.
+//
+// The accumulation keeps `__fadd_rn(acc, __fmul_rn(...))` in ascending tap
+// order, so the output is bit-identical to the two-kernel path rather than
+// merely close: see the module docs on why the FMA contraction is denied here.
+//
+// grid: (ceil(channels / 256),). block: 256.
+__global__ void conv1d_step(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ state,
+    float* __restrict__ out,
+    int channels,
+    int conv_kernel
+) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels) return;
+    int carry = conv_kernel - 1;
+
+    float staged[MAX_CONV_KERNEL];
+    for (int j = 0; j < carry; ++j) {
+        staged[j] = state[(long long)ch * carry + j];
+    }
+    float xv0 = x[ch];
+
+    float acc = 0.0f;
+    for (int i = 0; i < conv_kernel; ++i) {
+        float xv = (i < carry) ? staged[i] : xv0;
+        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
+    }
+    out[ch] = acc;
+
+    for (int j = 0; j + 1 < carry; ++j) {
+        state[(long long)ch * carry + j] = staged[j + 1];
+    }
+    if (carry > 0) {
+        state[(long long)ch * carry + carry - 1] = xv0;
+    }
+}
+
 // Advance the convolution cache to the last conv_kernel-1 inputs.
 //
 // grid-stride over channels, one thread per channel. Every window value is
@@ -550,6 +600,7 @@ pub struct LayerOpsKernels {
     softplus: CudaFunction,
     conv1d: CudaFunction,
     conv1d_state: CudaFunction,
+    conv1d_step: CudaFunction,
 }
 
 impl LayerOpsKernels {
@@ -566,6 +617,7 @@ impl LayerOpsKernels {
             softplus: module.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,
+            conv1d_step: module.load_function("conv1d_step")?,
         })
     }
 
@@ -889,6 +941,31 @@ impl LayerOpsKernels {
         let channels_i32 = channels as i32;
         let conv_kernel_i32 = conv_kernel as i32;
         let seq_len_i32 = seq_len as i32;
+
+        // One token needs no batch-wide view of the window, so the output and
+        // the cache advance are one launch. See `conv1d_step`.
+        if seq_len == 1 {
+            let cfg = LaunchConfig {
+                grid_dim: (channels.div_ceil(BLOCK) as u32, 1, 1),
+                block_dim: (BLOCK as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.conv1d_step);
+            builder
+                .arg(x)
+                .arg(weight)
+                .arg(&mut *state)
+                .arg(&mut *out)
+                .arg(&channels_i32)
+                .arg(&conv_kernel_i32);
+            // SAFETY: threads past `channels` return before touching memory;
+            // `state` is indexed in `[ch * carry, ch * carry + carry)` and
+            // `weight` in `[ch * conv_kernel, ...)`, both length-checked
+            // above, and `conv_kernel <= MAX_CONV_KERNEL` is what makes the
+            // `staged` register array large enough.
+            unsafe { builder.launch(cfg) }?;
+            return Ok(());
+        }
 
         let cfg = LaunchConfig {
             grid_dim: (channels.div_ceil(BLOCK) as u32, seq_len as u32, 1),

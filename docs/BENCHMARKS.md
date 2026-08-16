@@ -1270,8 +1270,8 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,365.74 ± 6.60 tok/s** | **1.52× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **96.80 tok/s**, 10.33 ms/step | **1.08× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,361.42 ± 5.52 tok/s** | **1.52× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.00 tok/s**, 9.71 ms/step | **1.02× slower** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1421,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **96.80 tok/s**, 10.33 ms/step | **1.08× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.00 tok/s**, 9.71 ms/step | **1.02× slower** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1441,6 +1441,10 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | split the shared expert over its contraction | 10.42 | 95.99 |
 | fuse the shared gate into the combine | 10.33 | 96.80 |
 | top-k selection on one warp, no barriers | 10.33 | 96.80 |
+| one-block dispatch table, split `moe_reduce`, wider combine | 10.00 | 100.05 |
+| alpha, beta and the GDN gates in one launch | 9.82 | 101.85 |
+| one-token convolution: output and cache advance fused | 9.76 | 102.46 |
+| routing and dispatch in one launch | 9.71 | 103.00 |
 
 ### The one idea behind all of it
 
@@ -1561,6 +1565,33 @@ it:
 
 The lesson is the same one the MMA tile taught in the prefill section: the
 transformation that fixed one kernel is not a property of the transformation.
+
+### Four more things that did not pay
+
+All four are the transformation that worked on a neighbouring kernel, applied
+where it did not:
+
+- **Staging the routed experts' activations in shared memory.** The arithmetic
+  looked overwhelming: eight warps a block and 512 blocks all contract against
+  the same 8 KiB, so `moe_expert_ffn_gemv` was reading 32 MiB per layer to
+  deliver 8 KiB against 13.8 MiB of weights read once. And unlike the GDN
+  projection, the footprint here is free — 8 KiB a block, four blocks a SM,
+  32 of the 48 KiB available. It cost 0.8% of the decode step anyway, because
+  those re-reads are **L1 hits**: four blocks' worth of activations is 32 KiB
+  and Turing's L1 is 64. Staging replaced a hit with a copy and a barrier.
+- **A 16-bit load for Q6_K's fp16 delta.** `load_half_le` reads two bytes
+  separately; the superblock is 210 bytes and the delta sits at offset 208, so
+  both are even and one 16-bit load is legal. Measured as nothing — nvcc had
+  already merged them.
+- **Trimming `moe_route`'s remaining barriers.** The softmax denominator's
+  last five tree steps are all within warp 0, so they can use `__syncwarp`
+  instead of `__syncthreads` without changing a single addition's order, and
+  the normalizing pass over 256 probabilities can be folded into the selection
+  warp's registers. Both are strictly less work. Neither moved the number:
+  the kernel is its launch floor.
+- **Fusing the SiLU into the q/k/v split.** One fewer launch, and the same
+  three-microsecond kernel — the split's block is half as wide as the SiLU's
+  grid-stride shape, so each thread now does three exponentials instead of one.
 
 ### A measurement discipline note
 

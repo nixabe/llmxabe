@@ -711,20 +711,21 @@ extern "C" {
 // the two differ in the last ulp — but it divides every probability equally,
 // so the *ordering* (and therefore the selection) is untouched, and it
 // cancels out of the renormalized weights almost exactly.
-__global__ void moe_route(
+// The routing itself, so the fused one-token kernel below can run it without
+// a second copy of two hundred lines. Every barrier inside is reached by every
+// thread of the block, which is what makes it safe to call from a
+// `__device__` function.
+__device__ void route_token(
     const float* __restrict__ logits,
-    const int* __restrict__ valid_tokens,
+    int token,
     int num_experts,
     int top_k,
+    float* probs,
+    float* rval,
+    int* ridx,
     int* __restrict__ topk_ids,
     float* __restrict__ topk_weights
 ) {
-    float* probs = xabe_shared;
-    float* rval  = xabe_shared + num_experts;
-    int*   ridx  = (int*)(rval + blockDim.x);
-
-    int token = blockIdx.x;
-    if (token >= *valid_tokens) return;
 
     const float* row = logits + (long long)token * num_experts;
 
@@ -762,16 +763,28 @@ __global__ void moe_route(
     // Nine barriers, against the eighty-one the other two shed between them.
     rval[threadIdx.x] = esum;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    // The same additions in the same order, with the last five steps under a
+    // warp barrier instead of a block barrier: once `s <= 16` every reader and
+    // every writer is lane 0..31 of warp 0, and `__syncwarp` fences shared
+    // memory for them. Five `__syncthreads()` on a kernel that runs as one
+    // block, forty times a decode step.
+    for (int s = blockDim.x >> 1; s > 16; s >>= 1) {
         if (threadIdx.x < s) rval[threadIdx.x] += rval[threadIdx.x + s];
         __syncthreads();
     }
-    float sum_exp = rval[0];
-    __syncthreads();
-    for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-        probs[e] = probs[e] / sum_exp;
+    if (threadIdx.x < 32) {
+        #pragma unroll
+        for (int s = 16; s > 0; s >>= 1) {
+            if (threadIdx.x < s) rval[threadIdx.x] += rval[threadIdx.x + s];
+            __syncwarp();
+        }
     }
     __syncthreads();
+    float sum_exp = rval[0];
+    // `probs` stays *unnormalized* in shared memory. The only consumer is the
+    // selection warp below, which divides in registers -- `probs[e] /
+    // sum_exp` is the same float either way -- so the pass that used to write
+    // the normalized array back, and the barrier after it, are gone.
 
     // --- k successive argmax passes, ties to the lower index --------------
     //
@@ -802,7 +815,7 @@ __global__ void moe_route(
         #pragma unroll
         for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
             int e = lane + 32 * i;
-            p[i] = (e < num_experts) ? probs[e] : -1.0f;
+            p[i] = (e < num_experts) ? probs[e] / sum_exp : -1.0f;
         }
         for (int j = 0; j < top_k; ++j) {
             float bv = -1.0f;
@@ -848,6 +861,25 @@ __global__ void moe_route(
         }
     }
 }
+
+// grid: (max_tokens,). block: MOE_THREADS.
+__global__ void moe_route(
+    const float* __restrict__ logits,
+    const int* __restrict__ valid_tokens,
+    int num_experts,
+    int top_k,
+    int* __restrict__ topk_ids,
+    float* __restrict__ topk_weights
+) {
+    int token = blockIdx.x;
+    if (token >= *valid_tokens) return;
+    float* probs = xabe_shared;
+    float* rval  = xabe_shared + num_experts;
+    int*   ridx  = (int*)(rval + blockDim.x);
+    route_token(logits, token, num_experts, top_k, probs, rval, ridx,
+                topk_ids, topk_weights);
+}
+
 
 // -------------------------------------------------------------------------
 // 2. Sorted-token indirection, into fixed-size buffers.
@@ -900,7 +932,7 @@ __global__ void moe_route(
 // any thread reads its base.
 //
 // grid: (1,). block: MOE_THREADS.
-__global__ void moe_dispatch_t1(
+__device__ void dispatch_token(
     const int* __restrict__ topk_ids,
     const int* __restrict__ valid_tokens,
     int top_k,
@@ -908,11 +940,11 @@ __global__ void moe_dispatch_t1(
     int block_size,
     int sorted_capacity,
     int expert_capacity,
+    int* cumsum,
     int* __restrict__ sorted_token_ids,
     int* __restrict__ expert_ids,
     int* __restrict__ num_tokens_post_pad
 ) {
-    int* cumsum = (int*)xabe_shared;              // num_experts + 1
     int tid = threadIdx.x;
     int numel = (*valid_tokens) * top_k;
 
@@ -952,6 +984,66 @@ __global__ void moe_dispatch_t1(
         for (int b = first; b < last && b < expert_capacity; ++b) expert_ids[b] = e;
     }
 }
+
+// grid: (1,). block: MOE_THREADS.
+__global__ void moe_dispatch_t1(
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int num_experts,
+    int block_size,
+    int sorted_capacity,
+    int expert_capacity,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ expert_ids,
+    int* __restrict__ num_tokens_post_pad
+) {
+    dispatch_token(topk_ids, valid_tokens, top_k, num_experts, block_size,
+                   sorted_capacity, expert_capacity, (int*)xabe_shared,
+                   sorted_token_ids, expert_ids, num_tokens_post_pad);
+}
+
+// Routing and the dispatch table it feeds, in one launch.
+//
+// Both run as a single block at one token, one immediately after the other,
+// with nothing between them but the eight expert ids the first wrote. Two
+// launches for that is two kernel floors -- about 13 us of a 9.8 ms decode
+// step across forty layers -- to move eight integers through global memory
+// and back.
+//
+// The `__syncthreads()` between them is what makes the hand-off legal: lane 0
+// of warp 0 wrote `topk_ids`, and a block barrier fences those writes for
+// every thread that is about to read them.
+//
+// grid: (1,). block: MOE_THREADS. Shared: probs + rval + ridx + cumsum.
+__global__ void moe_route_dispatch_t1(
+    const float* __restrict__ logits,
+    const int* __restrict__ valid_tokens,
+    int num_experts,
+    int top_k,
+    int block_size,
+    int sorted_capacity,
+    int expert_capacity,
+    int* __restrict__ topk_ids,
+    float* __restrict__ topk_weights,
+    int* __restrict__ sorted_token_ids,
+    int* __restrict__ expert_ids,
+    int* __restrict__ num_tokens_post_pad
+) {
+    if (*valid_tokens < 1) return;
+    float* probs  = xabe_shared;
+    float* rval   = xabe_shared + num_experts;
+    int*   ridx   = (int*)(rval + blockDim.x);
+    int*   cumsum = ridx + blockDim.x;
+
+    route_token(logits, 0, num_experts, top_k, probs, rval, ridx,
+                topk_ids, topk_weights);
+    __syncthreads();
+    dispatch_token(topk_ids, valid_tokens, top_k, num_experts, block_size,
+                   sorted_capacity, expert_capacity, cumsum,
+                   sorted_token_ids, expert_ids, num_tokens_post_pad);
+}
+
 
 __global__ void moe_align_count(
     const int* __restrict__ topk_ids,
@@ -1224,6 +1316,14 @@ __global__ void moe_expert_ffn_gemv(
 
     float ag[1] = {0.0f};
     float au[1] = {0.0f};
+    // Two tiles in flight. The two `dequant_tile` calls of one iteration are
+    // already independent, but the *next* iteration's loads cannot issue
+    // until this one's arithmetic has consumed its registers unless the loop
+    // is unrolled — and this kernel moves its weights at 46% of the card's
+    // streaming roofline, which is a memory-parallelism number rather than a
+    // bandwidth one. Two is the measured knee: 0.65% of the whole decode
+    // step, where four gave it back.
+    #pragma unroll 2
     for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
         float wg[MOE_TN];
         float wu[MOE_TN];
@@ -2458,6 +2558,7 @@ impl SharedExpertInt8 {
 pub struct MoeKernels {
     route: CudaFunction,
     dispatch_t1: CudaFunction,
+    route_dispatch_t1: CudaFunction,
     align_count: CudaFunction,
     align: CudaFunction,
     expert_ffn: CudaFunction,
@@ -2540,6 +2641,7 @@ impl MoeKernels {
         Ok(Self {
             route: module.load_function("moe_route")?,
             dispatch_t1: module.load_function("moe_dispatch_t1")?,
+            route_dispatch_t1: module.load_function("moe_route_dispatch_t1")?,
             align_count: module.load_function("moe_align_count")?,
             align: module.load_function("moe_align_block_size")?,
             expert_ffn: module.load_function("moe_expert_ffn")?,
@@ -2648,10 +2750,73 @@ impl MoeKernels {
         Ok(())
     }
 
+    /// Routing and the dispatch table, in as few launches as the shape allows.
+    ///
+    /// At one token that is **one** launch: both kernels run as a single block
+    /// and the second reads nothing from the first but eight expert ids. Above
+    /// one token the dispatch genuinely needs a grid, so it stays two calls.
+    pub fn route_and_dispatch(
+        &self,
+        stream: &Arc<CudaStream>,
+        buffers: &mut MoeBuffers,
+        logits: &CudaSlice<f32>,
+    ) -> Result<(), MoeError> {
+        let g = self.geometry;
+        if g.max_tokens != 1 {
+            self.route(stream, buffers, logits)?;
+            return self.build_dispatch(stream, buffers);
+        }
+        if g.num_experts > 32 * ROUTE_LANE_EXPERTS {
+            return Err(MoeError::UnsupportedGeometry {
+                geometry: Box::new(g),
+                reason: "the routing warp holds 16 experts per lane, so at most \
+                         512 experts",
+            });
+        }
+        let num_experts = g.num_experts as i32;
+        let top_k = g.experts_per_token as i32;
+        let block_size = g.block_size as i32;
+        let sorted_capacity = g.sorted_capacity() as i32;
+        let expert_capacity = g.expert_block_capacity() as i32;
+        // probs + one (float, int) reduction slot per thread + cumsum.
+        let shared = ((g.num_experts + THREADS as usize) * size_of::<f32>()
+            + (THREADS as usize + g.num_experts + 1) * size_of::<i32>())
+            as u32;
+
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: shared,
+        };
+        let mut builder = stream.launch_builder(&self.route_dispatch_t1);
+        builder
+            .arg(logits)
+            .arg(&buffers.valid_tokens)
+            .arg(&num_experts)
+            .arg(&top_k)
+            .arg(&block_size)
+            .arg(&sorted_capacity)
+            .arg(&expert_capacity)
+            .arg(&mut buffers.topk_ids)
+            .arg(&mut buffers.topk_weights)
+            .arg(&mut buffers.sorted_token_ids)
+            .arg(&mut buffers.expert_ids)
+            .arg(&mut buffers.num_tokens_post_pad);
+        // SAFETY: the union of the two kernels' own bounds, both checked in
+        // their single-launch forms above and below; the shared request is
+        // the sum of the two layouts, which the kernel splits at the same
+        // offsets.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
     /// Softmax + top-k over all experts, entirely on the device.
     ///
     /// `logits` is `[max_tokens][num_experts]`; only the first
     /// `valid_tokens` rows are read.
+    ///
+    /// [`Self::route_and_dispatch`] is what the forward path calls; this is
+    /// the batch half of it, and what the differential test drives directly.
     pub fn route(
         &self,
         stream: &Arc<CudaStream>,
