@@ -1062,7 +1062,10 @@ impl MoeBlock {
                 (g.max_tokens as u32).div_ceil(tt),
                 1,
             ),
-            block_dim: (THREADS, 1, 1),
+            // The block width *is* the contraction stride: that equality is
+            // what preserves the untiled kernel's per-thread summation order,
+            // and what makes the activation tile private to each thread.
+            block_dim: (ROUTER_JC, 1, 1),
             shared_mem_bytes: ((THREADS.div_ceil(32) * ROUTER_ET * tt) as usize * size_of::<f32>())
                 as u32,
         };
@@ -1217,6 +1220,30 @@ fn check_len(what: &'static str, expected: usize, found: usize) -> Result<(), Mo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_router_stages_the_contraction_at_the_block_width() {
+        // `ROUTER_JC == THREADS` is what makes thread `tid` accumulate the
+        // indices `tid, tid + 256, tid + 512, ...` — the untiled kernel's
+        // per-thread summation order. The logits feed a top-8 argmax over 256
+        // experts, so reassociating that sum does not perturb an answer
+        // slightly; it runs a different expert.
+        //
+        // It is also what makes the activation tile *private* to each thread,
+        // which is why the tile is registers and not shared memory.
+        assert_eq!(
+            ROUTER_JC, THREADS,
+            "the router's contraction stride left the block width",
+        );
+        assert!(
+            GLUE_SRC.contains(&format!("#define ROUTER_JC {ROUTER_JC}")),
+            "the kernel's ROUTER_JC no longer mirrors the Rust constant",
+        );
+        assert!(
+            GLUE_SRC.contains("acc[el][u] += wj * xv[u];"),
+            "the router's activation tile is no longer a register array",
+        );
+    }
+
     use super::*;
 
     fn config() -> ModelConfig {

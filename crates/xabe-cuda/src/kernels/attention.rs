@@ -57,36 +57,72 @@
 //! Nothing above `BM=BN=8` fits, and an 8x8 tile buys almost none of the
 //! arithmetic-intensity multiplier that tiling exists for.
 //!
-//! **Chosen shape: `BM = 1`, K and V not staged at all.**
+//! **Chosen shape: `BM = 8`, K and V not staged at all.**
 //!
 //! ```text
-//!   q_sh     head_dim floats            = 1024 B
-//!   score_sh head_dim/32 floats (8)     =   32 B
-//!   w_sh     head_dim/32 floats (8)     =   32 B
-//!                                        -------
-//!                                         1088 B  =  1.06 KiB  (2.2% of 48 KiB)
+//!   score_sh  BM * (head_dim/32 * 4) floats (256) = 1024 B
+//!   w_sh      BM * (head_dim/32 * 4) floats (256) = 1024 B
+//!   m/l/corr  3 * BM floats                (24)   =   96 B
+//!                                                  -------
+//!                                                   2144 B  =  2.1 KiB  (4.4% of 48 KiB)
 //! ```
 //!
-//! One block owns one (query row, query head). Its 256 threads are 8 warps;
-//! each warp computes one key's `q . k` per iteration with a shuffle
-//! reduction, so a tile is 8 keys. Each thread then owns one output dimension
-//! of the running accumulator. K and V are read straight from global memory,
-//! coalesced, exactly once each per block.
+//! One block owns **eight** query rows of one query head. Its 256 threads are
+//! 8 warps; each warp scores `ATTN_KT` keys per trip against all eight rows,
+//! so a tile is 32 keys. Each thread owns one output dimension of eight
+//! running accumulators. K and V are still read straight from global memory,
+//! coalesced.
 //!
-//! Staging K in shared memory would buy nothing at `BM = 1`: a block touches
-//! each K row once, so there is no intra-block reuse to amortize the staging
-//! against. The reuse is *across* blocks — 16 query heads share 2 KV heads,
-//! and neighbouring query rows share nearly the whole window — and that is
-//! served by the 6 MiB L2, not by shared memory.
+//! **The query tile is in registers, not shared.** That is the whole point of
+//! it. `BM = 1` was not slow because of bandwidth — it was slow because it did
+//! one memory instruction per multiply-add:
+//!
+//! ```text
+//!   scores:  per key, per lane   8 global k + 8 shared q  + 8 FMA + 5 shfl
+//!   values:  per key, per thread 1 global v + 1 shared w  + 1 FMA
+//! ```
+//!
+//! Turing issues 4 LSU operations per SM per clock against 64 FMAs, so a
+//! kernel at one load per multiply-add is running at a sixteenth of the FMA
+//! pipe and no amount of L2 hit rate changes that. Holding `q` in registers
+//! removes the shared read from the score loop entirely and makes one `k`
+//! element feed eight multiply-adds; one `v` element likewise feeds eight.
+//!
+//! ```text
+//!   scores:  per key, per lane   8 global k + 0 shared    + 64 FMA + 40 shfl
+//!   values:  per key, per thread 1 global v + 8 shared w  +  8 FMA
+//! ```
+//!
+//! Measured at 512 tokens: **21.1 ms -> 8.5 ms** per forward pass over the ten
+//! attention layers, which is 1,823 -> 1,922 tok/s end to end.
+//!
+//! The register array is what bounds `head_dim`: `qr[ATTN_QT][ATTN_MAXD]` is
+//! only in registers while every index folds to a constant, so `ATTN_MAXD` is
+//! a compile-time 8 and head dimensions above 256 are rejected rather than
+//! silently spilled to local memory.
+//!
+//! **Why the softmax bookkeeping is one thread per slot.** Widening the query
+//! tile multiplies the per-tile reductions by `BM` as well, and the obvious
+//! version — every thread sweeping `BM * tile` shared floats for the max and
+//! the normalizer — costs more than the value loop it was meant to amortize.
+//! `ATTN_QT * ATTN_KT` is therefore pinned to 32, which makes `ATTN_QT * tile`
+//! exactly the block width at every head dimension, so the exponential phase
+//! is one thread per (row, key) slot with no loop at all. The max and the
+//! normalizer stay serial and ascending in one thread per row, because the
+//! normalizer is a floating-point sum and a warp butterfly would reassociate
+//! it — see the differential test's exactness gate.
+//!
+//! Staging K in shared memory would still buy nothing: a block touches each K
+//! row once, so there is no intra-block reuse to amortize the staging
+//! against. The reuse is *across* blocks — 16 query heads share 2 KV heads —
+//! and that is served by the 6 MiB L2, not by shared memory.
 //!
 //! **Occupancy consequence, stated honestly.** Shared memory is not the
-//! limiter at 1.06 KiB per block; the limiter is Turing's 1024 threads per SM,
-//! giving 4 blocks of 256 threads per SM. That is full thread occupancy but
-//! low arithmetic intensity: this shape reads ~2 KiB of K+V per key per query
-//! row and does ~1024 FLOP with it, about 0.5 FLOP/byte before L2. The kernel
-//! is therefore bandwidth-bound rather than compute-bound, and its ceiling is
-//! set by how much of the KV window L2 can hold across a wave of blocks — not
-//! by FMA throughput.
+//! limiter at 2.1 KiB per block; the register file is. The query tile costs
+//! `ATTN_QT * head_dim / 32` registers per thread on top of the accumulators,
+//! which puts the kernel around two blocks of 256 threads per SM rather than
+//! four. That is half the thread occupancy for eight times the arithmetic per
+//! byte, and the measurement above is which way that trade goes.
 //!
 //! ## Tensor cores: not used, and what that costs
 //!
@@ -165,6 +201,23 @@ pub const fn attn_packed_gate_offset(head: usize, head_dim: usize) -> usize {
 /// `n_warps * KEYS_PER_WARP` keys, so this trades a little shared memory and a
 /// longer serial sweep per trip against a quarter of the barriers.
 const KEYS_PER_WARP: usize = 4;
+
+/// Query rows one block carries. Mirrors `ATTN_QT`.
+///
+/// The product `QUERY_TILE * KEYS_PER_WARP` is pinned to 32 by
+/// [`the_query_tile_gives_one_thread_per_softmax_slot`], which is what makes
+/// `QUERY_TILE * keys_per_tile()` equal the block width at every head
+/// dimension: `head_dim/32` warps times `KEYS_PER_WARP` keys times
+/// `QUERY_TILE` rows is `head_dim` threads exactly.
+const QUERY_TILE: usize = 8;
+
+/// Head dimensions one lane reduces over, at most. Mirrors `ATTN_MAXD`.
+///
+/// The query tile lives in registers as `qr[ATTN_QT][ATTN_MAXD]`, and an array
+/// indexed by anything the compiler cannot fold to a constant is spilled to
+/// local memory — which would cost more than the tiling saves. So the bound is
+/// a compile-time constant and `head_dim` is rejected above `32 * ATTN_MAXD`.
+const ATTN_MAXD: usize = 8;
 
 const ATTENTION_SRC: &str = r#"
 extern "C" {
@@ -266,8 +319,18 @@ __global__ void attn_rope_partial_neox(
 // rather than per key — mathematically identical, and it cuts the number of
 // expf evaluations by the tile width, because otherwise all head_dim threads
 // redundantly evaluate the same two exponentials for every key.
-// Keys one warp scores per trip. See the loop below.
+// Keys one warp scores per trip, and query rows one block carries.
+//
+// Their product is pinned to 32, which is what makes the block width exactly
+// `ATTN_QT * tile`: the per-tile softmax bookkeeping then has one thread per
+// (query row, key slot) and needs no loop at all. See the phases below.
 #define ATTN_KT 4
+#define ATTN_QT 8
+// Head dimensions one lane reduces over, `head_dim / 32`. Bounded because the
+// query tile lives in registers and `qr[ATTN_QT][ATTN_MAXD]` must be indexed
+// by constants after unrolling — a runtime bound spills it to local memory,
+// which is the whole win thrown away. 8 covers head_dim 256.
+#define ATTN_MAXD 8
 
 __global__ void attn_flash_causal(
     const float* __restrict__ q,
@@ -278,96 +341,171 @@ __global__ void attn_flash_causal(
     int kv_heads,
     int head_dim,
     const int* __restrict__ key_offset,
-    float scale
+    float scale,
+    int n_query
 ) {
     extern __shared__ float smem[];
     int n_warps = blockDim.x >> 5;
     int tile = n_warps * ATTN_KT;              // keys per barrier pair
-    float* q_sh     = smem;                    // head_dim floats
-    float* score_sh = smem + head_dim;         // tile floats
-    float* w_sh     = score_sh + tile;         // tile floats
+    float* score_sh = smem;                    // ATTN_QT * tile
+    float* w_sh     = score_sh + ATTN_QT * tile;
+    float* m_sh     = w_sh + ATTN_QT * tile;   // ATTN_QT, the running maxima
+    float* l_sh     = m_sh + ATTN_QT;          // ATTN_QT, the normalizers
+    float* corr_sh  = l_sh + ATTN_QT;          // ATTN_QT, this tile's rescale
 
-    long long qi = blockIdx.x;
+    long long qi0 = (long long)blockIdx.x * ATTN_QT;
     int h = blockIdx.y;
     int kvh = h / (q_heads / kv_heads);        // GQA: never assume 1:1
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
+    int dpt = head_dim >> 5;
 
-    long long qbase = (qi * (long long)q_heads + h) * (long long)head_dim;
-    q_sh[tid] = q[qbase + tid];
+    // The query tile in registers rather than shared.
+    //
+    // Lane `lane` owns dimensions `lane, lane + 32, ...` of *every* row in the
+    // tile — the same partition of the contraction the untiled kernel gave one
+    // block, so the dot product below sums in the same order. Holding it in
+    // registers is what turns the score loop from one shared read per
+    // multiply-add into none: a key element is loaded once and multiplied
+    // ATTN_QT times.
+    float qr[ATTN_QT][ATTN_MAXD];
+    #pragma unroll
+    for (int u = 0; u < ATTN_QT; ++u) {
+        long long qrow = qi0 + u;
+        const float* qp = q + (qrow * (long long)q_heads + h) * (long long)head_dim;
+        #pragma unroll
+        for (int i = 0; i < ATTN_MAXD; ++i) {
+            qr[u][i] = (i < dpt && qrow < (long long)n_query) ? qp[lane + 32 * i] : 0.0f;
+        }
+    }
+
+    if (tid < ATTN_QT) {
+        m_sh[tid] = neg_inf();
+        l_sh[tid] = 0.0f;
+    }
+    float acc[ATTN_QT];
+    #pragma unroll
+    for (int u = 0; u < ATTN_QT; ++u) acc[u] = 0.0f;
+
+    // Rows of the tile that exist, and the deepest key any of them sees. The
+    // causal bound is per row — row `qi0 + u` sees keys `[0, key_offset + qi0
+    // + u]` inclusive — so the loop runs to the *last* row's bound and the
+    // earlier rows mask the tail off. See the mask in phase 1.
+    int qt_live = (int)((long long)n_query - qi0);
+    if (qt_live > ATTN_QT) qt_live = ATTN_QT;
+    long long n_visible = (long long)(*key_offset) + qi0 + qt_live;
+
+    // One thread per (query row, key slot) for the softmax phases.
+    int su = tid / tile;
+    int sw = tid - su * tile;
+
     __syncthreads();
-
-    // The causal bound, written once. Query row qi sits at absolute position
-    // key_offset + qi and sees keys [0, key_offset + qi] inclusive.
-    long long n_visible = (long long)(*key_offset) + qi + 1;
-
-    float m = neg_inf();
-    float l = 0.0f;
-    float acc = 0.0f;
 
     for (long long j0 = 0; j0 < n_visible; j0 += tile) {
         // ATTN_KT keys per warp per trip, not one.
         //
-        // The barrier pair below is per *trip*, and one key per warp made it
-        // one barrier pair per eight keys: a 512-token prefill row crossed 128
-        // of them. The scores of several keys are independent, so a warp can
-        // compute ATTN_KT of them back to back and the block can rescale its
-        // running softmax once for all `tile` of them.
-        //
-        // `key = j0 + warp * ATTN_KT + r` stored at `score_sh[warp * ATTN_KT
-        // + r]` keeps slot `w` holding key `j0 + w`, which is what lets the
-        // value accumulation below stay a single ascending sweep.
+        // `key = j0 + warp * ATTN_KT + r` stored at `score_sh[u * tile + warp
+        // * ATTN_KT + r]` keeps slot `w` holding key `j0 + w`, which is what
+        // lets the value accumulation below stay a single ascending sweep.
         #pragma unroll
         for (int r = 0; r < ATTN_KT; ++r) {
             long long key = j0 + (long long)warp * ATTN_KT + r;
-            float partial = 0.0f;
+            float part[ATTN_QT];
+            #pragma unroll
+            for (int u = 0; u < ATTN_QT; ++u) part[u] = 0.0f;
             if (key < n_visible) {
                 const float* krow =
                     k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
                 // Lane l takes dimensions l, l+32, l+64, ...: consecutive lanes
                 // read consecutive floats, so every load is a full 128 B
-                // transaction, and q_sh[d] with d = lane + 32*i hits a distinct
-                // bank per lane.
-                for (int d = lane; d < head_dim; d += 32) partial += q_sh[d] * krow[d];
+                // transaction, and one such load feeds ATTN_QT multiply-adds.
+                #pragma unroll
+                for (int i = 0; i < ATTN_MAXD; ++i) {
+                    if (i < dpt) {
+                        float kd = krow[lane + 32 * i];
+                        #pragma unroll
+                        for (int u = 0; u < ATTN_QT; ++u) part[u] += qr[u][i] * kd;
+                    }
+                }
             }
-            for (int off = 16; off > 0; off >>= 1) {
-                partial += __shfl_xor_sync(0xffffffff, partial, off);
+            #pragma unroll
+            for (int u = 0; u < ATTN_QT; ++u) {
+                float p = part[u];
+                for (int off = 16; off > 0; off >>= 1) {
+                    p += __shfl_xor_sync(0xffffffff, p, off);
+                }
+                if (lane == 0) score_sh[u * tile + warp * ATTN_KT + r] = p * scale;
             }
-            if (lane == 0) score_sh[warp * ATTN_KT + r] = partial * scale;
         }
         __syncthreads();
 
-        long long remaining = n_visible - j0;
-        int n_this = (int)(remaining < (long long)tile ? remaining : (long long)tile);
-
-        float tile_max = neg_inf();
-        for (int w = 0; w < n_this; ++w) tile_max = fmaxf(tile_max, score_sh[w]);
-        float new_m = fmaxf(m, tile_max);
-        // Matches the reference's guard exactly: on the first tile there is
-        // no accumulator to rescale and expf(-inf - -inf) would be NaN.
-        float corr = (m == neg_inf()) ? 0.0f : expf(m - new_m);
-
-        // w_sh and score_sh are disjoint, so this write races nothing above.
-        if (tid < n_this) w_sh[tid] = expf(score_sh[tid] - new_m);
+        // Phase 1: the running max, one thread per query row.
+        //
+        // Serial and ascending over the tile, which is the order the untiled
+        // kernel folded it in. A warp butterfly would be faster and would also
+        // be a different reduction; `fmaxf` happens to be associative in
+        // floating point, but the normalizer in phase 3 is not, so the two are
+        // kept the same shape rather than one being quietly special.
+        if (tid < ATTN_QT) {
+            long long limit = (long long)(*key_offset) + qi0 + tid;
+            float tmax = neg_inf();
+            for (int w = 0; w < tile; ++w) {
+                if (j0 + w <= limit) tmax = fmaxf(tmax, score_sh[tid * tile + w]);
+            }
+            float m0 = m_sh[tid];
+            float new_m = fmaxf(m0, tmax);
+            // Matches the reference's guard exactly: on the first tile there is
+            // no accumulator to rescale and expf(-inf - -inf) would be NaN.
+            corr_sh[tid] = (m0 == neg_inf()) ? 0.0f : expf(m0 - new_m);
+            m_sh[tid] = new_m;
+        }
         __syncthreads();
 
-        float lsum = 0.0f;
-        for (int w = 0; w < n_this; ++w) lsum += w_sh[w];
-        l = l * corr + lsum;
-
-        float a = acc * corr;
-        for (int w = 0; w < n_this; ++w) {
-            a += w_sh[w] * v[((j0 + w) * (long long)kv_heads + kvh) * (long long)head_dim + tid];
+        // Phase 2: one exponential per slot, all in parallel. Masked slots
+        // write a literal zero, which is what makes a row whose causal bound
+        // ended earlier contribute exactly nothing to the tiles past it —
+        // `a += 0.0f * v` and `lsum += 0.0f` are both exact.
+        {
+            long long limit = (long long)(*key_offset) + qi0 + su;
+            w_sh[su * tile + sw] = (j0 + sw <= limit)
+                ? expf(score_sh[su * tile + sw] - m_sh[su])
+                : 0.0f;
         }
-        acc = a;
-        m = new_m;
+        __syncthreads();
+
+        // Phase 3: the normalizer, serial and ascending. Independent of phase
+        // 4, so the two run without a barrier between them.
+        if (tid < ATTN_QT) {
+            float lsum = 0.0f;
+            for (int w = 0; w < tile; ++w) lsum += w_sh[tid * tile + w];
+            l_sh[tid] = l_sh[tid] * corr_sh[tid] + lsum;
+        }
+
+        // Phase 4: the values. One global load per key now serves ATTN_QT
+        // rows instead of one, which is the whole point of the query tile.
+        #pragma unroll
+        for (int u = 0; u < ATTN_QT; ++u) acc[u] = acc[u] * corr_sh[u];
+        for (int w = 0; w < tile; ++w) {
+            if (j0 + w >= n_visible) break;
+            float vv =
+                v[((j0 + w) * (long long)kv_heads + kvh) * (long long)head_dim + tid];
+            #pragma unroll
+            for (int u = 0; u < ATTN_QT; ++u) acc[u] += w_sh[u * tile + w] * vv;
+        }
 
         // Before the next iteration overwrites score_sh and w_sh.
         __syncthreads();
     }
 
-    out[qbase + tid] = acc / l;
+    #pragma unroll
+    for (int u = 0; u < ATTN_QT; ++u) {
+        long long qrow = qi0 + u;
+        if (qrow < (long long)n_query) {
+            out[(qrow * (long long)q_heads + h) * (long long)head_dim + tid] =
+                acc[u] / l_sh[u];
+        }
+    }
 }
 
 // Append this batch's roped keys and raw values to the cache, at the absolute
@@ -523,7 +661,7 @@ impl AttentionKernels {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self, AttentionError> {
-        if head_dim == 0 || !head_dim.is_multiple_of(32) || head_dim > 1024 {
+        if head_dim == 0 || !head_dim.is_multiple_of(32) || head_dim > 32 * ATTN_MAXD {
             return Err(AttentionError::UnsupportedHeadDim { head_dim });
         }
         if kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
@@ -555,10 +693,11 @@ impl AttentionKernels {
         (self.head_dim / 32) * KEYS_PER_WARP
     }
 
-    /// Dynamic shared memory one block requests: `q_sh` plus the two
-    /// tile-wide scratch arrays. See the module docs for the budget.
+    /// Dynamic shared memory one block requests: the score and weight tiles,
+    /// which are now `QUERY_TILE` rows deep, plus the three per-row softmax
+    /// scalars. The query tile itself is in registers. See the module docs.
     pub fn shared_bytes(&self) -> usize {
-        (self.head_dim + 2 * self.keys_per_tile()) * size_of::<f32>()
+        (2 * QUERY_TILE * self.keys_per_tile() + 3 * QUERY_TILE) * size_of::<f32>()
     }
 
     /// The `1/sqrt(head_dim)` score scale.
@@ -749,13 +888,18 @@ impl AttentionKernels {
         Self::expect_len("output", out.len(), q_elems)?;
 
         let cfg = LaunchConfig {
-            grid_dim: (n_query as u32, self.q_heads as u32, 1),
+            grid_dim: (
+                (n_query as u32).div_ceil(QUERY_TILE as u32),
+                self.q_heads as u32,
+                1,
+            ),
             block_dim: (self.head_dim as u32, 1, 1),
             shared_mem_bytes: self.shared_bytes() as u32,
         };
         let q_heads = self.q_heads as i32;
         let kv_heads = self.kv_heads as i32;
         let head_dim = self.head_dim as i32;
+        let n_query_i32 = n_query as i32;
         let scale = self.scale();
         let mut builder = stream.launch_builder(&self.flash);
         builder
@@ -767,13 +911,17 @@ impl AttentionKernels {
             .arg(&kv_heads)
             .arg(&head_dim)
             .arg(positions)
-            .arg(&scale);
-        // SAFETY: the grid is (n_query, q_heads) with one thread per head
-        // dimension. The deepest key index any block reads is
+            .arg(&scale)
+            .arg(&n_query_i32);
+        // SAFETY: the grid is (ceil(n_query / QUERY_TILE), q_heads) with one
+        // thread per head dimension, and `n_query` is passed so the kernel
+        // masks the rows a partial tile does not have — it neither reads `q`
+        // nor writes `out` for them. The deepest key index any block reads is
         // `positions[0] + n_query - 1`, which the caller promised is below
         // `max_keys`, and all four buffers were checked against it.
-        // Shared memory covers q_sh plus the two `head_dim/32`-wide scratch
-        // arrays, which is everything the kernel indexes.
+        // Shared memory covers the two `QUERY_TILE x keys_per_tile` scratch
+        // tiles and the three per-row scalars, which is everything the kernel
+        // indexes; the query tile is in registers.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
@@ -881,9 +1029,20 @@ mod tests {
         // An off-by-one here leaks exactly one future token per row, which
         // moves aggregate error metrics by almost nothing. It is asserted
         // structurally because no tolerance would catch it reliably.
+        // The block's loop bound is the *last* row's window; each earlier row
+        // masks the tail off itself. Both halves are asserted, because
+        // dropping the per-row mask would silently let row `qi0` attend to
+        // seven future tokens and every aggregate metric would barely move.
         assert!(
-            ATTENTION_SRC.contains("long long n_visible = (long long)(*key_offset) + qi + 1;"),
+            ATTENTION_SRC
+                .contains("long long n_visible = (long long)(*key_offset) + qi0 + qt_live;"),
             "the causal window bound changed shape",
+        );
+        assert!(
+            ATTENTION_SRC.contains("long long limit = (long long)(*key_offset) + qi0 + tid;")
+                && ATTENTION_SRC.contains("long long limit = (long long)(*key_offset) + qi0 + su;")
+                && ATTENTION_SRC.contains("if (j0 + w <= limit) tmax ="),
+            "the per-row causal mask is gone from the softmax phases",
         );
         assert!(
             ATTENTION_SRC.contains("for (long long j0 = 0; j0 < n_visible; j0 += tile)")
@@ -911,13 +1070,13 @@ mod tests {
         // new weights in before rescaling produces a finite, plausible, wrong
         // answer whenever the max increases.
         let rescale_l = ATTENTION_SRC
-            .find("l = l * corr + lsum;")
+            .find("l_sh[tid] = l_sh[tid] * corr_sh[tid] + lsum;")
             .expect("normalizer rescale present");
         let rescale_acc = ATTENTION_SRC
-            .find("float a = acc * corr;")
+            .find("for (int u = 0; u < ATTN_QT; ++u) acc[u] = acc[u] * corr_sh[u];")
             .expect("accumulator rescale present");
         let fold_in = ATTENTION_SRC
-            .find("a += w_sh[w] * v[")
+            .find("acc[u] += w_sh[u * tile + w] * vv;")
             .expect("value accumulation present");
         assert!(rescale_acc < fold_in, "values folded in before rescaling");
         assert!(rescale_l < fold_in, "normalizer updated after the values");
@@ -945,10 +1104,10 @@ mod tests {
         // through why the textbook tile shapes do not fit at head_dim 256.
         const TURING_SHARED_PER_BLOCK: usize = 48 * 1024;
         let head_dim = 256usize;
-        let keys_per_tile = head_dim / 32;
-        let bytes = (head_dim + 2 * keys_per_tile) * size_of::<f32>();
-        assert_eq!(bytes, 1088);
-        assert!(bytes < TURING_SHARED_PER_BLOCK / 40);
+        let keys_per_tile = (head_dim / 32) * KEYS_PER_WARP;
+        let bytes = (2 * QUERY_TILE * keys_per_tile + 3 * QUERY_TILE) * size_of::<f32>();
+        assert_eq!(bytes, 2144);
+        assert!(bytes < TURING_SHARED_PER_BLOCK / 20);
 
         // The tile shapes that do not fit, so the arithmetic in the module
         // docs fails loudly if someone edits it.
@@ -1011,5 +1170,42 @@ mod tests {
         // The query and the output are indexed by the launch geometry rather
         // than by absolute position, so they keep the exact check.
         assert!(AttentionKernels::expect_len("query", 4097, 4096).is_err());
+    }
+
+    #[test]
+    fn the_query_tile_gives_one_thread_per_softmax_slot() {
+        // The kernel's softmax phases index `score_sh` and `w_sh` as
+        // `su * tile + sw` with `su = tid / tile`, and cover every slot with
+        // no loop. That is only true when the block is exactly as wide as the
+        // tile is big — which, since the block is `head_dim` threads and the
+        // tile is `(head_dim / 32) * KEYS_PER_WARP` keys deep per row, reduces
+        // to this product being a warp.
+        assert_eq!(
+            QUERY_TILE * KEYS_PER_WARP,
+            32,
+            "QUERY_TILE * KEYS_PER_WARP must be 32, or phase 2 misses slots",
+        );
+        for head_dim in [32usize, 64, 128, 256] {
+            let tile = (head_dim / 32) * KEYS_PER_WARP;
+            assert_eq!(
+                QUERY_TILE * tile,
+                head_dim,
+                "head_dim {head_dim}: block width and softmax slot count diverged",
+            );
+        }
+    }
+
+    #[test]
+    fn the_register_query_tile_bounds_the_head_dimension() {
+        // `qr[ATTN_QT][ATTN_MAXD]` is only in registers while every index
+        // folds to a constant, so the head dimension cannot exceed what
+        // ATTN_MAXD covers. Asserted because raising head_dim past it would
+        // compile, run, and silently spill.
+        assert_eq!(32 * ATTN_MAXD, 256);
+        assert!(ATTENTION_SRC.contains("#define ATTN_MAXD 8"));
+        assert!(
+            ATTENTION_SRC.contains("float qr[ATTN_QT][ATTN_MAXD];"),
+            "the query tile is no longer a register array",
+        );
     }
 }
