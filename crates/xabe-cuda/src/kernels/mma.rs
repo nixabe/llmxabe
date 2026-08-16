@@ -503,7 +503,7 @@ impl From<DriverError> for MmaError {
     }
 }
 
-/// Output rows one warp accumulates in [`MmaKernels::q8_0_proj`].
+/// Output rows one warp accumulates.
 ///
 /// Spelled here and as `MMA_ROWS` in the kernel;
 /// `the_row_band_matches_the_kernel` asserts they agree.
@@ -514,10 +514,57 @@ pub const MMA_TOKENS: usize = MMA_M;
 
 /// Tokens one warp accumulates in the split-layout projection.
 ///
-/// Unlike [`MMA_TOKENS`] this *is* a tunable: it is a whole number of 8-row
-/// MMA tiles stacked in one warp, and it sets the arithmetic intensity. Each
-/// extra tile multiplies the operations per weight byte without touching the
-/// weight traffic, because one B fragment feeds every token tile.
+/// Unlike [`MMA_TOKENS`] this *is* a tunable. Together with [`MMA_ROWS`] it
+/// sets both the arithmetic intensity — one B fragment feeds every token tile,
+/// so extra tiles multiply the operations per weight byte without touching the
+/// weight traffic — and the register pressure, which is
+/// `(MMA_SPLIT_TOKS / 8) * (MMA_ROWS / 8) * 2` accumulators per thread.
+///
+/// # A tuning result that reversed under measurement
+///
+/// 64 x 64 is 128 accumulators, which is more than ptxas can hold, and the
+/// kernel measures **13.6% of the card's 198 TOP/s int8 peak** on its own. A
+/// sweep of `bench_mma` says to shrink it. Milliseconds, isolated:
+///
+/// | tokens x rows x k | 64 x 64 | 16 x 128 |
+/// |---|---:|---:|
+/// | 128 x 8192 x 2048   |  0.209 | **0.132** |
+/// | 512 x 8192 x 2048   |  0.637 | **0.349** |
+/// | 512 x 2048 x 4096   |  0.316 | **0.190** |
+/// | 512 x 248320 x 2048 | 49.636 | **46.068** |
+///
+/// **Faster on every shape, and 8% slower in the engine** — 1,228 tok/s at
+/// n = 512 against 64 x 64's 1,341. Every alternative measured end to end lost:
+///
+/// | tile | n = 128 | n = 512 |
+/// |---|---:|---:|
+/// | 64 x 64  | 889.34 | **1341.39** |
+/// | 64 x 32  | 933.32 | 1309.01 |
+/// | 32 x 64  | 861.89 | 1284.06 |
+/// | 16 x 128 | 905.99 | 1228.07 |
+/// | 32 x 128 | 684.86 | 1211.75 |
+/// | 16 x 64  | 915.18 | 1164.79 |
+///
+/// The reason is that the token tile also divides the grid: `grid.y` is
+/// `tokens / MMA_SPLIT_TOKS`, and **every block in `y` re-reads the whole
+/// weight band**. Sixteen tokens per tile is four times the weight traffic of
+/// sixty-four. In `bench_mma` that traffic is free, because the weight is the
+/// only thing in L2; in a forward pass it competes with 32 GiB of everything
+/// else, and the extra reads cost more than the register pressure did.
+///
+/// Recorded because the isolated benchmark is not merely a weaker signal here,
+/// it points the wrong way. A microbenchmark of a kernel that re-reads a
+/// weight measures cache residency it will not have in situ.
+pub const MMA_SPLIT_TOKS: usize = 64;
+
+/// Batch width at or above which the engine's blocks route their projections
+/// through the integer tensor cores.
+///
+/// Deliberately **not** [`MMA_SPLIT_TOKS`], though it was the same constant
+/// until the tile was retuned. They answer different questions: the tile is
+/// how much work one warp holds, and this is whether a batch is wide enough to
+/// be worth quantizing activations for at all. A decode step of one token
+/// would pay the whole fixed cost to fill an eighth of a fragment.
 pub const MMA_SPLIT_TOKENS: usize = 64;
 
 /// The compiled integer tensor-core kernels.
@@ -668,7 +715,7 @@ impl MmaKernels {
         let cfg = LaunchConfig {
             grid_dim: (
                 (n_rows as u32).div_ceil(WARPS * MMA_ROWS as u32),
-                (tokens as u32).div_ceil(MMA_SPLIT_TOKENS as u32),
+                (tokens as u32).div_ceil(MMA_SPLIT_TOKS as u32),
                 1,
             ),
             block_dim: (32, WARPS, 1),
@@ -872,7 +919,7 @@ mod tests {
              stops covering the output rows",
         );
         assert!(
-            MMA_SRC.contains(&format!("#define MMA_TOKS {MMA_SPLIT_TOKENS}\n")),
+            MMA_SRC.contains(&format!("#define MMA_TOKS {MMA_SPLIT_TOKS}\n")),
             "the kernel's token tile must equal the host's, or the launch grid \
              stops covering the tokens",
         );
