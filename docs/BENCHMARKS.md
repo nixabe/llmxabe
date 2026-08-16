@@ -1491,6 +1491,43 @@ words, `28 mod 32 = -4`, which tiles exactly. Worth about nothing next to the
 activation tile, and taken anyway because it is provably right rather than
 accidentally equal.
 
+### Padding Q6_K to a 16-byte stride: a real trade, taken the other way
+
+Q6_K's superblock is 210 bytes. `210 * s` is 4-byte aligned only for even `s`,
+so every read of a superblock has to be 16 bits wide and the grouped GEMM's
+staging loop pays four load instructions per weight row. Padding the *device*
+stride to 224 makes every field of every superblock 16-byte aligned, which
+lets one `int4` load stage eight rows at a time: four loads per eight rows
+instead of four per row.
+
+It was implemented end to end — a `to_device_layout` re-stride on upload, a
+`file_block_bytes` / `block_bytes` split so GGUF validation and device
+addressing stop being the same number, and an `int4` staging loop whose lane
+split (`row = lane & 7`, `chunk = lane >> 3`) is also conflict-free against the
+112-byte shared stride. It works, and the numbers, interleaved three runs each:
+
+| | prefill tok/s | decode tok/s |
+| --- | ---: | ---: |
+| 210-byte stride | 1,626 | **104.91** |
+| 224-byte stride | **1,664** | 104.14 |
+
+**+2.3% prefill, −0.7% decode**, plus 1.1 GiB of VRAM. The pad bytes are never
+read, but they are inside the sectors that are, so the traffic grows 6.7% on
+`ffn_gate_exps` and `ffn_up_exps` — and decode is bandwidth-bound where prefill
+is not.
+
+Reverted, because decode is 0.2% ahead of llama.cpp and prefill is 27% behind:
+a trade that spends the goal condition that is met to buy the one that is not
+is the wrong direction. The patch is kept; if decode gains headroom elsewhere —
+flash-decoding over a split KV window is worth about 1.2% and is not done — the
+trade turns positive and it goes back in.
+
+A 212-byte stride was considered instead: 4-byte aligned, so `int` loads work
+and the padding costs 0.95% rather than 6.7%. It is not equivalent. Most of the
+224 win is that 224 is a multiple of **32**, so a superblock starts on a sector
+boundary; 212 gives the alignment for the loads without the alignment for the
+fetches.
+
 ### The dense projections are not weight-traffic bound either
 
 `mma_q8_0_proj_split` re-reads the whole weight band once per token tile --
