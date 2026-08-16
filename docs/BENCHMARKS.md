@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,361.42 ± 5.52 tok/s** | **1.52× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,430.58 ± 7.17 tok/s** | **1.45× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **105.2 tok/s**, 9.51 ms/step | **1.005× faster** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1299,8 +1299,10 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | `float4` GDN row loads | 1,248.27 | 1.08× |
 | int8 MMA on the shared expert | 1,341.39 | 1.07× |
 | word-wide Q6_K unpacking in the MoE MMA | 1,365.74 | 1.02× |
+| wider MoE tensor-core block, 32-slot dispatch | 1,380.38 | 1.01× |
+| four staging loads per weight row instead of eight | 1,430.58 | 1.04× |
 
-**6.80× overall.** No single change is more than 1.81×; the result is
+**7.12× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1450,6 +1452,66 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### Staging was 60% of the MoE GEMM, and it was a load count
+
+`profile_forward` puts the MoE at 210 ms of a 373 ms prefill -- 56% -- moving
+its weights at about 145 GB/s, a fifth of what the card does and a sixth of
+what the LM head's own GEMV reaches on the same silicon. Three experiments
+narrowed it down, and two of them were wrong in an instructive way.
+
+**Halving the inner loop made the pass 12% faster, and proved nothing.**
+Neither did stripping the scale multiplies, which made it 10% *slower*. Both
+change the kernel's output, the output is a router logit two layers later, and
+a model producing garbage routes its tokens differently -- concentrated onto a
+few experts in one case, spread onto badly-packed ones in the other. **Any
+experiment that perturbs numerics also perturbs the expert distribution, and
+therefore the weight traffic.** They cannot be used to attribute time.
+
+The experiment that worked runs the weight-staging loop **twice** per trip. It
+writes the same bytes to the same shared addresses, so the output is
+bit-identical and routing cannot move; the pass went 371.65 -> 437.50 ms.
+Staging is **66 ms of the kernel's 110**, and it stays that expensive on the
+second pass, when every byte is already in L1. So it is not DRAM bandwidth. It
+is the *number* of load instructions.
+
+There were eight per weight row per trip:
+
+| | bytes wanted | lanes used | sectors fetched |
+| --- | ---: | ---: | ---: |
+| `ql` | 64 | 32 | 2 |
+| `qh` | 32 | 16 | 1 |
+| sub-scales | 8 | 8 | 1 |
+| superblock delta | 2 | 1 | 1 |
+
+times two matrices. The last two fetch a 32-byte sector for eight and two
+useful bytes, and `load_half_le` reads its two bytes as two separate
+single-byte loads, so the delta alone was two instructions.
+
+The fix is that `qh`, the sub-scales and the delta together occupy 21 lanes of
+one warp — 16 for `qh`, 4 for the scales, 1 for the delta — so all three fit
+in a **single predicated 16-bit load** per matrix, with 11 lanes idle. Four
+loads per row instead of eight. The bytes fetched are identical; only the
+instruction count changed. The Q8_0 down projection got the same treatment for
+its fp16 scale.
+
+**1,380.38 -> 1,430.58 tok/s.**
+
+Two things tried on the way that did not pay:
+
+- **Accumulating the Q6_K sub-scale in int32.** SASS showed 20 of the inner
+  loop's 105 instructions were `I2F`, which is quarter-rate on Turing; folding
+  the int8 sub-scale into the integer accumulator cuts that to 8 per 16
+  elements. It measured as *nothing*, because the kernel is staging-bound, and
+  it moved block 31 enough for `forward_pass`'s error-growth guard to fail.
+  Reverted: the arithmetic is back to one float multiply per sub-block and
+  bit-identical to what it was.
+- **A 32-slot dispatch block** (`MOE_MMA_M` 16 -> 32) to halve the number of
+  times an expert's weights are re-read. Worth 1.01x, not the 1.25x the
+  padding arithmetic suggested -- because `profile_forward` says the routing
+  on this prompt is already almost perfectly packed: 496 dispatch blocks
+  launched, exactly 256 of them carrying work, which is the ideal. Kept
+  anyway, together with the wider 8-warp block, for the 1.01x each.
 
 ### The last launch that was only a sum
 

@@ -115,7 +115,7 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 const EMBED_THREADS: u32 = 256;
 
 /// Grouped-GEMM tile width the MoE dispatch tables pad to.
-const MOE_BLOCK_SIZE: usize = 16;
+const MOE_BLOCK_SIZE: usize = 32;
 
 /// The GGUF keys that are not in [`ModelConfig`] and must not be guessed.
 const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
