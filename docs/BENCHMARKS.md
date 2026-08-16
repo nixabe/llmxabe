@@ -2703,3 +2703,93 @@ from an extrapolated 49 s to 22 s.
 That is the single largest remaining item in the engine and it is a kernel
 rewrite, not a constant change. It is specified here rather than attempted
 half-way.
+
+## The KV-head-major flash kernel, measured (2026-08-17)
+
+The rewrite specified above landed as `attn_flash_causal_gqa`. The shape is the
+one predicted — grid `(n_query / GQA_QT, kv_heads)`, one warp per query head
+under that KV head, K and V staged in shared once per trip for all eight — with
+one correction: `GQA_QT` is **4**, not 8. A warp now owns a whole head, so a
+lane carries `head_dim / 32` accumulator dimensions per row instead of one, and
+`qr` plus `acc` is `2 * GQA_QT * ATTN_MAXD` registers. At 4 that is 64, which
+ptxas turns into 128 total and two resident blocks per SM; at 8 it is 128, which
+is the same wall the `ATTN_QT` 16 experiment hit from the other side. Traffic
+falls by exactly `GQA_QT`, so the shape that was reachable buys 4x and not 8x.
+
+Chunked prefill, 512-token chunks, one GPU, one repetition per row:
+
+| tokens | chunks | before (tok/s) | after (tok/s) | gain |
+| -----: | -----: | -------------: | ------------: | ---: |
+|    512 |      1 |        2,364.3 |       2,367.2 | +0.1% |
+|  2,048 |      4 |        2,088.1 |       2,122.1 | +1.6% |
+|  8,192 |     16 |        1,359.3 |       1,552.2 | +14.2% |
+| 16,384 |     32 |          913.9 |       1,134.6 | +24.1% |
+| 32,768 |     64 |          561.6 |         737.1 | +31.2% |
+| 65,536 |    128 |          321.2 |         441.1 | +37.3% |
+
+The gain grows monotonically with depth, which is the signature of the
+mechanism: attention is a fixed cost per (query, key) pair, so its share of the
+pass rises with context, and only attention changed. At 512 tokens — one chunk,
+one key window of 512 — there is nothing to win and nothing is lost.
+
+Peak VRAM at 65,536 is unchanged at 35.316 GiB of 47.27, because the KV cache
+dominates it and the KV cache did not move.
+
+### Why it is 1.4x on the kernel and not 4x
+
+`nsys` on the 8,192 run: `attn_flash_causal_gqa` is 34.7% of the pass where
+`attn_flash_causal` was 42.8%, 3,642 ms against 5,027, and the deepest chunk
+falls 31.65 -> 22.09 ms. That is 1.43x from a 4x traffic cut, and the reason is
+that the kernel is no longer bandwidth-bound. At the deepest chunk it now moves
+4.2 GB in 22.09 ms — 188 GB/s, 28% of this card's 672 — where the old kernel
+moved 16.4 GB at 77% of peak. The bound moved somewhere else.
+
+It moved to instruction issue, and specifically to the cross-lane reduction.
+Per (key, query row) the kernel spends `head_dim / 32` = 8 multiply-adds and
+then 5 `__shfl_xor_sync` plus 5 adds to reduce the dot product across the warp:
+40 reduction instructions per 64 useful multiply-adds at `GQA_QT` 4. Measured
+throughput is 3.2 TFLOP/s against a 16.3 TFLOP/s fp32 peak, which is what that
+ratio predicts once the load/store slots are counted too.
+
+That is a data-layout problem and the layout is a closed trade. With `L` lanes
+cooperating on one dot product and `head_dim / L` dimensions per lane, registers
+are `2 * GQA_QT * head_dim / L`, the traffic cut is `GQA_QT`, and the reduction
+costs `2 * log2(L)` instructions against `head_dim / L` multiply-adds:
+
+| L  | dims/lane | multiply-add share | registers at `GQA_QT` 4 | traffic cut |
+| -- | --------: | -----------------: | ----------------------: | ----------: |
+| 32 |         8 |                44% |                    64 ✓ |          4x |
+| 16 |        16 |                67% |                   128 ✗ |          4x |
+|  8 |        32 |                84% |                   256 ✗ |          4x |
+|  4 |        64 |                94% |                   512 ✗ |          4x |
+
+Every row that improves the reduction costs registers this part does not have.
+fp32 scalar code has no move left here; the next step is fp16 operands on the
+`mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` tensor cores, which do the
+reduction in hardware and raise the arithmetic ceiling from 16.3 to about 65
+TFLOP/s. Attention is two GEMMs and nothing else, so it is the right shape for
+that; it is a larger change than this one and is not attempted here.
+
+### Two cheaper fixes, both measured and both rejected
+
+**Swapping the grid axes.** Blocks are scheduled with x fastest, so the original
+grid `(n_query / ATTN_QT, q_heads)` makes the co-resident blocks many query
+tiles of one head — the worst order for reuse. Putting the head on x instead
+makes them the sixteen heads of one query tile, which share only two KV heads,
+and costs one line. It **lost 1.7%** across three interleaved pairs at 8,192
+(5,932/6,036/6,057 ms against 6,127/6,162/6,171). Sibling blocks start together
+but nothing keeps them together, and they drift apart faster than 6 MB of L2 can
+span. Only a staging barrier inside one block actually makes them share, which
+is why the kernel above stages rather than reorders. Reverted.
+
+**Widening `ATTN_QT` to 16.** Recorded above; also reverted.
+
+### What this did not touch: decode
+
+Decode is `n_query == 1` and still takes `attn_flash_causal_t1`, whose grid is
+`(1, q_heads)` — **sixteen blocks on a 72-SM card**. Before counting the same
+8x K/V redundancy, decode attention leaves 78% of the machine idle. The fix is
+flash-decoding: split the key range across blocks, have each produce a partial
+`(m, l, acc)`, and merge them in a second pass. That recovers both the
+parallelism and the redundancy at once, and it is the largest remaining item on
+the decode side.
