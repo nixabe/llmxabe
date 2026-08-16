@@ -2201,3 +2201,48 @@ on one card within minutes, so the drift applies to both arms equally.
 The earlier figure this document compared against, 2,070.50, is a single
 measurement from a different session. Re-measured this way llama.cpp is 2,076.2,
 which is the number the table above uses.
+
+### Hoisting the Gram kernel out of the chunk loop: measured, rejected (2026-08-16)
+
+`gdn_chunk_gram` is the one chunk stage that never reads or writes the
+recurrent state — it consumes `q_norm`/`k_norm` and produces `kk`/`kq`, and
+nothing else. Nothing therefore orders it against the chunk loop the other
+three stages are bound by, so it can be launched once for the whole sequence
+with the chunk index as a third grid axis. At 512 tokens that is 8 launches
+per layer collapsed to 1: **240 → 30** across the 30 GDN layers, about 210 of
+the pass's 960 launches, and 10.9 ms/pass of kernel time was on the table.
+
+It was implemented, it produced bit-identical output — all six device
+differential cases pass, including the 581-token ragged tail that exercises
+the fixed `chunk_len` stride the hoisted layout forces — and it is **1.07 ms
+slower**. Three interleaved pairs, `bench_forward` n=512, 4 reps each:
+
+| round | in the loop | hoisted |
+| --- | ---: | ---: |
+| 1 | 228.79 | 230.65 |
+| 2 | 230.26 | 231.12 |
+| 3 | 230.77 | 231.27 |
+| **mean ms/pass** | **229.94** | **231.01** |
+
+The hoisted arm loses every pair, which is what makes +0.47% readable against
+1.3% thermal drift: the drift moves both arms together and the ordering does
+not survive it by accident.
+
+The mechanism is L2, not launches. In the loop, `kk` and `kq` are one
+`chunk_len²` square per query/key head — 512 KiB at this geometry — written by
+the Gram kernel and read by `gdn_chunk_solve_and_apply` immediately afterwards,
+so the solve hits in L2 essentially always. Hoisted, all eight chunks' squares
+must coexist, because they are all produced before the first one is consumed:
+4 MiB live in a 6 MiB L2, competing with the projections and the state. The
+launches saved are worth less than the locality lost.
+
+The general lesson is the one this document keeps arriving at from the other
+direction: **on this part, launch count is not a bottleneck worth trading
+locality for.** A 512-token pass issues ~960 launches in 229 ms — 0.24 ms of
+launch overhead per millisecond of work would be a 100% tax, and the measured
+tax at prefill shape is ~0.4%. Collapsing launches only pays when it does not
+inflate the working set.
+
+This does not generalize to the state-carrying stages. It is specifically the
+finding that *this* hoist, the only one the data dependencies permit, is not
+worth taking.
