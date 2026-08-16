@@ -9,7 +9,9 @@
 | Gated DeltaNet, chunked (reference) | 30 | **critical** | Forward substitution per chunk, not explicit inverses; retained and tested, not on the forward path | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
 | GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
 | MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference; tiled, 9.3× at 512 tokens** |
-| Flash attention (GQA 16:2, head 256) | 10 | medium | Online softmax, `BM = 1`, scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window** |
+| Flash attention, prefill (GQA 16:2, head 256) | 10 | medium | Online softmax, KV head on the grid and one warp per query head, K/V staged in shared; scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window; 4x less K/V traffic, +37% at 64K** |
+| Flash attention, decode (split-K) | 10 | medium | Key range split across blocks, partial `(m, l, acc)` merged in a second pass — the only axis a one-row query has | **sm_75 kernel, gated at 4,096 keys against the scalar reference; +114% at ctx 8192** |
+| Flash attention, one-row fallback | 10 | low | Pre-tiling kernel, kept for geometries the split path cannot service | **sm_75 kernel, unchanged** |
 | LM head GEMV (2048 × 248,320) | 1 | medium | ~~split-K~~ — one warp per row; dominates weight bandwidth | **sm_75 kernel, argmax exact, 81–89% of roofline** |
 | `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | **sm_75 kernel, tables exact vs reference** |
 | mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | **sm_75 kernel, tail bit-identical** |

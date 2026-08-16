@@ -239,7 +239,7 @@ const GQA_QUERY_TILE: usize = 4;
 /// the block count that replaces decode's old sixteen. 64 gives 128 blocks
 /// against 72 SMs, which is where the card stops being the constraint; raising
 /// it further only shortens each slice and lengthens the combine.
-const DECODE_SPLITS: usize = 64;
+const DECODE_SPLITS: usize = 144;
 
 /// Keys the flash-decoding split pass stages per trip. Mirrors `DEC_KT`.
 ///
@@ -709,16 +709,26 @@ __global__ void attn_flash_causal_gqa(
         // Stage the tile. `n_visible` is block-uniform, so every warp runs the
         // same trip count and the barriers below are reached by all of them.
         __syncthreads();
-        for (int jj = 0; jj < GQA_KT; ++jj) {
-            long long key = j0 + jj;
-            bool live = key < n_visible;
-            const float* kp =
-                k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
-            const float* vp =
-                v + (key * (long long)kv_heads + kvh) * (long long)head_dim;
-            for (int d = tid; d < head_dim; d += nthr) {
-                k_sh[jj * head_dim + d] = live ? kp[d] : 0.0f;
-                v_sh[jj * head_dim + d] = live ? vp[d] : 0.0f;
+        // Every load for the tile is issued before any of it is stored; see
+        // the same loop in `attn_flash_decode_split` for why. Costs
+        // `2 * GQA_KT` registers, which is the reason it is measured here
+        // rather than assumed: this kernel is already at the two-block
+        // boundary where the decode one has room to spare.
+        for (int d = tid; d < head_dim; d += nthr) {
+            float kreg[GQA_KT];
+            float vreg[GQA_KT];
+            #pragma unroll
+            for (int jj = 0; jj < GQA_KT; ++jj) {
+                long long key = j0 + jj;
+                bool live = key < n_visible;
+                long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim + d;
+                kreg[jj] = live ? k[at] : 0.0f;
+                vreg[jj] = live ? v[at] : 0.0f;
+            }
+            #pragma unroll
+            for (int jj = 0; jj < GQA_KT; ++jj) {
+                k_sh[jj * head_dim + d] = kreg[jj];
+                v_sh[jj * head_dim + d] = vreg[jj];
             }
         }
         __syncthreads();
@@ -862,7 +872,7 @@ __global__ void attn_flash_causal_gqa(
 // and write the identity partial — `m = -inf`, `l = 0`, `acc = 0` — which the
 // combine folds in as `exp(-inf - gm) = 0`, exactly.
 #define DEC_KT 8
-#define DEC_SPLITS 64
+#define DEC_SPLITS 144
 
 __global__ void attn_flash_decode_split(
     const float* __restrict__ q,
@@ -917,16 +927,32 @@ __global__ void attn_flash_decode_split(
     for (long long j0 = begin; j0 < end; j0 += DEC_KT) {
         int n_this = (int)((end - j0) < (long long)DEC_KT ? (end - j0) : (long long)DEC_KT);
         __syncthreads();
-        for (int jj = 0; jj < DEC_KT; ++jj) {
-            long long key = j0 + jj;
-            bool live = jj < n_this;
-            const float* kp =
-                k + (key * (long long)kv_heads + kvh) * (long long)head_dim;
-            const float* vp =
-                v + (key * (long long)kv_heads + kvh) * (long long)head_dim;
-            for (int d = tid; d < head_dim; d += nthr) {
-                k_sh[jj * head_dim + d] = live ? kp[d] : 0.0f;
-                v_sh[jj * head_dim + d] = live ? vp[d] : 0.0f;
+        // Every load for the tile is issued before any of it is stored.
+        //
+        // Writing straight into shared makes each store depend on the load
+        // just above it, which leaves the tile with about one outstanding
+        // request per thread at a time; the kernel then waits out the full
+        // DRAM latency DEC_KT times per trip instead of once. Landing the
+        // whole tile in registers first leaves `2 * DEC_KT` requests in
+        // flight, which is what turns this loop from latency-bound into
+        // bandwidth-bound. Costs `2 * DEC_KT` registers, which this kernel
+        // has because one query row makes `qr` and `acc` a quarter of what
+        // the prefill kernel carries.
+        for (int d = tid; d < head_dim; d += nthr) {
+            float kreg[DEC_KT];
+            float vreg[DEC_KT];
+            #pragma unroll
+            for (int jj = 0; jj < DEC_KT; ++jj) {
+                long long key = j0 + jj;
+                bool live = jj < n_this;
+                long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim + d;
+                kreg[jj] = live ? k[at] : 0.0f;
+                vreg[jj] = live ? v[at] : 0.0f;
+            }
+            #pragma unroll
+            for (int jj = 0; jj < DEC_KT; ++jj) {
+                k_sh[jj * head_dim + d] = kreg[jj];
+                v_sh[jj * head_dim + d] = vreg[jj];
             }
         }
         __syncthreads();
