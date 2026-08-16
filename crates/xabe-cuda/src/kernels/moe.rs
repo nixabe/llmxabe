@@ -2471,6 +2471,17 @@ impl MoeBuffers {
         &self.valid_tokens
     }
 
+    /// The per-`(token, k)` routed contributions, `[max_flat_pairs][hidden]`,
+    /// already scaled by their routing weight.
+    ///
+    /// What [`MoeKernels::grouped_forward_partial`] leaves behind, for a
+    /// caller that sums them itself. Slot `(t, k)` starts at
+    /// `(t * experts_per_token + k) * hidden`; summing ascending in `k` is
+    /// what reproduces the reference's order.
+    pub fn partial(&self) -> &CudaSlice<f32> {
+        &self.partial
+    }
+
     /// Total device bytes held.
     pub fn bytes(&self) -> usize {
         (self.topk_ids.len()
@@ -2968,15 +2979,18 @@ impl MoeKernels {
         Ok(())
     }
 
-    /// The routed half of the MoE block: grouped GEMM over the dispatch
-    /// tables, then the fp32 weighted sum of each token's `top_k`
-    /// contributions.
+    /// The grouped GEMM over the dispatch tables, stopping at the per-(token,
+    /// k) contributions in [`MoeBuffers::partial`].
     ///
-    /// `hidden_states` is `[max_tokens][hidden]`, `out` is the same shape.
-    /// Requires [`Self::route`] and [`Self::build_dispatch`] to have run on
-    /// `buffers` for this step.
-    #[allow(clippy::too_many_arguments)]
-    pub fn grouped_forward(
+    /// `hidden_states` is `[max_tokens][hidden]`. Requires [`Self::route`] and
+    /// [`Self::build_dispatch`] to have run on `buffers` for this step.
+    ///
+    /// Callers that want the summed `[max_tokens][hidden]` result want
+    /// [`Self::grouped_forward`]. This entry point exists for the one caller
+    /// that folds the sum into a kernel it was going to launch anyway — the
+    /// sum is one fused multiply-add per element and the launch that performs
+    /// it is 2.2 us of a 9.6 ms step, so whoever can absorb it should.
+    pub fn grouped_forward_partial(
         &self,
         stream: &Arc<CudaStream>,
         buffers: &mut MoeBuffers,
@@ -2984,7 +2998,6 @@ impl MoeKernels {
         up: QuantTensor<'_>,
         down: QuantTensor<'_>,
         hidden_states: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
     ) -> Result<(), MoeError> {
         let g = self.geometry;
         check_stack("gate", gate, g.stack_elements())?;
@@ -3240,6 +3253,31 @@ impl MoeKernels {
             unsafe { builder.launch(down_cfg) }?;
         }
 
+        Ok(())
+    }
+
+    /// The routed half of the MoE block: grouped GEMM over the dispatch
+    /// tables, then the fp32 weighted sum of each token's `top_k`
+    /// contributions.
+    ///
+    /// `hidden_states` is `[max_tokens][hidden]`, `out` is the same shape.
+    /// Requires [`Self::route`] and [`Self::build_dispatch`] to have run on
+    /// `buffers` for this step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grouped_forward(
+        &self,
+        stream: &Arc<CudaStream>,
+        buffers: &mut MoeBuffers,
+        gate: QuantTensor<'_>,
+        up: QuantTensor<'_>,
+        down: QuantTensor<'_>,
+        hidden_states: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), MoeError> {
+        self.grouped_forward_partial(stream, buffers, gate, up, down, hidden_states)?;
+        let g = self.geometry;
+        let top_k = g.experts_per_token as i32;
+        let hidden = g.hidden as i32;
         let reduce_cfg = LaunchConfig {
             grid_dim: (g.max_tokens as u32, (g.hidden as u32).div_ceil(THREADS), 1),
             block_dim: (THREADS, 1, 1),

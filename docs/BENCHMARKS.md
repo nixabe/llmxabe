@@ -1271,7 +1271,7 @@ prefill numbers in every section before it.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,361.42 ± 5.52 tok/s** | **1.52× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.3 tok/s**, 9.59 ms/step | **1.00× — level** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **105.2 tok/s**, 9.51 ms/step | **1.005× faster** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1421,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.3 tok/s**, 9.59 ms/step | **1.00× — level** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **105.2 tok/s**, 9.51 ms/step | **1.005× faster** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1449,6 +1449,39 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | residual add folded into the output projection | 9.59 | 104.28 |
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
+| the routed sum folded into the combine | 9.51 | **105.2** |
+
+### The last launch that was only a sum
+
+`moe_reduce` existed to turn the per-`(token, k)` contributions the grouped
+GEMM writes into each token's routed sum. That is one fused multiply-add per
+element, and it cost a launch per layer — 2.2 us of a 9.6 ms step, forty times
+over, against a kernel that was going to read the result anyway.
+
+`moe_block_gate_and_combine` now reads `partial` directly and accumulates the
+`top_k` slices itself, ascending in `k` inside one thread, which is both the
+reference's order and the order `moe_reduce` used. `MoeKernels` grew
+`grouped_forward_partial`, which is the old `grouped_forward` minus its last
+launch; `grouped_forward` is now that plus the reduce, so
+`tests/moe_differential.rs` still drives the contract it was written against.
+
+The combine kept writing `routed`. Nothing on the forward path reads it, but
+`ffn_moe_out-N` is a golden waypoint `tests/moe_block.rs` gates on, and an
+8 KiB store is not worth losing a comparison against llama.cpp's own
+activations for.
+
+The fold made the combine read `top_k * hidden` floats per token instead of
+`hidden` — 64 KiB, which one block per token would have put on one of 72 SMs.
+So the combine took `moe_reduce`'s second grid dimension too, and shrank from
+1,024 threads to 256. Every block in the row now recomputes the gate's dot
+product; it reads the same 16 KiB each time, so seven of the eight are L2
+hits, and it is cheaper than the launch it replaced. 256 is also exactly
+`MOE_GATE_LANES`, so the gate's reduction tree is unchanged: `block_reduce_sum`
+sums per-warp partials ascending, and the zeros contributed by lanes past the
+gate's width land in the same places at any block width at or above it.
+
+**9.59 -> 9.51 ms, 104.3 -> 105.2 tok/s.** That is the first measurement in
+this project ahead of llama.cpp's `tg128` on the same card.
 
 ### Splitting a row eight ways was one split too many
 

@@ -103,12 +103,20 @@ use xabe_model::weights::{Directory, Role};
 /// Threads per block for the three glue kernels below.
 const THREADS: u32 = 256;
 
+/// Lanes that contribute to the shared expert's gate dot product.
+///
+/// Mirrors `MOE_GATE_LANES`, asserted below. Fixed rather than "the block
+/// width" because the gate is a floating-point sum: changing how many lanes
+/// carry it reassociates 2,048 products and moves the gate.
+const GATE_LANES: u32 = 256;
+
 /// Threads in the fused gate-and-combine block.
 ///
-/// That kernel is one block per token and its gate is a reduction over the
-/// full hidden dimension, so at one token the only parallelism available is
-/// the block's own width. sm_75's per-block ceiling is 1,024.
-const COMBINE_THREADS: u32 = 1024;
+/// Equal to [`GATE_LANES`], which is what makes the gate's reduction the same
+/// shape at any grid the combine half wants: threads past the gate's lanes
+/// would add literal zeros, and `block_reduce_sum` puts those zeros in the
+/// same places whatever the block's width is.
+const COMBINE_THREADS: u32 = GATE_LANES;
 
 /// Tokens the wide router instantiation carries. Mirrors its `TT`.
 const ROUTER_TT: u32 = 8;
@@ -355,16 +363,31 @@ ROUTER_LOGITS(moe_block_router_logits_t1, 1)
 // The operand order is `build_layer_ffn`'s: the shared expert is gated first,
 // then added to the routed sum with the routed sum on the left.
 //
-// grid: (max_tokens).
+// It also performs the routed sum itself, which `moe_reduce` used to do in a
+// launch of its own: `routed[t][j]` is the ascending-k sum of the `top_k`
+// contributions `MoeKernels::grouped_forward_partial` leaves in `partial`.
+// The loop is ascending and stays inside one thread, so it is the reference's
+// order and `moe_reduce`'s order alike, and the result is still written out
+// because `ffn_moe_out-N` is a golden waypoint `tests/moe_block.rs` gates on.
+//
+// grid: (max_tokens, ceil(hidden / blockDim.x)). The second dimension is not
+// decoration: this kernel now moves `top_k * hidden` floats per token, and one
+// block per token would put 64 KiB of that on a single one of the card's 72
+// SMs -- the failure mode `moe_reduce` had before it was split the same way.
+// The price is that all `gridDim.y` blocks recompute the gate's dot product;
+// it reads the same 16 KiB every time, so it is an L2 hit rather than a second
+// trip to DRAM, and it is cheaper than the launch it replaces.
 __global__ void moe_block_gate_and_combine(
     const float* __restrict__ w,
     const float* __restrict__ normed,
-    const float* __restrict__ routed,
+    const float* __restrict__ partial,
     const float* __restrict__ shexp,
     const float* __restrict__ residual,
     const int* __restrict__ valid_tokens,
+    int top_k,
     int hidden,
     float* __restrict__ gate,
+    float* __restrict__ routed,
     float* __restrict__ ffn_out,
     float* __restrict__ l_out
 ) {
@@ -380,18 +403,18 @@ __global__ void moe_block_gate_and_combine(
     // exponent. A drift test below asserts the intrinsic's name does not
     // appear anywhere in this kernel, so do not name it here either.
     // **The dot product runs on the first MOE_GATE_LANES threads only, at
-    // that stride, whatever the block's width is.** The block is 1,024 threads
-    // wide because the combine below is elementwise and the kernel is one
-    // block per token; the gate is a floating-point sum, and widening *it*
-    // from 256 lanes to 1,024 reassociates 2,048 products. That is not a
-    // hypothetical: it moved the gate enough for `tests/forward_pass.rs` to
-    // report block 31's relative error against llama.cpp growing 4.82x with
-    // the absolute error growing too, which is the shape of a real change
-    // rather than a magnitude collapse.
+    // that stride, whatever the block's width is.** The gate is a
+    // floating-point sum, and widening *it* from 256 lanes to 1,024
+    // reassociates 2,048 products. That is not a hypothetical: it moved the
+    // gate enough for `tests/forward_pass.rs` to report block 31's relative
+    // error against llama.cpp growing 4.82x with the absolute error growing
+    // too, which is the shape of a real change rather than a magnitude
+    // collapse.
     //
-    // Threads past MOE_GATE_LANES contribute a literal zero, and adding zeros
-    // to a float sum changes nothing, so the reduction is bit-identical to
-    // the 256-thread block this kernel used to be.
+    // Threads past MOE_GATE_LANES contribute a literal zero; `block_reduce_sum`
+    // sums the per-warp partials ascending, so those zeros land in the same
+    // places whatever the block's width is and the total is bit-identical at
+    // any width at or above MOE_GATE_LANES.
     float s = 0.0f;
     if (threadIdx.x < MOE_GATE_LANES) {
         for (int j = threadIdx.x; j < hidden; j += MOE_GATE_LANES) {
@@ -402,13 +425,17 @@ __global__ void moe_block_gate_and_combine(
     // already contains do double duty here.
     s = block_reduce_sum(s, xabe_moe_block_shared);
     float g = 1.0f / (1.0f + expf(-s));
-    if (threadIdx.x == 0) gate[t] = g;
+    if (threadIdx.x == 0 && blockIdx.y == 0) gate[t] = g;
 
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        float v = routed[base + j] + shexp[base + j] * g;
-        ffn_out[base + j] = v;
-        l_out[base + j]   = v + residual[base + j];
-    }
+    long long pbase = (long long)t * top_k * hidden;
+    int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (j >= hidden) return;
+    float r = 0.0f;
+    for (int k = 0; k < top_k; ++k) r += partial[pbase + (long long)k * hidden + j];
+    float v = r + shexp[base + j] * g;
+    routed[base + j] = r;
+    ffn_out[base + j] = v;
+    l_out[base + j]   = v + residual[base + j];
 }
 
 }
@@ -1028,8 +1055,9 @@ impl MoeBlock {
         self.moe
             .route_and_dispatch(stream, &mut self.buffers, &self.logits)?;
 
-        // 3. the routed experts.
-        self.moe.grouped_forward(
+        // 3. the routed experts. Stopping at `partial`: step 5 sums the
+        //    top-k contributions itself, which saves a launch per layer.
+        self.moe.grouped_forward_partial(
             stream,
             &mut self.buffers,
             QuantTensor {
@@ -1045,7 +1073,6 @@ impl MoeBlock {
                 quant: w.down_quant,
             },
             &self.normed,
-            &mut self.routed,
         )?;
 
         // 4. the shared expert, ungated — the kernel implements `expert_mlp`
@@ -1092,32 +1119,40 @@ impl MoeBlock {
             )?,
         }
 
-        // 5. the shared expert's sigmoid gate and the combine that consumes
-        //    it. One launch: the gate a block needs is the one that block
-        //    computes, so the dependency is a barrier rather than a kernel
-        //    boundary. Still `block_reduce_sum`, so it still needs one float
+        // 5. the routed sum, the shared expert's sigmoid gate, and the
+        //    combine that consumes both. One launch: the gate a block needs
+        //    is the one that block computes, so that dependency is a barrier
+        //    rather than a kernel boundary, and the routed sum is a
+        //    fused multiply-add per element the combine was going to read
+        //    anyway. Still `block_reduce_sum`, so it still needs one float
         //    per warp.
-        // A wider block than the rest of this module uses, because this one
-        // runs as a *single block per token*: the gate is a reduction over
-        // the whole hidden dimension, so it cannot be split across blocks
-        // without a second launch, and at one token that leaves one block on
-        // a 72-SM card. 1,024 threads is sm_75's ceiling and the widest that
-        // block can be.
+        // The row is split over `gridDim.y` blocks because this kernel reads
+        // `top_k * hidden` floats per token; one block per token would put
+        // 64 KiB of that on one of the card's 72 SMs. `COMBINE_THREADS` is
+        // `MOE_GATE_LANES`, which is what keeps the gate's reduction the
+        // shape `tests/forward_pass.rs` gated on.
         let cfg = LaunchConfig {
-            grid_dim: (g.max_tokens as u32, 1, 1),
+            grid_dim: (
+                g.max_tokens as u32,
+                (g.hidden as u32).div_ceil(COMBINE_THREADS),
+                1,
+            ),
             block_dim: (COMBINE_THREADS, 1, 1),
             shared_mem_bytes: ((COMBINE_THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
         };
+        let top_k_i32 = g.experts_per_token as i32;
         let mut builder = stream.launch_builder(&self.combine_fn);
         builder
             .arg(&w.shared_gate_inp)
             .arg(&self.normed)
-            .arg(&self.routed)
+            .arg(self.buffers.partial())
             .arg(&self.shexp)
             .arg(residual)
             .arg(self.buffers.valid_tokens())
+            .arg(&top_k_i32)
             .arg(&hidden_i32)
             .arg(&mut self.gate)
+            .arg(&mut self.routed)
             .arg(ffn_out)
             .arg(l_out);
         // SAFETY: one block per token slot, gated on the device
@@ -1171,8 +1206,18 @@ mod tests {
         // be `1/(1+exp(-x))` of a dot product against a `[hidden]` vector, and
         // it must multiply the shared expert only — not the routed sum.
         assert!(GLUE_SRC.contains("float g = 1.0f / (1.0f + expf(-s));"));
-        assert!(GLUE_SRC.contains("if (threadIdx.x == 0) gate[t] = g;"));
-        assert!(GLUE_SRC.contains("float v = routed[base + j] + shexp[base + j] * g;"));
+        assert!(GLUE_SRC.contains("gate[t] = g;"));
+        // The gate multiplies the shared expert alone, and the routed sum is
+        // added to the gated result rather than gated with it.
+        assert!(GLUE_SRC.contains("float v = r + shexp[base + j] * g;"));
+        assert!(
+            GLUE_SRC.contains("for (int k = 0; k < top_k; ++k) r += partial["),
+            "the routed sum this combine folded in must stay an ascending-k \
+             accumulation inside one thread",
+        );
+        // Mirrored, because `COMBINE_THREADS` derives from it and the gate's
+        // summation order depends on the two agreeing.
+        assert!(GLUE_SRC.contains(&format!("#define MOE_GATE_LANES {GATE_LANES}")));
         let start = GLUE_SRC
             .find("void moe_block_gate_and_combine")
             .expect("the fused gate-and-combine kernel is present");
