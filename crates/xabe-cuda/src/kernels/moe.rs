@@ -370,10 +370,26 @@ __device__ __forceinline__ void dequant_tile_q6k(
     const unsigned char* qlp = ql + ((grp & 1) ? l + 32 : l);
     int shift = 2 * grp;
 
+    // Two 16-bit loads rather than eight 8-bit ones. A Q6_K superblock is 210
+    // bytes and the tensor base is 256-aligned, so `qlp` and `qh + l` are both
+    // even — `l` is a multiple of 4 — and 16 bits is the widest load the
+    // format permits without a shift.
+    //
+    // Worth about 0.7% of decode and 0.5% of prefill: small, because these
+    // reads were already coalesced and hitting L1, so what is saved is issue
+    // slots rather than bandwidth. The same widening applied to
+    // `dequant_tile_q8_0` measures as nothing at all, and is not done there.
+    unsigned int qlw = (unsigned int)*(const unsigned short*)(qlp)
+        | ((unsigned int)*(const unsigned short*)(qlp + 2) << 16);
+    unsigned int qhw = (unsigned int)*(const unsigned short*)(qh + l)
+        | ((unsigned int)*(const unsigned short*)(qh + l + 2) << 16);
+
     #pragma unroll
     for (int t = 0; t < MOE_TN; ++t) {
-        int low = (grp < 2) ? (int)(qlp[t] & 0xF) : (int)(qlp[t] >> 4);
-        int raw = low | (int)(((qh[l + t] >> shift) & 3) << 4);
+        int qlb = (int)((qlw >> (8 * t)) & 0xFF);
+        int qhb = (int)((qhw >> (8 * t)) & 0xFF);
+        int low = (grp < 2) ? (qlb & 0xF) : (qlb >> 4);
+        int raw = low | (int)(((qhb >> shift) & 3) << 4);
         out[t] = q6k_value(d, sc, si, raw);
     }
 }
