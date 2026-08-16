@@ -157,6 +157,13 @@ const TILE_ROWS: u32 = 8;
 /// Threads per grouped-GEMM block.
 const GEMM_THREADS: u32 = TILE_ROWS * 32;
 
+/// Experts one lane of `moe_route`'s selection warp holds in registers.
+///
+/// Spelled here as well as in the kernel source, because NVRTC compiles from
+/// a string with no access to Rust constants;
+/// `the_routing_warp_bound_matches_the_kernel` asserts the two agree.
+const ROUTE_LANE_EXPERTS: usize = 16;
+
 /// Warps per block on the integer tensor-core path. Mirrors `MOE_MMA_WARPS`.
 const MMA_WARPS: u32 = 4;
 /// Output rows one warp owns — one `m8n8k16` N fragment. Mirrors `MOE_MMA_N`.
@@ -287,6 +294,9 @@ const MOE_SRC: &str = r#"
 // Tile shape. Mirrored by `TILE_M` / `TILE_K` / `TILE_ROWS` on the Rust side,
 // which size the shared memory and the grid; `tile_shape_is_mirrored_in_rust`
 // asserts the two never drift.
+// Experts one lane of the routing warp can hold in registers. 16 covers 512
+// experts; the launch path rejects anything wider.
+#define MOE_ROUTE_LANE_EXPERTS 16
 #define MOE_TM   16
 #define MOE_TK   128
 #define MOE_TN   4
@@ -768,42 +778,55 @@ __global__ void moe_route(
     // Equivalent to the reference's full sort-then-truncate, and cheaper:
     // k is 8 against 256 experts. A selected expert is masked with -1.0f,
     // which no softmax probability can reach, so it can never be re-picked.
-    for (int j = 0; j < top_k; ++j) {
-        float bv = -1.0f;
-        int   bi = -1;
-        for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-            float p = probs[e];
-            if (p > bv || (p == bv && (bi < 0 || e < bi))) { bv = p; bi = e; }
-        }
-        // Shuffled within the warp, then one pass over the warp winners.
-        // "Greatest value, lowest index on a tie" is associative *and*
-        // commutative, so the answer does not depend on the shape of the
-        // reduction the way a floating-point sum would — which is what makes
-        // it safe to change here, on a quantity that selects experts.
+    // **On one warp, and with no barriers at all.** The block-wide form cost
+    // two `__syncthreads()` and a serial pass over the warp winners per
+    // selected expert — sixteen barriers and eight serial passes for eight
+    // experts, in a kernel that runs as a single block on a 72-SM card, so
+    // the whole machine waits through them forty times a decode step.
+    //
+    // "Greatest value, lowest index on a tie" is associative *and*
+    // commutative, so the answer does not depend on the shape of the
+    // reduction the way a floating-point sum would — which is what makes it
+    // safe to change the shape at all, on a quantity that selects experts.
+    // That is the same argument the softmax denominator above cannot make,
+    // which is why that one still reduces through shared memory.
+    //
+    // Each lane holds its experts' probabilities in registers, and the
+    // butterfly shuffle leaves the winner in *every* lane, so the lane that
+    // owns it masks it in place. The mask loop is fully unrolled with a
+    // predicate rather than indexed by the winner, because a dynamic index
+    // into a register array spills it to local memory and undoes the point.
+    if (threadIdx.x < 32) {
+        int lane = threadIdx.x;
+        float p[MOE_ROUTE_LANE_EXPERTS];
         #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            float cv = __shfl_down_sync(0xffffffff, bv, off);
-            int   ci = __shfl_down_sync(0xffffffff, bi, off);
-            if (cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi))) { bv = cv; bi = ci; }
+        for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
+            int e = lane + 32 * i;
+            p[i] = (e < num_experts) ? probs[e] : -1.0f;
         }
-        if ((threadIdx.x & 31) == 0) {
-            rval[threadIdx.x >> 5] = bv;
-            ridx[threadIdx.x >> 5] = bi;
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float av = rval[0];
-            int   ai = ridx[0];
-            for (int w = 1; w < (int)(blockDim.x >> 5); ++w) {
-                float cv = rval[w];
-                int   ci = ridx[w];
-                if (cv > av || (cv == av && ci >= 0 && (ai < 0 || ci < ai))) { av = cv; ai = ci; }
+        for (int j = 0; j < top_k; ++j) {
+            float bv = -1.0f;
+            int   bi = -1;
+            #pragma unroll
+            for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
+                int e = lane + 32 * i;
+                if (p[i] > bv || (p[i] == bv && (bi < 0 || e < bi))) { bv = p[i]; bi = e; }
             }
-            topk_ids[(long long)token * top_k + j] = ai;
-            topk_weights[(long long)token * top_k + j] = av;
-            probs[ai] = -1.0f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                float cv = __shfl_xor_sync(0xffffffff, bv, off);
+                int   ci = __shfl_xor_sync(0xffffffff, bi, off);
+                if (cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi))) { bv = cv; bi = ci; }
+            }
+            #pragma unroll
+            for (int i = 0; i < MOE_ROUTE_LANE_EXPERTS; ++i) {
+                if (bi >= 0 && lane + 32 * i == bi) p[i] = -1.0f;
+            }
+            if (lane == 0) {
+                topk_ids[(long long)token * top_k + j] = bi;
+                topk_weights[(long long)token * top_k + j] = bv;
+            }
         }
-        __syncthreads();
     }
 
     // --- renormalize over just the selected k -----------------------------
@@ -2549,6 +2572,14 @@ impl MoeKernels {
         logits: &CudaSlice<f32>,
     ) -> Result<(), MoeError> {
         let g = self.geometry;
+        // The top-k selection holds every expert in one warp's registers.
+        if g.num_experts > 32 * ROUTE_LANE_EXPERTS {
+            return Err(MoeError::UnsupportedGeometry {
+                geometry: Box::new(g),
+                reason: "the routing warp holds 16 experts per lane, so at most \
+                         512 experts",
+            });
+        }
         let num_experts = g.num_experts as i32;
         let top_k = g.experts_per_token as i32;
         // probs[num_experts] + one (float, int) reduction slot per thread.
@@ -3218,6 +3249,11 @@ mod tests {
             // One value per lane per Q6_K group: 128 elements over 32 lanes.
             ("MOE_TN", TILE_K / 32),
             ("MOE_ROWS", TILE_ROWS as usize),
+            // The routing warp's per-lane register array. Too small and the
+            // top-k silently ignores the tail of the expert list; the launch
+            // path rejects a geometry above it, and this keeps the two ends
+            // of that check the same number.
+            ("MOE_ROUTE_LANE_EXPERTS", ROUTE_LANE_EXPERTS),
         ] {
             assert!(
                 MOE_SRC.contains(&format!("#define {name}   {value}"))
@@ -3328,9 +3364,18 @@ mod tests {
     fn routing_selection_carries_the_index_so_ties_break_low() {
         // `route_token` breaks ties on equal probability by lower expert
         // index. Without the index in the reduction the winner is whichever
-        // thread got there first, which is not even stable across runs.
-        assert!(MOE_SRC.contains("if (p > bv || (p == bv && (bi < 0 || e < bi)))"));
-        assert!(MOE_SRC.contains("if (cv > av || (cv == av && ci >= 0 && (ai < 0 || ci < ai)))"));
+        // lane got there first, which is not even stable across runs.
+        //
+        // Both halves are asserted: the per-lane scan over the experts it
+        // owns, and the cross-lane butterfly that merges the lanes. The
+        // second is what makes the selection independent of the reduction's
+        // shape, which is the property the kernel's own comment rests on.
+        assert!(MOE_SRC.contains("if (p[i] > bv || (p[i] == bv && (bi < 0 || e < bi)))"));
+        assert!(MOE_SRC.contains("if (cv > bv || (cv == bv && ci >= 0 && (bi < 0 || ci < bi)))"));
+        // And the mask that stops a selected expert being picked again must
+        // stay a predicated sweep, not a dynamic index: `p` is a register
+        // array, and indexing it by the winner spills it to local memory.
+        assert!(MOE_SRC.contains("if (bi >= 0 && lane + 32 * i == bi) p[i] = -1.0f;"));
     }
 
     #[test]

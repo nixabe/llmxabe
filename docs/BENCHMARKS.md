@@ -1271,7 +1271,7 @@ prefill numbers in every section before it.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,365.74 ± 6.60 tok/s** | **1.52× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **95.99 tok/s**, 10.42 ms/step | **1.09× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **96.80 tok/s**, 10.33 ms/step | **1.08× slower** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1421,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **95.99 tok/s**, 10.42 ms/step | **1.09× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **96.80 tok/s**, 10.33 ms/step | **1.08× slower** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1439,6 +1439,8 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | word-wide Q6_K unpacking | 10.63 | 94.03 |
 | capture the step as a CUDA graph | 10.70 | 93.50 |
 | split the shared expert over its contraction | 10.42 | 95.99 |
+| fuse the shared gate into the combine | 10.33 | 96.80 |
+| top-k selection on one warp, no barriers | 10.33 | 96.80 |
 
 ### The one idea behind all of it
 

@@ -72,10 +72,10 @@ years of CUDA tuning behind it, and the benchmarks make that concrete.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,365.74 ± 6.60** | 1.52× slower |
-| Decode, warm | 104.72 ± 0.36 tok/s | **95.99**, 10.42 ms/step | 1.09× slower |
+| Decode, warm | 104.72 ± 0.36 tok/s | **96.80**, 10.33 ms/step | 1.08× slower |
 
 Prefill was 29.6× slower, then 10.3×, and is now 1.52×. Decode was 1.61× and
-is now 1.09×. **Both are still losses**, and the project does not claim
+is now 1.08×. **Both are still losses**, and the project does not claim
 otherwise.
 
 The move that closed most of it was putting every quantized matmul on

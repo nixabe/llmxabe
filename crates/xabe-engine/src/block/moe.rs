@@ -321,37 +321,23 @@ __global__ void NAME(                                                          \
 ROUTER_LOGITS(moe_block_router_logits,    8)
 ROUTER_LOGITS(moe_block_router_logits_t1, 1)
 
-// gate[t] = sigmoid(dot(ffn_gate_inp_shexp, normed[t])).
+// The shared expert's gate and the combine that consumes it, in one launch.
 //
-// `ffn_gate_inp_shexp` is `[hidden]` — a single row — so this produces one
-// scalar per token, which is what `build_layer_ffn` then multiplies the whole
-// shared-expert output by. grid: (max_tokens).
+// `moe_block_shared_gate` and `moe_block_combine` were two kernels with the
+// same grid — one block per token — where the first produced one scalar per
+// block and the second immediately read it. Two launches, a round trip
+// through global memory, and two kernel-launch floors for a total of about
+// 4,100 arithmetic operations per token.
 //
-// `1 / (1 + exp(-x))` is `ggml_sigmoid`'s own formula, and `expf` rather than
-// `__expf` for the same reason `layer_ops.rs`'s SwiGLU uses it: the fast
-// intrinsic's error is relative to the result, not the exponent.
-__global__ void moe_block_shared_gate(
-    const float* __restrict__ w,
-    const float* __restrict__ x,
-    const int* __restrict__ valid_tokens,
-    int hidden,
-    float* __restrict__ gate
-) {
-    int t = blockIdx.x;
-    if (t >= *valid_tokens) return;
-
-    const float* xs = x + (long long)t * hidden;
-
-    float s = 0.0f;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        s += w[j] * xs[j];
-    }
-    s = block_reduce_sum(s, xabe_moe_block_shared);
-
-    if (threadIdx.x == 0) gate[t] = 1.0f / (1.0f + expf(-s));
-}
-
-// ffn_out = routed + shexp * gate;  l_out = ffn_out + residual.
+// A decode step issues roughly 1,100 device operations, and the smallest of
+// them measure 2.5 us each against kernels that average 8.6: at this shape
+// the launch floor, not the work, is what the glue costs. This pair merged
+// cleanly because the dependency is *within* a block — the gate a block needs
+// is the one that block computed — so a `__syncthreads()` replaces a launch.
+//
+// `gate` is still written. Nothing downstream reads it, but it is the
+// quantity `build_layer_ffn` names and a differential test that wants to see
+// the gate on its own should not have to infer it from the output.
 //
 // Two outputs rather than one because the golden capture has a waypoint
 // either side of the residual add (`ffn_out-N` and `l_out-N`), and keeping
@@ -360,21 +346,41 @@ __global__ void moe_block_shared_gate(
 //
 // The operand order is `build_layer_ffn`'s: the shared expert is gated first,
 // then added to the routed sum with the routed sum on the left.
-__global__ void moe_block_combine(
+//
+// grid: (max_tokens).
+__global__ void moe_block_gate_and_combine(
+    const float* __restrict__ w,
+    const float* __restrict__ normed,
     const float* __restrict__ routed,
     const float* __restrict__ shexp,
-    const float* __restrict__ gate,
     const float* __restrict__ residual,
     const int* __restrict__ valid_tokens,
     int hidden,
+    float* __restrict__ gate,
     float* __restrict__ ffn_out,
     float* __restrict__ l_out
 ) {
     int t = blockIdx.x;
     if (t >= *valid_tokens) return;
 
-    float g = gate[t];
     long long base = (long long)t * hidden;
+    const float* xs = normed + base;
+
+    // `1 / (1 + exp(-x))` is `ggml_sigmoid`'s own formula, and `expf` rather
+    // than the fast intrinsic for the same reason `layer_ops.rs`'s SwiGLU
+    // uses it: that intrinsic's error is relative to the result, not to the
+    // exponent. A drift test below asserts the intrinsic's name does not
+    // appear anywhere in this kernel, so do not name it here either.
+    float s = 0.0f;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
+        s += w[j] * xs[j];
+    }
+    // Returns the total to every thread, which is what makes the barrier it
+    // already contains do double duty here.
+    s = block_reduce_sum(s, xabe_moe_block_shared);
+    float g = 1.0f / (1.0f + expf(-s));
+    if (threadIdx.x == 0) gate[t] = g;
+
     for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
         float v = routed[base + j] + shexp[base + j] * g;
         ffn_out[base + j] = v;
@@ -753,7 +759,6 @@ pub struct MoeBlock {
     layer_ops: LayerOpsKernels,
     router_logits_fn: CudaFunction,
     router_logits_t1_fn: CudaFunction,
-    shared_gate_fn: CudaFunction,
     combine_fn: CudaFunction,
     buffers: MoeBuffers,
     normed: CudaSlice<f32>,
@@ -808,8 +813,7 @@ impl MoeBlock {
         Ok(Self {
             router_logits_fn: module.load_function("moe_block_router_logits")?,
             router_logits_t1_fn: module.load_function("moe_block_router_logits_t1")?,
-            shared_gate_fn: module.load_function("moe_block_shared_gate")?,
-            combine_fn: module.load_function("moe_block_combine")?,
+            combine_fn: module.load_function("moe_block_gate_and_combine")?,
             moe,
             layer_ops,
             buffers,
@@ -1065,44 +1069,33 @@ impl MoeBlock {
             )?,
         }
 
-        // 5. its sigmoid gate, which lives here because no kernel has it.
-        // Still `block_reduce_sum`, so it still needs one float per warp.
+        // 5. the shared expert's sigmoid gate and the combine that consumes
+        //    it. One launch: the gate a block needs is the one that block
+        //    computes, so the dependency is a barrier rather than a kernel
+        //    boundary. Still `block_reduce_sum`, so it still needs one float
+        //    per warp.
         let cfg = LaunchConfig {
             grid_dim: (g.max_tokens as u32, 1, 1),
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: ((THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
         };
-        let mut builder = stream.launch_builder(&self.shared_gate_fn);
+        let mut builder = stream.launch_builder(&self.combine_fn);
         builder
             .arg(&w.shared_gate_inp)
             .arg(&self.normed)
-            .arg(self.buffers.valid_tokens())
-            .arg(&hidden_i32)
-            .arg(&mut self.gate);
-        // SAFETY: one block per token slot, gated on the device
-        // `valid_tokens`; `w.shared_gate_inp` holds `hidden` floats and
-        // `gate` holds `max_tokens`.
-        unsafe { builder.launch(cfg) }?;
-
-        // 6. routed + gated shared, then the residual.
-        let cfg = LaunchConfig {
-            grid_dim: (g.max_tokens as u32, 1, 1),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = stream.launch_builder(&self.combine_fn);
-        builder
             .arg(&self.routed)
             .arg(&self.shexp)
-            .arg(&self.gate)
             .arg(residual)
             .arg(self.buffers.valid_tokens())
             .arg(&hidden_i32)
+            .arg(&mut self.gate)
             .arg(ffn_out)
             .arg(l_out);
         // SAFETY: one block per token slot, gated on the device
-        // `valid_tokens`; all five `[max_tokens][hidden]` buffers were
-        // length-checked above and the in-row loop is bounded by `hidden`.
+        // `valid_tokens`. `w.shared_gate_inp` holds `hidden` floats and
+        // `gate` holds `max_tokens`; all five `[max_tokens][hidden]` buffers
+        // were length-checked above and both in-row loops are bounded by
+        // `hidden`.
         unsafe { builder.launch(cfg) }?;
 
         Ok(())
@@ -1148,17 +1141,14 @@ mod tests {
         // implementation is most likely to leave out entirely: the gate must
         // be `1/(1+exp(-x))` of a dot product against a `[hidden]` vector, and
         // it must multiply the shared expert only — not the routed sum.
-        assert!(GLUE_SRC.contains("gate[t] = 1.0f / (1.0f + expf(-s));"));
+        assert!(GLUE_SRC.contains("float g = 1.0f / (1.0f + expf(-s));"));
+        assert!(GLUE_SRC.contains("if (threadIdx.x == 0) gate[t] = g;"));
         assert!(GLUE_SRC.contains("float v = routed[base + j] + shexp[base + j] * g;"));
         let start = GLUE_SRC
-            .find("void moe_block_shared_gate")
-            .expect("shared gate kernel present");
-        let end = GLUE_SRC[start..]
-            .find("void moe_block_combine")
-            .expect("combine kernel present")
-            + start;
+            .find("void moe_block_gate_and_combine")
+            .expect("the fused gate-and-combine kernel is present");
         assert!(
-            !GLUE_SRC[start..end].contains("__expf"),
+            !GLUE_SRC[start..].contains("__expf"),
             "the shared gate reverted to the fast intrinsic",
         );
     }
@@ -1202,7 +1192,7 @@ mod tests {
             GLUE_SRC
                 .matches("const int* __restrict__ valid_tokens")
                 .count(),
-            3
+            2
         );
         // *Reading* it, not one particular spelling of the guard. The router
         // early-returned on it until it was tiled; now a warp carries eight
@@ -1210,7 +1200,7 @@ mod tests {
         // Asserting the `return` form would have made a correct rewrite look
         // like a rule-5 violation, which is the opposite of what this test is
         // for.
-        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 3);
+        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 2);
         // What rule 5 actually forbids: a launch bound the host had to know.
         // `max_tokens` may size a grid — it is a geometry constant — but no
         // kernel may compare against a *count* passed by value.
