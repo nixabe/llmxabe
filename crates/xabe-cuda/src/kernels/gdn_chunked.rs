@@ -175,7 +175,17 @@ pub const MAX_SHARED_BYTES: usize = 48 * 1024;
 /// `INTER_TT`; the drift test below is what keeps the two in step, because a
 /// mismatch would size the shared staging for a different tile than the
 /// kernel indexes into and read past its end.
-const INTER_TT: u32 = 8;
+///
+/// `grid.x` is `chunk_len / INTER_TT` and every block in it reads the whole
+/// `head_dim x head_dim` state slice for its head, so this is also how many
+/// times per launch that slice is read.
+///
+/// | `INTER_TT` | tok/s |
+/// | --- | ---: |
+/// | 8 | 1,727.74 |
+/// | **16** | **1,735.42** |
+/// | 32 | 1,729.09 |
+const INTER_TT: u32 = 16;
 
 /// Value indices one solve block owns. Mirrors the kernel's `VB`.
 const SOLVE_VB: u32 = 32;
@@ -359,7 +369,7 @@ __global__ void gdn_chunk_gram(
 // and 32 value heads, eight gives 256 blocks over 72 SMs; sixteen would halve
 // that to 128 and buy only another factor of two on traffic that is already
 // L2-resident.
-#define INTER_TT 8
+#define INTER_TT 16
 
 __global__ void gdn_chunk_inter(
     const float* __restrict__ state,

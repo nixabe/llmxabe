@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,725**, 1,718–1,728 | **1.20× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,727**, 1,725–1,735 | **1.20× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1307,8 +1307,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | eight tokens at once in the GDN solve's output | 1,708.06 | 1.04× |
 | eight experts per router block instead of four | 1,721.84 | 1.02× |
 | eight `j` lanes per state-update block instead of four | 1,727.74 | 1.01× |
+| sixteen tokens per inter-chunk block instead of eight | 1,735.42 | 1.00× |
 
-**8.60× overall.** No single change is more than 1.81×; the result is
+**8.64× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1488,7 +1489,20 @@ it: **1,706 → 1,728 tok/s.**
 Past eight the block passes 512 threads and the grid stops covering the card —
 32 leaves four blocks in `z` and 512 in total, against 72 SMs.
 
+`gdn_chunk_inter` has the same shape — its `grid.x` is `chunk_len / INTER_TT`
+and every block in it reads the whole `head_dim x head_dim` state slice — and
+16 tokens per block beats 8 by 0.4% and 32 by 0.4%.
+
 Neither changes a summation order.
+
+The same reasoning applied to `gdn_chunk_gram` and **did not pay**. Every one
+of its 64 blocks per head reads all 64 key rows, so tiling four target tokens
+into a block ought to divide that by four. Measured interleaved against a
+`GRAM_TT = 1` build — which is the original kernel exactly — it is 1,720.29
+and 1,721.22 against 1,722.70: nothing. The chunk's keys are 32 KiB per head
+and sit in L2, so the traffic that tiling removes was never being paid at
+DRAM. Reverted; the arithmetic that says a kernel re-reads its input does not
+say the re-read costs anything.
 
 ### Half the GDN solve was parallel and did not say so
 
