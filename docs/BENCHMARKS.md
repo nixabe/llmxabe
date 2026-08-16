@@ -1270,8 +1270,12 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,727**, 1,725–1,735 | **1.20× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.4–105.8 tok/s** (thermal) | **level** |
+| Prefill, 512 tokens | `pp512` **2,076.2 tok/s** | **2,099.3** | **1.011× faster** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.8 tok/s** | **level** |
+
+Both rows are three alternating rounds of `llama-bench` and `bench_forward`
+on the same card in the same session — see "Level is not the same as ahead"
+at the end of this document for why nothing else is comparable.
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1308,8 +1312,16 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | eight experts per router block instead of four | 1,721.84 | 1.02× |
 | eight `j` lanes per state-update block instead of four | 1,727.74 | 1.01× |
 | sixteen tokens per inter-chunk block instead of eight | 1,735.42 | 1.00× |
+| pad the Q6_K device stride to 224 bytes | 1,762.46 | 1.02× |
+| the router's activation tile in registers, not shared | 1,823.01 | 1.03× |
+| eight query rows per flash block, query tile in registers | 1,921.76 | **1.05×** |
+| a 4x4 register tile in the GDN state update | 1,994.56 | 1.04× |
+| `float4` staged reads in `gdn_chunk_inter` | 2,009.77 | 1.01× |
+| lane-invariant coefficients hoisted out of the GDN solve | 2,068.68 | 1.03× |
+| a token band in the alpha/beta gates | 2,074.95 | 1.00× |
+| a tensor-core kernel for block 39's Q8_0 gate and up | 2,123.39 | 1.02× |
 
-**8.64× overall.** No single change is more than 1.81×; the result is
+**10.57× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -2057,3 +2069,135 @@ llama-bench -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
 - Any effect of `-b`/`-ub` tuning.
 - The `mmproj` vision encoder's resident VRAM cost.
 - Sustained thermal behaviour; all runs were short.
+
+## The gap was never the MoE GEMM (2026-08-16)
+
+Prefill spent this session going from 1,735 to 2,123 tok/s, and none of it came
+from the kernel everyone had been staring at.
+
+`llama-bench` was run under `nsys` on the same card, at the same batch, against
+the same file, and its kernel summary put side by side with this engine's:
+
+| stage | llama.cpp | llmxabe (before) | gap |
+| --- | ---: | ---: | ---: |
+| MoE gate/up, Q6_K | 77.8 ms | 58.8 ms | **−19.0, ahead** |
+| MoE down, Q8_0 | 41.4 ms | 39.6 ms | −1.8 |
+| Gated DeltaNet | 27.9 ms | **71.9 ms** | **+44.0** |
+| Attention | ~2.1 ms | **21.1 ms** | **+19.0** |
+| Dense projections | 37.8 ms | 52.9 ms | +15.1 |
+| everything else | ~46 ms | ~25 ms | −21 |
+
+The grouped GEMM — 25% of the pass, the subject of most of this document, and
+the thing three previous sessions optimized — was already **32% faster** than
+llama.cpp's. The whole deficit was in the two mixers and the dense projections,
+and the largest single item, Gated DeltaNet, had never been profiled against
+anything.
+
+### One defect, four kernels
+
+Attention, the DeltaNet state update, the DeltaNet solve, and the alpha/beta
+gates turned out to have the same shape of bug, and it is not a memory-traffic
+bug — it is an **instruction-count** bug:
+
+```text
+attn_flash_causal   per key: 8 global k + 8 shared q + 8 FMA   (scores)
+                             1 global v + 1 shared w + 1 FMA   (values)
+state_update        per i:   1 global k + 1 shared u + 1 FMA
+solve               per i:   1 global kk + 2 shared + 3 FMA
+alpha_beta_gates    per i:   2 global w  + 1 global x + 2 FMA
+```
+
+Roughly one memory instruction per multiply-add, everywhere. Turing issues
+**4 load/store operations per SM per clock against 64 FMAs**, so a kernel at
+that ratio runs at a sixteenth of the arithmetic pipe and no amount of L2 hit
+rate moves it. Every one of these looked "bandwidth-bound" in a roofline sense
+and none of them were: `attn_flash_causal` was reaching 2 TB/s of effective
+bandwidth, which is *L2 working properly*, and it was still 16× off.
+
+The fix is the same in all four: find the index the operand does not depend on,
+and reuse it.
+
+- **Attention** carries eight query rows per block with the query tile in
+  *registers*, so one `k` element feeds eight multiply-adds and the score
+  loop's shared reads disappear entirely. 21.1 → 8.5 ms.
+- **The state update** is a rank-`c` outer product, `S[vi][j] += Σ u[i][vi]
+  k[i][j]`. Neither operand depends on the other's index, so a 4×4 register
+  tile reads one `float4` from each and does sixteen multiply-adds. 15.6 →
+  5.3 ms.
+- **The solve** was recomputing `beta_t * kk_row[i] * decay[i]` in all 32 lanes
+  of a forward substitution and reloading `kk_row[i]` from global to do it.
+  None of it depends on the lane. 26.3 → 19.1 ms.
+- **The gates** had one warp per (head, token) reading 16 KiB of weights to do
+  4,096 multiply-adds. A band of eight tokens reads them once for eight times
+  the arithmetic.
+
+All four are **bit-identical**. That is not a coincidence — it is the reason
+each was safe to make. A register tile does not reassociate anything: every
+accumulator still sums its contraction in the same order. Hoisting
+`(beta_t * kk_row[i]) * decay[i]` out of a loop forms the same product in the
+same left-to-right association the expression already had, once instead of 32
+times. The golden gate agreed on all four, which is the check that matters when
+a routing logit two layers downstream turns a last-bit move into a different
+expert.
+
+### A partial band costs its empty lanes in full
+
+Both banded kernels regressed decode the first time, and by the same mechanism.
+At `n_query == 1` the flash kernel still ran eight multiply-adds and eight
+shuffle reductions per key to throw seven of them away; the gate kernel did the
+same with its token band. Decode fell 105.1 → 99.6 tok/s each time.
+
+Both now have a one-unit instantiation, dispatched on the batch. The flash
+kernel's is the *pre-tiling kernel unchanged*, because the two widths want
+different softmax bookkeeping: at eight rows the per-tile max and normalizer
+are one thread per row, since every thread sweeping `QT * tile` shared floats
+costs more than the value loop it amortizes; at one row there is nothing to
+amortize and the redundant sweep is cheaper than serializing onto one thread
+and adding a barrier.
+
+This is the second time in this document a batch-shaped tile has been a decode
+regression. It is worth stating as a rule: **any tile widened for prefill needs
+a one-unit sibling before it is committed**, because decode is the one-unit
+case of every one of them.
+
+### llama.cpp does not chunk the DeltaNet at all
+
+Worth recording, because it changes what "optimize the chunked form" is worth.
+`gated_delta_net_cuda` is a **sequential token-by-token scan** with the entire
+128×128 per-head state resident in four registers per thread, one warp per state
+column, zero shared memory and zero `__syncthreads` for the whole sequence. The
+chunked form exists in llama.cpp only as the slower ggml-graph fallback, and the
+CUDA file carries a `//TODO: Add chunked kernel for even faster pre-fill`.
+
+The arithmetic says why. At head dim 128, chunk 64, 512 tokens, the sequential
+scan is `4·D²` FMA per token — 33.5 M per head — and the chunked form is about
+42.3 M. **Chunking does 26% more arithmetic here**, and it only pays when the
+matmul shape buys tensor cores. Turing has no fp32 tensor cores, so in fp32 on
+this card chunking is pure overhead.
+
+This engine's chunked path is now 47.8 ms against llama.cpp's 27.9. The
+remaining 20 ms is reachable, but the way to reach it is to delete the chunking
+for prefill, not to keep tuning it — and that is a rewrite, not a tuning pass,
+so it is recorded here rather than attempted.
+
+### Level is not the same as ahead
+
+The headline is three alternating rounds of `llama-bench -p 512 -r 3` and
+`bench_forward` n=512, back to back on the same card in the same session:
+
+| round | llmxabe | llama.cpp |
+| --- | ---: | ---: |
+| 1 | 2,108.09 | 2,085.93 ± 160.36 |
+| 2 | 2,095.02 | 2,080.17 ± 160.95 |
+| 3 | 2,094.79 | 2,062.60 ± 179.53 |
+| **mean** | **2,099.3** | **2,076.2** |
+
+That is **1.011×**, and the honest reading is "a small repeatable win", not a
+headline. llama.cpp's own `pp512` reports ±160–180 tok/s run to run — an 8%
+spread — and this card's thermal drift is about 1.3%, both larger than the
+margin. What makes the comparison stand up is only that the two were alternated
+on one card within minutes, so the drift applies to both arms equally.
+
+The earlier figure this document compared against, 2,070.50, is a single
+measurement from a different session. Re-measured this way llama.cpp is 2,076.2,
+which is the number the table above uses.

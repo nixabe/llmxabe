@@ -17,9 +17,9 @@ RTX 8000, written in Rust.
 > time — decode steps replay from a captured CUDA graph. See
 > [Milestones](#milestones) for the itemized state.
 >
-> Measured against llama.cpp on the same card: prefill **~1,725 tok/s**
-> at 512 tokens against 2,070.50 (**1.20× slower**), decode **104.4–105.8
-> tok/s** against `tg128`'s 104.72 (**level**). See
+> Measured against llama.cpp on the same card, interleaved: prefill
+> **2,099 tok/s** at 512 tokens against 2,076 (**1.011× faster**), decode
+> **104.8 tok/s** against `tg128`'s 104.7 (**level**). See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why this exists
@@ -72,16 +72,22 @@ years of CUDA tuning behind it, and the benchmarks make that concrete.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,725**, 1,718–1,728 | 1.20× slower |
-| Decode, warm | 104.72 ± 0.36 tok/s | **104.4–105.8** (thermal) | level |
+| Prefill, 512 tokens | 2,076.2 tok/s | **2,099.3** | 1.011× faster |
+| Decode, warm | 104.72 ± 0.36 tok/s | **104.8** | level |
 
-Prefill was 29.6× slower, then 10.3×, and is now 1.20× — **still a loss**, and
-the project does not claim otherwise. Decode was 1.61× slower and is now
-**level**: 104.4–105.8 tok/s against `tg128`'s 104.72 ± 0.36, where the spread
-is this card's own thermal drift — 105.75 cold, 104.45 after an hour of
-benchmarking. The two are inside each other's error bars, so this is a draw
-rather than a win, and every A/B in [BENCHMARKS.md](docs/BENCHMARKS.md) is
-measured interleaved for that reason.
+Both rows are three alternating rounds of `llama-bench -p 512` and
+`bench_forward`, run back to back on the same card in the same session, which
+is the only way these two numbers can be compared: llama.cpp's own `pp512`
+reported ±160–180 tok/s run to run, and this card's thermal drift is about
+1.3% — larger than the prefill margin. Read prefill as **a small, repeatable
+win** and decode as **a draw**, not as a 1.011× headline.
+
+Prefill was 29.6× slower, then 10.3×, then 1.20×, and is now ahead. The step
+that closed it was not the MoE GEMM, which was already faster than llama.cpp's:
+it was four kernels — the flash attention block, the Gated DeltaNet state
+update and solve, and the alpha/beta gates — that had each been written with
+one memory instruction per multiply-add, on a part that issues four of the
+former per SM per clock against sixty-four of the latter.
 
 The move that closed most of it was putting every quantized matmul on
 Turing's integer tensor cores — `mma.m8n8k16.s32.s8.s8.s32`, ~198 TOP/s
@@ -226,7 +232,7 @@ Numbering follows the design plan. "Gate" is the condition for calling it done.
 | 02 | Differential harness | Per-tensor max-abs + cosine thresholds | done |
 | 03 | FP16 dense forward | Correct logits, any speed | **done** (fp32, not fp16) — full 40-block pass, argmax 25358 matching llama.cpp |
 | 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | **done** — dequant bit-identical over 8.4 M elements; grouped GEMM tiled, 9.3× on the MoE path, expert ids exact on all 37 tokens × top-8 |
-| 05 | Flash attention port, sm_75 | Correct at 128K | **correct at batch and decode shape, unverified at 128K** — scalar fp32, `BM = 1`, no tensor cores; gated against golden data at 19 and 512 tokens and against the batch path at decode shape. At `n_query = 1` the grid is 16 blocks on 72 SMs and the KV read runs at ~2.9% of peak bandwidth — see BENCHMARKS.md |
+| 05 | Flash attention port, sm_75 | Correct at 128K | **correct at batch and decode shape, unverified at 128K** — scalar fp32, no tensor cores; `BM = 8` with the query tile in registers for prefill and `BM = 1` for decode. Gated against golden data at 19 and 512 tokens and against the batch path at decode shape. At `n_query = 1` the grid is 16 blocks on 72 SMs and the KV read runs at ~2.9% of peak bandwidth — see BENCHMARKS.md |
 | 05b | Autoregressive decode | Incremental path equals batch path | **done** — KV cache + carried recurrent state; prefill-12-then-decode-7 matches a 19-token prefill at cosine 1.000000000, same argmax. 65.25 tok/s at 128-token context vs llama.cpp's 104.72 |
 | 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started; launch overhead measured at ~0.4% at n=512, so it is no longer a gate |
 | 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done; the device side runs a **single-sequence contiguous** KV cache (`block::attention::KvCache`), not yet the pager |
