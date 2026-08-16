@@ -113,6 +113,35 @@ const SHARED_INPUT_SEED: u64 = 0x_5EED_0E05;
 /// `cosine = 1.000000`. The bound below is ~51x that — room for hardware and
 /// driver variation, not room for a formulation bug, which would land orders
 /// of magnitude away on an output whose own max magnitude is only 1.0e-2.
+/// The same output from the integer tensor-core path, which is a different
+/// arithmetic and needs a different bound.
+///
+/// [`ROUTED_GATE`] gates fp32 summation order — a disagreement in the last
+/// bits. This gates something larger and deliberate: the activations are
+/// quantized to int8 with one fp32 scale per 32, which costs about `1/254` of
+/// the block's largest magnitude per element. The *weights* are not
+/// approximated at all — a Q6_K quant is an integer in `[-32, 31]` and the
+/// tensor core multiplies it exactly — and the int32 accumulation is exact, so
+/// activation quantization is the whole of the error.
+///
+/// Measured at the real geometry, 37 tokens x top-8 of 256, real Q6_K gate/up
+/// from layer 0: `max_abs = 4.59e-5`, `cosine = 0.999988`, on an output whose
+/// own max magnitude is 1.0e-2. The bound is ~2x the measured worst case.
+///
+/// It is still a real gate. The characteristic defect of hand-written MMA is a
+/// wrong fragment layout — mixing up the operand split (stride 4) with the
+/// accumulator split (stride 2) — and that does not produce a slightly worse
+/// answer, it produces a differently-shaped one. The cosine floor is what
+/// catches it; `max_abs_error` alone would not.
+///
+/// `max_rel_error` is excluded for the same floor reason as [`ROUTED_GATE`].
+const ROUTED_MMA_GATE: Tolerance = Tolerance {
+    max_abs_error: 1.0e-4,
+    max_rel_error: f32::INFINITY,
+    min_cosine_similarity: 0.9999,
+    allow_non_finite: false,
+};
+
 const ROUTED_GATE: Tolerance = Tolerance {
     max_abs_error: 5e-7,
     max_rel_error: 5e-2,
@@ -520,7 +549,7 @@ fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
     let directory = schema.resolve(&file).expect("schema must resolve");
     let g = geometry();
     let stream = ctx.default_stream();
-    let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+    let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
     let mut buffers = kernels.buffers(&stream).expect("buffers");
 
     // --- real expert stacks for one layer --------------------------------
@@ -609,6 +638,25 @@ fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
         quant: quant_of(stacks[2].info.ggml_type),
     };
 
+    // The integer path first, while `kernels` still has its `MmaKernels`.
+    // Both runs go through the same dispatch and the same down projection;
+    // only the gate/up GEMM differs, which is what makes the two comparisons
+    // below attributable.
+    assert!(
+        kernels.tensor_cores_enabled(),
+        "this device compiled the integer kernels, so the test must exercise          them — a silent fp32-only run would report a passing gate for a path          it never touched",
+    );
+    let t_mma = Instant::now();
+    kernels
+        .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+        .expect("grouped forward, integer tensor cores");
+    stream.synchronize().expect("sync");
+    let mma_time = t_mma.elapsed();
+    let mma_full = stream.clone_dtoh(&d_out).expect("out back");
+    stream.synchronize().expect("sync");
+    let mma_out: Vec<f32> = mma_full[..NUM_TOKENS * g.hidden].to_vec();
+
+    kernels.disable_tensor_cores();
     let t1 = Instant::now();
     kernels
         .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
@@ -619,7 +667,9 @@ fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
     let device_ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
     stream.synchronize().expect("sync");
     let device_out: Vec<f32> = full_out[..NUM_TOKENS * g.hidden].to_vec();
-    println!("device grouped forward (3 launches + one memset): {gpu_time:.2?}");
+    println!(
+        "device grouped forward (3 launches + one memset): fp32 {gpu_time:.2?},          int8 tensor cores {mma_time:.2?}"
+    );
 
     // --- host reference ---------------------------------------------------
     let routing = route_batch(&live_logits, g.experts_per_token);
@@ -728,6 +778,16 @@ fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
 
     assert_matches(&device_out, &flat_grouped, &ROUTED_GATE);
     assert_matches(&device_out, &flat_naive, &ROUTED_GATE);
+
+    // The integer path against the same host reference, at the bound int8
+    // activations permit rather than the one fp32 arithmetic does.
+    let vs_mma = compare(&mma_out, &flat_grouped);
+    println!("device int8 tensor cores vs host grouped_forward: {vs_mma}");
+    assert_matches(&mma_out, &flat_grouped, &ROUTED_MMA_GATE);
+    assert!(
+        mma_full[NUM_TOKENS * g.hidden..].iter().all(|&v| v == 0.0),
+        "the integer path wrote past the live token range",
+    );
 
     // Slots the live batch never used must be untouched, not filled with a
     // stale or wrapped-around token's output.

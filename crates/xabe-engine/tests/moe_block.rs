@@ -185,8 +185,31 @@ const LOUT_MAX_REL: f32 = 1e-2;
 const GATE_MAX_ABS: f32 = 5e-3;
 const GATE_MAX_FIT_RESIDUAL: f32 = 5e-2;
 
-const CPU_MAX_ABS: f32 = 5e-6;
-const CPU_MIN_COSINE: f32 = 1.0 - 1e-7;
+/// The routed grouped GEMM against `xabe_kernels::moe::naive_forward`.
+///
+/// This gates the **integer tensor-core** path: at 19 tokens the block is
+/// above `MMA_MIN_TOKENS`, so the gate/up projections run on `mma.m8n8k16`
+/// with the activations quantized to int8. That is a different arithmetic
+/// from the scalar fp32 reference, not a reassociation of it, and it needs a
+/// bound that says so — the previous 5e-6 was the fp32-summation-order bound
+/// and is still enforced, on the fp32 path, by
+/// `moe_differential.rs::ROUTED_GATE`.
+///
+/// The weights are not approximated: a Q6_K quant is an integer in
+/// `[-32, 31]`, the tensor core multiplies it exactly, and the int32
+/// accumulation is exact. All of the error is the activation quantization,
+/// which costs about `1/254` of each 32-element block's largest magnitude.
+///
+/// Measured at layer 0, 19 tokens, real Q6_K gate/up: `max_abs = 1.43e-4`,
+/// `cosine = 0.999987`. The bound is ~2x that.
+///
+/// What makes this still a real gate is the assertion that follows it, which
+/// is self-calibrating and not widened at all: the device must be no further
+/// from llama.cpp's own `ffn_moe_out` than this scalar fp32 reference is.
+/// Measured, the int8 device is *closer* — 2.53e-4 against the reference's
+/// 2.70e-4 — because llama.cpp quantizes activations for the same matmuls.
+const CPU_MAX_ABS: f32 = 3e-4;
+const CPU_MIN_COSINE: f32 = 0.9999;
 
 fn model_path() -> PathBuf {
     std::env::var_os("LLMXABE_MODEL")
