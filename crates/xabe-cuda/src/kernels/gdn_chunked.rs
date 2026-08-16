@@ -168,6 +168,12 @@ pub use super::gdn::L2_EPS;
 /// `head_dim = 128`).
 pub const MAX_SHARED_BYTES: usize = 48 * 1024;
 
+/// Tokens one `gdn_chunk_inter` block carries. Mirrors the kernel's
+/// `INTER_TT`; the drift test below is what keeps the two in step, because a
+/// mismatch would size the shared staging for a different tile than the
+/// kernel indexes into and read past its end.
+const INTER_TT: u32 = 8;
+
 const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
 
@@ -304,6 +310,19 @@ __global__ void gdn_chunk_gram(
 // shared-memory budget on U.
 //
 // grid: (C, value_heads). block: head_dim threads, one per value index.
+// Tokens one block carries. The state row this kernel contracts against does
+// not depend on `t`, so a block per token re-read the whole `head_dim x
+// head_dim` state matrix `c` times per chunk — 134 MB per chunk at Qwen3.6's
+// geometry, for 2 MB of distinct state. Carrying INTER_TT tokens divides both
+// that traffic and the load instructions that fetch it by INTER_TT.
+//
+// Eight and not sixteen: the accumulators are 2 * INTER_TT registers per
+// thread and the grid is `ceil(c / INTER_TT) * value_heads` blocks. At c = 64
+// and 32 value heads, eight gives 256 blocks over 72 SMs; sixteen would halve
+// that to 128 and buy only another factor of two on traffic that is already
+// L2-resident.
+#define INTER_TT 8
+
 __global__ void gdn_chunk_inter(
     const float* __restrict__ state,
     const float* __restrict__ q_norm,
@@ -316,33 +335,59 @@ __global__ void gdn_chunk_inter(
     int c
 ) {
     extern __shared__ float staged[];
-    float* sk = staged;
-    float* sq = staged + head_dim;
+    float* sk = staged;                             // [INTER_TT][head_dim]
+    float* sq = staged + INTER_TT * head_dim;       // [INTER_TT][head_dim]
 
-    int t = blockIdx.x;
+    int t0 = blockIdx.x * INTER_TT;
     int h = blockIdx.y;
     int vi = threadIdx.x;
     // Modulo, not division: llama.cpp tiles the query/key heads across the
     // value heads. See `super::gdn`'s module docs.
     int hq = h % qk_heads;
 
-    long long base_t = ((long long)(chunk_start + t) * qk_heads + hq) * head_dim;
-    sk[vi] = k_norm[base_t + vi];
-    sq[vi] = q_norm[base_t + vi];
+    #pragma unroll
+    for (int u = 0; u < INTER_TT; ++u) {
+        int t = t0 + u;
+        if (t < c) {
+            long long base_t = ((long long)(chunk_start + t) * qk_heads + hq) * head_dim;
+            sk[u * head_dim + vi] = k_norm[base_t + vi];
+            sq[u * head_dim + vi] = q_norm[base_t + vi];
+        } else {
+            // Multiplied into accumulators that are never stored, so the
+            // value only has to be finite.
+            sk[u * head_dim + vi] = 0.0f;
+            sq[u * head_dim + vi] = 0.0f;
+        }
+    }
     __syncthreads();
 
     const float* row = state + ((long long)h * head_dim + vi) * head_dim;
-    float acc_k = 0.0f;
-    float acc_q = 0.0f;
+    float acc_k[INTER_TT];
+    float acc_q[INTER_TT];
+    #pragma unroll
+    for (int u = 0; u < INTER_TT; ++u) { acc_k[u] = 0.0f; acc_q[u] = 0.0f; }
+
+    // `s` is loaded once and multiplied into every carried token, which is the
+    // whole point: the inner loop is now INTER_TT multiply-adds per state
+    // element instead of one.
     for (int j = 0; j < head_dim; ++j) {
         float s = row[j];
-        acc_k += s * sk[j];
-        acc_q += s * sq[j];
+        #pragma unroll
+        for (int u = 0; u < INTER_TT; ++u) {
+            acc_k[u] += s * sk[u * head_dim + j];
+            acc_q[u] += s * sq[u * head_dim + j];
+        }
     }
 
-    long long o = ((long long)h * c + t) * head_dim + vi;
-    sik[o] = acc_k;
-    oint[o] = acc_q;
+    #pragma unroll
+    for (int u = 0; u < INTER_TT; ++u) {
+        int t = t0 + u;
+        if (t < c) {
+            long long o = ((long long)h * c + t) * head_dim + vi;
+            sik[o] = acc_k[u];
+            oint[o] = acc_q[u];
+        }
+    }
 }
 
 // The chunk: solve for U', emit every token's output, advance the state.
@@ -778,6 +823,9 @@ impl GdnChunkedKernels {
 
         // --- chunks, in order: they are dependent through the state -------
         let staged_shared = (2 * self.head_dim * size_of::<f32>()) as u32;
+        // `gdn_chunk_inter` stages INTER_TT tokens' key and query vectors, not
+        // one of each.
+        let inter_shared = (2 * INTER_TT as usize * self.head_dim * size_of::<f32>()) as u32;
         let mut start = 0usize;
         while start < seq_len {
             let c = (start + self.chunk_len).min(seq_len) - start;
@@ -807,9 +855,9 @@ impl GdnChunkedKernels {
             unsafe { builder.launch(gram_cfg) }?;
 
             let inter_cfg = LaunchConfig {
-                grid_dim: (c as u32, self.value_heads as u32, 1),
+                grid_dim: ((c as u32).div_ceil(INTER_TT), self.value_heads as u32, 1),
                 block_dim: (self.head_dim as u32, 1, 1),
-                shared_mem_bytes: staged_shared,
+                shared_mem_bytes: inter_shared,
             };
             let mut builder = stream.launch_builder(&self.inter);
             builder
@@ -958,6 +1006,20 @@ mod tests {
         assert!(GDN_CHUNKED_SRC.contains("gcum[t] = running;"));
         assert!(GDN_CHUNKED_SRC.contains("decay[i] = expf(gcum[t] - gcum[i]);"));
         assert!(GDN_CHUNKED_SRC.contains("decay[i] = expf(gcum[c - 1] - gcum[i]);"));
+    }
+
+    #[test]
+    fn the_inter_tile_constant_matches_the_kernel_define() {
+        // The launch sizes shared memory from the Rust constant and the kernel
+        // indexes it with the `#define`. If they disagree the kernel reads
+        // past the staged tile, which is a silent wrong answer rather than a
+        // fault, so this is checked rather than trusted.
+        let needle = format!("#define INTER_TT {INTER_TT}\n");
+        assert!(
+            GDN_CHUNKED_SRC.contains(&needle),
+            "the kernel's INTER_TT is not {INTER_TT}; the shared staging \
+             `gdn_chunked_forward` allocates would be the wrong size",
+        );
     }
 
     #[test]
