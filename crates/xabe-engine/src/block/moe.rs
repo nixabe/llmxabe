@@ -254,6 +254,26 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
 // produced — and the reduction repeats `block_reduce_sum`'s shuffle-down and
 // ascending warp sum. The logits are bit-identical; only the traffic changed.
 //
+// That constraint is also why the activation tile is *not* vectorized. A
+// `float4` load would hand thread `tid` the indices `4*tid .. 4*tid + 3`, a
+// different partition of the contraction, and the note above is what happens
+// then: the logits move in their last bits and a different expert runs.
+//
+// # Why the activation tile is registers and not shared memory
+//
+// It was shared, and it never needed to be. The staging loop wrote
+// `sx[u * ROUTER_JC + tid]` and the inner loop read `sx[u * ROUTER_JC + tid]`
+// — the same index, so every thread was the only reader of every slot it
+// wrote. `ROUTER_JC == THREADS` is exactly the condition that makes the tile
+// private, and it is required for the summation order anyway.
+//
+// The round trip cost a store, `ROUTER_ET` reloads per token, and two
+// barriers, every trip: 88 memory instructions per trip to do 64 multiply-
+// adds. As `TT` registers it is 16, the barriers go away, and the block's
+// shared footprint drops from 10 KiB to 2 KiB, which is four resident blocks
+// per SM instead of one. Bit-identical — the same values in the same order,
+// read from a register instead of from shared.
+//
 // grid: (num_experts / ROUTER_ET, ceil(max_tokens / ROUTER_TT)) — never the
 // live token count.
 
@@ -279,8 +299,7 @@ __global__ void NAME(                                                          \
     int max_tokens,                                                            \
     float* __restrict__ logits                                                 \
 ) {                                                                            \
-    float* sx      = xabe_moe_block_shared;                                    \
-    float* scratch = sx + TT * ROUTER_JC;                                      \
+    float* scratch = xabe_moe_block_shared;                                    \
                                                                                \
     int tid  = threadIdx.x;                                                    \
     int lane = tid & 31;                                                       \
@@ -296,14 +315,13 @@ __global__ void NAME(                                                          \
         for (int u = 0; u < TT; ++u) acc[el][u] = 0.0f;                        \
                                                                                \
     for (int jc = 0; jc < hidden; jc += ROUTER_JC) {                           \
-        __syncthreads();                                                       \
         int j = jc + tid;                                                      \
+        float xv[TT];                                                          \
         _Pragma("unroll")                                                      \
         for (int u = 0; u < TT; ++u) {                                         \
             int t = (t0 + u < max_tokens) ? t0 + u : max_tokens - 1;           \
-            sx[u * ROUTER_JC + tid] = j < hidden ? x[(long long)t * hidden + j] : 0.0f; \
+            xv[u] = j < hidden ? x[(long long)t * hidden + j] : 0.0f;          \
         }                                                                      \
-        __syncthreads();                                                       \
         if (j < hidden) {                                                      \
             _Pragma("unroll")                                                  \
             for (int el = 0; el < ROUTER_ET; ++el) {                           \
@@ -311,7 +329,7 @@ __global__ void NAME(                                                          \
                 float wj = e < num_experts ? w[(long long)e * hidden + j] : 0.0f; \
                 _Pragma("unroll")                                              \
                 for (int u = 0; u < TT; ++u) {                                 \
-                    acc[el][u] += wj * sx[u * ROUTER_JC + tid];                \
+                    acc[el][u] += wj * xv[u];                                  \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -1045,8 +1063,8 @@ impl MoeBlock {
                 1,
             ),
             block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: ((tt * ROUTER_JC + THREADS.div_ceil(32) * ROUTER_ET * tt) as usize
-                * size_of::<f32>()) as u32,
+            shared_mem_bytes: ((THREADS.div_ceil(32) * ROUTER_ET * tt) as usize * size_of::<f32>())
+                as u32,
         };
         let f = if tt == 1 {
             &self.router_logits_t1_fn
