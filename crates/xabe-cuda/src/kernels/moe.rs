@@ -1560,6 +1560,28 @@ __global__ void moe_expert_down_mma(
     }
 }
 
+// SwiGLU for the shared expert's tensor-core path.
+//
+// The fp32 shared-expert kernel fuses this into its epilogue; the tensor-core
+// path cannot, because `mma_q8_0_proj_split` is a projection and knows nothing
+// about what its output feeds. One elementwise pass over `[max_tokens]
+// [intermediate]` is a rounding error against the two projections it sits
+// between.
+//
+// `x / (1 + exp(-x))`, exactly as `xabe_kernels::norm::silu` and the fp32
+// kernel above write it — not the algebraically equal `x * sigmoid(x)`.
+__global__ void moe_swiglu(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    long long n,
+    float* __restrict__ out
+) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
 // -------------------------------------------------------------------------
 // 4. fp32 weighted sum of each token's top-k contributions.
 // -------------------------------------------------------------------------
@@ -1888,6 +1910,16 @@ pub struct MoeBuffers {
     /// staged as zero rather than read.
     iq: CudaSlice<i8>,
     iq_scales: CudaSlice<f32>,
+    /// The shared expert's gate projection, held until `up` is ready to be
+    /// combined with it. The fp32 kernel needs no such buffer because it
+    /// computes both halves in one block and fuses the SwiGLU inline.
+    shared_gate_out: CudaSlice<f32>,
+    /// `silu(gate) * up`, its own buffer rather than either operand's so the
+    /// SwiGLU kernel's three pointers can stay `__restrict__`.
+    shared_swiglu: CudaSlice<f32>,
+    /// The shared expert's SwiGLU output quantized for its down projection.
+    siq: CudaSlice<i8>,
+    siq_scales: CudaSlice<f32>,
 }
 
 impl MoeBuffers {
@@ -1940,6 +1972,80 @@ impl MoeBuffers {
 }
 
 /// Compiled MoE kernels for one fixed geometry.
+/// One layer's shared expert repacked for the integer tensor cores.
+///
+/// About 3.5 MB per layer — three `intermediate * hidden` matrices as int8
+/// plus one fp32 scale per 32, against the Q8_0 the block already holds.
+/// Trivial beside the 692 MB of routed experts, which is why this one gets a
+/// repack where those get shared-memory staging: a second copy of the routed
+/// stacks would not fit beside the model, and a second copy of this one is
+/// noise.
+pub struct SharedExpertInt8 {
+    gate_q: CudaSlice<i8>,
+    gate_s: CudaSlice<f32>,
+    up_q: CudaSlice<i8>,
+    up_s: CudaSlice<f32>,
+    down_q: CudaSlice<i8>,
+    down_s: CudaSlice<f32>,
+}
+
+impl SharedExpertInt8 {
+    /// Repack all three matrices. `elements` is `intermediate * hidden`, the
+    /// same for each — `down` is the transpose of the other two, not a
+    /// different size.
+    pub fn repack(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        gate: QuantTensor<'_>,
+        up: QuantTensor<'_>,
+        down: QuantTensor<'_>,
+        elements: usize,
+    ) -> Result<Self, MoeError> {
+        for (which, t) in [("gate", gate), ("up", up), ("down", down)] {
+            if t.quant != ExpertQuant::Q8_0 {
+                return Err(MoeError::UnsupportedGeometry {
+                    geometry: Box::new(MoeGeometry::qwen3_6(16, 1)),
+                    reason: match which {
+                        "gate" => "shared gate is not Q8_0",
+                        "up" => "shared up is not Q8_0",
+                        _ => "shared down is not Q8_0",
+                    },
+                });
+            }
+        }
+        let mma = MmaKernels::new(ctx).map_err(MoeError::Mma)?;
+        // The source is already resident — `QuantTensor` carries a device
+        // slice — so this repacks in place on the card rather than round
+        // tripping through the host.
+        let one = |src: &CudaSlice<u8>| -> Result<(CudaSlice<i8>, CudaSlice<f32>), MoeError> {
+            let mut q = stream.alloc_zeros::<i8>(elements)?;
+            let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
+            mma.repack_q8_0(stream, src, &mut q, &mut sc, elements)
+                .map_err(MoeError::Mma)?;
+            Ok((q, sc))
+        };
+        let (gate_q, gate_s) = one(gate.bytes)?;
+        let (up_q, up_s) = one(up.bytes)?;
+        let (down_q, down_s) = one(down.bytes)?;
+        Ok(Self {
+            gate_q,
+            gate_s,
+            up_q,
+            up_s,
+            down_q,
+            down_s,
+        })
+    }
+
+    /// Device bytes held.
+    pub fn bytes(&self) -> usize {
+        self.gate_q.len()
+            + self.up_q.len()
+            + self.down_q.len()
+            + (self.gate_s.len() + self.up_s.len() + self.down_s.len()) * size_of::<f32>()
+    }
+}
+
 pub struct MoeKernels {
     route: CudaFunction,
     align_count: CudaFunction,
@@ -1954,6 +2060,7 @@ pub struct MoeKernels {
     reduce: CudaFunction,
     shared_ffn: CudaFunction,
     shared_down: CudaFunction,
+    swiglu: CudaFunction,
     geometry: MoeGeometry,
 }
 
@@ -2032,6 +2139,7 @@ impl MoeKernels {
             reduce: module.load_function("moe_reduce")?,
             shared_ffn: module.load_function("moe_shared_ffn")?,
             shared_down: module.load_function("moe_shared_down")?,
+            swiglu: module.load_function("moe_swiglu")?,
             geometry,
         })
     }
@@ -2059,6 +2167,10 @@ impl MoeKernels {
             xq_scales: stream.alloc_zeros::<f32>(g.max_tokens * g.hidden / 32)?,
             iq: stream.alloc_zeros::<i8>(g.sorted_capacity() * g.intermediate)?,
             iq_scales: stream.alloc_zeros::<f32>(g.sorted_capacity() * g.intermediate / 32)?,
+            shared_gate_out: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
+            shared_swiglu: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
+            siq: stream.alloc_zeros::<i8>(g.max_tokens * g.intermediate)?,
+            siq_scales: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate / 32)?,
         })
     }
 
@@ -2435,6 +2547,106 @@ impl MoeKernels {
         // SAFETY: one block per token slot, gated on the device
         // `valid_tokens`; `out` is `max_tokens * hidden` floats.
         unsafe { builder.launch(reduce_cfg) }?;
+        Ok(())
+    }
+
+    /// The shared expert on the integer tensor cores.
+    ///
+    /// Three `q8_0_proj_split` calls with a SwiGLU between the second and the
+    /// third, against the fp32 kernel's two fused launches. The fusion is what
+    /// is given up; the projection kernel it buys is the one already measured
+    /// at 27 TOP/s on the dense projections, and the extra elementwise pass
+    /// over `[max_tokens][intermediate]` is a rounding error beside it.
+    ///
+    /// Falls back to [`Self::shared_expert`] — the caller's job — when the
+    /// weights are not Q8_0 or the batch is too short to amortize the
+    /// quantization sweeps.
+    pub fn shared_expert_mma(
+        &self,
+        stream: &Arc<CudaStream>,
+        buffers: &mut MoeBuffers,
+        w: &SharedExpertInt8,
+        hidden_states: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), MoeError> {
+        let g = self.geometry;
+        let mma = self.mma.as_ref().ok_or(MoeError::UnsupportedGeometry {
+            geometry: Box::new(g),
+            reason: "the integer tensor cores are unavailable on this device",
+        })?;
+
+        // `normed` again, not the routed path's leftovers: the two are the
+        // same buffer today, but depending on that would make this correct by
+        // coincidence. The sweep is microseconds.
+        mma.quantize_rows(
+            stream,
+            hidden_states,
+            &mut buffers.xq,
+            &mut buffers.xq_scales,
+            g.max_tokens,
+            g.hidden,
+        )
+        .map_err(MoeError::Mma)?;
+
+        for (wq, ws, dst) in [(&w.gate_q, &w.gate_s, 0usize), (&w.up_q, &w.up_s, 1usize)] {
+            let target = if dst == 0 {
+                &mut buffers.shared_gate_out
+            } else {
+                &mut buffers.shared_inter
+            };
+            mma.q8_0_proj_split(
+                stream,
+                wq,
+                ws,
+                &buffers.xq,
+                &buffers.xq_scales,
+                target,
+                g.hidden,
+                g.intermediate,
+                g.max_tokens,
+            )
+            .map_err(MoeError::Mma)?;
+        }
+
+        let elems = g.max_tokens * g.intermediate;
+        let n = elems as i64;
+        let cfg = LaunchConfig {
+            grid_dim: ((elems as u32).div_ceil(THREADS), 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.swiglu);
+        builder
+            .arg(&buffers.shared_gate_out)
+            .arg(&buffers.shared_inter)
+            .arg(&n)
+            .arg(&mut buffers.shared_swiglu);
+        // SAFETY: every buffer is `max_tokens * intermediate` floats and the
+        // kernel bounds-checks its flat index against `n`.
+        unsafe { builder.launch(cfg) }?;
+
+        mma.quantize_rows(
+            stream,
+            &buffers.shared_swiglu,
+            &mut buffers.siq,
+            &mut buffers.siq_scales,
+            g.max_tokens,
+            g.intermediate,
+        )
+        .map_err(MoeError::Mma)?;
+
+        mma.q8_0_proj_split(
+            stream,
+            &w.down_q,
+            &w.down_s,
+            &buffers.siq,
+            &buffers.siq_scales,
+            out,
+            g.intermediate,
+            g.hidden,
+            g.max_tokens,
+        )
+        .map_err(MoeError::Mma)?;
         Ok(())
     }
 

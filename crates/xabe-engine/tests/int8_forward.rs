@@ -11,10 +11,12 @@
 //!
 //! - **fp32** — the path `forward_pass.rs` gates, so it is known-good by
 //!   transitivity.
-//! - **int8** — the same arithmetic with every Q8_0 projection's activations
-//!   quantized to int8 and multiplied on tensor cores: three per Gated
-//!   DeltaNet layer (30 of them) and four per Gated Attention layer (10), so
-//!   all 40 layers are covered.
+//! - **int8** — the same arithmetic with every quantized GEMM's activations
+//!   quantized to int8 and multiplied on tensor cores: three projections per
+//!   Gated DeltaNet layer (30 of them), four per Gated Attention layer (10),
+//!   and in all 40 layers the routed experts' Q6_K gate/up and Q8_0 down plus
+//!   the shared expert. Every matmul in the model that has an integer path
+//!   takes it on one side of this comparison and not the other.
 //!
 //! Agreement cannot be exact and is not asked to be: int8 activations cost
 //! about 1/127 per element, which is the entire price of the instruction.
@@ -173,8 +175,9 @@ fn integer_tensor_cores_agree_with_the_fp32_path_on_the_real_model() {
     let peak = b.iter().fold(0f32, |m, v| m.max(v.abs()));
 
     println!(
-        "\n{TOKENS} tokens: 30 Gated DeltaNet layers x 3 projections and 10 Gated \
-         Attention layers x 4, all on tensor cores\n\
+        "\n{TOKENS} tokens: every integer path in the model — 30 Gated DeltaNet \
+         layers x 3 projections, 10 Gated Attention layers x 4, and 40 layers \
+         of routed and shared experts\n\
          \x20 argmax   int8 {ia} (logit {va:.6})   fp32 {ib} (logit {vb:.6})\n\
          \x20 cosine   {cosine:.9}\n\
          \x20 max|diff| {max_abs:.6} against a peak logit of {peak:.3}",

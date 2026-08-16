@@ -94,7 +94,7 @@ use cudarc::driver::{
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
 use xabe_cuda::kernels::moe::{
-    ExpertQuant, MoeBuffers, MoeError, MoeGeometry, MoeKernels, QuantTensor,
+    ExpertQuant, MoeBuffers, MoeError, MoeGeometry, MoeKernels, QuantTensor, SharedExpertInt8,
 };
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::ModelConfig;
@@ -105,6 +105,28 @@ const THREADS: u32 = 256;
 
 /// Tokens one router block carries. Mirrors the kernel's `ROUTER_TT`.
 const ROUTER_TT: u32 = 8;
+
+/// Token count below which the shared expert stays on the fp32 kernel.
+///
+/// Higher than the routed path's threshold of 8, and measured rather than
+/// reasoned. The fp32 shared expert is *two* launches with the SwiGLU fused
+/// into the first; the integer path is six — two activation quantizations,
+/// three projections and a separate SwiGLU — because `q8_0_proj_split` is a
+/// projection and knows nothing about what its output feeds. Six launches and
+/// two extra sweeps over `[tokens][intermediate]` need a wide batch to pay
+/// for themselves.
+///
+/// Measured end to end, tok/s at each batch with the threshold at 8 (so the
+/// integer path ran) against the fp32 path:
+///
+/// |  19 | 265.34 -> 240.42 | -9.4%  |
+/// | 128 | 893.27 -> 895.87 | +0.3%  |
+/// | 512 | 1248.27 -> 1352.61 | +8.4% |
+///
+/// 128 is where it stops costing anything. Also gates the repack itself, so a
+/// decode-shaped pass does not pay 3.5 MB per layer for weights it will never
+/// read.
+const SHARED_MMA_MIN_TOKENS: usize = 128;
 /// Experts one router block covers. Mirrors `ROUTER_ET`.
 const ROUTER_ET: u32 = 4;
 /// Contraction the router stages per trip. Mirrors `ROUTER_JC`, and **must**
@@ -494,6 +516,10 @@ pub struct MoeLayerWeights {
     shared_gate_quant: ExpertQuant,
     shared_up_quant: ExpertQuant,
     shared_down_quant: ExpertQuant,
+    /// The shared expert repacked for the integer tensor cores, when its three
+    /// matrices are Q8_0 and the pass is wide enough to want them. About
+    /// 3.5 MB per layer.
+    shared_int8: Option<SharedExpertInt8>,
     /// How the router and the shared-expert gate were stored in the file.
     router_type: GgmlType,
     shared_gate_inp_type: GgmlType,
@@ -536,6 +562,39 @@ impl MoeLayerWeights {
         let (sdown_bytes, shared_down_quant) =
             quantized(file, directory, Role::MoeSharedDown, layer, one_expert)?;
 
+        let shared_gate = stream.clone_htod(sgate_bytes)?;
+        let shared_up = stream.clone_htod(sup_bytes)?;
+        let shared_down = stream.clone_htod(sdown_bytes)?;
+        // Repacked here, at upload, rather than lazily on the first pass:
+        // `AGENTS.md` rule 6 forbids allocating mid-forward, and a lazy repack
+        // would also poison the first timed repetition of every benchmark.
+        let shared_int8 = if geometry.max_tokens >= SHARED_MMA_MIN_TOKENS
+            && [shared_gate_quant, shared_up_quant, shared_down_quant]
+                .iter()
+                .all(|q| *q == ExpertQuant::Q8_0)
+        {
+            SharedExpertInt8::repack(
+                stream.context(),
+                stream,
+                QuantTensor {
+                    bytes: &shared_gate,
+                    quant: shared_gate_quant,
+                },
+                QuantTensor {
+                    bytes: &shared_up,
+                    quant: shared_up_quant,
+                },
+                QuantTensor {
+                    bytes: &shared_down,
+                    quant: shared_down_quant,
+                },
+                one_expert,
+            )
+            .ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             layer,
             post_norm: stream.clone_htod(&post_norm)?,
@@ -547,12 +606,13 @@ impl MoeLayerWeights {
             up_quant,
             down_quant,
             shared_gate_inp: stream.clone_htod(&shared_gate_inp)?,
-            shared_gate: stream.clone_htod(sgate_bytes)?,
-            shared_up: stream.clone_htod(sup_bytes)?,
-            shared_down: stream.clone_htod(sdown_bytes)?,
+            shared_gate,
+            shared_up,
+            shared_down,
             shared_gate_quant,
             shared_up_quant,
             shared_down_quant,
+            shared_int8,
             router_type,
             shared_gate_inp_type,
         })
@@ -598,6 +658,7 @@ impl MoeLayerWeights {
             + self.shared_gate.len()
             + self.shared_up.len()
             + self.shared_down.len()
+            + self.shared_int8.as_ref().map_or(0, SharedExpertInt8::bytes)
     }
 }
 
@@ -759,6 +820,23 @@ impl MoeBlock {
         })
     }
 
+    /// Force every MoE GEMM back onto its fp32 kernel.
+    ///
+    /// Both the routed experts and the shared one: dropping the `MmaKernels`
+    /// handle disables the routed path, and the shared path is gated on the
+    /// same flag so it follows. See
+    /// [`crate::forward::Forward::disable_tensor_cores`], which calls this so
+    /// `tests/int8_forward.rs` covers the MoE at all — without it the test
+    /// compared an integer MoE against an integer MoE and said nothing.
+    pub fn disable_tensor_cores(&mut self) {
+        self.moe.disable_tensor_cores();
+    }
+
+    /// Whether the MoE GEMMs will take the integer tensor-core path.
+    pub fn tensor_cores_enabled(&self) -> bool {
+        self.moe.tensor_cores_enabled()
+    }
+
     /// The geometry this block was compiled for.
     pub fn geometry(&self) -> MoeGeometry {
         self.geometry
@@ -918,24 +996,37 @@ impl MoeBlock {
 
         // 4. the shared expert, ungated — the kernel implements `expert_mlp`
         //    and nothing else.
-        self.moe.shared_expert(
-            stream,
-            &mut self.buffers,
-            QuantTensor {
-                bytes: &w.shared_gate,
-                quant: w.shared_gate_quant,
-            },
-            QuantTensor {
-                bytes: &w.shared_up,
-                quant: w.shared_up_quant,
-            },
-            QuantTensor {
-                bytes: &w.shared_down,
-                quant: w.shared_down_quant,
-            },
-            &self.normed,
-            &mut self.shexp,
-        )?;
+        match w
+            .shared_int8
+            .as_ref()
+            .filter(|_| self.moe.tensor_cores_enabled())
+        {
+            Some(i8w) => self.moe.shared_expert_mma(
+                stream,
+                &mut self.buffers,
+                i8w,
+                &self.normed,
+                &mut self.shexp,
+            )?,
+            None => self.moe.shared_expert(
+                stream,
+                &mut self.buffers,
+                QuantTensor {
+                    bytes: &w.shared_gate,
+                    quant: w.shared_gate_quant,
+                },
+                QuantTensor {
+                    bytes: &w.shared_up,
+                    quant: w.shared_up_quant,
+                },
+                QuantTensor {
+                    bytes: &w.shared_down,
+                    quant: w.shared_down_quant,
+                },
+                &self.normed,
+                &mut self.shexp,
+            )?,
+        }
 
         // 5. its sigmoid gate, which lives here because no kernel has it.
         // Still `block_reduce_sum`, so it still needs one float per warp.

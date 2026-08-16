@@ -868,13 +868,16 @@ impl Forward {
         for block in &mut self.attention {
             block.disable_tensor_cores();
         }
+        self.moe.disable_tensor_cores();
     }
 
     /// Whether this pass has the repacked int8 weights resident, in both
     /// mixers. A pass with one side repacked and not the other is a bug, so
     /// this reports the conjunction rather than either half.
     pub fn tensor_cores_enabled(&self) -> bool {
-        !self.gdn_int8.is_empty() && self.attention.iter().all(|b| b.tensor_cores_enabled())
+        !self.gdn_int8.is_empty()
+            && self.attention.iter().all(|b| b.tensor_cores_enabled())
+            && self.moe.tensor_cores_enabled()
     }
 
     /// Allocate carried state for one sequence of up to `max_seq` positions.
