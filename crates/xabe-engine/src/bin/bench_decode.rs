@@ -157,6 +157,24 @@ fn main() -> ExitCode {
     // step that every decode replays. `reshape` shares the 28.3 GiB of MoE
     // weights, which is the only reason two shapes fit at all.
     let built = Instant::now();
+    // Prefill in chunks, so the pass width stops being the prompt length.
+    //
+    // A single pass as wide as the prompt needs `0.581 MB * prompt_len` of
+    // scratch on top of the resident weights, which runs out of card somewhere
+    // past 8K and makes decode at a deep context unmeasurable -- the one thing
+    // the 128K target most needs measured. `Forward::run` already advances the
+    // sequence state by its own width, which is exactly what decode does at one
+    // token, so chunking is a property of the driver and not of the engine.
+    // Defaults to the whole prompt, which is the old behaviour.
+    let chunk = std::env::var("LLMXABE_DECODE_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(prompt_len);
+    if !prompt_len.is_multiple_of(chunk) {
+        error!("prompt {prompt_len} is not a multiple of chunk {chunk}");
+        return ExitCode::FAILURE;
+    }
     let mut prefill = match Forward::new(
         &ctx,
         &stream,
@@ -164,11 +182,11 @@ fn main() -> ExitCode {
         &directory,
         &weights,
         config.clone(),
-        prompt_len,
+        chunk,
     ) {
         Ok(f) => f,
         Err(e) => {
-            error!("FAILED to build the {prompt_len}-token prefill: {e}");
+            error!("FAILED to build the {chunk}-token prefill: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -197,9 +215,11 @@ fn main() -> ExitCode {
         .collect();
 
     let t = Instant::now();
-    if let Err(e) = prefill.run(&stream, &mut state, &ids, |_, _| {}) {
-        error!("FAILED during prefill: {e}");
-        return ExitCode::FAILURE;
+    for piece in ids.chunks(chunk) {
+        if let Err(e) = prefill.run(&stream, &mut state, piece, |_, _| {}) {
+            error!("FAILED during prefill: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     stream.synchronize().expect("sync");
     let prefill_ms = t.elapsed().as_secs_f64() * 1e3;

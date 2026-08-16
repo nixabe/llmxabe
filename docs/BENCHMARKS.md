@@ -2859,3 +2859,48 @@ row that fits in the register file. The next lever is fp16 operands on
 `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`, which does the reduction in
 hardware and raises the ceiling to roughly 65 TFLOP/s; it pairs naturally with
 an fp16 KV cache, which would also halve the 5 GiB the cache costs at 131,072.
+
+### The occupancy trade is closed too, measured (2026-08-17)
+
+Before reaching for tensor cores it is worth knowing whether the GQA kernel is
+short of arithmetic or short of latency hiding. The instruction mix says the
+former should not be binding: per key per warp it issues 20 shared loads, 64
+multiply-adds and 40 shuffle-plus-add, and on this part's 4-instruction issue
+against 2 fp32 warp-instructions per clock that mix bounds at roughly 12.4
+TFLOP/s. Measured is 3.2. The missing 4x is latency, not instructions.
+
+Two knobs were swept at 8,192 tokens in 512-token chunks, two pairs each.
+
+**Staged tile width `GQA_KT`.** 8 is the optimum and both neighbours lose:
+
+| `GQA_KT` | shared/block | blocks/SM | tok/s (p1, p2) |
+| -------: | -----------: | --------: | -------------: |
+|        4 |      9,216 B |         2 |  1490.1, 1456.0 |
+|        8 |     17,408 B |         2 |  **1571.5, 1539.3** |
+|       16 |     33,792 B |         1 |  1339.5, 1331.1 |
+
+16 halves the barrier count and doubles the compute between barriers, and still
+loses 14% — because 33,792 B admits only one block per SM. That is the direct
+measurement that **occupancy is what binds**, and it is why the answer is not a
+bigger tile.
+
+**Register cap.** ptxas lands the kernel at 128 registers, which at 256 threads
+is exactly two blocks of the 65,536-register file. `__maxnreg__` was used to try
+to buy a third:
+
+| cap | registers | spill | tok/s (p1, p2) |
+| --: | --------: | ----: | -------------: |
+|  — |       128 |     0 | **1571.5, 1539.3** |
+|  96 |        96 |  16 B | 1559.5, 1545.7 |
+|  84 |        84 |  32 B | 1461.5, 1454.2 |
+
+84 registers would fit three blocks in the register file (`256 * 84 * 3 =
+64,512`) and it changes nothing, because 17,408 B of shared still admits only
+two. A third block needs **both** ≤85 registers and ≤16,384 B of shared, and the
+only thing that buys the second is fp16 staging — which then costs a convert per
+element on the read side, and which by this table's own slope is worth 10-15%,
+not the 3-4x the remaining gap needs.
+
+So the fp32 kernel is at its local optimum on both axes. `GQA_KT` 8 and no
+register cap are kept, and neither knob is worth revisiting without first
+changing the arithmetic.
