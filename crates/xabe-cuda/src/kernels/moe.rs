@@ -164,6 +164,13 @@ const GEMM_THREADS: u32 = TILE_ROWS * 32;
 /// `the_routing_warp_bound_matches_the_kernel` asserts the two agree.
 const ROUTE_LANE_EXPERTS: usize = 16;
 
+/// Warps splitting the contraction in the one-token shared expert.
+///
+/// Mirrors `MOE_SHARED_WARPS`. Four rather than eight: eight leaves each warp
+/// two 128-element tiles, which is short enough that the block spends more
+/// time being scheduled than reading.
+const SHARED_WARPS: u32 = 4;
+
 /// Warps per block on the integer tensor-core path. Mirrors `MOE_MMA_WARPS`.
 const MMA_WARPS: u32 = 4;
 /// Output rows one warp owns — one `m8n8k16` N fragment. Mirrors `MOE_MMA_N`.
@@ -296,6 +303,7 @@ const MOE_SRC: &str = r#"
 // asserts the two never drift.
 // Experts one lane of the routing warp can hold in registers. 16 covers 512
 // experts; the launch path rejects anything wider.
+#define MOE_SHARED_WARPS 4
 #define MOE_ROUTE_LANE_EXPERTS 16
 #define MOE_TM   16
 #define MOE_TK   128
@@ -2016,7 +2024,7 @@ __global__ void moe_shared_ffn_gemv(
     long long wrow = (long long)r * hidden;
 
     // The launch path rejects a `hidden` this does not divide evenly.
-    int chunk = hidden / MOE_ROWS;
+    int chunk = hidden / MOE_SHARED_WARPS;
     int stop = warp * chunk + chunk;
 
     float ag[1] = {0.0f};
@@ -2035,14 +2043,14 @@ __global__ void moe_shared_ffn_gemv(
     warp_reduce_tile<1>(ag);
     warp_reduce_tile<1>(au);
 
-    __shared__ float sg[MOE_ROWS];
-    __shared__ float su[MOE_ROWS];
+    __shared__ float sg[MOE_SHARED_WARPS];
+    __shared__ float su[MOE_SHARED_WARPS];
     if (lane == 0) { sg[warp] = ag[0]; su[warp] = au[0]; }
     __syncthreads();
     if (threadIdx.x == 0) {
         float g = 0.0f;
         float u = 0.0f;
-        for (int w = 0; w < MOE_ROWS; ++w) { g += sg[w]; u += su[w]; }
+        for (int w = 0; w < MOE_SHARED_WARPS; ++w) { g += sg[w]; u += su[w]; }
         inter[r] = (g / (1.0f + expf(-g))) * u;
     }
 }
@@ -3389,7 +3397,7 @@ impl MoeKernels {
             // One block per output row, its warps splitting the contraction.
             // See `moe_shared_ffn_gemv` for why the row-per-warp shape was
             // the wrong one at this geometry.
-            if !g.hidden.is_multiple_of(TILE_ROWS as usize * TILE_K) {
+            if !g.hidden.is_multiple_of(SHARED_WARPS as usize * TILE_K) {
                 return Err(MoeError::UnsupportedGeometry {
                     geometry: Box::new(g),
                     reason: "the one-token shared expert splits `hidden` over \
@@ -3399,7 +3407,7 @@ impl MoeKernels {
             }
             let ffn_cfg = LaunchConfig {
                 grid_dim: (g.intermediate as u32, 1, 1),
-                block_dim: (GEMM_THREADS, 1, 1),
+                block_dim: (SHARED_WARPS * 32, 1, 1),
                 shared_mem_bytes: 0,
             };
             let mut builder = stream.launch_builder(&self.shared_ffn_gemv);

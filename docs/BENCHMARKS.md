@@ -1271,7 +1271,7 @@ prefill numbers in every section before it.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,361.42 ± 5.52 tok/s** | **1.52× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.5 tok/s**, 9.66 ms/step | **1.01× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.3 tok/s**, 9.59 ms/step | **1.00× — level** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1421,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **103.5 tok/s**, 9.66 ms/step | **1.01× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **104.3 tok/s**, 9.59 ms/step | **1.00× — level** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1448,6 +1448,38 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | GDN output norm and SwiGLU in one launch | 9.67 | 103.45 |
 | residual add folded into the output projection | 9.59 | 104.28 |
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
+| four warps per shared-expert row instead of eight | 9.59 | 104.3 |
+
+### Splitting a row eight ways was one split too many
+
+`moe_shared_ffn_gemv` was retiled earlier in this arc from "one warp per row"
+to "one block per row, eight warps splitting the contraction", which is what
+took decode from 10.70 to 10.42 ms. Eight was chosen because it is the block
+width the surrounding kernels use, not because anything measured it.
+
+At `hidden = 2048` eight warps leave each warp **two 128-element tiles**: it
+issues four global loads, reduces across its lanes, and retires. That is short
+enough that the block spends more of its life being scheduled than reading,
+and the 512-block grid is already four times the number of resident blocks the
+card will hold. Halving the split to four doubles the work each warp does
+without changing the grid, and the whole kernel is a 128-thread block instead
+of a 256-thread one:
+
+| warps splitting the row | ms/step | tok/s |
+| --- | --- | --- |
+| 8 | 9.63 | 103.8 |
+| **4** | **9.59** | **104.3** |
+| 2 | 9.64 | 103.8 |
+
+Two is worse again, and for the opposite reason: each warp is now reading
+1 KiB, but there are only two of them per block, so the block cannot cover its
+own memory latency. Four is the knee, and it is a knee rather than a trend —
+which is the reason to measure it rather than reason about it.
+
+The partial sum is now four wide instead of eight, so the shared expert's
+output is not bit-identical to what it was. `forward_pass`'s golden gate — a
+per-block relative-error comparison against llama.cpp's own activations —
+passes unchanged, and the final argmax is the same token.
 
 ### The one idea behind all of it
 

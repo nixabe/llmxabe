@@ -12,13 +12,14 @@ RTX 8000, written in Rust.
 > and prefilling 12 tokens then decoding 7 reaches that same token with
 > cosine 1.000000000 against prefilling all 19 at once.
 >
-> What it cannot do: there is **no HTTP surface**, no tokenizer, no batching
-> across sequences, and no CUDA graph capture. It generates token ids for one
-> sequence at a time. See [Milestones](#milestones) for the itemized state.
+> What it cannot do: there is **no HTTP surface**, no tokenizer, and no
+> batching across sequences. It generates token ids for one sequence at a
+> time — decode steps replay from a captured CUDA graph. See
+> [Milestones](#milestones) for the itemized state.
 >
-> Measured against llama.cpp on the same card: prefill **419.28 ± 2.37 tok/s**
-> at 512 tokens against 2,070.50 (**4.94× slower**), decode **64.1 tok/s**
-> against `tg128`'s 104.72 (**1.61× slower**). See
+> Measured against llama.cpp on the same card: prefill **1,362.83 tok/s**
+> at 512 tokens against 2,070.50 (**1.52× slower**), decode **104.3 tok/s**
+> against `tg128`'s 104.72 (**level**). See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why this exists
@@ -72,7 +73,7 @@ years of CUDA tuning behind it, and the benchmarks make that concrete.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | 2,070.50 ± 160.35 tok/s | **1,361.42 ± 5.52** | 1.52× slower |
-| Decode, warm | 104.72 ± 0.36 tok/s | **103.5**, 9.66 ms/step | 1.01× slower |
+| Decode, warm | 104.72 ± 0.36 tok/s | **104.3**, 9.59 ms/step | 1.00× — level |
 
 Prefill was 29.6× slower, then 10.3×, and is now 1.52×. Decode was 1.61× and
 is now 1.01×. **Both are still losses**, and the project does not claim
