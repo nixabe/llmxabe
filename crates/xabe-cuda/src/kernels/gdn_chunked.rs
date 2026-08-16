@@ -85,12 +85,15 @@
 //! same answer; in floating point and in silicon they are not equivalent, and
 //! three arguments all point the same way.
 //!
-//! **Shared memory.** `M^-1` is `C x C` = 16 KiB at `C = 64`, and `U` is
-//! `C x head_dim` = 32 KiB. Holding both resident is 48 KiB — exactly the
-//! per-block shared-memory limit on Turing without the opt-in carve-out, with
-//! nothing left for the cumulative decay or any staging, and it stops fitting
-//! the moment `chunk_len` or `head_dim` moves. Forward substitution needs only
-//! `U`.
+//! **Shared memory.** This argument held while a block owned a whole head's
+//! `U` — `C x head_dim` = 32 KiB at `C = 64`, against `M^-1`'s `C x C` = 16
+//! KiB, for 48 KiB exactly at Turing's per-block limit with nothing left over.
+//! It no longer does: a solve block now owns a `SOLVE_VB`-wide band of value
+//! indices, so its `U` slice is 8 KiB and an inverse would fit beside it.
+//! **The shared-memory case against inversion is void; the arithmetic one
+//! below is what the choice now rests on.** Recorded rather than deleted
+//! because the conclusion outlived its first reason, and a reader who
+//! rediscovers the 48 KiB sum should know it was already accounted for.
 //!
 //! **Arithmetic.** Inverting costs `C^3/6` ~= 44k multiply-adds per head per
 //! chunk and the following `C x C x head_dim` product costs 524k. Forward
@@ -173,6 +176,14 @@ pub const MAX_SHARED_BYTES: usize = 48 * 1024;
 /// mismatch would size the shared staging for a different tile than the
 /// kernel indexes into and read past its end.
 const INTER_TT: u32 = 8;
+
+/// Value indices one solve block owns. Mirrors the kernel's `VB`.
+const SOLVE_VB: u32 = 32;
+/// Value indices one state-update block owns. Mirrors `STATE_VB`.
+const STATE_VB: u32 = 32;
+/// State columns one state-update block owns. Mirrors `STATE_JB`; the block
+/// is `STATE_VB * STATE_JB` threads.
+const STATE_JB: u32 = 4;
 
 const GDN_CHUNKED_SRC: &str = r#"
 extern "C" {
@@ -418,8 +429,19 @@ __global__ void gdn_chunk_inter(
 //      the state *after* token t's own update. Making the two triangles agree
 //      — the obvious "simplification" — is precisely the recurrent kernel's
 //      read-before-update bug, transposed.
+// Value indices one solve block owns. Mirrors `SOLVE_VB` on the Rust side.
+//
+// `vi` is a pure spectator in the forward substitution — thread `vi` reads
+// only its own column of U' and never another's — so the axis splits freely
+// across blocks. Splitting it four ways turns 32 blocks into 128, which is
+// what puts the kernel on most of the 72 SMs instead of fewer than half.
+// `gcum` is recomputed per block; that is 64 sequential adds against a kernel
+// whose shortest section is 2,016 iterations.
+#define VB 32
+
 __global__ void gdn_chunk_solve_and_apply(
-    float* __restrict__ state,
+    float* __restrict__ uprime,
+    float* __restrict__ lambda_last,
     const float* __restrict__ v,
     const float* __restrict__ log_decay,
     const float* __restrict__ beta,
@@ -436,12 +458,13 @@ __global__ void gdn_chunk_solve_and_apply(
     int c
 ) {
     extern __shared__ float shared[];
-    float* u     = shared;                              // [c][head_dim], holds U'
-    float* gcum  = shared + (long long)c * head_dim;    // [c], log space
+    float* u     = shared;                              // [c][VB], holds U'
+    float* gcum  = shared + (long long)c * VB;          // [c], log space
     float* decay = gcum + c;                            // [c], one row at a time
 
     int h = blockIdx.x;
-    int vi = threadIdx.x;
+    int vl = threadIdx.x;
+    int vi = blockIdx.y * VB + vl;
     // Modulo, not division. See `super::gdn`'s module docs.
     int hq = h % qk_heads;
 
@@ -457,7 +480,7 @@ __global__ void gdn_chunk_solve_and_apply(
     // inf and then NaN. Everything below exponentiates a *difference* of two
     // gcum entries instead, which is bounded above by 1 for non-positive
     // log-decays.
-    if (vi == 0) {
+    if (vl == 0) {
         float running = 0.0f;
         for (int t = 0; t < c; ++t) {
             running += log_decay[(long long)(chunk_start + t) * value_heads + h];
@@ -474,7 +497,7 @@ __global__ void gdn_chunk_solve_and_apply(
     // Thread vi owns column vi of U' throughout, so the inner reduction is a
     // per-thread sequential loop over i with no cross-thread communication —
     // only the __syncthreads() that publishes row t before row t+1 reads it.
-    // u[i * head_dim + vi] is bank-conflict free: consecutive vi land in
+    // u[i * VB + vl] is bank-conflict free: consecutive vl land in
     // consecutive banks.
     //
     // decay[i] is rebuilt cooperatively each iteration rather than recomputed
@@ -482,7 +505,7 @@ __global__ void gdn_chunk_solve_and_apply(
     // so computing it once costs 1/head_dim of the alternative on a kernel
     // whose inner loop is otherwise pure multiply-add.
     for (int t = 0; t < c; ++t) {
-        for (int i = vi; i <= t; i += blockDim.x) {
+        for (int i = vl; i <= t; i += blockDim.x) {
             decay[i] = expf(gcum[t] - gcum[i]);
         }
         __syncthreads();
@@ -495,10 +518,10 @@ __global__ void gdn_chunk_solve_and_apply(
 
         const float* kk_row = kk + ((long long)hq * c + t) * c;
         for (int i = 0; i < t; ++i) {
-            acc -= beta_t * kk_row[i] * decay[i] * u[i * head_dim + vi];
+            acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];
         }
 
-        u[t * head_dim + vi] = acc;
+        u[t * VB + vl] = acc;
         // Publishes row t, and holds every thread until the whole block is
         // done reading `decay` before the next iteration overwrites it.
         __syncthreads();
@@ -506,7 +529,7 @@ __global__ void gdn_chunk_solve_and_apply(
 
     // --- 3. Per-token output, from the state *including* token t's update. --
     for (int t = 0; t < c; ++t) {
-        for (int i = vi; i <= t; i += blockDim.x) {
+        for (int i = vl; i <= t; i += blockDim.x) {
             decay[i] = expf(gcum[t] - gcum[i]);
         }
         __syncthreads();
@@ -514,7 +537,7 @@ __global__ void gdn_chunk_solve_and_apply(
         const float* kq_row = kq + ((long long)hq * c + t) * c;
         float o_intra = 0.0f;
         for (int i = 0; i <= t; ++i) {
-            o_intra += kq_row[i] * decay[i] * u[i * head_dim + vi];
+            o_intra += kq_row[i] * decay[i] * u[i * VB + vl];
         }
         float o_inter = expf(gcum[t]) * oint[((long long)h * c + t) * head_dim + vi];
         long long ht = (long long)(chunk_start + t) * value_heads + h;
@@ -522,38 +545,89 @@ __global__ void gdn_chunk_solve_and_apply(
         __syncthreads();
     }
 
-    // --- 4. Chunk-end state: S = e^{gcum_{c-1}} S_in + sum_i r_i u'_i k_i^T,
-    //        r_i = exp(gcum_{c-1} - gcum_i). ------------------------------
+    // --- 4a. Publish U' with the chunk-end decay folded in. ---------------
     //
-    // This is llama.cpp's `g_diff = g_last - g_cum` and `g_last` exactly
-    // (`delta-net-base.cpp:201-227`), reached from the substitution above
-    // rather than transcribed.
+    // `r_i = exp(gcum_{c-1} - gcum_i)` is llama.cpp's `g_diff = g_last -
+    // g_cum` exactly (`delta-net-base.cpp:201-227`), reached from the
+    // substitution above rather than transcribed. Folding it here rather than
+    // inside the state update costs `c` multiplies per column instead of
+    // `c * head_dim`.
     //
-    // Thread vi owns row vi of the state, so the read-modify-write is private
-    // to the thread and needs no synchronisation. Every thread reads the same
-    // k_norm element at the same time, which the hardware broadcasts.
-    for (int i = vi; i < c; i += blockDim.x) {
+    // The state update itself is `gdn_chunk_state_update`, a separate launch,
+    // and the reason is occupancy. This kernel has one thread per (head, vi)
+    // — 4,096 threads, 128 warps, about 5% of what 72 SMs can hold — because
+    // `vi` is the only axis sections 1 through 3 are parallel over. The state
+    // update is parallel over (head, vi, j) as well: 524,288 independent
+    // outputs. Leaving it here would run two thirds of this kernel's
+    // arithmetic at a twentieth of the machine.
+    for (int i = vl; i < c; i += blockDim.x) {
         decay[i] = expf(gcum[c - 1] - gcum[i]);
     }
     __syncthreads();
 
-    // Fold r_i into this thread's column of U' once, rather than into every
-    // one of the head_dim inner iterations below. Each thread touches only its
-    // own column, so this needs no barrier and U' is dead afterwards.
     for (int i = 0; i < c; ++i) {
-        u[i * head_dim + vi] *= decay[i];
+        uprime[((long long)h * c + i) * head_dim + vi] = u[i * VB + vl] * decay[i];
+    }
+    if (vl == 0 && blockIdx.y == 0) lambda_last[h] = expf(gcum[c - 1]);
+}
+
+// The chunk-end state update, split out of the solve for occupancy:
+//
+//   S[h][vi][j] = lambda_last[h] * S[h][vi][j] + sum_i U'[h][i][vi] k[i][j]
+//
+// grid: (value_heads, head_dim / STATE_VB, head_dim / STATE_JB), one thread
+// per (vi, j) pair. Every output is independent, so this saturates where its
+// parent could not.
+//
+// The `i` loop runs ascending and the update is a single fused
+// `lambda * S + acc`, both as the solve had them: reassociating the sum or
+// splitting the fused multiply-add into a scale pass and an accumulate pass
+// would round differently on a value that is carried into every later chunk.
+#define STATE_VB 32
+#define STATE_JB 4
+
+__global__ void gdn_chunk_state_update(
+    float* __restrict__ state,
+    const float* __restrict__ uprime,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ lambda_last,
+    int head_dim,
+    int qk_heads,
+    int chunk_start,
+    int c
+) {
+    extern __shared__ float su[];                       // [c][STATE_VB]
+
+    int h  = blockIdx.x;
+    int v0 = blockIdx.y * STATE_VB;
+    int j0 = blockIdx.z * STATE_JB;
+    int hq = h % qk_heads;
+
+    int vl = threadIdx.x & (STATE_VB - 1);
+    int jl = threadIdx.x / STATE_VB;
+    int vi = v0 + vl;
+    int j  = j0 + jl;
+
+    // Staged once per block and read `c` times by every one of the STATE_JB
+    // threads that share a `vi`; consecutive `vl` land in consecutive banks.
+    for (int idx = threadIdx.x; idx < c * STATE_VB; idx += blockDim.x) {
+        int i = idx / STATE_VB;
+        int lv = idx % STATE_VB;
+        su[idx] = uprime[((long long)h * c + i) * head_dim + v0 + lv];
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int i = 0; i < c; ++i) {
+        // Uniform across the warp — every thread of a warp shares `j` only
+        // when STATE_JB divides 32, which it does; the divergent case still
+        // reads at most STATE_JB distinct addresses.
+        float kv = k_norm[((long long)(chunk_start + i) * qk_heads + hq) * head_dim + j];
+        acc += su[i * STATE_VB + vl] * kv;
     }
 
-    float lambda_last = expf(gcum[c - 1]);
-    float* row = state + ((long long)h * head_dim + vi) * head_dim;
-    for (int j = 0; j < head_dim; ++j) {
-        float acc = 0.0f;
-        for (int i = 0; i < c; ++i) {
-            long long ki = ((long long)(chunk_start + i) * qk_heads + hq) * head_dim + j;
-            acc += u[i * head_dim + vi] * k_norm[ki];
-        }
-        row[j] = lambda_last * row[j] + acc;
-    }
+    float* cell = state + ((long long)h * head_dim + vi) * head_dim + j;
+    *cell = lambda_last[h] * *cell + acc;
 }
 
 }
@@ -638,6 +712,16 @@ pub struct GdnChunkedScratch {
     sik: CudaSlice<f32>,
     /// `[value_heads][chunk_len][head_dim]`, `S_in q_t`.
     oint: CudaSlice<f32>,
+    /// `[value_heads][chunk_len][head_dim]`, the solved `U'` with the
+    /// chunk-end decay `r_i` already folded in.
+    ///
+    /// The solve holds `U'` in shared memory while it needs it and publishes
+    /// it here for `gdn_chunk_state_update`, which is a separate launch
+    /// because the state update is parallel over one more axis than the solve
+    /// is. See the kernel.
+    uprime: CudaSlice<f32>,
+    /// `[value_heads]`, `exp(gcum[c-1])` for the chunk just solved.
+    lambda_last: CudaSlice<f32>,
     max_seq_len: usize,
 }
 
@@ -654,6 +738,7 @@ pub struct GdnChunkedKernels {
     gram: CudaFunction,
     inter: CudaFunction,
     solve: CudaFunction,
+    state_update: CudaFunction,
     head_dim: usize,
     value_heads: usize,
     qk_heads: usize,
@@ -688,7 +773,7 @@ impl GdnChunkedKernels {
         if chunk_len == 0 || chunk_len > 1024 {
             return Err(GdnChunkedError::UnsupportedChunkLen { chunk_len });
         }
-        let needed = shared_bytes_for_solve(chunk_len, head_dim);
+        let needed = shared_bytes_for_solve(chunk_len);
         if needed > MAX_SHARED_BYTES {
             return Err(GdnChunkedError::SharedMemoryExceeded {
                 needed,
@@ -703,6 +788,7 @@ impl GdnChunkedKernels {
             gram: module.load_function("gdn_chunk_gram")?,
             inter: module.load_function("gdn_chunk_inter")?,
             solve: module.load_function("gdn_chunk_solve_and_apply")?,
+            state_update: module.load_function("gdn_chunk_state_update")?,
             head_dim,
             value_heads,
             qk_heads,
@@ -750,6 +836,8 @@ impl GdnChunkedKernels {
             kq: stream.alloc_zeros::<f32>(gram)?,
             sik: stream.alloc_zeros::<f32>(inter)?,
             oint: stream.alloc_zeros::<f32>(inter)?,
+            uprime: stream.alloc_zeros::<f32>(inter)?,
+            lambda_last: stream.alloc_zeros::<f32>(self.value_heads)?,
             max_seq_len,
         })
     }
@@ -878,13 +966,18 @@ impl GdnChunkedKernels {
             unsafe { builder.launch(inter_cfg) }?;
 
             let solve_cfg = LaunchConfig {
-                grid_dim: (self.value_heads as u32, 1, 1),
-                block_dim: (self.head_dim as u32, 1, 1),
-                shared_mem_bytes: shared_bytes_for_solve(c, self.head_dim) as u32,
+                grid_dim: (
+                    self.value_heads as u32,
+                    (self.head_dim as u32).div_ceil(SOLVE_VB),
+                    1,
+                ),
+                block_dim: (SOLVE_VB, 1, 1),
+                shared_mem_bytes: shared_bytes_for_solve(c) as u32,
             };
             let mut builder = stream.launch_builder(&self.solve);
             builder
-                .arg(&mut *state)
+                .arg(&mut scratch.uprime)
+                .arg(&mut scratch.lambda_last)
                 .arg(v)
                 .arg(log_decay)
                 .arg(beta)
@@ -899,13 +992,40 @@ impl GdnChunkedKernels {
                 .arg(&qk_heads)
                 .arg(&chunk_start)
                 .arg(&c_i32);
-            // SAFETY: one block per value head, head_dim threads per block, and
-            // shared memory sized for exactly the `c * head_dim` entries of U'
+            // SAFETY: one block per (value head, SOLVE_VB-wide band of value
+            // indices), SOLVE_VB threads per block, and shared memory sized
+            // for exactly the `c * SOLVE_VB` entries of U' this band holds
             // plus the `c` cumulative log-decays and the `c` decay ratios the
-            // kernel indexes. Every global index is bounded by the same
-            // reasoning as the two kernels above, and `c >= 1` inside the loop
-            // so `gcum[c - 1]` is in range.
+            // kernel indexes. `uprime` is `value_heads * chunk_len * head_dim`
+            // and `lambda_last` is `value_heads`. Every other global index is
+            // bounded by the same reasoning as the two kernels above, and
+            // `c >= 1` inside the loop so `gcum[c - 1]` is in range.
             unsafe { builder.launch(solve_cfg) }?;
+
+            let update_cfg = LaunchConfig {
+                grid_dim: (
+                    self.value_heads as u32,
+                    (self.head_dim as u32).div_ceil(STATE_VB),
+                    (self.head_dim as u32).div_ceil(STATE_JB),
+                ),
+                block_dim: (STATE_VB * STATE_JB, 1, 1),
+                shared_mem_bytes: (c * STATE_VB as usize * size_of::<f32>()) as u32,
+            };
+            let mut builder = stream.launch_builder(&self.state_update);
+            builder
+                .arg(&mut *state)
+                .arg(&scratch.uprime)
+                .arg(&scratch.k_norm)
+                .arg(&scratch.lambda_last)
+                .arg(&head_dim)
+                .arg(&qk_heads)
+                .arg(&chunk_start)
+                .arg(&c_i32);
+            // SAFETY: one thread per (value index, state column) pair, so the
+            // state index `(h * head_dim + vi) * head_dim + j` covers
+            // `value_heads * head_dim * head_dim` exactly once. Shared memory
+            // holds the `c * STATE_VB` slice of `uprime` this block reads.
+            unsafe { builder.launch(update_cfg) }?;
 
             start += c;
         }
@@ -920,8 +1040,8 @@ impl GdnChunkedKernels {
 /// whole reason the triangular system is solved by substitution rather than by
 /// materialising the `c x c` inverse, and the same reason the `c x c` decay
 /// mask llama.cpp builds as a tensor is rebuilt here one row at a time.
-fn shared_bytes_for_solve(c: usize, head_dim: usize) -> usize {
-    (c * head_dim + 2 * c) * size_of::<f32>()
+fn shared_bytes_for_solve(c: usize) -> usize {
+    (c * SOLVE_VB as usize + 2 * c) * size_of::<f32>()
 }
 
 #[cfg(test)]
@@ -962,9 +1082,9 @@ mod tests {
         // order, and both halves are needed: making the solve inclusive
         // double-counts token t's own key, and making the output exclusive is
         // the classic read-before-update bug.
-        assert!(GDN_CHUNKED_SRC.contains("for (int i = 0; i < t; ++i) {\n            acc -= beta_t * kk_row[i] * decay[i] * u[i * head_dim + vi];"));
+        assert!(GDN_CHUNKED_SRC.contains("for (int i = 0; i < t; ++i) {\n            acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];"));
         assert!(GDN_CHUNKED_SRC.contains(
-            "for (int i = 0; i <= t; ++i) {\n            o_intra += kq_row[i] * decay[i] * u[i * head_dim + vi];"
+            "for (int i = 0; i <= t; ++i) {\n            o_intra += kq_row[i] * decay[i] * u[i * VB + vl];"
         ));
     }
 
@@ -978,7 +1098,7 @@ mod tests {
         // reciprocal of a cumulative decay that reaches 2.5e-42 on this model,
         // and overflows fp32. See the module docs.
         let rescale = at("float acc = beta_t * (v_t - expf(gcum[t]) * sik[");
-        let subtract = at("acc -= beta_t * kk_row[i] * decay[i] * u[i * head_dim + vi];");
+        let subtract = at("acc -= beta_t * kk_row[i] * decay[i] * u[i * VB + vl];");
         assert!(
             rescale < subtract,
             "the interference sum is subtracted before the carried-in state is decayed",
@@ -1035,19 +1155,28 @@ mod tests {
             "float o_inter = expf(gcum[t]) * oint[((long long)h * c + t) * head_dim + vi];"
         ));
         assert!(GDN_CHUNKED_SRC.contains("out[ht * head_dim + vi] = o_inter + o_intra;"));
-        assert!(GDN_CHUNKED_SRC.contains("float lambda_last = expf(gcum[c - 1]);"));
-        assert!(GDN_CHUNKED_SRC.contains("row[j] = lambda_last * row[j] + acc;"));
+        // `lambda_last` is now published by the solve and consumed by
+        // `gdn_chunk_state_update`, which is a separate launch. Both halves are
+        // asserted: computing it and applying it are in different kernels, so
+        // an edit could plausibly drop either.
+        assert!(GDN_CHUNKED_SRC.contains("lambda_last[h] = expf(gcum[c - 1]);"));
+        assert!(GDN_CHUNKED_SRC.contains("*cell = lambda_last[h] * *cell + acc;"));
     }
 
     #[test]
     fn the_query_key_head_is_selected_by_modulo_not_division() {
-        // Both kernels that index a query/key head must tile, not block:
+        // Every kernel that indexes a query/key head must tile, not block:
         // llama.cpp's fused op is `fastmodulo(h_idx, n_k_heads)` and its
         // fallback broadcasts with `ggml_repeat_4d`. See `super::gdn`.
+        //
+        // Three, not two: `gdn_chunk_state_update` was split out of the solve
+        // and reads `k_norm` itself, so it makes the same choice and can get
+        // it wrong the same way.
         assert_eq!(
             GDN_CHUNKED_SRC.matches("int hq = h % qk_heads;").count(),
-            2,
-            "gdn_chunk_inter and gdn_chunk_solve_and_apply must both use modulo",
+            3,
+            "gdn_chunk_inter, gdn_chunk_solve_and_apply and \
+             gdn_chunk_state_update must all use modulo",
         );
         assert!(
             !GDN_CHUNKED_SRC.contains("heads_per_kv"),
@@ -1071,9 +1200,20 @@ mod tests {
         // the ungated delta rule with the intra-chunk key interference dropped,
         // which is a plausible-looking kernel that diverges from the recurrent
         // form only as keys within a chunk start to correlate.
-        let publish = at("u[t * head_dim + vi] = acc;");
-        let update = at("acc += u[i * head_dim + vi] * k_norm[ki];");
-        assert!(publish < update, "the state is updated before U is solved");
+        // The state update is a separate kernel now, so "before" is a data
+        // dependency rather than a source ordering: the solve publishes U'
+        // into `uprime` and `gdn_chunk_state_update` is the only reader.
+        let publish = at("u[t * VB + vl] = acc;");
+        let fold =
+            at("uprime[((long long)h * c + i) * head_dim + vi] = u[i * VB + vl] * decay[i];");
+        assert!(
+            publish < fold,
+            "U' is published to global before it is solved"
+        );
+        assert!(
+            GDN_CHUNKED_SRC.contains("acc += su[i * STATE_VB + vl] * kv;"),
+            "the state update must consume the solved U', not the raw residuals",
+        );
     }
 
     #[test]
@@ -1123,14 +1263,17 @@ mod tests {
 
     #[test]
     fn shared_memory_at_the_real_geometry_fits_a_turing_block() {
-        // head_dim 128, chunk_len 64: 32.5 KiB, comfortably inside the 48 KiB a
-        // block gets without the opt-in carve-out.
-        let needed = shared_bytes_for_solve(64, 128);
-        assert_eq!(needed, (64 * 128 + 2 * 64) * 4);
+        // chunk_len 64 over a SOLVE_VB-wide band: 8.5 KiB, well inside the
+        // 48 KiB a block gets without the opt-in carve-out. It was 32.5 KiB
+        // when a block owned a whole head.
+        let needed = shared_bytes_for_solve(64);
+        assert_eq!(needed, (64 * SOLVE_VB as usize + 2 * 64) * 4);
         assert!(needed < MAX_SHARED_BYTES, "{needed} bytes");
-        // Holding a 64x64 inverse as well would not fit, which is the shared
-        // memory half of the substitution argument.
-        assert!(needed + 64 * 64 * 4 > MAX_SHARED_BYTES);
+        // A 64x64 inverse *would* now fit beside it — 8.5 + 16 KiB — which is
+        // why the module docs no longer offer shared memory as a reason to
+        // prefer forward substitution. The arithmetic reason is untouched and
+        // is asserted separately by `no_inverse_is_materialised`.
+        assert!(needed + 64 * 64 * 4 < MAX_SHARED_BYTES);
     }
 
     #[test]
