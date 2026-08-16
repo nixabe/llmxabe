@@ -176,7 +176,7 @@ __global__ void mma_quantize_rows_q8(
 // loaded once and reused across every row tile -- the same reuse the fp32
 // projection needed, for the same reason.
 #define MMA_ROWS 64
-#define MMA_TOKS 64
+#define MMA_TOKS 32
 
 __global__ void mma_q8_0_proj(
     const unsigned char* __restrict__ weight,
@@ -296,6 +296,26 @@ __global__ void mma_repack_q8_0(
     if (lane == 0) scales[b] = load_half_le_mma(blk);
 }
 
+// Contraction the block stages per trip, and the padded row stride it stages
+// into.
+//
+// The inner loop used to read its B fragment straight from global on every
+// 32-element block: four warps sharing one row band meant four fetches of the
+// same bytes, and every one of them was a dependent global load in a kernel
+// that only fits eight warps to an SM. L1 caught most of the traffic and none
+// of the latency.
+//
+// Staged, each weight byte is fetched once per block and the mainloop reads
+// shared. `PROJ_WSTRIDE` is 144 rather than 128 because the fragment load is
+// `row = lane >> 2`, four consecutive bytes per lane: at a 128-byte stride
+// that is 32 words, every row lands on the same bank, and the access is an
+// eight-way conflict. 144 bytes is 36 words and `36 mod 32 == 4`, which tiles
+// the 32 banks exactly -- the same rule `kernels::moe` documents.
+#define PROJ_KC      128
+#define PROJ_WSTRIDE 144
+
+extern __shared__ signed char xabe_proj_shared[];
+
 __global__ void mma_q8_0_proj_split(
     const signed char* __restrict__ wq,
     const float* __restrict__ ws,
@@ -320,7 +340,11 @@ __global__ void mma_q8_0_proj_split(
     // passes over the weights become two.
     int t0   = (blockIdx.y * blockDim.y + threadIdx.y) * MMA_TOKS;
     int n0   = blockIdx.x * MMA_ROWS;
-    if (t0 >= n_tokens || n0 >= n_rows) return;
+    // No early return: the staging loop below is a block-wide barrier pair and
+    // a warp that left would deadlock the rest. `t0 >= n_tokens` is instead
+    // masked at the epilogue, and `n0 >= n_rows` cannot happen because the
+    // grid is `ceil(n_rows / MMA_ROWS)`.
+    if (n0 >= n_rows) return;
 
     int blocks = k_dim / 32;
     int quad = (lane & 3) * 4;
@@ -343,7 +367,39 @@ __global__ void mma_q8_0_proj_split(
 #pragma unroll
         for (int r = 0; r < ntile; ++r) { facc[t][r][0] = 0.0f; facc[t][r][1] = 0.0f; }
 
-    for (int b = 0; b < blocks; ++b) {
+    signed char* sw  = xabe_proj_shared;                            // [MMA_ROWS][PROJ_WSTRIDE]
+    float*       sws = (float*)(sw + MMA_ROWS * PROJ_WSTRIDE);      // [MMA_ROWS][PROJ_KC/32]
+    int tid      = threadIdx.y * 32 + lane;
+    int nthreads = blockDim.y * 32;
+
+    for (int kc = 0; kc < k_dim; kc += PROJ_KC) {
+        __syncthreads();
+        // Sixteen bytes a lane, so a row of the tile is eight instructions for
+        // the whole block rather than four per warp per 32-element block.
+        for (int idx = tid; idx < MMA_ROWS * (PROJ_KC / 16); idx += nthreads) {
+            int r = idx / (PROJ_KC / 16);
+            int c = (idx % (PROJ_KC / 16)) * 16;
+            int wr = n0 + r;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (wr < n_rows) {
+                v = *(const uint4*)(wq + (long long)wr * k_dim + kc + c);
+            }
+            *(uint4*)(sw + r * PROJ_WSTRIDE + c) = v;
+        }
+        for (int idx = tid; idx < MMA_ROWS * (PROJ_KC / 32); idx += nthreads) {
+            int r = idx / (PROJ_KC / 32);
+            int bb = idx % (PROJ_KC / 32);
+            int wr = n0 + r;
+            // A row past `n_rows` stages a zero scale, which is enough to make
+            // every product it feeds exactly zero without zeroing its quants.
+            sws[r * (PROJ_KC / 32) + bb] =
+                wr < n_rows ? ws[(long long)wr * blocks + (kc >> 5) + bb] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+    for (int bb = 0; bb < PROJ_KC / 32; ++bb) {
+        int b = (kc >> 5) + bb;
         // One A fragment pair and one scale per token tile.
         unsigned int a0[ttile], a1[ttile];
         float dx[ttile];
@@ -362,17 +418,12 @@ __global__ void mma_q8_0_proj_split(
 
 #pragma unroll
         for (int r = 0; r < ntile; ++r) {
-            int nb = n0 + r * 8;
-            int wr = nb + brow;
-            unsigned int b0 = 0, b1 = 0;
-            if (wr < n_rows) {
-                const signed char* wp = wq + (long long)wr * k_dim + b * 32 + quad;
-                b0 = *(const unsigned int*)(wp);
-                b1 = *(const unsigned int*)(wp + 16);
-            }
-            int r0 = nb + dcol, r1 = r0 + 1;
-            float dw0 = (r0 < n_rows) ? ws[(long long)r0 * blocks + b] : 0.0f;
-            float dw1 = (r1 < n_rows) ? ws[(long long)r1 * blocks + b] : 0.0f;
+            const signed char* wp =
+                sw + (r * 8 + brow) * PROJ_WSTRIDE + bb * 32 + quad;
+            unsigned int b0 = *(const unsigned int*)(wp);
+            unsigned int b1 = *(const unsigned int*)(wp + 16);
+            float dw0 = sws[(r * 8 + dcol) * (PROJ_KC / 32) + bb];
+            float dw1 = sws[(r * 8 + dcol + 1) * (PROJ_KC / 32) + bb];
 
             // The B fragment is loaded once and consumed by every token tile.
 #pragma unroll
@@ -390,6 +441,7 @@ __global__ void mma_q8_0_proj_split(
                 facc[t][r][1] += (float)acc1 * dx[t] * dw1;
             }
         }
+    }
     }
 
 #pragma unroll
@@ -531,21 +583,13 @@ pub const MMA_TOKENS: usize = MMA_M;
 /// weight traffic — and the register pressure, which is
 /// `(MMA_SPLIT_TOKS / 8) * (MMA_ROWS / 8) * 2` accumulators per thread.
 ///
-/// # A tuning result that reversed under measurement
+/// # A tuning result that reversed twice
 ///
-/// 64 x 64 is 128 accumulators, which is more than ptxas can hold, and the
-/// kernel measures **13.6% of the card's 198 TOP/s int8 peak** on its own. A
-/// sweep of `bench_mma` says to shrink it. Milliseconds, isolated:
-///
-/// | tokens x rows x k | 64 x 64 | 16 x 128 |
-/// |---|---:|---:|
-/// | 128 x 8192 x 2048   |  0.209 | **0.132** |
-/// | 512 x 8192 x 2048   |  0.637 | **0.349** |
-/// | 512 x 2048 x 4096   |  0.316 | **0.190** |
-/// | 512 x 248320 x 2048 | 49.636 | **46.068** |
-///
-/// **Faster on every shape, and 8% slower in the engine** — 1,228 tok/s at
-/// n = 512 against 64 x 64's 1,341. Every alternative measured end to end lost:
+/// This constant was 64 for most of the project's life, and the reason was
+/// weight traffic. The token tile divides the grid — `grid.y` is `tokens /
+/// MMA_SPLIT_TOKS` and **every block in `y` re-reads the whole weight band** —
+/// so a narrow tile multiplied the DRAM traffic. A full sweep at the time,
+/// end to end, put 64 ahead of everything:
 ///
 /// | tile | n = 128 | n = 512 |
 /// |---|---:|---:|
@@ -556,17 +600,58 @@ pub const MMA_TOKENS: usize = MMA_M;
 /// | 32 x 128 | 684.86 | 1211.75 |
 /// | 16 x 64  | 915.18 | 1164.79 |
 ///
-/// The reason is that the token tile also divides the grid: `grid.y` is
-/// `tokens / MMA_SPLIT_TOKS`, and **every block in `y` re-reads the whole
-/// weight band**. Sixteen tokens per tile is four times the weight traffic of
-/// sixty-four. In `bench_mma` that traffic is free, because the weight is the
-/// only thing in L2; in a forward pass it competes with 32 GiB of everything
-/// else, and the extra reads cost more than the register pressure did.
+/// and a later sweep under the shared-row-band mapping agreed: `8 x 32 x 64`
+/// measured 1,369 against `4 x 64 x 64`'s 1,435.
 ///
-/// Recorded because the isolated benchmark is not merely a weaker signal here,
-/// it points the wrong way. A microbenchmark of a kernel that re-reads a
-/// weight measures cache residency it will not have in situ.
-pub const MMA_SPLIT_TOKS: usize = 64;
+/// **Staging the weight tile in shared memory reversed it.** Once each block
+/// fetches the band once, with `uint4` loads, instead of once per warp with
+/// scattered four-byte reads, the traffic argument for a wide token tile is
+/// gone — and what is left is the register pressure the wide tile was buying
+/// its way out of: `(MMA_SPLIT_TOKS / 8) * (MMA_ROWS / 8) * 2` accumulators
+/// per thread, 128 of them at 64 x 64, which pins ptxas at 255 registers and
+/// eight warps to an SM. Halving it to 64 roughly doubles the resident warps.
+///
+/// Re-swept end to end with the staged tile, tok/s at n = 512:
+///
+/// | warps x tokens x rows | tok/s |
+/// | --- | ---: |
+/// | **4 x 32 x 64** | **2,255.68** |
+/// | 2 x 32 x 64 | 2,239.56 |
+/// | 4 x 16 x 64 | 2,212.23 |
+/// | 8 x 16 x 64 | 2,152.69 |
+/// | 4 x 64 x 64 | 2,142.98 |
+/// | 4 x 32 x 32 | 2,123.91 |
+/// | 4 x 32 x 128 | 2,085.36 |
+/// | 8 x 64 x 64 | 2,077.50 |
+///
+/// The kernel went 53.0 -> 38.4 ms per 512-token pass across the two changes
+/// together, and neither is worth much without the other: staging alone was
+/// 2.0 ms, and the narrow tile alone had already been measured as a loss,
+/// twice.
+///
+/// Recorded at length because the isolated `bench_mma` benchmark points the
+/// wrong way here — a microbenchmark of a kernel that re-reads a weight
+/// measures cache residency it will not have in situ — and because a tuning
+/// result is only valid against the kernel structure it was measured on.
+pub const MMA_SPLIT_TOKS: usize = 32;
+
+/// Contraction the split projection stages per trip. Mirrors `PROJ_KC`.
+pub const PROJ_KC: usize = 128;
+
+/// Padded row stride of the staged weight tile, in bytes. Mirrors
+/// `PROJ_WSTRIDE`.
+///
+/// 144 and not `PROJ_KC`: the fragment load is `row = lane >> 2` with four
+/// consecutive bytes per lane, so at a 128-byte stride all eight rows of a
+/// fragment land on the same bank and the read is an eight-way conflict. 144
+/// bytes is 36 words and `36 mod 32 == 4`, which tiles the banks exactly.
+const PROJ_WSTRIDE: usize = 144;
+
+/// Shared bytes one split-projection block needs: the staged weight tile plus
+/// its per-32 scales.
+const fn proj_shared_bytes() -> u32 {
+    (MMA_ROWS * PROJ_WSTRIDE + MMA_ROWS * (PROJ_KC / 32) * size_of::<f32>()) as u32
+}
 
 /// Batch width at or above which the engine's blocks route their projections
 /// through the integer tensor cores.
@@ -675,7 +760,7 @@ impl MmaKernels {
             return Ok(());
         }
 
-        const WARPS: u32 = 8;
+        const WARPS: u32 = 4;
         let cfg = LaunchConfig {
             grid_dim: (blocks.div_ceil(WARPS as usize) as u32, 1, 1),
             block_dim: (32, WARPS, 1),
@@ -710,7 +795,9 @@ impl MmaKernels {
         n_rows: usize,
         tokens: usize,
     ) -> Result<(), MmaError> {
-        if !k.is_multiple_of(32) {
+        // The staged weight tile is `PROJ_KC` wide, so the contraction has to
+        // be a whole number of chunks and not merely of MMA steps.
+        if !k.is_multiple_of(PROJ_KC) {
             return Err(MmaError::RaggedContraction { k });
         }
         expect_len("split wq", wq.len(), n_rows * k)?;
@@ -730,7 +817,7 @@ impl MmaKernels {
                 1,
             ),
             block_dim: (32, WARPS, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: proj_shared_bytes(),
         };
         let (k_i, n_i, t_i) = (k as i32, n_rows as i32, tokens as i32);
         let mut builder = stream.launch_builder(&self.proj_split);
