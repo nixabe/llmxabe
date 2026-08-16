@@ -2394,3 +2394,32 @@ block and hundreds across the card. Widening `MOE_MMA_KC` from 128 to 256 would
 double each row's contiguous run from 112 bytes to a full 224-byte superblock
 at the cost of a wider staged tile; that is the next thing to try, and it is a
 real change to the fragment and scale indexing rather than a hint.
+
+## Head to head after the scan: 1.136x (2026-08-16)
+
+Three alternating rounds of `bench_forward` n=512 (4 reps) and
+`llama-bench -p 512 -n 0 -r 3 -ngl 99`, back to back on the same card in the
+same session, same GGUF:
+
+| round | llmxabe | llama.cpp |
+| --- | ---: | ---: |
+| 1 | 2,334.93 ± 20.64 | 1,998.44 ± 107.77 |
+| 2 | 2,332.04 ± 12.37 | 2,088.79 ± 60.51 |
+| 3 | 2,328.40 ± 10.04 | 2,069.22 ± 51.24 |
+| **mean tok/s** | **2,331.8** | **2,052.2** |
+
+**1.136x**, winning every round. The previous measurement of this pair, taken
+the same way earlier in the session, was **1.011x** on 2,099.3 against 2,076.2
+— "a small repeatable win, not a headline". Deleting the chunking for prefill
+is what moved it, and the two MoE `__launch_bounds__` added the last half
+percent.
+
+The caveat that applied at 1.011x still applies to the *method* and no longer
+to the *conclusion*: llama.cpp's own `pp512` spreads ±50–108 tok/s run to run
+here, and this card drifts about 1.3%. A 13.6% margin is several times both,
+and the arms were alternated within minutes so the drift applies to each
+equally. llmxabe's own spread is ±10–21, tighter than llama.cpp's by a factor
+of three to five.
+
+Decode is unchanged at **104.24 tok/s**, above the 100 tok/s floor the goal
+sets for it. Prefill was the half of the goal that was behind; it no longer is.
