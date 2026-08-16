@@ -211,6 +211,13 @@ const KEYS_PER_WARP: usize = 4;
 /// `QUERY_TILE` rows is `head_dim` threads exactly.
 const QUERY_TILE: usize = 8;
 
+/// Tokens one rotary block carries. Mirrors `ROPE_TT`.
+///
+/// The rotary frequency depends on the head dimension and nothing else, so a
+/// block per token recomputed a double-precision `pow` for every (token, head,
+/// dimension) triple to get one of 32 distinct values. A band hoists it out.
+const ROPE_TOKENS: u32 = 16;
+
 /// Head dimensions one lane reduces over, at most. Mirrors `ATTN_MAXD`.
 ///
 /// The query tile lives in registers as `qr[ATTN_QT][ATTN_MAXD]`, and an array
@@ -267,6 +274,20 @@ __global__ void attn_split_query_gate(
 // which raises theta_base to a f64 power. Doing it in float diverges visibly
 // at the positions this model actually reaches: at position 262,143 a float
 // angle loses about 5 significant digits.
+// Tokens one rotary block carries.
+//
+// The frequency `theta_base ^ (-2 d / rope_dim)` depends on the head dimension
+// and nothing else, yet a block per token made it a **double-precision `pow`
+// per (token, head, dimension) triple** -- 262,144 of them per pass for the
+// query stream alone, for 32 distinct values. Turing runs fp64 at a
+// thirty-second of fp32, and `pow` is a libdevice call on top of that.
+//
+// A band of tokens computes it once and reuses it, which is bit-identical:
+// the same `pow` of the same arguments, hoisted out of a loop. The angle and
+// its sine and cosine still have to be per token, and still have to be double
+// -- see below.
+#define ROPE_TT 16
+
 __global__ void attn_rope_partial_neox(
     const float* __restrict__ in,
     float* __restrict__ out,
@@ -274,32 +295,45 @@ __global__ void attn_rope_partial_neox(
     int head_dim,
     int rope_dim,
     const int* __restrict__ pos_offset,
-    float theta_base
+    float theta_base,
+    int n_tokens
 ) {
-    long long t = blockIdx.x;
+    long long t0 = (long long)blockIdx.x * ROPE_TT;
     int h = blockIdx.y;
     int d = threadIdx.x;
-    long long base = (t * (long long)n_heads + h) * (long long)head_dim;
 
     int half = rope_dim >> 1;
 
     if (d >= rope_dim) {
-        out[base + d] = in[base + d];
+        for (int u = 0; u < ROPE_TT; ++u) {
+            long long t = t0 + u;
+            if (t >= n_tokens) break;
+            long long base = (t * (long long)n_heads + h) * (long long)head_dim;
+            out[base + d] = in[base + d];
+        }
         return;
     }
     // Dimensions [half, rope_dim) are written by their partner thread d-half.
     if (d >= half) return;
 
-    double pos = (double)(*pos_offset) + (double)t;
+    // Hoisted: the one quantity in here that does not depend on the token.
     double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
-    double angle = pos * freq;
-    float sin_a = (float)sin(angle);
-    float cos_a = (float)cos(angle);
 
-    float x0 = in[base + d];
-    float x1 = in[base + d + half];
-    out[base + d]        = x0 * cos_a - x1 * sin_a;
-    out[base + d + half] = x0 * sin_a + x1 * cos_a;
+    for (int u = 0; u < ROPE_TT; ++u) {
+        long long t = t0 + u;
+        if (t >= n_tokens) break;
+        long long base = (t * (long long)n_heads + h) * (long long)head_dim;
+
+        double pos = (double)(*pos_offset) + (double)t;
+        double angle = pos * freq;
+        float sin_a = (float)sin(angle);
+        float cos_a = (float)cos(angle);
+
+        float x0 = in[base + d];
+        float x1 = in[base + d + half];
+        out[base + d]        = x0 * cos_a - x1 * sin_a;
+        out[base + d + half] = x0 * sin_a + x1 * cos_a;
+    }
 }
 
 // Causal GQA attention, online-softmax streaming form.
@@ -948,13 +982,14 @@ impl AttentionKernels {
         Self::expect_len("rope output", out.len(), n)?;
 
         let cfg = LaunchConfig {
-            grid_dim: (n_tokens as u32, n_heads as u32, 1),
+            grid_dim: ((n_tokens as u32).div_ceil(ROPE_TOKENS), n_heads as u32, 1),
             block_dim: (self.head_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         let n_heads_i = n_heads as i32;
         let head_dim = self.head_dim as i32;
         let rope_dim_i = rope_dim as i32;
+        let n_tokens_i = n_tokens as i32;
         let mut builder = stream.launch_builder(&self.rope);
         builder
             .arg(input)
@@ -963,10 +998,13 @@ impl AttentionKernels {
             .arg(&head_dim)
             .arg(&rope_dim_i)
             .arg(positions)
-            .arg(&theta_base);
-        // SAFETY: the grid is (n_tokens, n_heads) with one thread per head
-        // dimension; both buffers were checked to hold exactly that many
-        // floats, and every thread touches only its own head's slice.
+            .arg(&theta_base)
+            .arg(&n_tokens_i);
+        // SAFETY: the grid is (ceil(n_tokens / ROPE_TOKENS), n_heads) with one
+        // thread per head dimension, and `n_tokens` is passed so the band
+        // stops at the last real token; both buffers were checked to hold
+        // exactly that many floats, and every thread touches only its own
+        // head's slice.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
@@ -1195,8 +1233,14 @@ mod tests {
         // multiplying by a cos of angle zero — is not, and would fail the
         // exact-equality gate the differential test puts on the tail.
         assert!(
-            ATTENTION_SRC.contains("if (d >= rope_dim) {\n        out[base + d] = in[base + d];"),
+            ATTENTION_SRC.contains("out[base + d] = in[base + d];"),
             "the untouched rotary tail is no longer a plain copy",
+        );
+        // And it is still selected by the same bound, now inside the token
+        // band rather than outside it.
+        assert!(
+            ATTENTION_SRC.contains("if (d >= rope_dim) {"),
+            "the rotary tail is no longer selected by rope_dim",
         );
     }
 
