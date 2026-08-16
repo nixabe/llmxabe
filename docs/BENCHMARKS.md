@@ -2619,3 +2619,87 @@ residual stream rather than concentrated anywhere, so the next step is not
 another sharing fix — it is chunked prefill, which bounds activation memory by
 the chunk instead of the sequence and fixes the throughput curve at the same
 time.
+
+## Why the tok/s curve decays and llama.cpp's does not (2026-08-17)
+
+llama.cpp holds 3,686 -> 3,151 -> 2,738 tok/s from 32K to 96K on three GPUs,
+and 1,730 -> 1,410 -> 1,235 on one. llmxabe went 2,647 at 2,048 tokens to 799
+at 24,576. Two separate causes, and only the first was the obvious one.
+
+### Chunked prefill was missing, and it was not the main problem
+
+llama.cpp processes a prompt in `-ub`-sized micro-batches against a KV cache.
+llmxabe built one pass as wide as the prompt, so activation memory scaled with
+the prompt and the whole sequence's attention happened in a single shot.
+
+The engine already supported the alternative: `Forward::run` runs `self.tokens`
+positions at `state.position()` and advances the state, which is exactly what a
+decode step is at one token. Only `bench_forward` was missing it. Behind
+`LLMXABE_BENCH_CHUNK` a prompt is now prefilled as fixed-shape passes over one
+carried state, and peak VRAM at 8,192 tokens drops from 37.19 GiB to 33.13.
+
+It did **not** fix the throughput curve, and the per-chunk timings say why:
+
+| prompt | chunks | ms/prompt | ms/chunk | tok/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 214.9 | 214.9 | 2,382 |
+| 2,048 | 4 | 976.0 | 244.0 | 2,098 |
+| 8,192 | 16 | 6,004.4 | 375.3 | 1,364 |
+
+A fixed-shape 512-token pass gets **slower as the context behind it grows** —
+215 to 375 ms. Chunking bounds the memory; it does not bound that.
+
+### Attention is 43% of an 8K prefill, and reads K/V eight times over
+
+`nsys` over the chunked 8,192-token run, 10 attention layers of 40:
+
+| kernel | share | total ms | avg ms | min -> max |
+| --- | ---: | ---: | ---: | --- |
+| **`attn_flash_causal`** | **42.8%** | 5,027 | 15.7 | 0.85 -> 31.65 |
+| `moe_expert_ffn_mma` | 17.3% | 2,027 | 1.62 | — |
+| `mma_q8_0_proj_split` | 10.7% | 1,256 | 0.16 | — |
+| `moe_expert_down_mma` | 10.2% | 1,202 | 0.94 | — |
+| `gdn_scan_prefill` | 7.9% | 928 | 0.97 | — |
+
+The min-to-max spread is the whole story: the first chunk's attention is
+0.85 ms and the sixteenth's is 31.65 ms, linear in the context behind it, while
+every other kernel is flat.
+
+At the last chunk that launch moves **16.4 GB of K/V in 31.65 ms — 77% of the
+card's 672 GB/s.** It is bandwidth-bound, and the bandwidth is being spent
+eight times over. The grid is `(n_query / ATTN_QT, q_heads)`: one block per
+(query tile, **query** head), and each block streams the whole causal K and V
+range for itself. This model has **16 query heads against 2 KV heads**, so the
+eight query heads that share a KV head each read the same keys and values
+independently.
+
+The arithmetic, at the last chunk of an 8K prefill: 1,024 blocks each reading
+8,192 keys x 1 KiB of K and the same of V is 16.4 GB, against the 2.05 GB the
+same work needs if a block serves all eight query heads of one KV head. The
+measured 31.65 ms against a 24.4 ms roofline for 16.4 GB confirms which of the
+two the kernel is actually paying.
+
+### Widening the query tile is not the fix — measured
+
+The obvious lever is to amortize over more query rows per block: `ATTN_QT` 8 to
+16 with `ATTN_KT` 4 to 2, keeping their product pinned at 32. That halves the
+block count and so halves K/V traffic.
+
+It is **slower**: 6,004 -> 6,647 ms on an 8K chunked prefill, and 214.9 -> 217.1
+at 512. `qr[ATTN_QT][ATTN_MAXD]` goes from 64 to 128 registers per lane, which
+takes the kernel from two resident blocks per SM to one, and half the latency
+hiding costs more than half the traffic saves. Reverted.
+
+The register wall is the reason: amortization times `head_dim/32` is the
+register count, so 64 registers buys 8-way amortization and 64-way needs 512.
+The way past it is not a wider tile but **sharing the K/V tile through shared
+memory across the eight query heads of one KV head** — grid `(n_query/QT,
+kv_heads)`, K and V staged once per key tile, the head loop inside. That trades
+8x the DRAM traffic for 8x the shared traffic, and shared is roughly 19x the
+aggregate bandwidth on this part. Estimated 31.65 ms -> 4 ms at the same tile
+shape, which would take an 8K prefill from 6.0 s to about 4.0 s and a 32K one
+from an extrapolated 49 s to 22 s.
+
+That is the single largest remaining item in the engine and it is a kernel
+rewrite, not a constant change. It is specified here rather than attempted
+half-way.
