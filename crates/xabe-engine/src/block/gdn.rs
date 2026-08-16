@@ -2291,7 +2291,7 @@ impl GdnBlock {
             )?;
             Ok(Mixer::Recurrent)
         } else {
-            self.chunked.prefill(
+            self.chunked.scan(
                 stream,
                 &mut self.chunked_scratch,
                 &mut state.recurrent,

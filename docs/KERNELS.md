@@ -5,7 +5,8 @@
 | Kernel | Layers | Risk | Plan | Status |
 | --- | --- | --- | --- | --- |
 | Gated DeltaNet, recurrent (decode) | 30 | **critical** | Delta rule, one token at a time | **sm_75 kernel, max_abs 2.98e-8 vs reference** |
-| Gated DeltaNet, chunked (prefill) | 30 | **critical** | Forward substitution per chunk, not explicit inverses | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
+| Gated DeltaNet, scan (prefill) | 30 | **critical** | Sequential scan, state in registers, no shared memory — what a forward pass runs | **sm_75 kernel, max_abs 1e-7 vs both host forms; +4.5% prefill** |
+| Gated DeltaNet, chunked (reference) | 30 | **critical** | Forward substitution per chunk, not explicit inverses; retained and tested, not on the forward path | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
 | GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
 | MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference; tiled, 9.3× at 512 tokens** |
 | Flash attention (GQA 16:2, head 256) | 10 | medium | Online softmax, `BM = 1`, scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window** |

@@ -196,6 +196,16 @@ const SOLVE_VB: u32 = 32;
 /// substitution is sequential in `t` and runs on the first row of them, and
 /// the per-token output is not, so it runs on all of them.
 const SOLVE_TT: u32 = 8;
+/// Warps in a scan block, each owning one value index. Mirrors `SCAN_WARPS`.
+const SCAN_WARPS: u32 = 4;
+
+/// Head dimensions one scan lane carries, at most. Mirrors `SCAN_MAXR`.
+///
+/// The state is a register array indexed by constants after unrolling, so the
+/// bound is compile-time and head dimensions above `32 * SCAN_MAXR` are
+/// rejected rather than silently spilled to local memory.
+const SCAN_MAXR: usize = 4;
+
 /// Value indices one state-update block owns. Mirrors `STATE_VB`.
 const STATE_VB: u32 = STATE_VLANES * STATE_VT;
 /// State columns one state-update block owns. Mirrors `STATE_JB`.
@@ -280,6 +290,128 @@ __global__ void gdn_chunk_normalize_qk(
     q_out[base + j] = qv * (1.0f / fmaxf(sqrtf(q_sq), eps)) * scale;
     k_out[base + j] = kv * (1.0f / fmaxf(sqrtf(k_sq), eps));
 }
+
+// The whole sequence as a sequential scan, with the state in registers.
+//
+// This is the prefill path. The chunked kernels below it are the reference
+// implementation and stay gated by their own differential tests, but they are
+// not what a forward pass runs, and the reason is arithmetic rather than
+// engineering.
+//
+// At head_dim 128 and chunk 64 the chunked form does about 42.3 M multiply-adds
+// per head per 512 tokens against the scan's `4 * D^2` per token, which is
+// 33.5 M -- **26% more work**. Chunking is not a FLOP reduction here; it is a
+// reshaping that turns the recurrence into matmuls, and it pays only when the
+// matmul shape buys tensor cores. Turing has no fp32 tensor cores, so on this
+// card in fp32 the chunked form is pure overhead. llama.cpp reached the same
+// conclusion: its CUDA gated-delta op is a scan, and the chunked form survives
+// only as the slower ggml-graph fallback.
+//
+// grid: (value_heads, head_dim / SCAN_WARPS). block: (32, SCAN_WARPS).
+//
+// **One warp owns one (value head, value index) pair for the whole sequence.**
+// Lane `l` holds `S[vi][l], S[vi][l + 32], ...` -- `head_dim / 32` floats, four
+// at this geometry -- and never writes them out until the last token. The
+// contraction of both `S k` and `S q` is over `j`, which is exactly the axis
+// the lanes span, so both reductions are warp shuffles: no shared memory, no
+// `__syncthreads`, and no global round trip for the state at any point in the
+// sequence. The chunked path wrote and re-read the whole state eight times per
+// layer to achieve the same thing.
+//
+// Every warp of a head re-reads the same `q` and `k` rows, which is a 128-fold
+// read amplification and is deliberate: the per-token working set is a few
+// tens of KiB across all heads and never leaves L1, and sharing it through
+// shared memory would reintroduce the barriers this shape exists to avoid.
+#define SCAN_WARPS 4
+// Head dimensions one lane carries. `head_dim / 32`, bounded so the state is a
+// register array indexed by constants after unrolling -- a runtime bound
+// spills it to local memory and the whole design with it.
+#define SCAN_MAXR 4
+
+__global__ void gdn_scan_prefill(
+    float* __restrict__ state,
+    const float* __restrict__ q_norm,
+    const float* __restrict__ k_norm,
+    const float* __restrict__ v,
+    const float* __restrict__ log_decay,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int head_dim,
+    int value_heads,
+    int qk_heads,
+    int seq_len
+) {
+    int h  = blockIdx.x;
+    int vi = blockIdx.y * SCAN_WARPS + threadIdx.y;
+    if (vi >= head_dim) return;
+    int lane = threadIdx.x;
+    int nr = head_dim >> 5;
+
+    // Modulo, not division. See `super::gdn`'s module docs.
+    int hq = h % qk_heads;
+
+    float sreg[SCAN_MAXR];
+    long long sbase = ((long long)h * head_dim + vi) * head_dim;
+    #pragma unroll
+    for (int r = 0; r < SCAN_MAXR; ++r) {
+        sreg[r] = (r < nr) ? state[sbase + r * 32 + lane] : 0.0f;
+    }
+
+    for (int t = 0; t < seq_len; ++t) {
+        long long ht = (long long)t * value_heads + h;
+        long long qk = ((long long)t * qk_heads + hq) * head_dim;
+
+        float kj[SCAN_MAXR], qj[SCAN_MAXR];
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            if (r < nr) {
+                kj[r] = k_norm[qk + r * 32 + lane];
+                qj[r] = q_norm[qk + r * 32 + lane];
+            } else {
+                kj[r] = 0.0f;
+                qj[r] = 0.0f;
+            }
+        }
+
+        // `expf`, not `__expf`: the decay multiplies the whole state every
+        // token, so a systematic bias compounds over the context rather than
+        // averaging out. Same choice, and same reasoning, as the decode step.
+        float decay = expf(log_decay[ht]);
+
+        // 1. Decay, held in registers rather than written and re-read.
+        // 2. Delta correction against the *decayed* state.
+        float predicted = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            sreg[r] *= decay;
+            predicted += sreg[r] * kj[r];
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            predicted += __shfl_xor_sync(0xffffffff, predicted, off);
+        }
+        float vcorr = beta[ht] * (v[ht * head_dim + vi] - predicted);
+
+        // 3. Outer-product update, and 4. the output from the *updated* state,
+        //    in one pass: the freshly written state is consumed for the output
+        //    while it is still in the register.
+        float o = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            sreg[r] += vcorr * kj[r];
+            o += sreg[r] * qj[r];
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            o += __shfl_xor_sync(0xffffffff, o, off);
+        }
+        if (lane == 0) out[ht * head_dim + vi] = o;
+    }
+
+    #pragma unroll
+    for (int r = 0; r < SCAN_MAXR; ++r) {
+        if (r < nr) state[sbase + r * 32 + lane] = sreg[r];
+    }
+}
+
 
 // The two intra-chunk Gram matrices, per query/key head:
 //
@@ -914,6 +1046,7 @@ pub struct GdnChunkedKernels {
     inter: CudaFunction,
     solve: CudaFunction,
     state_update: CudaFunction,
+    scan: CudaFunction,
     head_dim: usize,
     value_heads: usize,
     qk_heads: usize,
@@ -964,6 +1097,7 @@ impl GdnChunkedKernels {
             inter: module.load_function("gdn_chunk_inter")?,
             solve: module.load_function("gdn_chunk_solve_and_apply")?,
             state_update: module.load_function("gdn_chunk_state_update")?,
+            scan: module.load_function("gdn_scan_prefill")?,
             head_dim,
             value_heads,
             qk_heads,
@@ -1017,7 +1151,129 @@ impl GdnChunkedKernels {
         })
     }
 
+    /// L2-normalize the whole sequence's queries and keys into the scratch.
+    ///
+    /// Shared by [`Self::prefill`] and [`Self::scan`]; the query is also
+    /// pre-scaled by `1/sqrt(head_dim)` here, which is why neither mixer
+    /// applies an output scale of its own.
+    fn normalize_sequence(
+        &self,
+        stream: &Arc<CudaStream>,
+        scratch: &mut GdnChunkedScratch,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        seq_len: usize,
+    ) -> Result<(), GdnChunkedError> {
+        // One float per warp, which is all `block_reduce_sum` stores.
+        let reduce_shared = (self.head_dim.div_ceil(32) * size_of::<f32>()) as u32;
+        let norm_cfg = LaunchConfig {
+            grid_dim: ((seq_len * self.qk_heads) as u32, 1, 1),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: reduce_shared,
+        };
+        let head_dim = self.head_dim as i32;
+        let eps = L2_EPS;
+        let scale = self.output_scale();
+        let mut builder = stream.launch_builder(&self.normalize);
+        builder
+            .arg(q)
+            .arg(k)
+            .arg(&mut scratch.q_norm)
+            .arg(&mut scratch.k_norm)
+            .arg(&head_dim)
+            .arg(&eps)
+            .arg(&scale);
+        // SAFETY: one block per (token, qk head) pair and one thread per head
+        // element, over inputs and outputs of `seq_len * qk_heads * head_dim`.
+        // Shared memory covers one float per warp, all the reduction writes.
+        unsafe { builder.launch(norm_cfg) }?;
+        Ok(())
+    }
+
+    /// The whole sequence as a sequential scan, with the state in registers.
+    ///
+    /// This is what a forward pass runs. [`Self::prefill`] is the chunked
+    /// reference implementation and keeps its own differential tests, but at
+    /// this head dimension the chunked form does about 26% more arithmetic
+    /// than the scan and only pays when its matmul shape buys tensor cores,
+    /// which fp32 on `sm_75` does not have. See `gdn_scan_prefill`.
+    ///
+    /// The normalization pass is shared with the chunked path and runs first,
+    /// unchanged: the scan consumes `q_norm` and `k_norm`, not `q` and `k`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan(
+        &self,
+        stream: &Arc<CudaStream>,
+        scratch: &mut GdnChunkedScratch,
+        state: &mut CudaSlice<f32>,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        log_decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        seq_len: usize,
+    ) -> Result<(), GdnChunkedError> {
+        if seq_len > scratch.max_seq_len {
+            return Err(GdnChunkedError::SequenceTooLong {
+                seq_len,
+                capacity: scratch.max_seq_len,
+            });
+        }
+        if seq_len == 0 {
+            return Ok(());
+        }
+        if self.head_dim > 32 * SCAN_MAXR {
+            return Err(GdnChunkedError::UnsupportedHeadDim {
+                head_dim: self.head_dim,
+            });
+        }
+
+        let head_dim = self.head_dim as i32;
+        let value_heads = self.value_heads as i32;
+        let qk_heads = self.qk_heads as i32;
+
+        self.normalize_sequence(stream, scratch, q, k, seq_len)?;
+
+        let cfg = LaunchConfig {
+            grid_dim: (
+                self.value_heads as u32,
+                (self.head_dim as u32).div_ceil(SCAN_WARPS),
+                1,
+            ),
+            block_dim: (32, SCAN_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_i32 = seq_len as i32;
+        let mut builder = stream.launch_builder(&self.scan);
+        builder
+            .arg(&mut *state)
+            .arg(&scratch.q_norm)
+            .arg(&scratch.k_norm)
+            .arg(v)
+            .arg(log_decay)
+            .arg(beta)
+            .arg(&mut *out)
+            .arg(&head_dim)
+            .arg(&value_heads)
+            .arg(&qk_heads)
+            .arg(&seq_i32);
+        // SAFETY: one warp per (value head, value index), both covered by the
+        // grid and the `vi >= head_dim` guard. The state index
+        // `(h * head_dim + vi) * head_dim + r * 32 + lane` stays inside
+        // `value_heads * head_dim * head_dim`; the token indices stay below
+        // `seq_len`, which was checked against the scratch capacity and which
+        // bounds every `q_norm`, `k_norm`, `v`, `log_decay`, `beta` and `out`
+        // access. No shared memory is requested and none is indexed.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
     /// Run the chunked form over `seq_len` tokens, advancing `state`.
+    ///
+    /// This is the chunked-parallel reference. [`Self::scan`] is what a
+    /// forward pass runs; both are held to the same differential gate against
+    /// the same two host forms, because neither is a reference for the other.
     ///
     /// `q` and `k` are `[seq_len][qk_heads][head_dim]` raw — not normalized,
     /// not scaled; this does both. `v` is `[seq_len][value_heads][head_dim]`,
@@ -1060,29 +1316,7 @@ impl GdnChunkedKernels {
         let value_heads = self.value_heads as i32;
         let qk_heads = self.qk_heads as i32;
 
-        // --- normalize the whole sequence once ---------------------------
-        // One float per warp, which is all `block_reduce_sum` stores.
-        let reduce_shared = (self.head_dim.div_ceil(32) * size_of::<f32>()) as u32;
-        let norm_cfg = LaunchConfig {
-            grid_dim: ((seq_len * self.qk_heads) as u32, 1, 1),
-            block_dim: (self.head_dim as u32, 1, 1),
-            shared_mem_bytes: reduce_shared,
-        };
-        let eps = L2_EPS;
-        let scale = self.output_scale();
-        let mut builder = stream.launch_builder(&self.normalize);
-        builder
-            .arg(q)
-            .arg(k)
-            .arg(&mut scratch.q_norm)
-            .arg(&mut scratch.k_norm)
-            .arg(&head_dim)
-            .arg(&eps)
-            .arg(&scale);
-        // SAFETY: one block per (token, qk head) pair and one thread per head
-        // element, over inputs and outputs of `seq_len * qk_heads * head_dim`.
-        // Shared memory covers one float per warp, all the reduction writes.
-        unsafe { builder.launch(norm_cfg) }?;
+        self.normalize_sequence(stream, scratch, q, k, seq_len)?;
 
         // --- chunks, in order: they are dependent through the state -------
         let staged_shared = (2 * self.head_dim * size_of::<f32>()) as u32;
@@ -1365,13 +1599,15 @@ mod tests {
         // llama.cpp's fused op is `fastmodulo(h_idx, n_k_heads)` and its
         // fallback broadcasts with `ggml_repeat_4d`. See `super::gdn`.
         //
-        // Three, not two: `gdn_chunk_state_update` was split out of the solve
-        // and reads `k_norm` itself, so it makes the same choice and can get
-        // it wrong the same way.
+        // Four, not three: `gdn_chunk_state_update` was split out of the solve
+        // and reads `k_norm` itself, and `gdn_scan_prefill` — the kernel a
+        // forward pass actually runs — makes the same choice independently of
+        // all three. Each can get it wrong the same way, and the failure mode
+        // is a model that still generates fluent text.
         assert_eq!(
             GDN_CHUNKED_SRC.matches("int hq = h % qk_heads;").count(),
-            3,
-            "gdn_chunk_inter, gdn_chunk_solve_and_apply and \
+            4,
+            "gdn_scan_prefill, gdn_chunk_inter, gdn_chunk_solve_and_apply and \
              gdn_chunk_state_update must all use modulo",
         );
         assert!(

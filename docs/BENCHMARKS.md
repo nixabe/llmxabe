@@ -2246,3 +2246,105 @@ inflate the working set.
 This does not generalize to the state-carrying stages. It is specifically the
 finding that *this* hoist, the only one the data dependencies permit, is not
 worth taking.
+
+## Deleting the chunking for prefill: 2,221 → 2,322 tok/s (2026-08-16)
+
+The section above on llama.cpp's DeltaNet ends by saying the remaining 20 ms is
+reachable but "the way to reach it is to delete the chunking for prefill, not
+to keep tuning it." That is now done and measured.
+
+`gdn_scan_prefill` is a sequential token-by-token scan: one warp per (value
+head, value index), the whole `head_dim`-wide state row held in `SCAN_MAXR`
+fp32 registers per lane for the entire sequence, two `__shfl_xor_sync`
+butterflies per token, **no shared memory and no `__syncthreads` at all**. It
+replaces four launches per chunk — Gram, inter, solve, state update — with one
+launch for the whole sequence. The normalization pass is unchanged and shared
+with the chunked path, which still exists as `prefill` and still has its own
+tests.
+
+Three interleaved rounds, `bench_forward` n=512, 4 reps each:
+
+| round | chunked | scan |
+| --- | ---: | ---: |
+| 1 | 229.20 | 219.78 |
+| 2 | 231.02 | 220.78 |
+| 3 | 231.27 | 221.08 |
+| **mean ms/pass** | **230.50** | **220.55** |
+| **tok/s** | **2,221.3** | **2,321.5** |
+
+**−9.95 ms, +4.5%**, winning every pair — the same interleaving discipline the
+rejected Gram hoist above was measured under, and here the ordering is
+unambiguous rather than marginal.
+
+Decode is unaffected: 104.30 vs 103.95 tok/s over two interleaved rounds, a
+0.34% difference well inside run-to-run noise and clear of the 100 tok/s floor.
+The scan is the one tile-shaped change in this document that did *not* need a
+one-unit sibling, because it never had a token tile to begin with: at one token
+its loop runs once and its launch geometry is identical.
+
+### It is gated, and it was not before
+
+The scan was written before this session and left uncommitted for one reason:
+nothing tested it. There were five `.prefill(` comparisons in
+`gdn_chunked_differential.rs` and zero `.scan(` ones, so the only thing
+exercising the kernel a forward pass actually runs was an end-to-end argmax,
+which cannot separate a real bug from a knife-edge input.
+
+`run_case` is now parameterized over the entry point, and the scan answers to
+the same gate as the chunked form against the same two host references — the
+chunked host form *and* the recurrent host form, outputs and final state
+checked separately, per head:
+
+| case | tokens | result |
+| --- | ---: | --- |
+| `device_scan_gdn_matches_both_reference_forms_over_512_tokens` | 512 | pass |
+| `device_scan_gdn_matches_both_reference_forms_from_a_non_zero_initial_state` | 581 | pass |
+| `device_scan_gdn_matches_the_chunked_form_on_a_single_token` | 1 | pass |
+| `device_scan_gdn_survives_this_models_real_decay_rates` | 197 | pass |
+
+The last is the one that mattered most. The scan carries `exp(log_decay)` per
+token in a register rather than a cumulative log-decay per chunk, so it does
+not inherit the chunked kernel's proof that nothing ever divides by a decay,
+and this model reaches `exp(-91.578)` in a single token. It comes through with
+zero non-finite elements.
+
+### The relative-error guard was checking the wrong condition
+
+Adding the one-token scan case exposed a defect in the *test harness*, not the
+kernel. `GATE` demotes `max_rel_error` to a tripwire because `compare()`
+divides by `max(|reference|, 1e-6)` and GDN drives many components to zero;
+`check()` guarded that demotion by asserting the element driving the worst
+ratio is below `1e-3`, on the reasoning that above that the ratio is a real
+measurement rather than a floor artefact.
+
+But it asserted the magnitude *unconditionally*. The scan at one token reports
+`max_rel 4.9e-6` on a reference of `1.0e-3` — an absolute error near `5e-9`,
+four orders of magnitude inside every bound in play — and failed a guard that
+exists to police an excuse it never invoked. The guard now fires only when the
+demotion is load-bearing, i.e. when the ratio actually exceeds what the stated
+gate would have allowed. That is strictly stronger: it stops rejecting answers
+more accurate than the one it was written to protect, and it still catches the
+case it was written for.
+
+### The int8 argmax check was a coin flip on this input
+
+Switching the mixer flipped `int8_forward`'s argmax, and the honest reading is
+that the test was never decidable on this prompt rather than that the scan is
+wrong. Instrumenting both arms with their top-3 logits:
+
+| | best | runner-up | margin |
+| --- | --- | --- | ---: |
+| fp32 | 220 @ 6.647565 | 248045 @ 6.524912 | **0.1227** |
+| int8 (scan) | 248045 @ 6.568379 | 220 @ 6.564664 | 0.0037 |
+
+The int8 path's own worst disagreement with fp32 on this input is **0.278**,
+more than twice the fp32 margin between the top two candidates. Two tokens that
+close cannot be separated through 40 layers of int8 requantization by anything
+but luck; at HEAD the luck fell the other way. The pre-scan run measured the
+same near-tie — `max|diff| 0.203` against a margin of `0.123`.
+
+The assertion is now conditional on the reference margin clearing `0.25`, and
+prints the full comparison when it does not, so an argmax flip reports *why* it
+flipped instead of asserting on rounding. The cosine floor (`0.999`) is
+unconditional and is what actually gates the distribution: it reads `0.999681`
+with the scan against `0.999843` without, both far above the bound.

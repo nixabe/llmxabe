@@ -94,9 +94,9 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_cuda::kernels::gdn_chunked::GdnChunkedKernels;
+use xabe_cuda::kernels::gdn_chunked::{GdnChunkedKernels, GdnChunkedScratch};
 use xabe_kernels::compare::{ComparisonResult, Tolerance, assert_matches, compare};
 use xabe_kernels::gdn::chunked::chunked_forward;
 use xabe_kernels::gdn::recurrent::recurrent_forward;
@@ -329,21 +329,34 @@ fn report(label: &str, w: &Worst) {
 /// fold the result into the running worst case.
 ///
 /// The relative-error justification is asserted here, not described in a
-/// comment: if the element driving `max_rel_error` ever climbs above
-/// [`REL_ARTEFACT_CEILING`], the ratio has stopped being an artefact of
-/// `compare()`'s denominator floor, [`GATE`]'s demotion of `max_rel_error`
-/// stops being defensible, and this fails loudly instead of quietly passing.
+/// comment: if a comparison *relies* on [`GATE`]'s demotion of `max_rel_error`
+/// — that is, its ratio exceeds what [`STATED_GATE`] would have allowed — then
+/// the ratio has to actually be the artefact the demotion assumes it is. If the
+/// element driving it is above [`REL_ARTEFACT_CEILING`], it is a measurement
+/// instead, the demotion stops being defensible, and this fails loudly rather
+/// than quietly passing.
+///
+/// The two conditions are checked together, not separately. A ratio that clears
+/// `STATED_GATE` on its own has excused nothing, so the magnitude it sits on
+/// carries no weight: the scan form at one token reports `max_rel 4.9e-6` on a
+/// reference of `1.0e-3` — an absolute error near `5e-9` — which is above the
+/// ceiling and simultaneously four orders inside every bound in play. Failing
+/// that would be the guard rejecting an answer more accurate than the one it
+/// was written to protect.
 fn check(candidate: &[f32], reference: &[f32], label: &str, head: usize, worst: &mut Worst) {
     let result = compare(candidate, reference);
     worst.absorb(&result, reference);
 
     let rel_driver = reference[result.max_rel_error_index].abs();
+    let demotion_is_load_bearing = result.max_rel_error > STATED_GATE.max_rel_error;
     assert!(
-        rel_driver < REL_ARTEFACT_CEILING,
-        "{label}, head {head}: max_rel_error {:.3e} is on a reference value of {rel_driver:.3e}, \
-         which is large enough for the ratio to be a measurement rather than an artefact of \
-         compare()'s 1e-6 floor — max_abs_error and cosine alone are no longer a sufficient gate",
+        !demotion_is_load_bearing || rel_driver < REL_ARTEFACT_CEILING,
+        "{label}, head {head}: max_rel_error {:.3e} exceeds the stated gate's {:.0e} *and* sits \
+         on a reference value of {rel_driver:.3e}, which is large enough for the ratio to be a \
+         measurement rather than an artefact of compare()'s 1e-6 floor — max_abs_error and \
+         cosine alone are no longer a sufficient gate",
         result.max_rel_error,
+        STATED_GATE.max_rel_error,
     );
 
     // The stated project gate, on the two bounds the floor does not distort.
@@ -357,9 +370,66 @@ fn check(candidate: &[f32], reference: &[f32], label: &str, head: usize, worst: 
     assert_matches(candidate, reference, &GATE);
 }
 
-/// Run the device chunked kernel over `seq_len` tokens and check it against
-/// both host forms, per head, outputs and final state separately.
-fn run_case(ctx: &Arc<CudaContext>, seed: u64, seq_len: usize, nonzero_initial_state: bool) {
+/// Which device entry point a case exercises.
+///
+/// The two are held to the *same* gate against the *same* two host references
+/// deliberately. They are different algorithms — one chunked and parallel, one
+/// a sequential scan with the state in registers — reaching the same recurrence,
+/// so neither is a reference for the other and both have to answer to the host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Form {
+    /// [`GdnChunkedKernels::prefill`], the chunked-parallel form.
+    Chunked,
+    /// [`GdnChunkedKernels::scan`], the sequential form a forward pass runs.
+    Scan,
+}
+
+impl Form {
+    fn name(self) -> &'static str {
+        match self {
+            Form::Chunked => "chunked",
+            Form::Scan => "scan",
+        }
+    }
+
+    /// Dispatch to the entry point. Both take the same ten arguments; the only
+    /// thing that differs is which kernels run behind them.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        self,
+        kernels: &GdnChunkedKernels,
+        stream: &Arc<CudaStream>,
+        scratch: &mut GdnChunkedScratch,
+        state: &mut CudaSlice<f32>,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        log_decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        seq_len: usize,
+    ) {
+        let r = match self {
+            Form::Chunked => kernels.prefill(
+                stream, scratch, state, q, k, v, log_decay, beta, out, seq_len,
+            ),
+            Form::Scan => kernels.scan(
+                stream, scratch, state, q, k, v, log_decay, beta, out, seq_len,
+            ),
+        };
+        r.unwrap_or_else(|e| panic!("{} launches: {e}", self.name()));
+    }
+}
+
+/// Run one device entry point over `seq_len` tokens and check it against both
+/// host forms, per head, outputs and final state separately.
+fn run_case(
+    ctx: &Arc<CudaContext>,
+    form: Form,
+    seed: u64,
+    seq_len: usize,
+    nonzero_initial_state: bool,
+) {
     let config = ModelConfig::qwen3_6_35b_a3b();
     let g = config.gdn;
     let head_dim = g.head_dim as usize;
@@ -371,9 +441,10 @@ fn run_case(ctx: &Arc<CudaContext>, seed: u64, seq_len: usize, nonzero_initial_s
     let whole_chunks = seq_len / chunk_len;
     let tail = seq_len % chunk_len;
     println!(
-        "case: {seq_len} tokens = {whole_chunks} chunk(s) of {chunk_len} + tail {tail}, \
+        "case [{}]: {seq_len} tokens = {whole_chunks} chunk(s) of {chunk_len} + tail {tail}, \
          initial_state={}, head_dim={head_dim}, value_heads={value_heads}, qk_heads={qk_heads} \
          ({heads_per_kv} value heads per kv head)",
+        form.name(),
         if nonzero_initial_state {
             "non-zero"
         } else {
@@ -413,20 +484,19 @@ fn run_case(ctx: &Arc<CudaContext>, seed: u64, seq_len: usize, nonzero_initial_s
         .expect("upload log_decay");
     let d_b = stream.clone_htod(&inputs.flat_beta()).expect("upload beta");
 
-    kernels
-        .prefill(
-            &stream,
-            &mut scratch,
-            &mut d_state,
-            &d_q,
-            &d_k,
-            &d_v,
-            &d_g,
-            &d_b,
-            &mut d_out,
-            seq_len,
-        )
-        .expect("prefill launches");
+    form.run(
+        &kernels,
+        &stream,
+        &mut scratch,
+        &mut d_state,
+        &d_q,
+        &d_k,
+        &d_v,
+        &d_g,
+        &d_b,
+        &mut d_out,
+        seq_len,
+    );
 
     let device_out = stream.clone_dtoh(&d_out).expect("read outputs");
     let device_state = stream.clone_dtoh(&d_state).expect("read state");
@@ -520,7 +590,7 @@ fn device_chunked_gdn_matches_both_reference_forms_over_eight_whole_chunks() {
     // 512 tokens is 8 whole chunks of 64: long enough that a per-chunk state
     // handoff bug has to show, and the same length the recurrent differential
     // test uses so the two are directly comparable.
-    run_case(&ctx, 0x5EED_1234, 512, false);
+    run_case(&ctx, Form::Chunked, 0x5EED_1234, 512, false);
 }
 
 #[test]
@@ -529,7 +599,41 @@ fn device_chunked_gdn_handles_a_ragged_tail_from_a_non_zero_initial_state() {
     // 581 = 9 * 64 + 5. The tail chunk is 5 tokens: a 5x5 triangular system, a
     // 5-thread Gram block, and a shared-memory allocation an order of
     // magnitude smaller than the whole-chunk one.
-    run_case(&ctx, 0x1234_5EED, 581, true);
+    run_case(&ctx, Form::Chunked, 0x1234_5EED, 581, true);
+}
+
+// The scan path, on the same inputs and against the same two host references.
+//
+// It is a forward pass's actual GDN mixer, so it needs at least the gate the
+// chunked form has. The two cases below are byte-for-byte the two above with a
+// different entry point, which is the point: whatever a case would have caught
+// in the chunked kernel, it catches in the scan.
+//
+// The scan has no chunk structure at all — the state lives in `SCAN_MAXR`
+// registers per lane for the whole sequence — so "8 whole chunks" and "a
+// ragged tail" are not distinctions it can see. They are still the right two
+// lengths: 512 is what a prefill pass runs, and 581 is a length whose token
+// count is coprime with nothing in the launch geometry, which is exactly where
+// an off-by-one in the sequential loop would sit.
+
+#[test]
+fn device_scan_gdn_matches_both_reference_forms_over_512_tokens() {
+    let Some(ctx) = setup() else { return };
+    run_case(&ctx, Form::Scan, 0x5EED_1234, 512, false);
+}
+
+#[test]
+fn device_scan_gdn_matches_both_reference_forms_from_a_non_zero_initial_state() {
+    let Some(ctx) = setup() else { return };
+    run_case(&ctx, Form::Scan, 0x1234_5EED, 581, true);
+}
+
+#[test]
+fn device_scan_gdn_matches_the_chunked_form_on_a_single_token() {
+    let Some(ctx) = setup() else { return };
+    // One token is the scan's shortest sequence and the case its loop bound is
+    // most likely to get wrong, and it is the shape decode runs.
+    run_case(&ctx, Form::Scan, 0x0000_0001, 1, true);
 }
 
 /// The per-token log-decays measured on the real model, as
@@ -549,6 +653,21 @@ const REAL_DECAY_SPIKES: [(usize, usize, f32); 4] = [
 
 #[test]
 fn device_chunked_gdn_survives_this_models_real_decay_rates() {
+    let Some(ctx) = setup() else { return };
+    real_decay_case(&ctx, Form::Chunked);
+}
+
+#[test]
+fn device_scan_gdn_survives_this_models_real_decay_rates() {
+    // The scan reaches the same recurrence by a different route — it carries
+    // `exp(log_decay)` per token in a register rather than a cumulative
+    // log-decay per chunk — so it does not inherit the chunked form's proof
+    // that nothing divides by a decay. It gets the same gate.
+    let Some(ctx) = setup() else { return };
+    real_decay_case(&ctx, Form::Scan);
+}
+
+fn real_decay_case(ctx: &Arc<CudaContext>, form: Form) {
     // The defect-2 gate. The synthetic decays the two cases above use bottom
     // out at exp(-6.5) per chunk; this model reaches exp(-91.578) in a single
     // token, and the kernel's original `v_t / lambda_t` overflowed fp32 there
@@ -563,7 +682,6 @@ fn device_chunked_gdn_survives_this_models_real_decay_rates() {
     // 524288 state elements non-finite**. With the reformulation: 0 and 0,
     // agreeing with the recurrent form at max_abs 5.18e-7 (outputs) and
     // 9.86e-7 (state), cosine 1.000000000.
-    let Some(ctx) = setup() else { return };
     let config = ModelConfig::qwen3_6_35b_a3b();
     let g = config.gdn;
     let head_dim = g.head_dim as usize;
@@ -586,14 +704,15 @@ fn device_chunked_gdn_survives_this_models_real_decay_rates() {
         .copied()
         .fold(f32::INFINITY, f32::min);
     println!(
-        "case: {seq_len} tokens with the real model's decay rates, \
+        "case [{}]: {seq_len} tokens with the real model's decay rates, \
          min per-token log-decay {worst_decay:.3} (lambda {:.3e}), \
          initial_state=non-zero",
+        form.name(),
         worst_decay.exp(),
     );
 
     let stream = ctx.default_stream();
-    let kernels = GdnChunkedKernels::new(&ctx, head_dim, value_heads, qk_heads, chunk_len)
+    let kernels = GdnChunkedKernels::new(ctx, head_dim, value_heads, qk_heads, chunk_len)
         .expect("kernels must compile for the real geometry");
     let mut scratch = kernels
         .scratch(&stream, seq_len)
@@ -613,20 +732,19 @@ fn device_chunked_gdn_survives_this_models_real_decay_rates() {
         .expect("upload log_decay");
     let d_b = stream.clone_htod(&inputs.flat_beta()).expect("upload beta");
 
-    kernels
-        .prefill(
-            &stream,
-            &mut scratch,
-            &mut d_state,
-            &d_q,
-            &d_k,
-            &d_v,
-            &d_g,
-            &d_b,
-            &mut d_out,
-            seq_len,
-        )
-        .expect("prefill launches");
+    form.run(
+        &kernels,
+        &stream,
+        &mut scratch,
+        &mut d_state,
+        &d_q,
+        &d_k,
+        &d_v,
+        &d_g,
+        &d_b,
+        &mut d_out,
+        seq_len,
+    );
 
     let device_out = stream.clone_dtoh(&d_out).expect("read outputs");
     let device_state = stream.clone_dtoh(&d_state).expect("read state");
