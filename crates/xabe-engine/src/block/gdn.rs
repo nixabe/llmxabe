@@ -265,6 +265,54 @@ __global__ void gdn_proj_q8_0(
     }
 }
 
+// The same projection at one token, over the *repacked* split layout.
+//
+// Q8_0 interleaves a 2-byte scale with every 32 quants, so a row's quants sit
+// at byte `b * 34 + 2` and a warp reading `blk[2 + lane]` covers 32 contiguous
+// bytes that are 32-byte aligned only when `b == 15 (mod 16)`. Fifteen blocks
+// in sixteen straddle a sector boundary, so the fetch is two sectors for
+// thirty-two useful bytes — **half of every read is discarded**, which is most
+// of why `gdn_proj_q8_0` moves its weights at 47% of this card's streaming
+// roofline rather than nearer its ceiling.
+//
+// `GdnLayerInt8` already separates the quants from the scales for the tensor
+// cores. Over that layout a row's quants are `k_dim` contiguous bytes from a
+// 32-byte-aligned base, so the same warp reads exactly one sector.
+//
+// The arithmetic is `gdn_proj_q8_0`'s operand for operand — same per-lane
+// product, same ascending `b`, same `warp_reduce_sum` — and the repacked scale
+// is the identical fp16 value widened the identical way, so this is
+// **bit-identical**, not merely equivalent.
+//
+// grid: (ceil(N / warps),). block: (32, warps).
+__global__ void gdn_proj_split_gemv(
+    const signed char* __restrict__ wq,
+    const float* __restrict__ ws,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int k_dim,
+    int n_rows
+) {
+    int lane = threadIdx.x;
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;
+    if (n >= n_rows) return;
+
+    int blocks = k_dim / 32;
+    const signed char* row = wq + (long long)n * k_dim;
+    const float* sc = ws + (long long)n * blocks;
+
+    float acc = 0.0f;
+    for (int b = 0; b < blocks; ++b) {
+        float d = sc[b];
+        signed char q = row[b * 32 + lane];
+        acc += (float)q * d * x[b * 32 + lane];
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        out[n] = acc;
+    }
+}
+
 // The same projection, tiled over tokens.
 //
 // `gdn_proj_q8_0` above gives each (output row, token) pair its own warp, so
@@ -987,6 +1035,7 @@ pub struct GdnBlock {
     recurrent_scratch: GdnScratch,
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
+    proj_split_gemv: CudaFunction,
     proj_tiled: [CudaFunction; 2],
     proj_f32: CudaFunction,
     silu: CudaFunction,
@@ -1037,6 +1086,7 @@ impl GdnBlock {
             recurrent_scratch,
             chunked_scratch,
             proj_q8_0: module.load_function("gdn_proj_q8_0")?,
+            proj_split_gemv: module.load_function("gdn_proj_split_gemv")?,
             proj_tiled: [
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
@@ -1187,12 +1237,11 @@ impl GdnBlock {
         // int8 conversion is done once here rather than three times inside
         // `project`. `None` keeps the fp32 path, which is what decode and
         // small batches take.
-        let tc = int8.filter(|_| Self::uses_tensor_cores(tokens));
 
         let result = self.run(
             stream,
             weights,
-            tc,
+            int8,
             state,
             hidden,
             out,
@@ -1217,6 +1266,12 @@ impl GdnBlock {
         tokens: usize,
     ) -> Result<(), GdnBlockError> {
         let g = self.geometry;
+        // One token over the repacked layout is a GEMV, and a *different*
+        // reason to want the repack than the tensor cores are: the split
+        // layout's contiguous quants are worth having even when the
+        // arithmetic stays fp32. See `gdn_proj_split_gemv`.
+        let gemv = tc.filter(|_| tokens == 1);
+        let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
         // 1. attn_norm-N
         self.layer_ops.rms_norm(
@@ -1259,6 +1314,25 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
+        } else if let Some(i8w) = gemv {
+            self.project_split_gemv(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+            )?;
+            self.project_split_gemv(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+            )?;
         } else {
             self.project(
                 stream,
@@ -1381,6 +1455,16 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
+        } else if let Some(i8w) = gemv {
+            self.project_split_gemv(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+            )?;
         } else {
             self.project(
                 stream,
@@ -1435,6 +1519,47 @@ impl GdnBlock {
         self.mma
             .quantize_rows(stream, x, q, sc, tokens, k_dim)
             .map_err(GdnBlockError::Mma)?;
+        Ok(())
+    }
+
+    /// The one-token projection over the repacked split layout.
+    ///
+    /// See `gdn_proj_split_gemv`: this exists because Q8_0's 34-byte block
+    /// stride makes the untiled kernel's warp read straddle a sector boundary
+    /// fifteen times in sixteen, and the repacked quants do not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_split_gemv(
+        &self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+    ) -> Result<(), GdnBlockError> {
+        check_len("split gemv x", k_dim, x.len())?;
+        check_len("split gemv out", n_rows, out.len())?;
+        check_len("split gemv wq", n_rows * k_dim, wq.len())?;
+        check_len("split gemv ws", n_rows * k_dim / QK8_0, ws.len())?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_rows as u32).div_ceil(PROJ_WARPS), 1, 1),
+            block_dim: (32, PROJ_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i32, n_i32) = (k_dim as i32, n_rows as i32);
+        let mut builder = stream.launch_builder(&self.proj_split_gemv);
+        builder
+            .arg(wq)
+            .arg(ws)
+            .arg(x)
+            .arg(&mut *out)
+            .arg(&k_i32)
+            .arg(&n_i32);
+        // SAFETY: one warp per output row over a grid covering `n_rows` and
+        // returning above it; every buffer was length-checked immediately
+        // above against exactly the extent the kernel indexes.
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 

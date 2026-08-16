@@ -521,7 +521,7 @@ pub struct Forward {
     ///
     /// Built only for shapes above `GdnBlock::uses_tensor_cores`, so a decode
     /// pass does not pay 1.13 GiB for a path it never takes.
-    gdn_int8: Vec<GdnLayerInt8>,
+    gdn_int8: Arc<Vec<GdnLayerInt8>>,
     /// Shared with every other shape built over the same model.
     ///
     /// At 725 MiB per layer these are 28.3 GiB — the single largest thing on
@@ -563,7 +563,9 @@ impl Forward {
         config: ModelConfig,
         tokens: usize,
     ) -> Result<Self, ForwardError> {
-        Self::build(ctx, stream, file, directory, weights, config, tokens, None)
+        Self::build(
+            ctx, stream, file, directory, weights, config, tokens, None, None,
+        )
     }
 
     /// Build a second pass over the **same resident weights**, for a different
@@ -605,6 +607,7 @@ impl Forward {
             self.config.clone(),
             tokens,
             Some(Arc::clone(&self.moe_weights)),
+            Some(Arc::clone(&self.gdn_int8)),
         )
     }
 
@@ -618,6 +621,7 @@ impl Forward {
         config: ModelConfig,
         tokens: usize,
         shared_moe: Option<Arc<Vec<MoeLayerWeights>>>,
+        gdn_int8: Option<Arc<Vec<GdnLayerInt8>>>,
     ) -> Result<Self, ForwardError> {
         let hidden = config.hidden_size as usize;
         let vocab = config.vocab_size as usize;
@@ -685,15 +689,27 @@ impl Forward {
             gdn_weights.push(ManuallyDrop::new(alias_gdn_layer(weights, stream, layer)?));
         }
 
-        // The repack is a one-time cost that makes the tensor-core path
-        // usable; see `GdnLayerInt8`. Skipped entirely for shapes that will
-        // not take that path, which is what keeps a decode pass cheap.
-        let mut gdn_int8 = Vec::new();
-        if GdnBlock::uses_tensor_cores(tokens) {
-            for w in &gdn_weights {
-                gdn_int8.push(gdn.repack(stream, w)?);
+        // The repack serves two different paths: the tensor cores above the
+        // threshold, and a one-token GEMV that wants the split layout for its
+        // *alignment* rather than its arithmetic — Q8_0's 34-byte block stride
+        // makes an in-place read straddle a sector boundary fifteen times in
+        // sixteen. See `gdn_proj_split_gemv`.
+        //
+        // Shared through `reshape` like the MoE weights, and for the same
+        // reason: a prefill pass and the decode pass driven over the same
+        // sequence would otherwise hold two copies of 1.13 GiB.
+        let gdn_int8 = match gdn_int8 {
+            Some(shared) => shared,
+            None => {
+                let mut built = Vec::new();
+                if GdnBlock::uses_tensor_cores(tokens) || tokens == 1 {
+                    for w in &gdn_weights {
+                        built.push(gdn.repack(stream, w)?);
+                    }
+                }
+                Arc::new(built)
             }
-        }
+        };
 
         // --- the 10 Gated Attention layers, which copy --------------------
         let attn_kernels = Arc::new(AttentionKernelSet::new(ctx, &config, tokens)?);
@@ -864,7 +880,7 @@ impl Forward {
     /// leave the ten Gated Attention layers on tensor cores in the supposed
     /// fp32 twin, and the differential test would silently stop covering them.
     pub fn disable_tensor_cores(&mut self) {
-        self.gdn_int8.clear();
+        self.gdn_int8 = Arc::new(Vec::new());
         for block in &mut self.attention {
             block.disable_tensor_cores();
         }
