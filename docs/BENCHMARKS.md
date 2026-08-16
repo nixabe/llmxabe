@@ -1270,7 +1270,7 @@ prefill numbers in every section before it.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,430.58 ± 7.17 tok/s** | **1.45× slower** |
+| Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,628 ± 6 tok/s** | **1.27× slower** |
 | Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **105.2 tok/s**, 9.51 ms/step | **1.005× faster** |
 
 Decode is treated separately at the end of this document; the sections between
@@ -1302,8 +1302,9 @@ Every row is `bench_forward` at n = 512 on GPU 0, 2 warmup passes discarded,
 | wider MoE tensor-core block, 32-slot dispatch | 1,380.38 | 1.01× |
 | four staging loads per weight row instead of eight | 1,430.58 | 1.04× |
 | a block's warps share one weight band | 1,440.00 | 1.01× |
+| pad the staged activation row off a 32-bank stride | 1,630.00 | **1.13×** |
 
-**7.17× overall.** No single change is more than 1.81×; the result is
+**8.11× overall.** No single change is more than 1.81×; the result is
 compounding, and roughly half of it is not arithmetic at all — it is fixing
 kernels that re-read the same bytes.
 
@@ -1453,6 +1454,42 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | fix a repack the reshape did not inherit | 9.59 | 104.28 |
 | four warps per shared-expert row instead of eight | 9.59 | 104.3 |
 | the routed sum folded into the combine | 9.51 | **105.2** |
+
+### One number was a multiple of 32, and it cost 13% of prefill
+
+Both MoE tensor-core kernels stage the activation tile in shared memory with a
+row stride of `MOE_MMA_KC` — 128 bytes. The MMA operand load is
+
+```c
+sa + (mf * 8 + arow) * 128 + kk + quad
+```
+
+where `arow = lane >> 2` runs over eight rows and `quad = (lane & 3) * 4` over
+four words. A shared bank is a word and there are 32 of them, so a **128-byte
+stride is exactly 32 banks**: all eight rows land on the same four banks, and
+every one of these loads is an **eight-way conflict**. It is issued four times
+per contraction step in the kernel that is a quarter of the prefill.
+
+A conflict-free stride has to move each row four banks along, so the stride in
+words must be `4 (mod 32)`. 144 bytes is 36 words, `36 mod 32 = 4`, and the
+eight rows tile the 32 banks exactly once. Sixteen wasted bytes a row.
+
+**1,440 -> 1,630 tok/s, +13%,** and the same padding applies to the down
+projection's tile, which had the identical stride.
+
+Three earlier experiments had already said the kernel was neither
+bandwidth-bound nor short of arithmetic; none of them said *why*, because a
+bank conflict does not show up in bytes moved or instructions issued. It shows
+up as a load taking eight times as long as it should, and with `ncu`
+unavailable on this host the only way to it was reading the index expression
+and counting banks.
+
+The weight tile's stride was 100 bytes — 25 words — chosen earlier so the
+eight rows would land on distinct banks. Distinct is not the same as four
+apart: adding the word offset collided three of the eight. 112 bytes is 28
+words, `28 mod 32 = -4`, which tiles exactly. Worth about nothing next to the
+activation tile, and taken anyway because it is provably right rather than
+accidentally equal.
 
 ### The dense projections are not weight-traffic bound either
 

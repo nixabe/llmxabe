@@ -202,11 +202,18 @@ const MMA_M: usize = 32;
 /// decode step of one token, where the integer path loses.
 const MMA_MIN_TOKENS: usize = 8;
 
+/// Bytes per staged activation row. Mirrors `MOE_MMA_ASTRIDE`.
+///
+/// 16 more than the contraction it holds: a 128-byte stride is 32 shared
+/// banks, which makes every fragment load an eight-way conflict. See the
+/// kernel.
+const MMA_ASTRIDE: usize = MMA_KC + 16;
+
 /// Contraction staged per trip. Mirrors `MOE_MMA_KC`.
 const MMA_KC: usize = 128;
 /// Bytes per staged weight row. Mirrors `MOE_MMA_WSTRIDE` — see the kernel on
-/// why it is 100 and not the 96 the payload needs.
-const MMA_WSTRIDE: usize = 100;
+/// why it is 112 and not the 96 the payload needs.
+const MMA_WSTRIDE: usize = 112;
 /// Bytes per staged scale row. Mirrors `MOE_MMA_SSTRIDE`.
 const MMA_SSTRIDE: usize = 12;
 
@@ -219,7 +226,7 @@ const MMA_DSTRIDE: usize = MMA_KC + (MMA_KC / 32) * 4;
 /// staged slot.
 const fn mma_down_shared_bytes() -> u32 {
     (MMA_ROWS as usize * MMA_DSTRIDE
-        + MMA_M * MMA_KC
+        + MMA_M * MMA_ASTRIDE
         + MMA_M * (MMA_KC / 32) * size_of::<f32>()
         + MMA_M * size_of::<i64>()
         + MMA_M * size_of::<i32>()) as u32
@@ -231,7 +238,7 @@ const fn mma_down_shared_bytes() -> u32 {
 const fn mma_shared_bytes() -> u32 {
     (2 * MMA_ROWS as usize * MMA_WSTRIDE
         + 2 * MMA_ROWS as usize * MMA_SSTRIDE
-        + MMA_M * MMA_KC
+        + MMA_M * MMA_ASTRIDE
         + MMA_M * (MMA_KC / 32) * size_of::<f32>()
         + MMA_M * size_of::<i64>()) as u32
 }
@@ -1467,14 +1474,35 @@ __global__ void moe_expert_down_gemv(
 // halves the shared footprint for no extra loop overhead.
 #define MOE_MMA_KC    128
 
+// Bytes per staged activation row.
+//
+// 144 and not `MOE_MMA_KC`. A 128-byte row stride is exactly 32 shared banks,
+// and the fragment load `sa + (mf * 8 + arow) * stride + kk + quad` varies
+// `arow` over eight rows and `quad` over four words -- so with a 32-word
+// stride all eight rows land on the same four banks and every one of these
+// loads is an **eight-way conflict**, on the kernel that is a quarter of
+// prefill. 144 bytes is 36 words and `36 mod 32 = 4`, so row `i` starts four
+// banks along from row `i - 1` and the eight rows tile the 32 banks exactly
+// once. The sixteen wasted bytes a row buy a conflict-free load.
+#define MOE_MMA_ASTRIDE (MOE_MMA_KC + 16)
+
 // Bytes per staged weight row: 64 of `ql`, then 32 of `qh` at offset 64.
 //
-// 100 and not 96. The payload is 96, but a 96-byte stride is 24 shared banks,
-// and `gcd(24, 32) = 8` collapses the eight rows a warp reads into four bank
-// groups — a two-way conflict on every operand load. 25 words is coprime with
-// 32, so the eight rows land on eight distinct banks and the load is
-// conflict-free. The four wasted bytes per row buy that.
-#define MOE_MMA_WSTRIDE 100
+// 112 and not the 96 the payload needs. The operand load varies the row over
+// eight values and the word within a row over four, so a conflict-free stride
+// has to send each row exactly four banks along from the last: **the stride in
+// words must be 4 mod 32**. 112 bytes is 28 words, `28 * i mod 32` walks
+// 0, 28, 24, ..., 4, and the four words each row contributes fill the gaps, so
+// the warp's 32 lanes tile the 32 banks exactly once.
+//
+// 96 is 24 words and `gcd(24, 32) = 8`, which collapses the eight rows into
+// four bank groups -- a two-way conflict. 100 was the first fix and only
+// spread the rows: 25 is coprime with 32 so the eight row bases are distinct,
+// but they are not four apart, and three of the eight collided once the word
+// offset was added. Worth about nothing next to
+// `MOE_MMA_ASTRIDE`, and kept because it is the shape that is provably right
+// rather than the shape that happened to measure the same.
+#define MOE_MMA_WSTRIDE 112
 // Bytes per staged scale row: 8 int8 sub-scales, then the fp32 superblock
 // delta at offset 8 (which is where the 4-byte alignment requirement lands).
 #define MOE_MMA_SSTRIDE 12
@@ -1498,7 +1526,7 @@ __global__ void moe_expert_ffn_mma(
     unsigned char* ssg = swu + MOE_MMA_ROWS * MOE_MMA_WSTRIDE;
     unsigned char* ssu = ssg + MOE_MMA_ROWS * MOE_MMA_SSTRIDE;
     signed char*   sa  = (signed char*)(ssu + MOE_MMA_ROWS * MOE_MMA_SSTRIDE);
-    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_KC);
+    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_ASTRIDE);
     long long*     rows = (long long*)(sas + MOE_MMA_M * (MOE_MMA_KC / 32));
 
     int blk = blockIdx.y;
@@ -1626,7 +1654,7 @@ __global__ void moe_expert_ffn_mma(
             unsigned int v = row >= 0
                 ? *(const unsigned int*)(xq + row * hidden + kc + k4)
                 : 0u;
-            *(unsigned int*)(sa + m * MOE_MMA_KC + k4) = v;
+            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
         }
         for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 32); idx += blockDim.x) {
             int m  = idx / (MOE_MMA_KC / 32);
@@ -1737,7 +1765,7 @@ __global__ void moe_expert_ffn_mma(
                 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
                     unsigned int a = *(const unsigned int*)(
-                        sa + (mf * 8 + arow) * MOE_MMA_KC + kk + 16 * h + quad);
+                        sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + 16 * h + quad);
                     int g0 = 0, g1 = 0, u0 = 0, u1 = 0;
                     asm volatile(
                         "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
@@ -1896,7 +1924,7 @@ __global__ void moe_expert_down_mma(
 ) {
     unsigned char* sw  = (unsigned char*)xabe_shared;
     signed char*   sa  = (signed char*)(sw + MOE_MMA_ROWS * MOE_MMA_DSTRIDE);
-    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_KC);
+    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_ASTRIDE);
     long long*     rows = (long long*)(sas + MOE_MMA_M * (MOE_MMA_KC / 32));
     int*           slot_flat = (int*)(rows + MOE_MMA_M);
 
@@ -1978,7 +2006,7 @@ __global__ void moe_expert_down_mma(
             unsigned int v = row >= 0
                 ? *(const unsigned int*)(iq + row * intermediate + kc + k4)
                 : 0u;
-            *(unsigned int*)(sa + m * MOE_MMA_KC + k4) = v;
+            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
         }
         for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 32); idx += blockDim.x) {
             int m  = idx / (MOE_MMA_KC / 32);
@@ -2004,7 +2032,7 @@ __global__ void moe_expert_down_mma(
             #pragma unroll
             for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
                 unsigned int a = *(const unsigned int*)(
-                    sa + (mf * 8 + arow) * MOE_MMA_KC + kk + quad);
+                    sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + quad);
                 int d0 = 0, d1 = 0;
                 asm volatile(
                     "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
