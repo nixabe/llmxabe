@@ -302,6 +302,17 @@ __device__ __forceinline__ float h2f(unsigned short h) {
     asm("{ .reg .f16 a; mov.b16 a, %1; cvt.f32.f16 %0, a; }" : "=f"(f) : "h"(h));
     return f;
 }
+// Both halves of a packed word at once. One 32-bit load feeds two dimensions,
+// which is what keeps a binary16 cache from costing twice the load count it
+// saves in bytes.
+__device__ __forceinline__ void h2f2(unsigned w, float* lo, float* hi) {
+    asm("{ .reg .f16 a, b;\n"
+        "  mov.b32 {a, b}, %2;\n"
+        "  cvt.f32.f16 %0, a;\n"
+        "  cvt.f32.f16 %1, b; }\n"
+        : "=f"(*lo), "=f"(*hi) : "r"(w));
+}
+
 __device__ __forceinline__ unsigned short f2h(float f) {
     unsigned short h;
     asm("{ .reg .f16 a; cvt.rn.f16.f32 a, %1; mov.b16 %0, a; }" : "=h"(h) : "f"(f));
@@ -1304,21 +1315,33 @@ __global__ void attn_flash_decode_split(
         // bandwidth-bound. Costs `2 * DEC_KT` registers, which this kernel
         // has because one query row makes `qr` and `acc` a quarter of what
         // the prefill kernel carries.
-        for (int d = tid; d < head_dim; d += nthr) {
-            float kreg[DEC_KT];
-            float vreg[DEC_KT];
+        // Two dimensions per thread, because they are one 32-bit word in a
+        // binary16 cache. Loading them singly would halve the bytes and keep
+        // the load count, which measured as a net loss on decode even while it
+        // won on prefill.
+        int hd2 = head_dim >> 1;
+        for (int d2 = tid; d2 < hd2; d2 += nthr) {
+            unsigned kreg[DEC_KT];
+            unsigned vreg[DEC_KT];
             #pragma unroll
             for (int jj = 0; jj < DEC_KT; ++jj) {
                 long long key = j0 + jj;
                 bool live = jj < n_this;
-                long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim + d;
-                kreg[jj] = live ? h2f(k[at]) : 0.0f;
-                vreg[jj] = live ? h2f(v[at]) : 0.0f;
+                long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim;
+                const unsigned* kp = (const unsigned*)(k + at);
+                const unsigned* vp = (const unsigned*)(v + at);
+                kreg[jj] = live ? kp[d2] : 0u;
+                vreg[jj] = live ? vp[d2] : 0u;
             }
             #pragma unroll
             for (int jj = 0; jj < DEC_KT; ++jj) {
-                k_sh[jj * head_dim + d] = kreg[jj];
-                v_sh[jj * head_dim + d] = vreg[jj];
+                float lo, hi;
+                h2f2(kreg[jj], &lo, &hi);
+                k_sh[jj * head_dim + 2 * d2] = lo;
+                k_sh[jj * head_dim + 2 * d2 + 1] = hi;
+                h2f2(vreg[jj], &lo, &hi);
+                v_sh[jj * head_dim + 2 * d2] = lo;
+                v_sh[jj * head_dim + 2 * d2 + 1] = hi;
             }
         }
         __syncthreads();
