@@ -279,10 +279,12 @@ __global__ void gdn_proj_q8_0(
 // cores. Over that layout a row's quants are `k_dim` contiguous bytes from a
 // 32-byte-aligned base, so the same warp reads exactly one sector.
 //
-// The arithmetic is `gdn_proj_q8_0`'s operand for operand — same per-lane
-// product, same ascending `b`, same `warp_reduce_sum` — and the repacked scale
-// is the identical fp16 value widened the identical way, so this is
-// **bit-identical**, not merely equivalent.
+// The scale is the identical fp16 value widened the identical way, and each
+// product is still `q * d * x`. The *partition* differs — a lane owns four
+// consecutive elements rather than one element of each block — so the warp
+// reduction sums in a different order and this is equivalent rather than
+// bit-identical. It is a plain dot product feeding a projection, not a
+// selection, so reassociation here is the ordinary kind.
 //
 // grid: (ceil(N / warps),). block: (32, warps).
 __global__ void gdn_proj_split_gemv(
@@ -299,13 +301,26 @@ __global__ void gdn_proj_split_gemv(
 
     int blocks = k_dim / 32;
     const signed char* row = wq + (long long)n * k_dim;
-    const float* sc = ws + (long long)n * blocks;
+    const float* sc = ws + (long long)n * (k_dim / 32);
 
+    // Four quants and four activations per lane per step, so one instruction
+    // moves 128 bytes of weight across the warp instead of 32. The split
+    // layout is what makes this legal: `k_dim` is a multiple of 128 and the
+    // row base a multiple of `k_dim`, so both the `char4` and the `float4` are
+    // aligned by construction.
+    //
+    // A lane's four elements always share a Q8_0 block — they start at a
+    // multiple of 4 and a block is 32 — so one scale covers all four.
     float acc = 0.0f;
-    for (int b = 0; b < blocks; ++b) {
-        float d = sc[b];
-        signed char q = row[b * 32 + lane];
-        acc += (float)q * d * x[b * 32 + lane];
+    for (int c = 0; c < k_dim; c += 128) {
+        int e0 = c + 4 * lane;
+        char4 q = *(const char4*)(row + e0);
+        float4 xv = *(const float4*)(x + e0);
+        float d = sc[e0 >> 5];
+        acc += (float)q.x * d * xv.x;
+        acc += (float)q.y * d * xv.y;
+        acc += (float)q.z * d * xv.z;
+        acc += (float)q.w * d * xv.w;
     }
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
