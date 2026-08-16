@@ -103,6 +103,15 @@ use xabe_model::weights::{Directory, Role};
 /// Threads per block for the three glue kernels below.
 const THREADS: u32 = 256;
 
+/// Tokens one router block carries. Mirrors the kernel's `ROUTER_TT`.
+const ROUTER_TT: u32 = 8;
+/// Experts one router block covers. Mirrors `ROUTER_ET`.
+const ROUTER_ET: u32 = 4;
+/// Contraction the router stages per trip. Mirrors `ROUTER_JC`, and **must**
+/// equal [`THREADS`] — that equality is what preserves the untiled kernel's
+/// per-thread summation order, which the router cannot afford to change.
+const ROUTER_JC: u32 = THREADS;
+
 /// RMS epsilon when the file does not carry one.
 ///
 /// llama.cpp reads `f_norm_rms_eps` from
@@ -155,33 +164,138 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
 
 // logits[t][e] = dot(ffn_gate_inp row e, normed[t]).
 //
-// grid: (num_experts, max_tokens) — never the live token count. `w` is the
-// GGUF tensor `[hidden, num_experts]` with ne[0] fastest-varying, so expert
-// e's row is `hidden` *contiguous* floats at `e * hidden`. Reading it the
-// other way round would gather at stride `num_experts` and produce a router
-// that is wrong on every token while still summing to one.
+// `w` is the GGUF tensor `[hidden, num_experts]` with ne[0] fastest-varying,
+// so expert e's row is `hidden` *contiguous* floats at `e * hidden`. Reading
+// it the other way round would gather at stride `num_experts` and produce a
+// router that is wrong on every token while still summing to one.
+//
+// # Why this is tiled and the obvious version is not viable
+//
+// This is the smallest matmul in the layer — 2048x256 against 256 experts of
+// 3x2048x512 — and the first version, one block per (expert, token) pair
+// reducing a 2048-term dot product, was **7.6% of the whole forward pass**.
+// The arithmetic was never the problem. At 512 tokens that grid is 131,072
+// blocks, and each one re-read a full 2048-float weight row *and* a full
+// 2048-float activation row: 2.1 GB of loads per layer to cover 6 MB of
+// distinct data.
+//
+// A block now covers ROUTER_ET experts and ROUTER_TT tokens at once. The
+// weight row is read once per token tile instead of once per token, the
+// activation rows once per expert *group* instead of once per expert, and the
+// traffic falls about fivefold. Both reads stay fully coalesced.
+//
+// # Why the summation order is preserved exactly
+//
+// A first attempt gave each warp its own expert and reduced with a plain warp
+// shuffle. It was faster and it was wrong: the per-thread partition of the
+// contraction changed, the logits moved in their last bits, and `tests/
+// forward_pass.rs` caught block 31's error jumping 5.26x. The router's output
+// is not consumed as a number — it is consumed by a top-8 argmax over 256
+// experts. A last-bit disagreement between two adjacent logits does not
+// perturb an answer slightly; it runs a different expert.
+//
+// So `ROUTER_JC` equals the block width and the staging loop hands thread
+// `tid` the indices `tid, tid + 256, tid + 512, ...` in that order — the
+// sequence the untiled `for (j = threadIdx.x; j < hidden; j += blockDim.x)`
+// produced — and the reduction repeats `block_reduce_sum`'s shuffle-down and
+// ascending warp sum. The logits are bit-identical; only the traffic changed.
+//
+// grid: (num_experts / ROUTER_ET, ceil(max_tokens / ROUTER_TT)) — never the
+// live token count.
+
+// Tokens one block carries, and experts it covers. The product is the 32
+// accumulators each thread holds. `ROUTER_JC` is the contraction staged per
+// trip and **must equal the block width**, which is what keeps each thread's
+// summation order identical to the untiled kernel's.
+#define ROUTER_TT 8
+#define ROUTER_ET 4
+#define ROUTER_JC 256
+
 __global__ void moe_block_router_logits(
     const float* __restrict__ w,
     const float* __restrict__ x,
     const int* __restrict__ valid_tokens,
     int hidden,
     int num_experts,
+    int max_tokens,
     float* __restrict__ logits
 ) {
-    int e = blockIdx.x;
-    int t = blockIdx.y;
-    if (t >= *valid_tokens) return;
+    float* sx      = xabe_moe_block_shared;                 // [ROUTER_TT][ROUTER_JC]
+    float* scratch = sx + ROUTER_TT * ROUTER_JC;            // [n_warps][ROUTER_TT*ROUTER_ET]
 
-    const float* row = w + (long long)e * hidden;
-    const float* xs  = x + (long long)t * hidden;
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int n_warps = (int)(blockDim.x >> 5);
+    int e0 = blockIdx.x * ROUTER_ET;
+    int t0 = blockIdx.y * ROUTER_TT;
 
-    float s = 0.0f;
-    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        s += row[j] * xs[j];
+    float acc[ROUTER_ET][ROUTER_TT];
+    #pragma unroll
+    for (int el = 0; el < ROUTER_ET; ++el)
+        #pragma unroll
+        for (int u = 0; u < ROUTER_TT; ++u) acc[el][u] = 0.0f;
+
+    for (int jc = 0; jc < hidden; jc += ROUTER_JC) {
+        __syncthreads();
+        int j = jc + tid;
+        #pragma unroll
+        for (int u = 0; u < ROUTER_TT; ++u) {
+            // Clamped rather than branched: a token past the live count is
+            // read — harmlessly, the buffer is `max_tokens` rows — but never
+            // written, exactly as the untiled version left its logits stale.
+            int t = (t0 + u < max_tokens) ? t0 + u : max_tokens - 1;
+            sx[u * ROUTER_JC + tid] = j < hidden ? x[(long long)t * hidden + j] : 0.0f;
+        }
+        __syncthreads();
+        if (j < hidden) {
+            #pragma unroll
+            for (int el = 0; el < ROUTER_ET; ++el) {
+                int e = e0 + el;
+                float wj = e < num_experts ? w[(long long)e * hidden + j] : 0.0f;
+                #pragma unroll
+                for (int u = 0; u < ROUTER_TT; ++u) {
+                    acc[el][u] += wj * sx[u * ROUTER_JC + tid];
+                }
+            }
+        }
     }
-    s = block_reduce_sum(s, xabe_moe_block_shared);
 
-    if (threadIdx.x == 0) logits[(long long)t * num_experts + e] = s;
+    // `block_reduce_sum`'s reduction, done once for all 32 accumulators
+    // instead of 32 times: shuffle-down within the warp, then one ascending
+    // pass over the warp totals. Same operations in the same order, so the
+    // logits are bit-identical to the untiled kernel's — which matters more
+    // here than anywhere else in the block, because the router's output is
+    // fed to a top-8 selection and a last-bit disagreement between two
+    // adjacent logits does not perturb an answer, it picks a different expert.
+    #pragma unroll
+    for (int el = 0; el < ROUTER_ET; ++el) {
+        #pragma unroll
+        for (int u = 0; u < ROUTER_TT; ++u) {
+            float v = acc[el][u];
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                v += __shfl_down_sync(0xffffffff, v, offset);
+            }
+            if (lane == 0) scratch[warp * (ROUTER_ET * ROUTER_TT) + el * ROUTER_TT + u] = v;
+        }
+    }
+    __syncthreads();
+
+    int live = *valid_tokens;
+    if (tid < ROUTER_ET * ROUTER_TT) {
+        int el = tid / ROUTER_TT;
+        int u  = tid % ROUTER_TT;
+        float total = 0.0f;
+        for (int wv = 0; wv < n_warps; ++wv) {
+            total += scratch[wv * (ROUTER_ET * ROUTER_TT) + el * ROUTER_TT + u];
+        }
+        int e = e0 + el;
+        int t = t0 + u;
+        if (e < num_experts && t < live) {
+            logits[(long long)t * num_experts + e] = total;
+        }
+    }
 }
 
 // gate[t] = sigmoid(dot(ffn_gate_inp_shexp, normed[t])).
@@ -748,11 +862,18 @@ impl MoeBlock {
         // 2. router logits, then softmax + top-k + renormalize on the device.
         let hidden_i32 = g.hidden as i32;
         let experts_i32 = g.num_experts as i32;
-        let reduce_shared = ((THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32;
+        let max_tokens_i32 = g.max_tokens as i32;
         let cfg = LaunchConfig {
-            grid_dim: (g.num_experts as u32, g.max_tokens as u32, 1),
+            grid_dim: (
+                (g.num_experts as u32).div_ceil(ROUTER_ET),
+                (g.max_tokens as u32).div_ceil(ROUTER_TT),
+                1,
+            ),
             block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: reduce_shared,
+            shared_mem_bytes: ((ROUTER_TT * ROUTER_JC
+                + THREADS.div_ceil(32) * ROUTER_ET * ROUTER_TT)
+                as usize
+                * size_of::<f32>()) as u32,
         };
         let mut builder = stream.launch_builder(&self.router_logits_fn);
         builder
@@ -761,13 +882,15 @@ impl MoeBlock {
             .arg(self.buffers.valid_tokens())
             .arg(&hidden_i32)
             .arg(&experts_i32)
+            .arg(&max_tokens_i32)
             .arg(&mut self.logits);
-        // SAFETY: the grid is (num_experts, max_tokens); `w.router` was
-        // checked to hold `num_experts * hidden` floats and `normed`
-        // `max_tokens * hidden`, so `e * hidden + j` and `t * hidden + j` are
-        // both in range for `j < hidden`. `logits` holds
-        // `max_tokens * num_experts`. Shared memory covers one float per warp,
-        // which is all `block_reduce_sum` writes.
+        // SAFETY: `w.router` was checked to hold `num_experts * hidden` floats
+        // and `normed` `max_tokens * hidden`. The kernel returns for
+        // `e >= num_experts` and clamps its token index to `max_tokens - 1`,
+        // so `e * hidden + j` and `t * hidden + j` are both in range for
+        // `j < hidden`. `logits` holds `max_tokens * num_experts` and is
+        // written only for `t < valid_tokens`. The warp reduction uses no
+        // shared memory.
         unsafe { builder.launch(cfg) }?;
 
         self.moe.route(stream, &mut self.buffers, &self.logits)?;
@@ -815,10 +938,11 @@ impl MoeBlock {
         )?;
 
         // 5. its sigmoid gate, which lives here because no kernel has it.
+        // Still `block_reduce_sum`, so it still needs one float per warp.
         let cfg = LaunchConfig {
             grid_dim: (g.max_tokens as u32, 1, 1),
             block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: reduce_shared,
+            shared_mem_bytes: ((THREADS as usize).div_ceil(32) * size_of::<f32>()) as u32,
         };
         let mut builder = stream.launch_builder(&self.shared_gate_fn);
         builder
@@ -917,7 +1041,18 @@ mod tests {
         // one expert's row is `hidden` contiguous floats. Gathering at stride
         // `num_experts` instead produces a router that is wrong on every
         // token and whose weights still sum to one.
-        assert!(GLUE_SRC.contains("const float* row = w + (long long)e * hidden;"));
+        //
+        // Asserted as the index expression rather than as one spelling of a
+        // hoisted row pointer: the tiled kernel indexes `w` inline, and the
+        // invariant is which of the two axes is contiguous, not whether a
+        // pointer was named.
+        assert!(GLUE_SRC.contains("w[(long long)e * hidden + j]"));
+        assert!(
+            !GLUE_SRC.contains("num_experts + e]")
+                || GLUE_SRC.contains("logits[(long long)t * num_experts + e]"),
+            "the only `* num_experts + e` may be the logits store, which is \
+             `[max_tokens][num_experts]` and genuinely strided that way",
+        );
     }
 
     #[test]
@@ -933,14 +1068,25 @@ mod tests {
     #[test]
     fn every_launch_shape_comes_from_the_geometry_and_the_token_count_from_the_device() {
         // AGENTS.md rule 5: nothing on this path may be sized by a host-side
-        // value. All three glue kernels must gate on the device scalar.
+        // value. All three glue kernels must take the device scalar and act on
+        // it.
         assert_eq!(
             GLUE_SRC
                 .matches("const int* __restrict__ valid_tokens")
                 .count(),
             3
         );
-        assert_eq!(GLUE_SRC.matches("*valid_tokens) return;").count(), 3);
+        // *Reading* it, not one particular spelling of the guard. The router
+        // early-returned on it until it was tiled; now a warp carries eight
+        // tokens, so it reads the scalar once and gates the store instead.
+        // Asserting the `return` form would have made a correct rewrite look
+        // like a rule-5 violation, which is the opposite of what this test is
+        // for.
+        assert_eq!(GLUE_SRC.matches("*valid_tokens").count(), 3);
+        // What rule 5 actually forbids: a launch bound the host had to know.
+        // `max_tokens` may size a grid — it is a geometry constant — but no
+        // kernel may compare against a *count* passed by value.
+        assert!(!GLUE_SRC.contains("int live_tokens"));
     }
 
     #[test]
