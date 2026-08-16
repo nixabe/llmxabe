@@ -2976,3 +2976,86 @@ is that it is necessary but perhaps not sufficient on its own: 4x the ceiling at
 the same 20% utilization would be about 12.8 TFLOP/s against llama.cpp's 25, so
 the tile structure has to improve alongside the arithmetic. That is specified
 here rather than attempted half-way.
+
+## Tensor cores, and where the head-to-head stands now (2026-08-17)
+
+The previous section named the gap as a ceiling — llama.cpp running attention
+at ~25 TFLOP/s where this card's fp32 peak is 16.3 — and said closing it meant
+porting attention to `m16n8k8`. That is done, together with the binary16 KV
+cache it wants. One GPU, chunked prefill at 512, against llama.cpp on the same
+card and model file with `-fa 1`:
+
+### Prefill
+
+| tokens | session start | now | llama.cpp | ratio |
+| -----: | ------------: | --: | --------: | ----: |
+|    512 |       2,364.3 | **2,436.1** |   2,155.8 | **1.130** |
+|  2,048 |       2,088.1 | **2,311.4** |   2,118.0 | **1.091** |
+|  8,192 |       1,359.3 | 1,957.0 |   1,978.7 | 0.989 |
+| 16,384 |         913.9 | 1,622.6 |         — |     — |
+| 32,768 |         561.6 | 1,204.7 |   1,729.9 | 0.696 |
+| 65,536 |         321.2 |   810.3 |   1,410.4 | 0.575 |
+| 131,072 |            — |   505.8 |   1,119.3 | 0.452 |
+
+### Decode
+
+|     ctx | session start | now | llama.cpp | ratio |
+| ------: | ------------: | --: | --------: | ----: |
+|     512 |          98.3 | **104.4** |    104.19 | **1.002** |
+|   2,048 |          78.3 | 102.2 |    103.91 | 0.984 |
+|   8,192 |          43.2 |  94.9 |    100.48 | 0.944 |
+|  32,768 |             — |  76.6 |         — |     — |
+| 131,072 |             — |  45.1 |     67.65 | 0.666 |
+
+**llmxabe is now ahead of llama.cpp at 512 and 2,048 tokens of prefill and at
+512 of decode, and within 2% at 8,192 prefill and 2-6% at 2,048-8,192 decode.**
+It is still behind from 32K up, by 1.4x at 32K prefill and 2.2x at 131,072.
+
+At 131,072 on one card: 505.8 tok/s prefill, 45.1 decode, **peak 35.637 GiB of
+47.27**, sequence state 2.562 GiB. Prefill there is 2.06x what it was at the
+start of this work and the residency headroom grew from 9.1 to 11.6 GiB.
+
+### What moved, in order
+
+| change | where measured | effect |
+| ------ | -------------- | -----: |
+| KV head on the grid, K/V staged in shared | 8,192 prefill | +13.3% |
+| split-K flash decoding | ctx 8,192 decode | +114% |
+| whole tile of loads issued before any store | ctx 32,768 decode | +7.9% |
+| `DECODE_SPLITS` 64 -> 144 | ctx 32,768 decode | +1.8% |
+| `m16n8k8` tensor cores | 8,192 prefill | +13.3% |
+| binary16 KV cache | 8,192 prefill | +9.9% |
+| two cached dimensions per decode load | ctx 32,768 decode | +6.5% |
+
+### Rejected, with numbers, so they are not tried again
+
+- Swapping the flash grid's axes for L2 reuse: **-1.7%**, three pairs. Sibling
+  blocks drift apart faster than 6 MB of L2 spans.
+- `ATTN_QT` 8 -> 16: **-10%**. `qr` doubles to 128 registers, halving resident
+  blocks.
+- `GQA_KT` 16: **-14%**. 33,792 B of shared admits one block per SM.
+- `__maxnreg__(84)` to chase a third block: **-6%**, 32 B of spill, and the
+  third block never appears because shared still admits two.
+- One query head per tensor-core block: **-6%** against the scalar kernel. The
+  MMA fixed the arithmetic and re-broke the traffic.
+- Serial per-row softmax in the tensor-core kernel: **-9%**. 240 of 256 threads
+  idle between two barriers once per 32 keys.
+- Holding the Q fragments in registers across the key loop: **no win**, and 146
+  registers. `Q K^T` was not shared-bound after all.
+
+### What still separates 32K-128K
+
+Attention at 65,536 is about 54 s of an 80.9 s pass, which is 6.6 TFLOP/s
+against llama.cpp's 22.1. Neither DRAM (16.5 s of traffic at peak bandwidth)
+nor the tensor cores (5.5 s at peak) nor shared memory (3.7 s) accounts for 54,
+so what is left is latency: the kernel needs 57.4 KiB of shared and therefore
+runs **one block per SM**, eight warps, with four `__syncthreads` per 32-key
+tile and no second block to cover them. Two blocks per SM needs 32 KiB, and the
+staged Q, K and V tiles do not fit twice at this shape.
+
+The two ways out are a fourth reduction in traffic — four query heads per block
+rather than two, which halves the block count again but needs a different warp
+mapping and a 64-register output accumulator — and named barriers, so the two
+head groups stop waiting on each other at the two barriers that are per-head
+rather than per-block. Neither is a constant change; both are specified here
+rather than attempted half-way.
