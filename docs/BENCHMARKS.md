@@ -2904,3 +2904,75 @@ not the 3-4x the remaining gap needs.
 So the fp32 kernel is at its local optimum on both axes. `GQA_KT` 8 and no
 register cap are kept, and neither knob is worth revisiting without first
 changing the arithmetic.
+
+## 128K on one GPU, measured end to end (2026-08-17)
+
+The capability claim, run rather than projected. One Quadro RTX 8000, chunked
+prefill at 512 tokens, a genuine 131,072-position sequence state:
+
+```
+prompt 131072 tokens, prefill 510967.4 ms (256.5 tok/s)
+  mean          23.40 ms      42.74 tok/s
+sequence state 5.063 GiB for 131108 positions; peak VRAM 38.137 GiB of 47.27
+```
+
+**The model runs at 128K on a single card with 9.1 GiB to spare.** The KV cache
+is 5.063 GiB of that, which is the 40 KiB per token the fp32 layout implies, and
+nothing else in the engine scales with context — the 30 GDN layers carry a fixed
+2 MiB of recurrent state each regardless of depth.
+
+Against llama.cpp on the same single card, same model file, `-fa 1`:
+
+| at 131,072 | llmxabe | llama.cpp | ratio |
+| ---------- | ------: | --------: | ----: |
+| prefill tok/s |  256.5 |   1,119.3 | 0.229 |
+| decode tok/s  |  42.74 |     67.65 | 0.632 |
+| peak VRAM     | 38.1 GiB |       — |     — |
+
+So the capacity half of the target is met and the throughput half is not.
+
+### Why, stated as a roofline and not as a guess
+
+llama.cpp processes 131,072 tokens in 117.1 s. Its own 512-token rate on this
+card is 2,155.8 tok/s, so the 256 chunks cost about 60.7 s of everything that is
+not attention, leaving roughly 56.4 s for attention. Attention over that prompt
+is 1,413 TFLOP:
+
+    10 layers * 4 * 512 queries * 16 heads * 256 dims * sum(window)
+    sum(window) = 512 * (1 + 2 + ... + 256) = 16.84e6
+
+1,413 TFLOP in 56.4 s is **25 TFLOP/s**. This card's fp32 peak is 16.3. A number
+above the fp32 peak cannot be reached by any fp32 kernel, however written, so
+this is not a tuning gap — llama.cpp is running attention in fp16 on the tensor
+cores. `ggml/src/ggml-cuda/fattn.cu:461` says so directly:
+
+    // If Turing tensor cores are available, use them:
+    if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+
+head_dim here is 256, so this model takes `fattn-mma-f16.cuh`. (The note in
+`docs/KERNELS.md` that pointed at `fattn-tile.cu`/`fattn-vec.cuh` "not the WMMA
+path" was wrong for this geometry and has been corrected.)
+
+llmxabe's attention runs at 3.2 TFLOP/s, 20% of the fp32 peak. llama.cpp's runs
+at 25 TFLOP/s, 38% of the 65 TFLOP/s that `m16n8k8` with fp32 accumulation
+offers. **Both are at an ordinary fraction of their respective ceilings; the
+ceilings differ by 4x.** That is the whole remaining gap, and no amount of fp32
+scheduling closes it — the two preceding sections measured that trade closed on
+the reduction axis, the occupancy axis, and the tile-width axis.
+
+### What would close it, and what it costs
+
+Porting attention to `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32`. It
+takes fp16 operands and accumulates in fp32, so the rounding is confined to the
+inputs rather than to the 256-term dot product — materially better than the
+packed-`half2` alternative, which would need fp16 accumulation and would breach
+the tolerance this repo's differential tests are gated at.
+
+It requires an fp16 K/V cache, which is a separate benefit: it halves the 5.063
+GiB above and halves the DRAM traffic the decode path is currently limited by.
+
+It is a rewrite rather than a change, and the honest estimate from the roofline
+is that it is necessary but perhaps not sufficient on its own: 4x the ceiling at
+the same 20% utilization would be about 12.8 TFLOP/s against llama.cpp's 25, so
+the tile structure has to improve alongside the arithmetic. That is specified
+here rather than attempted half-way.

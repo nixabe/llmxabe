@@ -306,7 +306,7 @@ Relevant areas — treat as areas, not addresses:
 
 | Need | llama.cpp |
 | --- | --- |
-| sm_75 flash attention | `ggml/src/ggml-cuda/fattn-tile.cu`, `fattn-vec.cuh` (not the WMMA path) |
+| sm_75 flash attention | `ggml/src/ggml-cuda/fattn-mma-f16.cuh` and `mma.cuh` — **the tensor-core path**, which is what `fattn.cu:461` selects for this model. `fattn-tile.cu` and `fattn-vec.cuh` are the fallbacks it does *not* take here. |
 | K-quant superblock unpacking | `ggml/src/ggml-cuda/dequantize.cuh`, `vecdotq.cuh`, `ggml/src/ggml-common.h` |
 | Quantized matvec at decode shapes | `ggml/src/ggml-cuda/mmvq.cu` |
 | Gated DeltaNet | `ggml/src/ggml-cuda/gated_delta_net.cu` |
