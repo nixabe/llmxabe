@@ -1784,7 +1784,23 @@ __global__ void moe_swiglu(
 // and is applied to every token unconditionally, so there is no slot to look
 // up and no routing weight to apply.
 //
-// grid: (ceil(intermediate / MOE_ROWS),). block: MOE_ROWS warps.
+// **Split over the contraction, one output row per block.** The obvious shape
+// — one warp per row, MOE_ROWS rows per block — gives this kernel 64 blocks
+// at the real geometry, because the shared expert's intermediate is 512 and
+// MOE_ROWS is 8. Sixty-four blocks on a 72-SM card leaves eight SMs with no
+// work at all and the other sixty-four running one block of eight warps, a
+// quarter of the threads sm_75 will hold. It measured at **16% of the card's
+// streaming roofline**, the worst of any kernel in a decode step, while the
+// routed pair next door — same arithmetic, same format, 512 blocks — reached
+// 47%.
+//
+// So the block owns one row and its MOE_ROWS warps split the contraction
+// between them, which multiplies the block count by MOE_ROWS instead of
+// dividing the row count by it. The per-warp partial sums are combined
+// through shared memory at the end: eight additions, once per row, against
+// the eight-fold parallelism they buy.
+//
+// grid: (intermediate,). block: MOE_ROWS warps, all on one row.
 __global__ void moe_shared_ffn_gemv(
     const unsigned char* __restrict__ gate_q, int gate_quant,
     const unsigned char* __restrict__ up_q,   int up_quant,
@@ -1797,13 +1813,17 @@ __global__ void moe_shared_ffn_gemv(
     if (*valid_tokens < 1) return;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
-    int r = blockIdx.x * MOE_ROWS + warp;
+    int r = blockIdx.x;
     if (r >= intermediate) return;
     long long wrow = (long long)r * hidden;
 
+    // The launch path rejects a `hidden` this does not divide evenly.
+    int chunk = hidden / MOE_ROWS;
+    int stop = warp * chunk + chunk;
+
     float ag[1] = {0.0f};
     float au[1] = {0.0f};
-    for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
+    for (int j0 = warp * chunk; j0 < stop; j0 += MOE_TK) {
         float wg[MOE_TN];
         float wu[MOE_TN];
         dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
@@ -1817,9 +1837,15 @@ __global__ void moe_shared_ffn_gemv(
     warp_reduce_tile<1>(ag);
     warp_reduce_tile<1>(au);
 
-    if (lane == 0) {
-        float act = ag[0] / (1.0f + expf(-ag[0]));
-        inter[r] = act * au[0];
+    __shared__ float sg[MOE_ROWS];
+    __shared__ float su[MOE_ROWS];
+    if (lane == 0) { sg[warp] = ag[0]; su[warp] = au[0]; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int w = 0; w < MOE_ROWS; ++w) { g += sg[w]; u += su[w]; }
+        inter[r] = (g / (1.0f + expf(-g))) * u;
     }
 }
 
@@ -3049,8 +3075,19 @@ impl MoeKernels {
 
         // One token is a GEMV; see `moe_shared_ffn_gemv`.
         if g.max_tokens == 1 {
+            // One block per output row, its warps splitting the contraction.
+            // See `moe_shared_ffn_gemv` for why the row-per-warp shape was
+            // the wrong one at this geometry.
+            if !g.hidden.is_multiple_of(TILE_ROWS as usize * TILE_K) {
+                return Err(MoeError::UnsupportedGeometry {
+                    geometry: Box::new(g),
+                    reason: "the one-token shared expert splits `hidden` over \
+                             8 warps in 128-element tiles, so it must be a \
+                             multiple of 1024",
+                });
+            }
             let ffn_cfg = LaunchConfig {
-                grid_dim: ((g.intermediate as u32).div_ceil(TILE_ROWS), 1, 1),
+                grid_dim: (g.intermediate as u32, 1, 1),
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };

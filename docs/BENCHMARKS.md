@@ -1271,7 +1271,7 @@ prefill numbers in every section before it.
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
 | Prefill, 512 tokens | `pp512` **2,070.50 ± 160.35 tok/s** | **1,365.74 ± 6.60 tok/s** | **1.52× slower** |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **94.03 tok/s**, 10.63 ms/step | **1.11× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **95.99 tok/s**, 10.42 ms/step | **1.09× slower** |
 
 Decode is treated separately at the end of this document; the sections between
 here and there are all prefill.
@@ -1421,7 +1421,7 @@ overlap in their fixes. Everything above is prefill. This is decode.
 
 | | llama.cpp | llmxabe | position |
 | --- | ---: | ---: | --- |
-| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **94.03 tok/s**, 10.63 ms/step | **1.11× slower** |
+| Decode, warm | `tg128` **104.72 ± 0.36 tok/s** | **95.99 tok/s**, 10.42 ms/step | **1.09× slower** |
 
 Decode began this session at 65.03 tok/s and 1.61× slower.
 
@@ -1437,6 +1437,8 @@ Decode began this session at 65.03 tok/s and 1.61× slower.
 | warp-shuffle reductions in the two routing kernels | 11.59 | 86.27 |
 | argmax on the device instead of over PCIe | 11.05 | 90.47 |
 | word-wide Q6_K unpacking | 10.63 | 94.03 |
+| capture the step as a CUDA graph | 10.70 | 93.50 |
+| split the shared expert over its contraction | 10.42 | 95.99 |
 
 ### The one idea behind all of it
 
@@ -1536,6 +1538,27 @@ What was kept anyway, and why:
   fluent, finite, and frozen after one step — against the launch path's
   `[198, 248045, 74455, 198, …]`. The count is published once per pass now,
   ahead of the capture, and repeats write nothing.
+
+### Two shapes that did not pay, on the kernel that looks most like the one that did
+
+`gdn_proj_split_gemv` is the largest single item in a decode step at 2.25 ms
+and 71% of the roofline, and two changes that worked elsewhere did nothing for
+it:
+
+- **128-bit weight loads.** `int4` instead of `char4` cuts the step from four
+  loads per sixteen elements to five per sixteen *including* the scale — and
+  it forces the activation reads to a 64-byte lane stride, so each of the four
+  `float4`s touches 64 sectors to use 512 bytes. Net: nothing, within noise.
+- **Staging the activations in shared memory.** Every warp in the grid
+  contracts against the same 8 KiB, and at 8,192 output rows that is 67 MiB of
+  L2 traffic per launch. Staging it once per block is the transformation that
+  took the MoE grouped GEMM from 110.9 ms to 11.9 ms — and here it cost 3.6%
+  of the whole decode step (10.42 → 10.79 ms), because 8-16 KiB of shared
+  memory takes the block count per SM from four to three and the L2 was
+  serving those re-reads at a price the occupancy was worth more than.
+
+The lesson is the same one the MMA tile taught in the prefill section: the
+transformation that fixed one kernel is not a property of the transformation.
 
 ### A measurement discipline note
 
