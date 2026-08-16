@@ -589,10 +589,24 @@ pub struct GatedAttentionBlock {
     /// tiles — that a short batch cannot amortize, and a decode step of one
     /// token would pay all of it to fill an eighth of a fragment.
     int8: Option<AttnInt8>,
-    /// Activations quantized once per contraction width and reused by every
-    /// projection that shares it. Allocated on first use, then kept.
-    xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+}
 
+/// The per-pass buffers every Gated Attention layer needs, owned once.
+///
+/// These are pure scratch: each is written and consumed inside a single
+/// layer's [`GatedAttentionBlock::forward`] and carries nothing across layers.
+/// The ten layers run strictly in sequence, so one set serves all of them, and
+/// holding one set instead of ten is the difference between 1.68 MB and
+/// 0.17 MB of VRAM per token of context.
+///
+/// That is not a micro-optimization at this geometry. `q_dim` is 4,096 —
+/// sixteen heads of 256 — and seven of these buffers are that wide, so a
+/// private copy per layer was the single largest consumer of per-token memory
+/// in the engine, larger than the Gated DeltaNet block and the MoE dispatch
+/// put together. `GdnBlock` was already shared across its thirty layers; this
+/// is the same arrangement for the other ten.
+pub struct AttnScratch {
+    tokens: usize,
     normed: CudaSlice<f32>,
     packed: CudaSlice<f32>,
     query: CudaSlice<f32>,
@@ -607,6 +621,109 @@ pub struct GatedAttentionBlock {
     gate_sigmoid: CudaSlice<f32>,
     gated: CudaSlice<f32>,
     projected: CudaSlice<f32>,
+    /// Activations quantized once per contraction width and reused by every
+    /// projection that shares it. Allocated on first use, then kept.
+    xq: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
+}
+
+impl AttnScratch {
+    /// Allocate for a fixed token count, once per [`crate::forward::Forward`].
+    pub fn new(
+        stream: &Arc<CudaStream>,
+        config: &ModelConfig,
+        tokens: usize,
+    ) -> Result<Self, AttentionBlockError> {
+        let hidden = config.hidden_size as usize;
+        let a = &config.attention;
+        let q_dim = a.q_heads as usize * a.head_dim as usize;
+        let kv_dim = a.kv_heads as usize * a.head_dim as usize;
+        Ok(Self {
+            tokens,
+            normed: stream.alloc_zeros::<f32>(tokens * hidden)?,
+            packed: stream.alloc_zeros::<f32>(tokens * 2 * q_dim)?,
+            query: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            query_normed: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            query_roped: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            key: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            key_normed: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            key_roped: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            value: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
+            pregate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gate_sigmoid: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
+            projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
+            xq: None,
+        })
+    }
+
+    /// The token count this scratch was sized for.
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    /// Drop the quantized activation mirror. See
+    /// [`GatedAttentionBlock::disable_tensor_cores`].
+    pub fn forget_quantized_activations(&mut self) {
+        self.xq = None;
+    }
+
+    /// `attn_norm-N`: the input RMSNorm, `[tokens][hidden]`.
+    pub fn normed_input(&self) -> &CudaSlice<f32> {
+        &self.normed
+    }
+    /// `Qcur_full-N`: the packed query+gate projection, `[tokens][2*q_dim]`.
+    pub fn packed_query_gate(&self) -> &CudaSlice<f32> {
+        &self.packed
+    }
+    /// `Qcur_reshaped-N`: the deinterleaved query, `[tokens][q_heads][head_dim]`.
+    pub fn query(&self) -> &CudaSlice<f32> {
+        &self.query
+    }
+    /// `gate_reshaped-N`: the deinterleaved output gate, same shape.
+    pub fn gate(&self) -> &CudaSlice<f32> {
+        &self.gate
+    }
+    /// `Qcur_normed-N`: the query after its per-head RMSNorm.
+    pub fn query_normed(&self) -> &CudaSlice<f32> {
+        &self.query_normed
+    }
+    /// `Qcur-N`: the query after partial rotary.
+    pub fn query_roped(&self) -> &CudaSlice<f32> {
+        &self.query_roped
+    }
+    /// `Kcur-N` (first record): the raw key projection, `[tokens][kv_dim]`.
+    pub fn key(&self) -> &CudaSlice<f32> {
+        &self.key
+    }
+    /// `Kcur_normed-N`: the key after its per-head RMSNorm.
+    pub fn key_normed(&self) -> &CudaSlice<f32> {
+        &self.key_normed
+    }
+    /// `Kcur-N` (second record): the key after partial rotary.
+    pub fn key_roped(&self) -> &CudaSlice<f32> {
+        &self.key_roped
+    }
+    /// `Vcur-N`: the value projection. Neither normed nor rotated.
+    pub fn value(&self) -> &CudaSlice<f32> {
+        &self.value
+    }
+    /// `attn_pregate-N`: attention output before the gate.
+    pub fn pregate(&self) -> &CudaSlice<f32> {
+        &self.pregate
+    }
+    /// `gate_sigmoid-N`: `sigmoid(gate)`.
+    pub fn gate_sigmoid(&self) -> &CudaSlice<f32> {
+        &self.gate_sigmoid
+    }
+    /// `attn_gated-N`: the gated attention output.
+    pub fn gated(&self) -> &CudaSlice<f32> {
+        &self.gated
+    }
+    /// `attn_output-N`: the output projection, before the residual add.
+    pub fn projected(&self) -> &CudaSlice<f32> {
+        &self.projected
+    }
 }
 
 /// One attention layer's Q8_0 projections in the split int8 layout.
@@ -701,7 +818,6 @@ impl GatedAttentionBlock {
     /// back to the fp32 kernels. See [`crate::forward::Forward::disable_tensor_cores`].
     pub fn disable_tensor_cores(&mut self) {
         self.int8 = None;
-        self.xq = None;
     }
 
     /// Whether this block has its repacked int8 weights resident.
@@ -717,8 +833,9 @@ impl GatedAttentionBlock {
     /// the wider of the two so the second call cannot reallocate mid-pass,
     /// which `AGENTS.md` rule 6 forbids.
     fn quantize_activations(
-        &mut self,
+        &self,
         stream: &Arc<CudaStream>,
+        sc: &mut AttnScratch,
         pick: ScratchPick,
         tokens: usize,
         k_dim: usize,
@@ -726,18 +843,18 @@ impl GatedAttentionBlock {
         let widest = tokens * self.hidden.max(self.q_heads * self.head_dim);
         let need = tokens * k_dim;
         debug_assert!(need <= widest);
-        if !self.xq.as_ref().is_some_and(|(q, _)| q.len() >= need) {
-            self.xq = Some((
+        if !sc.xq.as_ref().is_some_and(|(q, _)| q.len() >= need) {
+            sc.xq = Some((
                 stream.alloc_zeros::<i8>(widest)?,
                 stream.alloc_zeros::<f32>(widest / 32)?,
             ));
         }
         let src = match pick {
-            ScratchPick::Normed => &self.normed,
-            ScratchPick::Gated => &self.gated,
+            ScratchPick::Normed => &sc.normed,
+            ScratchPick::Gated => &sc.gated,
         };
         let i8w = self.int8.as_ref().expect("caller checked");
-        let (q, sc) = self.xq.as_mut().expect("just allocated");
+        let (q, sc) = sc.xq.as_mut().expect("just allocated");
         i8w.mma.quantize_rows(stream, src, q, sc, tokens, k_dim)?;
         Ok(())
     }
@@ -821,21 +938,6 @@ impl GatedAttentionBlock {
             w_v,
             w_out,
             int8,
-            xq: None,
-            normed: stream.alloc_zeros::<f32>(tokens * hidden)?,
-            packed: stream.alloc_zeros::<f32>(tokens * 2 * q_dim)?,
-            query: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            gate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            query_normed: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            query_roped: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            key: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
-            key_normed: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
-            key_roped: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
-            value: stream.alloc_zeros::<f32>(tokens * kv_dim)?,
-            pregate: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            gate_sigmoid: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
-            projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
         })
     }
 
@@ -870,9 +972,14 @@ impl GatedAttentionBlock {
     /// correct for every later query, whereas rotating on read would redo the
     /// same work for the whole window on every step. Values are never rotated
     /// at all.
+    /// Eight plain arguments rather than a config struct, for the reason the
+    /// rest of this workspace gives: every one is a distinct per-call tensor or
+    /// position, not related configuration.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
         stream: &Arc<CudaStream>,
+        sc: &mut AttnScratch,
         hidden_state: &CudaSlice<f32>,
         cache: &mut KvCache,
         pos_offset: usize,
@@ -904,7 +1011,7 @@ impl GatedAttentionBlock {
             stream,
             hidden_state,
             &self.w_input_norm,
-            &mut self.normed,
+            &mut sc.normed,
             t,
             self.hidden,
             self.rms_eps,
@@ -915,17 +1022,17 @@ impl GatedAttentionBlock {
         // Steps 2 and 5 all read `normed` and all contract over `hidden`, so
         // one quantization serves three projections.
         if self.int8.is_some() {
-            self.quantize_activations(stream, ScratchPick::Normed, t, self.hidden)?;
+            self.quantize_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
         }
         if let Some(i8w) = self.int8.as_ref() {
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
             i8w.mma.q8_0_proj_split(
                 stream,
                 &i8w.qgate_q,
                 &i8w.qgate_s,
                 xq,
                 xs,
-                &mut self.packed,
+                &mut sc.packed,
                 self.hidden,
                 2 * q_dim,
                 t,
@@ -937,23 +1044,23 @@ impl GatedAttentionBlock {
                     bytes: &self.w_qgate,
                     quant: ExpertQuant::Q8_0,
                 },
-                &self.normed,
+                &sc.normed,
                 t,
-                &mut self.packed,
+                &mut sc.packed,
             )?;
         }
 
         // 3. Deinterleave. See the module docs: this is the step that is a
         //    different model if it is done as a halves split.
         k.mixer
-            .split_query_and_gate(stream, &self.packed, &mut self.query, &mut self.gate, t)?;
+            .split_query_and_gate(stream, &sc.packed, &mut sc.query, &mut sc.gate, t)?;
 
         // 4. Per-head RMSNorm on the query.
         k.ops.rms_norm(
             stream,
-            &self.query,
+            &sc.query,
             &self.w_q_norm,
-            &mut self.query_normed,
+            &mut sc.query_normed,
             t * self.q_heads,
             self.head_dim,
             self.rms_eps,
@@ -962,14 +1069,14 @@ impl GatedAttentionBlock {
         // 5. Key and value projections, off the same normed input — and off
         //    the same quantization of it that step 2 already paid for.
         if let Some(i8w) = self.int8.as_ref() {
-            let (xq, xs) = self.xq.as_ref().expect("quantized at step 2");
+            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
             i8w.mma.q8_0_proj_split(
                 stream,
                 &i8w.k_q,
                 &i8w.k_s,
                 xq,
                 xs,
-                &mut self.key,
+                &mut sc.key,
                 self.hidden,
                 kv_dim,
                 t,
@@ -980,7 +1087,7 @@ impl GatedAttentionBlock {
                 &i8w.v_s,
                 xq,
                 xs,
-                &mut self.value,
+                &mut sc.value,
                 self.hidden,
                 kv_dim,
                 t,
@@ -992,9 +1099,9 @@ impl GatedAttentionBlock {
                     bytes: &self.w_k,
                     quant: ExpertQuant::Q8_0,
                 },
-                &self.normed,
+                &sc.normed,
                 t,
-                &mut self.key,
+                &mut sc.key,
             )?;
             k.kv.forward(
                 stream,
@@ -1002,18 +1109,18 @@ impl GatedAttentionBlock {
                     bytes: &self.w_v,
                     quant: ExpertQuant::Q8_0,
                 },
-                &self.normed,
+                &sc.normed,
                 t,
-                &mut self.value,
+                &mut sc.value,
             )?;
         }
 
         // 6. Per-head RMSNorm on the key. The value is not normed.
         k.ops.rms_norm(
             stream,
-            &self.key,
+            &sc.key,
             &self.w_k_norm,
-            &mut self.key_normed,
+            &mut sc.key_normed,
             t * self.kv_heads,
             self.head_dim,
             self.rms_eps,
@@ -1023,8 +1130,8 @@ impl GatedAttentionBlock {
         //    broadcast — hence two head counts.
         k.mixer.rope(
             stream,
-            &self.query_normed,
-            &mut self.query_roped,
+            &sc.query_normed,
+            &mut sc.query_roped,
             t,
             self.q_heads,
             self.rope_dim,
@@ -1033,8 +1140,8 @@ impl GatedAttentionBlock {
         )?;
         k.mixer.rope(
             stream,
-            &self.key_normed,
-            &mut self.key_roped,
+            &sc.key_normed,
+            &mut sc.key_roped,
             t,
             self.kv_heads,
             self.rope_dim,
@@ -1050,8 +1157,8 @@ impl GatedAttentionBlock {
         //    replayed from a CUDA graph.
         k.mixer.append_kv(
             stream,
-            &self.key_roped,
-            &self.value,
+            &sc.key_roped,
+            &sc.value,
             &mut cache.k,
             &mut cache.v,
             t,
@@ -1064,10 +1171,10 @@ impl GatedAttentionBlock {
         //    longer and the kernel reads none of the tail.
         k.mixer.forward(
             stream,
-            &self.query_roped,
+            &sc.query_roped,
             &cache.k,
             &cache.v,
-            &mut self.pregate,
+            &mut sc.pregate,
             t,
             cache.max_seq,
             positions,
@@ -1076,10 +1183,10 @@ impl GatedAttentionBlock {
         // 10. The output gate.
         k.elementwise.sigmoid_gate(
             stream,
-            &self.pregate,
-            &self.gate,
-            &mut self.gate_sigmoid,
-            &mut self.gated,
+            &sc.pregate,
+            &sc.gate,
+            &mut sc.gate_sigmoid,
+            &mut sc.gated,
             q_elems,
         )?;
 
@@ -1087,17 +1194,17 @@ impl GatedAttentionBlock {
         //     reads the gated core output — so it re-quantizes rather than
         //     reusing what step 2 produced.
         if self.int8.is_some() {
-            self.quantize_activations(stream, ScratchPick::Gated, t, q_dim)?;
+            self.quantize_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
         }
         if let Some(i8w) = self.int8.as_ref() {
-            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
             i8w.mma.q8_0_proj_split(
                 stream,
                 &i8w.out_q,
                 &i8w.out_s,
                 xq,
                 xs,
-                &mut self.projected,
+                &mut sc.projected,
                 q_dim,
                 self.hidden,
                 t,
@@ -1109,74 +1216,17 @@ impl GatedAttentionBlock {
                     bytes: &self.w_out,
                     quant: ExpertQuant::Q8_0,
                 },
-                &self.gated,
+                &sc.gated,
                 t,
-                &mut self.projected,
+                &mut sc.projected,
             )?;
         }
 
         // 12. Residual.
         k.elementwise
-            .residual_add(stream, hidden_state, &self.projected, out, hidden_elems)?;
+            .residual_add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
 
         Ok(())
-    }
-
-    /// `attn_norm-N`: the input RMSNorm, `[tokens][hidden]`.
-    pub fn normed_input(&self) -> &CudaSlice<f32> {
-        &self.normed
-    }
-    /// `Qcur_full-N`: the packed query+gate projection, `[tokens][2*q_dim]`.
-    pub fn packed_query_gate(&self) -> &CudaSlice<f32> {
-        &self.packed
-    }
-    /// `Qcur_reshaped-N`: the deinterleaved query, `[tokens][q_heads][head_dim]`.
-    pub fn query(&self) -> &CudaSlice<f32> {
-        &self.query
-    }
-    /// `gate_reshaped-N`: the deinterleaved output gate, same shape.
-    pub fn gate(&self) -> &CudaSlice<f32> {
-        &self.gate
-    }
-    /// `Qcur_normed-N`: the query after its per-head RMSNorm.
-    pub fn query_normed(&self) -> &CudaSlice<f32> {
-        &self.query_normed
-    }
-    /// `Qcur-N`: the query after partial rotary.
-    pub fn query_roped(&self) -> &CudaSlice<f32> {
-        &self.query_roped
-    }
-    /// `Kcur-N` (first record): the raw key projection, `[tokens][kv_dim]`.
-    pub fn key(&self) -> &CudaSlice<f32> {
-        &self.key
-    }
-    /// `Kcur_normed-N`: the key after its per-head RMSNorm.
-    pub fn key_normed(&self) -> &CudaSlice<f32> {
-        &self.key_normed
-    }
-    /// `Kcur-N` (second record): the key after partial rotary.
-    pub fn key_roped(&self) -> &CudaSlice<f32> {
-        &self.key_roped
-    }
-    /// `Vcur-N`: the value projection. Neither normed nor rotated.
-    pub fn value(&self) -> &CudaSlice<f32> {
-        &self.value
-    }
-    /// `attn_pregate-N`: attention output before the gate.
-    pub fn pregate(&self) -> &CudaSlice<f32> {
-        &self.pregate
-    }
-    /// `gate_sigmoid-N`: `sigmoid(gate)`.
-    pub fn gate_sigmoid(&self) -> &CudaSlice<f32> {
-        &self.gate_sigmoid
-    }
-    /// `attn_gated-N`: the gated attention output.
-    pub fn gated(&self) -> &CudaSlice<f32> {
-        &self.gated
-    }
-    /// `attn_output-N`: the output projection, before the residual add.
-    pub fn projected(&self) -> &CudaSlice<f32> {
-        &self.projected
     }
 }
 

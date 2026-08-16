@@ -130,8 +130,14 @@ __global__ void mma_quantize_rows_q8(
     float* __restrict__ scales,
     int k_dim
 ) {
-    int row   = blockIdx.y;
-    int block = blockIdx.x * blockDim.y + threadIdx.y;
+    // Row on x, contraction block on y -- deliberately, and not the other way
+    // round. grid.y and grid.z are capped at 65,535 while grid.x is capped at
+    // 2^31-1, and `rows` here is the MoE dispatch *slot* count, which is
+    // `max_tokens * top_k` plus padding. Putting it on y capped the model's
+    // context at about 7,168 tokens, with the failure surfacing as a bare
+    // CUDA_ERROR_INVALID_VALUE from the launch.
+    int row   = blockIdx.x;
+    int block = blockIdx.y * blockDim.y + threadIdx.y;
     int lane  = threadIdx.x;
     int blocks = k_dim / 32;
     if (block >= blocks) return;
@@ -721,7 +727,7 @@ impl MmaKernels {
 
         const WARPS: u32 = 4;
         let cfg = LaunchConfig {
-            grid_dim: ((k / 32).div_ceil(WARPS as usize) as u32, rows as u32, 1),
+            grid_dim: (rows as u32, (k / 32).div_ceil(WARPS as usize) as u32, 1),
             block_dim: (32, WARPS, 1),
             shared_mem_bytes: 0,
         };
@@ -977,6 +983,22 @@ fn expect_len(what: &'static str, actual: usize, expected: usize) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_row_axis_of_the_quantizer_is_x_because_only_x_is_unbounded() {
+        // `rows` is the MoE dispatch slot count -- `max_tokens * top_k` plus
+        // padding -- so it is the one launch dimension in this file that scales
+        // with context. grid.y and grid.z stop at 65,535; grid.x stops at
+        // 2^31-1. With rows on y the model could not exceed about 7,168 tokens
+        // and the failure was an unattributed CUDA_ERROR_INVALID_VALUE, which
+        // is why this is asserted rather than left to a comment.
+        assert!(MMA_SRC.contains("int row   = blockIdx.x;"));
+        assert!(MMA_SRC.contains("int block = blockIdx.y * blockDim.y + threadIdx.y;"));
+        assert!(
+            !MMA_SRC.contains("int row   = blockIdx.y;"),
+            "rows on grid.y caps context at 65,535 slots",
+        );
+    }
 
     #[test]
     fn the_kernel_uses_the_turing_shape_and_not_the_ampere_one() {

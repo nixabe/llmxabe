@@ -3038,15 +3038,18 @@ impl MoeKernels {
         // one that can actually bite.
         //
         // The quantity to bound is `expert_block_capacity`, which is what every
-        // dispatch launch actually puts in grid.y. This used to bound
-        // `sorted_capacity` — the *slot* count, `block_size` times larger — and
-        // so refused geometries the hardware has no objection to. At the real
-        // geometry that capped the model at about 7,168 tokens of context when
-        // grid.y at that point is 2,040 of an available 65,535. Nothing else
-        // depends on the slot count fitting a grid dimension: it is a loop
-        // bound inside the dispatch kernels and a length for `sorted_token_ids`
-        // and `inter`, both indexed by `int`, which 65,535 * `block_size`
-        // cannot overflow.
+        // dispatch launch puts in grid.y. This used to bound `sorted_capacity`
+        // — the *slot* count, `block_size` times larger — and so capped context
+        // at about 7,168 tokens where grid.y is 2,040 of an available 65,535.
+        //
+        // That bound was not arbitrary, though, and relaxing it alone was not
+        // enough: `MmaKernels::quantize_rows` took `rows` on grid.y, and the
+        // down projection passes `sorted_capacity` as `rows`. Past 7,168 tokens
+        // the launch failed with a bare `CUDA_ERROR_INVALID_VALUE`. That kernel
+        // now takes rows on grid.x, where the limit is 2^31-1, so the slot
+        // count no longer reaches a 65,535 axis anywhere. Nothing else needs it
+        // to: inside the dispatch kernels it is a loop bound, and outside it is
+        // a length for `sorted_token_ids` and `inter`, both indexed by `int`.
         if geometry.expert_block_capacity() > 65_535 {
             return Err(bad(
                 "dispatch-block capacity exceeds the 65535 grid.y limit",

@@ -96,7 +96,9 @@ use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::{LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role};
 
-use crate::block::attention::{AttentionBlockError, AttentionKernelSet, GatedAttentionBlock};
+use crate::block::attention::{
+    AttentionBlockError, AttentionKernelSet, AttnScratch, GatedAttentionBlock,
+};
 use crate::block::gdn::{GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights};
 use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
 use crate::state::{SequenceState, StateError};
@@ -539,6 +541,10 @@ pub struct Forward {
     layer_ops: LayerOpsKernels,
     gdn: GdnBlock,
     attention: Vec<GatedAttentionBlock>,
+    /// One set of per-pass buffers for all ten attention layers. They run in
+    /// sequence and nothing crosses a layer boundary, so ten private copies
+    /// were ten times the per-token VRAM for no benefit. See [`AttnScratch`].
+    attn_scratch: AttnScratch,
     moe: MoeBlock,
     lm_head: LmHeadKernels,
 
@@ -797,6 +803,11 @@ impl Forward {
             )?);
         }
 
+        // One scratch for all ten of them: they run in sequence and nothing
+        // crosses a layer boundary. Ten private copies cost 1.68 MB of VRAM
+        // per token of context against this one's 0.17 MB.
+        let attn_scratch = AttnScratch::new(stream, &config, tokens)?;
+
         // --- the MoE, on every block ---------------------------------------
         let moe_geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, tokens);
         let moe = MoeBlock::new(ctx, stream, moe_geometry, rms_eps)?;
@@ -843,6 +854,7 @@ impl Forward {
             layer_ops,
             gdn,
             attention,
+            attn_scratch,
             moe,
             lm_head,
             w_token_embd,
@@ -1248,6 +1260,7 @@ impl Forward {
                     let (cache, positions) = state.kv_and_position_mut(attn_slot);
                     self.attention[attn_slot].forward(
                         stream,
+                        &mut self.attn_scratch,
                         &self.hidden_state,
                         cache,
                         pos_offset,

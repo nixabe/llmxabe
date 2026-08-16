@@ -2539,3 +2539,83 @@ The prefill goal is met and then some at the length it was set at. It is met
 past 6,144 it does not run. Long-context prefill and decode-at-depth are the
 two places the engine is now clearly behind, and both trace to the same
 missing piece — a chunked prefill with a shared activation arena.
+
+## Context ceiling: 6,144 -> 24,576 tokens (2026-08-17)
+
+Two changes, prompted by asking why an engine on a 48 GiB card could not
+prefill 8K tokens when the weights are 29.8 GiB.
+
+### The MTP head was already excluded — that was not it
+
+Worth stating because it is the first thing to suspect: the GGUF reports
+`block_count = 41` for a 40-layer model, and block 40 is the MTP/`nextn` head —
+a complete extra attention block with its own 256-expert MoE, about 0.75 GiB.
+llama.cpp logs `unused tensor blk.40.* -- ignoring` for all twenty of them.
+
+`WeightSchema::new` already omits it and only the test-only `with_mtp`
+constructor includes it, which the profile corroborates: 39 `moe_expert_ffn_mma`
+launches plus one `_q8` per pass, not 41. Measured directly, a build at one
+token peaks at **32.127 GiB**, of which 2.291 GiB is the weight arena, leaving
+~29.8 GiB of weights against a 30.37 GiB file — the MTP head's worth less.
+
+### Ten private attention scratches were 1.68 MB per token
+
+VRAM grew at a very linear **2.05 MB per token of context**, which is enormous
+next to the 8 KB a hidden-state row needs. `GdnBlock` is constructed once and
+shared across all thirty of its layers; `attention` is a `Vec` of ten blocks,
+and each one held its own copy of fourteen scratch buffers inline.
+
+At this geometry `q_dim` is 4,096 — sixteen heads of 256 — and seven of those
+fourteen buffers are that wide. One layer's set is 43,008 floats per token, or
+**168 KiB/token**; ten of them are 1.68 MB/token, which was more than the Gated
+DeltaNet block, the MoE dispatch, and the residual stream put together.
+
+They are pure scratch — written and consumed inside one layer's `forward`,
+nothing crossing a layer boundary — and the layers run strictly in sequence, so
+one set serves all ten. Extracted into `AttnScratch`, owned by `Forward`, passed
+in by reference. Measured per-token VRAM: **2.05 MB -> 0.581 MB**, a 3.5x
+reduction, and prefill at 512 tokens is unchanged at 2,347.6 tok/s.
+
+### The 65,535 grid axis, twice
+
+With the memory fixed, 8,192 tokens then failed with a bare
+`CUDA_ERROR_INVALID_VALUE`. Two guards were involved and the first correction
+was wrong.
+
+The MoE geometry check bounded `sorted_capacity` — the dispatch *slot* count,
+`max_tokens * top_k` plus padding — against the 65,535 `grid.y` limit, while
+every dispatch launch puts `expert_block_capacity` there, `block_size` times
+smaller. Relaxing it to bound the block count looked right and **was not
+sufficient**: `MmaKernels::quantize_rows` took `rows` on `grid.y`, and the down
+projection passes `sorted_capacity` as `rows`. The old guard was therefore
+load-bearing by accident, at exactly the observed boundary — 7,168 tokens gives
+65,280 slots and 8,000 gives 71,936.
+
+The fix is at the source. `mma_quantize_rows_q8` now takes the row on `grid.x`,
+capped at 2^31-1, and the contraction block on `grid.y`, which is 4 blocks wide
+at this geometry. The slot count no longer reaches a 65,535 axis anywhere.
+
+### Where that leaves the context sweep
+
+| tokens | peak VRAM | prefill tok/s |
+| ---: | ---: | ---: |
+| 512 | 32.85 GiB | 2,347.6 |
+| 2,048 | — | **2,646.7** |
+| 8,192 | 37.19 GiB | 1,690.9 |
+| 16,384 | 41.82 GiB | 1,075.0 |
+| 24,576 | 46.44 GiB | 798.6 |
+
+**4x the reachable context, at no throughput cost where it already ran.** The
+shape of the curve is unchanged and is the next problem: prefill still peaks at
+2,048 tokens and decays quadratically after, because `bench_forward` runs the
+whole sequence as one cold pass with no KV cache, so attention is O(n^2) in a
+single shot. llama.cpp processes the same prompt in 512-token micro-batches
+against a KV cache and holds 1,730 tok/s at 32K on one GPU against llmxabe's
+1,691 at 8K and 799 at 24K.
+
+32K remains out of reach on one card by about 8 GiB. The remaining 0.581
+MB/token is now spread thinly across the GDN block, the MoE dispatch and the
+residual stream rather than concentrated anywhere, so the next step is not
+another sharing fix — it is chunked prefill, which bounds activation memory by
+the chunk instead of the sequence and fixes the throughput curve at the same
+time.

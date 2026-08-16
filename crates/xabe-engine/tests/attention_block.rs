@@ -77,7 +77,7 @@ use std::time::Instant;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::block::attention::{
-    AttentionKernelSet, GatedAttentionBlock, KvCache, attention_layers,
+    AttentionKernelSet, AttnScratch, GatedAttentionBlock, KvCache, attention_layers,
 };
 use xabe_engine::weights::DeviceWeights;
 use xabe_gguf::{GgufFile, GgufValue};
@@ -976,6 +976,10 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         .expect("block weights resolve and scratch allocates");
         assert_eq!(block.layer(), layer);
         assert_eq!(block.tokens(), tokens);
+        // Shared across the ten layers in a real pass; one block's worth here.
+        let mut scratch =
+            AttnScratch::new(&stream, &config, tokens).expect("attention scratch allocates");
+        assert_eq!(scratch.tokens(), tokens);
 
         let d_in = stream
             .clone_htod(block_in.as_slice())
@@ -990,7 +994,15 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         // in device memory rather than by passing a host zero.
         let positions = stream.alloc_zeros::<i32>(1).expect("alloc position");
         block
-            .forward(&stream, &d_in, &mut cache, 0, &positions, &mut d_out)
+            .forward(
+                &stream,
+                &mut scratch,
+                &d_in,
+                &mut cache,
+                0,
+                &positions,
+                &mut d_out,
+            )
             .expect("block forward launches");
         stream.synchronize().expect("sync after forward");
 
@@ -1194,77 +1206,77 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         let steps = vec![
             dev_step(
                 "attn_norm",
-                read(&stream, block.normed_input()),
+                read(&stream, scratch.normed_input()),
                 &host.normed,
                 &gold_norm,
                 PRE_PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Qcur_full",
-                read(&stream, block.packed_query_gate()),
+                read(&stream, scratch.packed_query_gate()),
                 &host.packed,
                 &gold_full,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Qcur_reshaped",
-                read(&stream, block.query()),
+                read(&stream, scratch.query()),
                 &host.query,
                 &gold_q,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "gate_reshaped",
-                read(&stream, block.gate()),
+                read(&stream, scratch.gate()),
                 &host.gate,
                 &gold_gate,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Qcur_normed",
-                read(&stream, block.query_normed()),
+                read(&stream, scratch.query_normed()),
                 &host.query_normed,
                 &gold_qn,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Kcur",
-                read(&stream, block.key()),
+                read(&stream, scratch.key()),
                 &host.key,
                 &gold_k,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Vcur",
-                read(&stream, block.value()),
+                read(&stream, scratch.value()),
                 &host.value,
                 &gold_v,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Kcur_normed",
-                read(&stream, block.key_normed()),
+                read(&stream, scratch.key_normed()),
                 &host.key_normed,
                 &gold_kn,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Qcur(rope)",
-                read(&stream, block.query_roped()),
+                read(&stream, scratch.query_roped()),
                 &host.query_roped,
                 &gold_qr,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "Kcur(rope)",
-                read(&stream, block.key_roped()),
+                read(&stream, scratch.key_roped()),
                 &host.key_roped,
                 &gold_kr,
                 PROJECTION_VS_GOLDEN,
             ),
             dev_step(
                 "attn_pregate",
-                read(&stream, block.pregate()),
+                read(&stream, scratch.pregate()),
                 &host.pregate,
                 &gold_pre,
                 PROJECTION_VS_GOLDEN,
@@ -1277,7 +1289,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 scale: Some((1.0, "sigmoid's unit range")),
                 ..dev_step(
                     "gate_sigmoid",
-                    read(&stream, block.gate_sigmoid()),
+                    read(&stream, scratch.gate_sigmoid()),
                     &host.gate_sigmoid,
                     &gold_sig,
                     PROJECTION_VS_GOLDEN,
@@ -1291,7 +1303,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 scale: Some((pregate_rms, "attn_pregate's RMS")),
                 ..dev_step(
                     "attn_gated",
-                    read(&stream, block.gated()),
+                    read(&stream, scratch.gated()),
                     &host.gated,
                     &gold_gated,
                     PROJECTION_VS_GOLDEN,
@@ -1309,7 +1321,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 )),
                 ..dev_step(
                     "attn_output",
-                    read(&stream, block.projected()),
+                    read(&stream, scratch.projected()),
                     &host.projected,
                     &gold_proj,
                     PROJECTION_VS_GOLDEN,
@@ -1353,9 +1365,9 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         }
 
         // ---- 6. The interleave, on this repository's own output. ------
-        let dev_packed = read(&stream, block.packed_query_gate());
-        let dev_query = read(&stream, block.query());
-        let dev_gate = read(&stream, block.gate());
+        let dev_packed = read(&stream, scratch.packed_query_gate());
+        let dev_query = read(&stream, scratch.query());
+        let dev_gate = read(&stream, scratch.gate());
         let (host_q, host_gate) = deinterleave(&dev_packed, q_heads, head_dim);
         let bad_q = dev_query
             .iter()
@@ -1390,10 +1402,10 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         );
 
         // ---- 7. The rotary tail, bit-exact. ---------------------------
-        let dev_qn = read(&stream, block.query_normed());
-        let dev_qr = read(&stream, block.query_roped());
-        let dev_kn = read(&stream, block.key_normed());
-        let dev_kr = read(&stream, block.key_roped());
+        let dev_qn = read(&stream, scratch.query_normed());
+        let dev_qr = read(&stream, scratch.query_roped());
+        let dev_kn = read(&stream, scratch.key_normed());
+        let dev_kr = read(&stream, scratch.key_roped());
         let rope_dim = a.rope_dim as usize;
         let tail_mismatches = |before: &[f32], after: &[f32], heads: usize| -> usize {
             let mut bad = 0;
