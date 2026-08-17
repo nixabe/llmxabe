@@ -4993,3 +4993,284 @@ before being named a fix and re-verified against every accuracy gate
 after. The honest remaining-gap analysis above -- what's fixed, what §2.6
 says cannot be fixed at this batch width by any implementation, and what's
 named but unmeasured -- is this workstream's hand-off point.
+
+## Widening the softmax-rescale tile: built, and rejected on register spill (2026-08-18)
+
+Profiling task for the deep-prefill gap: `nsys --delay --duration` windows
+over `bench_forward`'s chunked-prefill run at `LLMXABE_BENCH_N=131072
+LLMXABE_BENCH_CHUNK=8192`, one window at a fresh 8,192-token chunk (depth 0)
+and one at the tail chunk (depth ~122,880-131,072), GPU 0. `cuda_gpu_trace`
+summed by kernel name settles which of attention or MoE/GDN the deep-depth
+ratio decay lives in, no guessing required:
+
+| kernel | shallow chunk, % of kernel time | deep chunk, % of kernel time |
+|---|---:|---:|
+| `attn_flash_causal_mma` | 8.09% | **71.79%** |
+| `moe_expert_ffn_mma` | 18.71% | 5.71% |
+| `moe_expert_down_mma` | 12.17% | 3.68% |
+| `gdn_scan_prefill` | 18.80% | 6.22% |
+| `mma_q8_0_proj_split` | 20.15% | 6.18% |
+
+MoE and GDN's *absolute* per-chunk cost barely moves between the two
+windows (they are O(chunk), not O(depth)); attention's does, from a small
+fraction of a shallow chunk to nearly three-quarters of a deep one. The
+deep-prefill gap is where the earlier sections already narrowed it to:
+attention's own per-token cost growing with depth, not a MoE or GDN
+regression at width. This settles which of the two candidate directions in
+this session's brief to chase.
+
+### The structural difference against `fattn-mma-f16.cuh`
+
+llama.cpp's Turing config for `DKQ=DV=256` (`ggml_cuda_fattn_mma_get_config_turing`,
+`fattn-mma-f16.cuh:91`) sets `nbatch_fa = 64`: it rescales the running
+softmax max, normalizer and `P V` accumulator once per 64 keys.
+`attn_flash_causal_mma` rescales once per `MMA_KT` keys, which is 8 at the
+shipped `MMA_HPB` 8 -- **eight times finer-grained** than llama.cpp's
+kernel on the same head dimension. Read closely, `MMA_KT` 8 is not a
+traffic decision at all: `MMA_HPB` (heads sharing one staged K/V tile,
+which *is* the traffic lever measured in the "Tensor cores" section above)
+and `MMA_KT` (keys between one barrier pair and the next, which costs
+nothing in traffic, only in how many times the fixed per-tile overhead is
+paid) are two different axes that happen to be tied together by the
+current code: `MMA_KT == 8 * MMA_WPH` and `MMA_WPH == 8 / MMA_HPB`, so
+pinning `MMA_HPB` at 8 for the traffic win pins `MMA_WPH` at 1 and `MMA_KT`
+at 8 as a side effect, not by anything the traffic argument requires.
+llama.cpp reaches 64 by looping a warp over several 16-key `ldmatrix`
+batches before its one softmax pass, independent of how many Q columns
+share a KV tile -- exactly the two axes this kernel conflates.
+
+At a 122,880-key deep-chunk window that is 15,360 outer trips against
+llama.cpp's ~1,920 for the same keys, each trip paying two barriers
+(`__syncthreads` for the staged-tile handoff, `MMA_HEAD_BAR` for the
+softmax) and a full accumulator rescale (`o[t][k] *= cg` over `MMA_MAXT`
+32 tiles) that is fixed-cost per trip and does not shrink with a narrower
+tile. Decoupling the two axes -- keep `MMA_HPB` 8 for the traffic win, add
+a serial inner loop so one warp covers `MMA_KEY_TRIPS` octets before the
+rescale, widening `MMA_KT` to `8 * MMA_KEY_TRIPS` without touching
+`MMA_HPB` or `MMA_WPH` -- is untried in every earlier section's rejected
+list (which covers `ldmatrix`, `m8n8k4`, a two-deep staged tile, a
+grid-axis swap, wider *query* tiles, and `__maxnreg__`, none of which is
+this).
+
+### Built, correct in shape, measured, and found to spill
+
+The `Q K^T` computation loop was changed from one octet per warp per trip
+to `MMA_KEY_TRIPS` octets computed serially into `my_s` before the
+existing (unmodified) softmax-reduce and `P V` phases, which were already
+generic in `MMA_KT` from an earlier session's work at lower `MMA_HPB` and
+needed no change. `MMA_KEY_TILE` becomes `8 * MMA_WARPS_PER_HEAD *
+MMA_KEY_TRIPS`; the K/V staging macro, the shared-memory sizing, and the
+value stride are all already parametrized on `MMA_KEY_TILE` and scale
+automatically. Host-side structural tests (`the_tensor_core_block_shape_is_one_choice_and_not_three`,
+`the_staged_tiles_fit_the_shared_memory_that_was_opted_in_to`) updated and
+green; shared memory at `MMA_KEY_TRIPS` 2 is 30,464 B and at 4 is 55,296 B,
+both under the 65,536 B carveout, so the launch was never going to fail --
+the failure was somewhere `ncu` would normally show and `nsys` cannot.
+
+`nvcc -arch=compute_75 -code=sm_75 -Xptxas -v` on the extracted kernel
+source (the same substitute for `ncu`'s `ERR_NVGPUCTRPERM` the MoE
+prefetch section used) settles it without guessing:
+
+| `MMA_KEY_TRIPS` | `MMA_KT` | shared bytes | registers | spill stores | spill loads |
+|---:|---:|---:|---:|---:|---:|
+| 1 (shipped) | 8 | 13,952 | 252 | 0 | 0 |
+| 2 | 16 | 30,464 | 255 | 12 B | 12 B |
+| 4 | 32 | 55,296 | 255 | 388 B | 312 B |
+
+The shipped kernel already sits at 252 of 255 registers with zero spill --
+essentially no headroom at all, not the ~217/255 an earlier section
+estimated before Q actually moved into registers. `MMA_KEY_TRIPS` 2 adds a
+handful of live registers (a wider `kreg`/`vlo`/`vhi` prefetch, sized
+`MMA_KREG`/`MMA_VREG`, both proportional to `MMA_KT`) and immediately
+spills; `MMA_KEY_TRIPS` 4 spills by 30x more. `bench_attention`,
+`LLMXABE_ATTN_CHUNK=8192`, GPU 0:
+
+| key_offset | shipped (ms) | `MMA_KEY_TRIPS` 2 (ms) | `MMA_KEY_TRIPS` 4 (ms) |
+|---:|---:|---:|---:|
+| 65,536 | 315.3 / 330.9 / 334.1 | 325.4 / 334.1 / 334.7 | 620.1 |
+| 131,072 | 626.9 / 663.6 / 673.7 | 641.9 / 672.6 / 674.8 | 1235.7 |
+
+Three interleaved pairs at `MMA_KEY_TRIPS` 2: 1.024x, 1.014x, and 1.002x
+slower than shipped at 131,072 -- a wash trending slightly negative, the
+signature of a 12-byte spill roughly cancelling the barrier count it saves.
+`MMA_KEY_TRIPS` 4's 388-byte spill is not subtle: **1.96x slower**, one
+pair, no interleaving needed to see it. Spilling in the trip that exists
+to keep the DRAM round trip covered pays the exact latency the kernel is
+built to hide, a second time -- the same mechanism the MoE prefetch
+section named for a different kernel, on this kernel too.
+
+### Not shipped
+
+Reverted with `git checkout -- crates/xabe-cuda/src/kernels/attention.rs`,
+zero diff against the parent commit. The mechanism this section names --
+`attn_flash_causal_mma` runs at 252/255 registers already, so any register
+lever, register-pipelined prefetch (MoE section) or a wider softmax-rescale
+tile (this section) alike, spills on this kernel specifically -- is worth
+keeping distinct from the MoE section's identical-shaped finding, because
+the two kernels reach the same wall by different roads: MoE's
+`__launch_bounds__` trades registers for occupancy on purpose and a
+register lever fights that trade; this kernel was never trading for
+occupancy, it simply has no register budget left after `Q` moved into
+registers to win the shared-memory carveout that `MMA_HPB` 8 needed. A
+future attempt at this specific lever needs registers freed elsewhere
+first -- `Q` is the only large holder at 64 registers, and moving it back
+to shared is foreclosed by the same shared-memory arithmetic that put it
+in registers to begin with (`q_sh` alone would want 67,584 B against the
+65,536 B carveout at `MMA_HPB` 8). That forecloses this specific lever
+without a block-shape change bigger than a tuning knob, which is not what
+this section attempted.
+
+### What this leaves for deep prefill
+
+Every named lever this file knows for `attn_flash_causal_mma` -- traffic
+(`MMA_HPB`), two arithmetic substitutions (`exp2f`, `__syncwarp`), and now
+the softmax-rescale tile width -- is spent, tried, or structurally
+foreclosed. The kernel profiles at 71.79% of a deep chunk's kernel time,
+so MoE and GDN's combined 15.79% at that same depth is the remaining
+lever with headroom: their per-chunk cost is fixed regardless of depth, so
+a win there moves every depth's ratio by the same absolute amount, which
+matters more at 8,192-32,768 (where MoE alone was 18.71%+12.17% = 30.9% of
+a shallow chunk, against attention's 8.09%) than at 131,072 where
+attention already dominates. The MoE MMA pair is the next section.
+
+## Widening M on the routed-expert MMA kernels: a real win, and a real trade (2026-08-18)
+
+Shared-memory double-buffering -- the untried lever this session's brief
+named alongside the register prefetch the previous session already
+rejected -- was ruled out by arithmetic before writing any code. Turing
+gives an SM 65,536 B; `moe_expert_ffn_mma`'s current footprint is 21,760 B
+and `__launch_bounds__` already asks for three resident blocks,
+`3 * 21,760 = 65,280`, 256 B of slack. A double-buffered staging pipeline
+needs roughly double that per block for the tiles it pipelines: even
+buffering only the weight tile (16,384 -> 32,768 B) leaves no room for
+three blocks, and a full double buffer of every staged tile is
+`2 * 21,504 + 256 = 43,264` B, which admits **one** block per SM, not two
+or three. This kernel's own comment names the mechanism: it is
+bandwidth-bound *through occupancy* -- "what it needs from the scheduler
+is loads in flight, and what puts loads in flight is resident warps" -- so
+a 3x occupancy cut to buy latency-hiding that occupancy was already
+providing is the same trade the register-prefetch section rejected, on
+the same kernel family, for the same reason. Not built, because the
+arithmetic already answers it and AGENTS.md is explicit that a speculative
+kernel should not be built before the mechanism is named with numbers.
+
+The lever this session did build is named in the same brief: "tile-shape
+changes that raise arithmetic intensity (wider M or N per block, fewer
+redundant dequants)." `MOE_MMA_M` -- the dispatch slots one block's staged
+weight tile is shared across -- was 32, and `forward.rs`'s own
+`MOE_BLOCK_SIZE` was already dispatching at exactly that ceiling. Widening
+`M` to 64 doubles how many routed tokens amortize one staged weight-tile
+load before it is discarded, which is where this kernel's traffic actually
+goes (its own comment: "at 512 tokens it moves 470 MB of Q6_K per layer").
+
+### The occupancy this costs, computed the same way as the double-buffer's arithmetic
+
+`MOE_MMA_M` 64 doubles `sa`, `sas` and `rows` (the tiles that scale with
+staged tokens, not with the weight tile), taking `moe_expert_ffn_mma`'s
+footprint from 21,760 to 27,136 B. `3 * 27,136 = 81,408` is past the
+65,536 B ceiling, so `MOE_MMA_BLOCKS_PER_SM` drops 3 -> 2 (`2 * 27,136 =
+54,272`, 11,264 B to spare). `moe_expert_down_mma`'s footprint goes
+14,720 -> 20,224 B; `4 * 20,224 = 80,896` is past the ceiling too, so
+`MOE_DOWN_BLOCKS_PER_SM` drops 4 -> 3 (`3 * 20,224 = 60,672`, 4,864 B to
+spare). Both are a real, named occupancy cost, unlike the double-buffer's
+which would have been a 3x or 4x cut -- this is 1.5x and 1.33x -- and both
+came with more register headroom per thread (85 -> 128 at two blocks
+instead of three), which absorbed `MOE_MMA_MF`'s accumulator arrays
+doubling (4 -> 8) with no spill: `nvcc -Xptxas -v` on the extracted source
+confirms both kernels compile clean at the new shape.
+
+All six `moe_differential.rs` tests pass unchanged, including
+`device_grouped_forward_matches_the_reference_on_real_expert_weights` at
+its existing gate; `moe_block.rs`'s eleven tests pass, including the one
+that exercises block 39's Q8_0 exception path
+(`moe_expert_ffn_mma_q8`, left at its own unguarded register allocation
+since it runs one layer in forty and was never occupancy-tuned);
+`int8_forward.rs` and `the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`
+both pass at unchanged tolerances on the final tree.
+
+### Isolated, `bench_moe_mma`, three interleaved pairs, GPU 0
+
+Old code cannot dispatch above `block_size` 32 (the geometry check
+rejects it), so the honest before/after compares each side at its own
+production width -- `block_size` 32 against the old ceiling, 64 against
+the new one -- rather than holding width fixed at a number only one side
+could reach in practice:
+
+| tokens | old (`M` 32, `block_size` 32) ms | new (`M` 64, `block_size` 64) ms | ratio |
+|---:|---:|---:|---:|
+| 512 | 3.545 / 3.774 / 3.551 | 4.691 / 4.695 / 4.697 | **0.772x (29.6% slower)** |
+| 8,192 | 21.983 / 24.480 / 23.950 | 20.121 / 21.359 / 20.978 | **1.127x** |
+
+The 512-token loss and the 8,192-token win are both real, and the
+mechanism for the loss is occupancy, not the wider tile wasting bytes on
+padding: at 512 tokens and 8 experts/token, an average expert sees only
+16 routed tokens, well under even the *old* `M` 32, so the wider tile buys
+no traffic reduction there and only pays the occupancy cut. Checked
+directly rather than inferred -- the new kernel (`M` 64) dispatched at the
+*old* `block_size` 32 measures 4.630 ms, matching the `block_size` 64
+number rather than recovering the old 3.62 ms mean, which rules out tile
+padding as the cost: the loss is `MOE_MMA_BLOCKS_PER_SM`'s occupancy cut,
+paid regardless of how many of the wider tile's slots are actually live.
+
+### End to end, `bench_forward`, GPU 0, `git worktree`-isolated baseline
+
+`git stash` was tried first for the baseline A/B and abandoned mid-session:
+this checkout is shared with sibling agents actively editing the same
+files, and a stash/pop window is exactly the race that could silently
+clobber their concurrent work. `git worktree add --detach` against `HEAD`
+builds an isolated baseline binary with no shared mutable state; every
+number below an isolated-worktree baseline against the working tree's
+build, not a stashed-and-restored one.
+
+| tokens | chunk | before (tok/s) | after (tok/s) | ratio |
+|---:|---:|---:|---:|---:|
+| 512 | 512 | 2,410.7 | 2,228.6 | 0.924 |
+| 2,048 | 2,048 | 3,096.9 | 3,095.8 | 1.000 (wash) |
+| 8,192 | 8,192 | 3,082.8 (mean of 3) | 3,201.9 (mean of 3) | **1.039** |
+| 32,768 | 8,192 | 2,417.4 (mean of 2) | 2,502.2 (mean of 2) | **1.035** |
+| 65,536 | 8,192 | 1,908.5 | 1,965.2 | **1.030** |
+| 131,072 | 8,192 | 1,355.1 | 1,382.0 | **1.020** |
+
+2,048 is a wash: wide enough (64 average tokens/expert) that the traffic
+win and the occupancy cost roughly cancel. 512 is the one real regression,
+diluted end to end from the isolated kernel's 29.6% to 7.6% because MoE is
+a smaller share of a 512-token pass than of an 8,192-token one.
+
+### Against llama.cpp, both sides fresh, both at their own best width
+
+llama.cpp figures are this session's own re-measurement at `-b 8192 -ub
+4096` (`-ub 512` at 512), matching the convention "The baseline was
+llama.cpp's default, not its best" established earlier in this file:
+
+| tokens | llmxabe (before) | llmxabe (after) | llama.cpp | ratio before | ratio after |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 2,410.7 | 2,228.6 | 2,155.8 | 1.12x | 1.03x |
+| 2,048 | 3,096.9 | 3,095.8 | 2,951.2 | 1.05x | 1.05x |
+| 8,192 | 3,082.8 | 3,201.9 | 3,077.9 | 1.00x | **1.04x** |
+| 32,768 | 2,417.4 | 2,502.2 | 2,506.2 | 0.96x | **1.00x** |
+| 65,536 | 1,908.5 | 1,965.2 | 1,935.7 | 0.99x | **1.02x** |
+| 131,072 | 1,355.1 | 1,382.0 | 1,439.5 | 0.94x | 0.96x |
+
+Both of this session's target depths cross or reach parity: **8,192 to
+1.04x** and **32,768 to 1.00x**, both up from short of it. 65,536 crosses
+too, to 1.02x, though it was not the primary target. 131,072 improves from
+0.94x to 0.96x but stays short -- consistent with the profiling at the top
+of this session's work: attention is 71.8% of a deep chunk's kernel time
+there, and MoE's combined 9.4% at that same depth has much less room left
+to move the ratio by than it does at 8,192-32,768, where MoE was
+18.71%+12.17% = 30.9% of the chunk. 512 is a real, named cost of this
+change -- down from 1.12x to 1.03x -- but stays a win against llama.cpp, so
+it was judged worth shipping rather than reverting: the two depths this
+session was asked to close are closed, and the one depth that regressed
+was never the target and remains ahead.
+
+### What is left
+
+Deep prefill (65,536-131,072) is now bounded by attention alone, per the
+previous section's profiling and the register-spill reject that closed
+off the one lever this file knew for it. 512-token MoE throughput could
+recover its regression with a second kernel variant compiled at `M` 32
+for narrow batches, selected by token count the way the fp32/int8
+crossover at `MMA_MIN_TOKENS` already is -- specified here, not attempted,
+because 512 remains a win against llama.cpp and this session's two named
+targets do not need it.

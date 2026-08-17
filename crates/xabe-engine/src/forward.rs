@@ -119,7 +119,14 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 const EMBED_THREADS: u32 = 256;
 
 /// Grouped-GEMM tile width the MoE dispatch tables pad to.
-const MOE_BLOCK_SIZE: usize = 32;
+///
+/// The ceiling `xabe_cuda::kernels::moe::MoeKernels::new` allows
+/// (`MMA_M`, currently 64) and not below it: a wider dispatch tile means
+/// `moe_expert_ffn_mma`/`moe_expert_down_mma` share one staged weight tile
+/// across more routed tokens before re-fetching it, which is where their
+/// traffic actually goes. See "Widening M on the routed-expert MMA kernels"
+/// in docs/BENCHMARKS.md.
+const MOE_BLOCK_SIZE: usize = 64;
 
 /// The GGUF keys that are not in [`ModelConfig`] and must not be guessed.
 const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";

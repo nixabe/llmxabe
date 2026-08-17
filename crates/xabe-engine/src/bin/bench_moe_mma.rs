@@ -53,7 +53,7 @@ const DEFAULT_MODEL_PATH: &str =
 const LAYER: u32 = 0;
 
 /// Grouped-GEMM dispatch tile width, matching the engine's own.
-const BLOCK_SIZE: usize = 16;
+const BLOCK_SIZE: usize = 64;
 
 /// Chunk widths a real prefill actually launches at 8,192-token chunking,
 /// plus the 512 row bench_attention and bench_mma already use.

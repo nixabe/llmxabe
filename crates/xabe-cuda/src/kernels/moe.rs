@@ -188,7 +188,7 @@ const MMA_ROWS: u32 = MMA_WARPS * MMA_N;
 ///
 /// A `block_size` above this would have its tail silently dropped, so
 /// [`MoeKernels::new`] rejects such a geometry rather than trusting callers.
-const MMA_M: usize = 32;
+const MMA_M: usize = 64;
 /// Token count below which the fp32 grouped GEMM is faster.
 ///
 /// Measured per layer at Qwen3.6's geometry, `grouped_forward` end to end
@@ -1586,7 +1586,17 @@ __global__ void moe_expert_down_gemv(
 #define MOE_MMA_ROWS  (MOE_MMA_WARPS * MOE_MMA_N)
 // Slots staged per block. `block_size` must not exceed this; the Rust side
 // checks it, because a larger dispatch block would silently drop its tail.
-#define MOE_MMA_M     32
+//
+// 64, not 32: this kernel is bandwidth-bound on the *weight* tile it stages
+// (see `MOE_MMA_BLOCKS_PER_SM` below), so the arithmetic intensity that
+// matters is how many dispatch slots share one staged weight tile before it
+// is discarded. Doubling `M` halves the weight-tile loads per routed token
+// for any expert with enough traffic to fill more than one tile, at the
+// cost of the occupancy `MOE_MMA_BLOCKS_PER_SM` gives up to make room for
+// the wider `sa`/`sas`/`rows` tiles. See "Widening M on the routed-expert
+// MMA kernels" in docs/BENCHMARKS.md for the traffic argument and the
+// measurement against the occupancy loss.
+#define MOE_MMA_M     64
 #define MOE_MMA_MF    (MOE_MMA_M / 8)
 // Contraction staged per trip: one Q6_K *half*, which is the unit the format's
 // `ql`/`qh` split is addressed in. Half a superblock rather than a whole one
@@ -1626,19 +1636,21 @@ __global__ void moe_expert_down_gemv(
 // delta at offset 8 (which is where the 4-byte alignment requirement lands).
 #define MOE_MMA_SSTRIDE 16
 
-// Three blocks per SM, asked for explicitly.
+// Two blocks per SM, asked for explicitly.
 //
 // This kernel is bandwidth-bound, not compute-bound: at 512 tokens it moves
 // 470 MB of Q6_K per layer and issues about 5% of the card's int8 throughput
 // doing it, so what it needs from the scheduler is loads in flight, and what
-// puts loads in flight is resident warps. Its shared footprint is 21,760 bytes
-// and Turing's SM has 65,536 to give, so three blocks fit with 256 bytes to
-// spare -- but only if the register allocation also fits three, and ptxas has
-// no reason to aim for that unless told.
+// puts loads in flight is resident warps. At `MOE_MMA_M` 32 its shared
+// footprint was 21,760 bytes and three blocks fit Turing's 65,536 with 256
+// to spare. At `MOE_MMA_M` 64 -- see that constant's own comment for why --
+// the footprint is 27,136 bytes: three would need 81,408, past the ceiling,
+// so the occupancy target drops to two (54,272, with 11,264 to spare) and
+// ptxas is told to fit registers for two blocks rather than three.
 //
 // The second argument is the one that matters. The first is redundant with the
 // launch's `block_dim` and is stated so the pair cannot drift apart silently.
-#define MOE_MMA_BLOCKS_PER_SM 3
+#define MOE_MMA_BLOCKS_PER_SM 2
 
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_MMA_BLOCKS_PER_SM)
 moe_expert_ffn_mma(
@@ -2041,10 +2053,12 @@ __global__ void moe_expert_down(
 // `4r + (quad/4)` — thirty-two distinct banks across the warp, no conflict.
 #define MOE_MMA_DSTRIDE (MOE_MMA_KC + (MOE_MMA_KC / 32) * 4)
 
-// Four blocks per SM, for the same reason the gate/up kernel asks for three.
-// Q8_0 stages one weight tile rather than two, so this kernel's footprint is
-// 14,720 bytes and four of them fit in 65,536 with room left.
-#define MOE_DOWN_BLOCKS_PER_SM 4
+// Three blocks per SM, for the same reason the gate/up kernel asks for two.
+// Q8_0 stages one weight tile rather than two, so at `MOE_MMA_M` 32 this
+// kernel's footprint was 14,720 bytes and four fit in 65,536 with room left;
+// at `MOE_MMA_M` 64 it is 20,224 bytes, four would need 80,896 past the
+// ceiling, and three fits with 4,864 to spare.
+#define MOE_DOWN_BLOCKS_PER_SM 3
 
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_DOWN_BLOCKS_PER_SM)
 moe_expert_down_mma(
