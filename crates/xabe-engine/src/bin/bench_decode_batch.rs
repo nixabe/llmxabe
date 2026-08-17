@@ -191,7 +191,10 @@ fn main() -> ExitCode {
 
     // ---- The baseline: one sequence, graph-captured, exactly `bench_decode`'s
     // methodology. -----------------------------------------------------------
-    {
+    // `LLMXABE_SKIP_SINGLE_STREAM` is a profiling aid only: it drops this
+    // block's kernels out of an `nsys` capture so a per-kernel breakdown of
+    // the batch sweep below is not diluted by the N=1 baseline's own calls.
+    if std::env::var_os("LLMXABE_SKIP_SINGLE_STREAM").is_none() {
         let mut prefill = Forward::new(
             &ctx,
             &stream,

@@ -165,7 +165,31 @@ const GATE_TT: u32 = 8;
 /// Spelled here and in the kernel source, which NVRTC compiles from a string
 /// with no access to Rust constants;
 /// `the_projection_tiles_match_the_kernel` asserts the two agree.
-const PROJ_TILES: [u32; 2] = [8, 16];
+///
+/// `2` and `4` exist for batched decode, where `tokens` is the number of
+/// sequences advancing together rather than a prefill chunk. Below the old
+/// floor of 8 this used to fall back to `project_per_sequence`, one untiled
+/// launch per sequence — correct, but paying the weight traffic `tokens`
+/// times over rather than once.
+///
+/// Adding a tile is not enough on its own — `proj_tile_for` also had to
+/// change how it chooses one. Its old rule, "widest tile no wider than
+/// `tokens`", picked tile 2 for 3 tokens: `ceil(3 / 2)` is two *independent*
+/// grid.y slices, and each one re-walks the whole weight matrix on its own —
+/// the reuse is within a slice, not across them. Two slices is two full
+/// weight reads for 3 tokens, worse than it looks, and it measured worse in
+/// practice: on `bench_decode_batch` at a 32,768-token context, adding tile
+/// 2 under the old rule made N=3 *slower* than the per-sequence fallback it
+/// replaced (41.1 ms/step against 38.6 ms). `proj_tile_for` now picks the
+/// smallest tile that covers `tokens` in a *single* slice below the widest
+/// declared tile, which sends 3 tokens to tile 4 instead — one guarded slice
+/// at 75% live, one weight read, not two. 2 tokens still gets tile 2 as the
+/// exact fit it always was; only the in-between counts changed. See
+/// `docs/BENCHMARKS.md`'s batched-decode section for the regression and the
+/// fix, and for the original 8/16 floor, which was measured at 19+ tokens
+/// under the old multi-slice rule that still governs tokens at or above the
+/// widest declared tile.
+const PROJ_TILES: [u32; 4] = [2, 4, 8, 16];
 
 /// Output rows each warp accumulates, per tile width above.
 ///
@@ -186,22 +210,38 @@ const PROJ_TILES: [u32; 2] = [8, 16];
 /// the weight twice as often and the activation four times less, and the
 /// activation is the larger term. (16, 8) halves the activation traffic again
 /// and gives it back to occupancy.
-const PROJ_ROWS: [u32; 2] = [4, 4];
+const PROJ_ROWS: [u32; 4] = [4, 4, 4, 4];
 
 /// Which specialization to launch for `tokens`, and its width.
 ///
-/// The widest tile that is *fully live*. A partial tile takes the guarded
-/// path, where every thread still carries the whole accumulator array and only
-/// part of it does any work; measured, using a 32-wide tile for a 19-token
-/// batch costs 21% (208.8 to 164.5 tok/s).
+/// Two different rules, one on each side of the widest declared tile.
+///
+/// **Below it**, the smallest tile that covers `tokens` in a single grid.y
+/// slice — not the widest tile no wider than `tokens`. A launch is
+/// `ceil(tokens / tile)` *independent* slices, and each one re-walks the
+/// whole weight matrix on its own regardless of how few of its rows are
+/// live: the guarded path still pays close to a full slice's weight-read
+/// cost (measured, using a 32-wide tile for a 19-token batch costs 21%,
+/// 208.8 to 164.5 tok/s — expensive, but a single expensive slice, not two
+/// or three of them). Picking the widest tile no wider than `tokens` instead
+/// minimizes the *emptiest* slice's waste and, below the widest declared
+/// tile, routinely costs more slices doing it — 3 tokens against tiles [2,
+/// 4, 8, 16] picks 2 that way, and `ceil(3 / 2)` is two full weight reads for
+/// three tokens, not one; picking the smallest covering tile sends it to 4
+/// instead, one guarded slice at 75% live. See `PROJ_TILES`'s doc comment
+/// for the measurement that changed this rule.
+///
+/// **At or above it**, the original "widest tile, however many slices"
+/// rule: `tokens` is large enough that repeating the widest tile amortizes
+/// the weight read across the most tokens per slice, proven at 128 and 512
+/// tokens in `PROJ_ROWS`'s own sweep, and a single covering tile does not
+/// exist up here regardless.
 fn proj_tile_for(tokens: usize) -> (usize, u32) {
-    let mut chosen = 0;
-    for (i, &t) in PROJ_TILES.iter().enumerate() {
-        if tokens >= t as usize {
-            chosen = i;
-        }
+    if let Some(i) = PROJ_TILES.iter().position(|&t| tokens <= t as usize) {
+        return (i, PROJ_TILES[i]);
     }
-    (chosen, PROJ_TILES[chosen])
+    let widest = PROJ_TILES.len() - 1;
+    (widest, PROJ_TILES[widest])
 }
 
 /// Threads per block for the elementwise kernels.
@@ -511,6 +551,8 @@ __global__ void NAME(                                                         \
     }                                                                         \
 }
 
+GDN_PROJ_TILED(gdn_proj_q8_0_t2,  2,  4)
+GDN_PROJ_TILED(gdn_proj_q8_0_t4,  4,  4)
 GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8,  4)
 GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
@@ -1267,7 +1309,7 @@ pub struct GdnBlock {
     proj_q8_0: CudaFunction,
     proj_split_gemv: CudaFunction,
     proj_split_gemv_add: CudaFunction,
-    proj_tiled: [CudaFunction; 2],
+    proj_tiled: [CudaFunction; 4],
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
     alpha_beta_gates_t1: CudaFunction,
@@ -1323,6 +1365,8 @@ impl GdnBlock {
             proj_split_gemv: module.load_function("gdn_proj_split_gemv")?,
             proj_split_gemv_add: module.load_function("gdn_proj_split_gemv_add")?,
             proj_tiled: [
+                module.load_function("gdn_proj_q8_0_t2")?,
+                module.load_function("gdn_proj_q8_0_t4")?,
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
             ],
@@ -1635,25 +1679,6 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
-        } else if tokens < PROJ_TILES[0] as usize {
-            self.project_per_sequence(
-                stream,
-                Projection::Q8_0(&w.qkv),
-                &s.normed,
-                &mut s.qkv,
-                g.hidden,
-                g.conv_dim(),
-                tokens,
-            )?;
-            self.project_per_sequence(
-                stream,
-                Projection::Q8_0(&w.gate),
-                &s.normed,
-                &mut s.z,
-                g.hidden,
-                g.value_dim(),
-                tokens,
-            )?;
         } else {
             self.project(
                 stream,
@@ -1802,17 +1827,6 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
             self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
-        } else if tokens < PROJ_TILES[0] as usize {
-            self.project_per_sequence(
-                stream,
-                Projection::Q8_0(&w.out),
-                &s.final_output,
-                &mut s.projected,
-                g.value_dim(),
-                g.hidden,
-                tokens,
-            )?;
-            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else {
             self.project(
                 stream,
@@ -1824,43 +1838,6 @@ impl GdnBlock {
                 tokens,
             )?;
             self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
-        }
-        Ok(())
-    }
-
-    /// [`Self::project`], looped once per sequence over a one-token slice.
-    ///
-    /// Below the tiled projection's narrowest live tile
-    /// ([`PROJ_TILES`]`[0]`), the guarded path pays close to a full live
-    /// tile's weight-read cost while only a fraction of its lanes produce a
-    /// real answer — measured at a batch width of 2, `gdn_proj_q8_0_t8`
-    /// averaged 142.5 us per call against the untiled kernel's low
-    /// microseconds, because the occupancy the wide accumulator array costs
-    /// is not recovered by amortizing a weight read that few sequences do
-    /// not exist to share. `tokens` separate untiled reads cost `tokens`
-    /// times the weight, but each runs at the untiled kernel's own full
-    /// efficiency, which below the tile width is cheaper in absolute terms.
-    /// See `docs/BENCHMARKS.md`'s batched-decode section for the
-    /// measurement this dispatch is set from.
-    #[allow(clippy::too_many_arguments)]
-    fn project_per_sequence(
-        &self,
-        stream: &Arc<CudaStream>,
-        weight: Projection<'_>,
-        x: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
-        k_dim: usize,
-        n_rows: usize,
-        tokens: usize,
-    ) -> Result<(), GdnBlockError> {
-        for i in 0..tokens {
-            // SAFETY: `i < tokens`, and `k_dim`/`n_rows` are `x`'s and
-            // `out`'s own per-token widths, checked by `project` itself
-            // against `tokens * k_dim` and `tokens * n_rows` immediately
-            // below via the one-token call's own `tokens = 1` check.
-            let xi = unsafe { crate::viewslice::subslice(stream, x, i * k_dim, k_dim) };
-            let mut oi = unsafe { crate::viewslice::subslice(stream, out, i * n_rows, n_rows) };
-            self.project(stream, weight, &xi, &mut oi, k_dim, n_rows, 1)?;
         }
         Ok(())
     }
@@ -2731,27 +2708,45 @@ mod tests {
                  `proj_tile_for` will try to launch one",
             );
         }
-        // The chooser picks the widest fully-live tile, falling back to the
-        // narrowest available when the batch is smaller than any of them —
-        // 2 tokens must still be projected, and the guarded path handles the
-        // partial tile exactly as the untiled kernel would have.
-        for tokens in [2usize, 8, 15, 16, 31, 32, 128, 512] {
+        // Below the widest declared tile, the chooser picks the *smallest*
+        // tile that covers `tokens` in one slice — which can be wider than
+        // `tokens`, deliberately, to avoid a second slice. `proj_tile_for` is
+        // never called below 2 tokens: `project` special-cases `tokens == 1`
+        // to the untiled kernel before this chooser is reached.
+        for (tokens, want) in [
+            (2usize, 2u32),
+            (3, 4),
+            (4, 4),
+            (5, 8),
+            (7, 8),
+            (8, 8),
+            (9, 16),
+            (15, 16),
+            (16, 16),
+        ] {
             let (slot, tile) = proj_tile_for(tokens);
             assert_eq!(tile, PROJ_TILES[slot]);
-            if tokens >= PROJ_TILES[0] as usize {
-                assert!(
-                    tile as usize <= tokens,
-                    "{tokens} tokens chose a {tile}-wide tile, which is never fully live",
-                );
-            } else {
-                assert_eq!(tile, PROJ_TILES[0], "a sub-tile batch takes the narrowest");
-            }
+            assert_eq!(
+                tile, want,
+                "{tokens} tokens should take the smallest tile that covers it in one slice",
+            );
+            assert!(
+                tile as usize >= tokens,
+                "{tokens} tokens chose a {tile}-wide tile that needs a second slice",
+            );
         }
-        // And it must actually widen as the batch grows, or the whole
-        // specialization is dead code that always launches tile 8.
-        assert_eq!(proj_tile_for(8).1, 8);
-        assert_eq!(proj_tile_for(19).1, 16);
-        assert_eq!(proj_tile_for(512).1, 16);
+        // At and above the widest declared tile, no single tile covers
+        // `tokens` any more, and the chooser falls back to the original
+        // rule: the widest tile, however many slices that takes. Proven at
+        // 128 and 512 tokens in `PROJ_ROWS`'s own sweep.
+        for tokens in [17usize, 19, 31, 32, 128, 512] {
+            let (slot, tile) = proj_tile_for(tokens);
+            assert_eq!(tile, PROJ_TILES[slot]);
+            assert_eq!(
+                tile, 16,
+                "{tokens} tokens is past every single-slice tile and must fall back to the widest",
+            );
+        }
     }
 
     #[test]
