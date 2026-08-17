@@ -454,6 +454,14 @@ __device__ __forceinline__ float half_bits_to_float(unsigned short bits) {
 // the scalar reference operand for operand; reassociating to
 // `d * (scale * q)` is mathematically equal, rounds differently, and would
 // cost bit-identical weights.
+//
+// `d`, `sc` and `si` are taken apart rather than pre-folded into `d *
+// (float)sc[si]`: tried by hand for `moe_expert_ffn_gemv` and confirmed by
+// `cuobjdump -sass` to produce byte-identical code (see "The MoE decode
+// GEMV, re-measured" in `docs/BENCHMARKS.md`) — `sc[si]` not depending on
+// the tile's loop variable is provable from the source as written, and
+// `ptxas` already proves it. This form stays because it is the more legible
+// one, not because it is faster.
 __device__ __forceinline__ float q6k_value(float d, const signed char* sc, int si, int raw) {
     return d * (float)sc[si] * (float)(raw - 32);
 }
@@ -1359,6 +1367,16 @@ __global__ void moe_expert_ffn(
         __syncthreads();
 
         int bm = live_tile_rows(rows);
+        // At decode, `block_size` (a dispatch bucket) is wider than `MOE_TM`
+        // (a tile pass), so a block with one live token still runs this loop
+        // twice: once over the real row, once over a tile that is entirely
+        // the padding sentinel. `live` above only bounds-checks the output
+        // row, so without this it dequantizes and contracts the whole weight
+        // stack a second time for a tile that could only ever contribute
+        // zero. `bm` is uniform across the block (`live_tile_rows`'s own
+        // guarantee), so every thread takes this branch together — skipping
+        // straight to the next `m0` costs nothing but the wasted pass.
+        if (bm == 0) continue;
         float ag[MOE_TM];
         float au[MOE_TM];
 #define MOE_FFN_TILE(TM) tile_gemm_pair<TM>(                                  \
@@ -1972,6 +1990,10 @@ __global__ void moe_expert_down(
         __syncthreads();
 
         int bm = live_tile_rows(rows);
+        // Same wasted second pass as `moe_expert_ffn` above, and the same
+        // fix: skip a tile that is entirely the padding sentinel rather than
+        // dequantizing and contracting the down-projection stack against it.
+        if (bm == 0) continue;
         float ad[MOE_TM];
 #define MOE_DOWN_TILE(TM) tile_gemm_single<TM>(                               \
             down_q, down_quant, inter, rows, xs,                              \
