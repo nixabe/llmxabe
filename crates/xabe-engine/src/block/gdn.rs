@@ -540,17 +540,33 @@ __global__ void NAME(                                                         \
             }                                                                 \
         }                                                                     \
     } else {                                                                  \
+        /* Same TT/RR-wide unrolled shape as the fully-live branch above --  \
+         * the live count gates each element with a predicate, never bounds \
+         * the loop, so `acc`/`xv` stay register-resident instead of        \
+         * spilling to local memory the way a runtime trip count forces.    \
+         * Out-of-range activation slots read as zero, which makes their    \
+         * contribution to `acc` exactly zero; out-of-range row slots       \
+         * re-address a real, already-in-bounds row (`n0`) rather than walk \
+         * off the end of `weight`, and are simply never read back below.   \
+         * See docs/BENCHMARKS.md's batched-decode section for the measured \
+         * cost of the runtime-bound form this replaced. */                 \
         for (int b = 0; b < blocks; ++b) {                                    \
             int kidx = b * 32 + lane;                                         \
             float xv[TT];                                                     \
-            for (int i = 0; i < live_t; ++i)                                  \
-                xv[i] = x[(long long)(t0 + i) * k_dim + kidx];                \
-            for (int r = 0; r < live_r; ++r) {                                \
+            _Pragma("unroll")                                                 \
+            for (int i = 0; i < (TT); ++i)                                    \
+                xv[i] = (t0 + i < n_tokens)                                    \
+                    ? x[(long long)(t0 + i) * k_dim + kidx]                   \
+                    : 0.0f;                                                    \
+            _Pragma("unroll")                                                 \
+            for (int r = 0; r < (RR); ++r) {                                  \
+                int rr = (n0 + r < n_rows) ? (n0 + r) : n0;                    \
                 const unsigned char* blk =                                    \
-                    weight + (long long)(n0 + r) * blocks * 34 + b * 34;      \
+                    weight + (long long)rr * blocks * 34 + b * 34;            \
                 float w = (float)(signed char)blk[2 + lane]                   \
                         * load_half_le(blk);                                  \
-                for (int i = 0; i < live_t; ++i) acc[r][i] += w * xv[i];      \
+                _Pragma("unroll")                                             \
+                for (int i = 0; i < (TT); ++i) acc[r][i] += w * xv[i];        \
             }                                                                 \
         }                                                                     \
     }                                                                         \
