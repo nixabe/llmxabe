@@ -16,8 +16,16 @@
 //! and interleaved against its predecessor instead of paid for with a full
 //! model load and a `bench_forward` run.
 //!
+//! Not a duplicate of `xabe-cuda`'s own `bench_moe`: that one covers all four
+//! public entry points at synthetic weights and batches up to 512, which is
+//! the right tool for a broad sweep. This one is narrower and heavier —
+//! real GGUF weights, up to 8,192 tokens, the two MMA kernels a chunked
+//! prefill actually spends time in — which is what an isolated A/B on their
+//! staging loop needs. The name is distinct because a cargo workspace cannot
+//! link two same-named bins from different crates in one build.
+//!
 //! ```text
-//! CUDA_VISIBLE_DEVICES=0 cargo run --release -p xabe-engine --bin bench_moe
+//! CUDA_VISIBLE_DEVICES=0 cargo run --release -p xabe-engine --bin bench_moe_mma
 //! ```
 //!
 //! `LLMXABE_MODEL` overrides the model path.

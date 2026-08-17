@@ -4347,8 +4347,12 @@ bandwidth peak -- no longer traffic-bound, and named "a shared-memory staging
 pipeline of the kind Marlin uses" as the way to more of the ceiling.
 
 No bench isolated these two kernels from a full model load, so the first step
-was `bench_moe`: loads one real layer's mixed-quant expert stacks and times
-`MoeKernels::grouped_forward` alone. Baseline, three interleaved rounds:
+was `bench_moe_mma` -- named apart from `xabe-cuda`'s own `bench_moe`, which
+covers all four MoE entry points at synthetic weights and batches up to 512;
+this one loads one real layer's mixed-quant expert stacks from the GGUF file
+and reaches 8,192 tokens, the shape a chunked prefill actually launches
+these two kernels at. It times `MoeKernels::grouped_forward` alone.
+Baseline, three interleaved rounds:
 
 | tokens | ms | TOP/s |
 |---:|---:|---:|
@@ -4372,7 +4376,7 @@ is computed, only *when* it is loaded), and **passes every gate**: all six
 `device_grouped_forward_matches_the_reference_on_real_expert_weights` at its
 existing `ROUTED_MMA_GATE` tolerance with no loosening.
 
-It is also slower. Three interleaved `bench_moe` pairs against the baseline
+It is also slower. Three interleaved `bench_moe_mma` pairs against the baseline
 above:
 
 | tokens | baseline ms | +prefetch ms | change |
@@ -4425,6 +4429,6 @@ kernel's own comment. A register prefetch pipeline does not add a second
 latency-hiding mechanism on top of that one; it **competes with it** for the
 same register budget, and on this card it loses -- either as an outright
 spill (3 blocks/SM, 20% slower) or as a wash once occupancy is traded down to
-make room for it (2 blocks/SM). Not shipped. `bench_moe` is kept: it is the
-first isolated harness for either kernel and makes the next attempt here
+make room for it (2 blocks/SM). Not shipped. `bench_moe_mma` is kept: it is
+the first isolated harness for either kernel and makes the next attempt here
 measurable in seconds rather than a full `bench_forward` run.
