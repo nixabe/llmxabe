@@ -4076,3 +4076,129 @@ used to find `GdnBlock`'s equivalent defect.
    own fixed-size `KvCache`, allocated for the whole run up front -- fine for
    a controlled benchmark, not what a server admitting and evicting requests
    needs. That is `xabe-cache`'s two-group pager, not this workstream's.
+
+## The GQA-head-tiled decode kernel: built, and reverted on the fp16 `Q` it requires (2026-08-17)
+
+The previous section specced `attn_flash_decode_mma` -- tile the GQA-head
+axis into `m16n8k8`'s M dimension the way `fattn-mma-f16.cuh` does for this
+geometry, replacing the per-key `expf` loop with a tiled softmax. It got
+built this round: a fourth kernel alongside `attn_flash_decode_warp` /
+`_split` / `_combine`, wired into `decode()`'s dispatch behind a
+`disable_decode_mma()` A/B lever mirroring `MoeKernels::disable_tensor_cores`.
+It does not ship. Two independent reasons, both measured, neither a
+tolerance to move.
+
+### Shape, as built
+
+One block per `(split, kv_head)`, same grid `attn_flash_decode_warp` and
+`_split` already use -- `(DEC_SPLITS, kv_heads) = (288, 2)`, 576 blocks. Four
+warps (128 threads) per block, `DMMA_KT = 32` keys staged per trip. The
+occupancy fork the previous section named as open -- pad `gqa_ratio` (8) to
+`m16n8k8`'s 16-row minimum, or pack two KV heads' query groups into one
+tile -- resolved by argument rather than measurement, because the packing
+alternative isn't slower, it's impossible: the `B` operand is the keys, which
+differ per KV head, so two KV heads cannot share one `Q K^T` tile, and there
+is no reduction axis to fold two `mma` calls into one instead. That leaves
+padding: `a0` carries the 8 real GQA rows, `a1` is hardcoded to `0u` --
+never read from shared memory, so the dead 8 rows contribute exactly zero
+with no uninitialized-memory risk -- and the softmax and final write were
+generalized (mirroring `attn_flash_causal_mma`'s `rat`/`krow`/`kcol` split)
+to cover any `DMMA_KT`, so the occupancy knob (`DMMA_WPO`, currently 4) can
+move without a rewrite. Verified by standalone `nvcc -arch=sm_75 -cubin
+--ptxas-options=-v`: 121 registers, 0 spill stores, 0 spill loads, unchanged
+across the generalization. `attn_flash_decode_combine` was not touched.
+
+### First reason: it is 1.7x slower than the kernel it replaces
+
+`bench_attention` in decode mode (`LLMXABE_ATTN_CHUNK=1`), `DMMA_WPO = 4`:
+
+| key_offset | ms | GB/s | TFLOP/s |
+|---:|---:|---:|---:|
+| 32,768 | 0.575 | 116.8 | 0.93 |
+| 65,536 | 1.083 | 123.9 | 0.99 |
+| 98,304 | 1.522 | 132.2 | 1.06 |
+| 131,072 | 2.023 | 132.7 | 1.06 |
+
+Against `attn_flash_decode_warp`'s 1.1706 ms at 131,072 keys (measured two
+sections up, same card, same method): **1.73x slower**, not faster. Working
+diagnosis, not yet confirmed with `nsys` -- shared memory is 38,496 bytes
+(37.6 KiB) per block at `DMMA_WPO = 4`, computed from the same
+`qstride`/`vstride` formula `shared_bytes_mma` uses for prefill. That fits
+under the 48 KiB default carveout with no `set_attribute` opt-in, but two
+resident blocks would need 75.2 KiB against Turing's ~64 KiB/SM shared-memory
+budget -- one block, four warps, is plausibly all that fits. The kernel
+stages K then V with a blocking `__syncthreads()` before computing, the way
+`attn_flash_causal_mma` did before it grew `MMA_PREFETCH`'s double-buffered
+prefetch; at four warps and one block/SM there is nothing else resident to
+hide that round trip behind, which `attn_flash_causal_mma`'s own history
+already says matters. The softmax generalization above was written so a
+`DMMA_WPO = 2` occupancy experiment (20.8 KiB/block, three blocks/SM) could
+be tried without another rewrite. It was not measured -- the second reason
+below made it moot before it was worth the GPU time.
+
+### Second reason: it fails the differential gate this session was told not to move
+
+`device_decode_matches_the_reference_over_a_deep_window`, case `n_keys = 61`:
+
+```
+differential comparison failed: max_abs_error 1.110882e-5 exceeds tolerance 1.000000e-5 at index 254
+  full metrics: cosine=1.000000 max_abs=1.110882e-5 @[254] max_rel=3.630314e-2 @[207] non_finite=0/256
+  worst element: Some((-0.051015135, -0.051026244)) (candidate, reference)
+```
+
+The other two cases in the same test passed under the same 1e-5 `GATE`, but
+close to it: `n_keys=4096` max_abs `6.358e-6`, `n_keys=4097` max_abs
+`7.659e-6`. All three, including the failure, are far inside `MMA_GATE`
+(`8 * F16_HALF_ULP = 3.9e-3`, derived and already accepted for prefill's
+tensor-core kernel two sections up) -- `1.11e-5` is `0.0028x` of it. That
+is the tell: this is the same fp16-operand rounding `MMA_GATE` exists for,
+at the same magnitude, just occurring on the kernel `attention_differential.rs`
+still holds to the tighter fp32-reference `GATE`.
+
+The reason it's a new rounding source rather than the existing one: `k` and
+`v` are already rounded through binary16 before either kernel sees them
+(`as_cached`, present for every decode differential test, including the ones
+`attn_flash_decode_warp` already passes at `GATE`) -- that budget is spent by
+both kernels equally and is not what moved. `Q` is what changed. Every scalar
+decode/prefill kernel in this file keeps `Q` in fp32 through the dot product;
+`attn_flash_decode_mma` is the first decode kernel to round it too, because
+`mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` has no other operand type
+to give it. That is not a implementation gap to close -- it is the
+instruction's fixed contract, the same one prefill's kernel already accepts
+under `MMA_GATE`. Widening `uses_tensor_cores` to route this kernel's single
+decode row to `MMA_GATE` the same way was the first thing tried here, and is
+exactly the move this round was told not to make: it would pass the test by
+relabeling which gate applies to it, not by making the arithmetic meet the
+one the test already holds. Reverted before it reached a commit.
+
+### What happened to the tolerance and the code
+
+Nothing shipped moved. `uses_tensor_cores` is back to exactly what it was --
+`n_query >= MMA_QUERY_TILE && self.mma_is_available()`, no decode case added.
+The entire `attn_flash_decode_mma` kernel, its `DMMA_*` macros, the
+`DECODE_MMA_*` Rust constants, the `decode_mma` field and
+`disable_decode_mma` lever, and the three-way dispatch in `decode()` were
+removed with `git checkout -- crates/xabe-cuda/src/kernels/attention.rs`,
+returning the file to `c8b8d94` (worker-1's landed `MMA_HPB = 8` state) with
+zero diff. `attention_differential`'s full nine-test suite was re-run against
+that exact state afterward and is green, including the case that failed
+above.
+
+### What this leaves for a future attempt
+
+Both reasons trace to the same root: reusing `m16n8k8` for `Q K^T` at decode
+requires rounding `Q`, and rounding `Q` is the one thing this session's gate
+will not accept for a single decode row, no matter how the surrounding
+kernel is tuned. A kernel that kept `Q K^T` scalar (fp32, as
+`attn_flash_decode_warp` already does) and used tensor cores only for `P V`
+would sidestep the correctness finding, but `P V` was never the expensive
+half here -- the calibration ladder two sections up named the per-key
+`expf`/rescale loop as the cost, and that loop runs once per key regardless
+of which matmul comes after it, so a `P V`-only tensor-core kernel would keep
+paying for the exact loop this redesign exists to remove. The tiled-softmax
+idea itself is not what failed; tiling it on top of an all-scalar `Q K^T`
+(warp-level score reduction instead of `mma`, matching `attn_flash_causal_gqa`'s
+row/lane assignment rather than a fragment layout) is the version of this
+that was not tried and does not carry the rounding cost -- worth naming for
+whoever picks this back up, since it keeps the "softmax per tile, not per
+key" win without the operand the current gate rejects.
