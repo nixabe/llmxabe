@@ -247,7 +247,7 @@ const MMA_QUERY_TILE: usize = 16;
 /// blocks are `n_query/MMA_QUERY_TILE * q_heads/this`, so this is the direct
 /// lever on the traffic the launch issues — which is what the kernel is bound
 /// by at long context.
-const MMA_HEADS_PER_BLOCK: usize = 4;
+const MMA_HEADS_PER_BLOCK: usize = 8;
 
 /// Warps serving one query head. Mirrors `MMA_WPH`.
 ///
@@ -268,7 +268,15 @@ const MMA_KEY_TILE: usize = 8 * MMA_WARPS_PER_HEAD;
 /// The unroll bound on `o[MMA_MAXT][4]`, so it is four registers apiece whether
 /// or not a geometry uses them all. `head_dim / (8 * MMA_WARPS_PER_HEAD)` must
 /// not exceed it; at head_dim 256 and two warps per head it is exactly 16.
-const MMA_MAX_TILES: usize = 16;
+const MMA_MAX_TILES: usize = 256 / (8 * MMA_WARPS_PER_HEAD);
+
+/// Padding of `v_sh`, in words. Mirrors `MMA_VSTRIDE`.
+///
+/// The value fragment is read at `dim * this + 4*oct + tig` with `dim`
+/// carrying `g`, which lands the 32 lanes of a warp on 32 distinct banks
+/// exactly when `gcd(this, 32) == 4`. This is the smallest such stride that
+/// still holds `MMA_KEY_TILE / 2` words.
+const MMA_VALUE_STRIDE: usize = 4 + 8 * (MMA_KEY_TILE / 2 - 4).div_ceil(8);
 
 /// Dynamic shared memory one tensor-core block needs at a head dimension.
 ///
@@ -283,10 +291,9 @@ const MMA_MAX_TILES: usize = 16;
 /// than at `cargo test`.
 const fn mma_shared_bytes(head_dim: usize) -> usize {
     let qstride = head_dim / 2 + 4;
-    let vstride = MMA_KEY_TILE / 2 + 4;
-    let words = MMA_HEADS_PER_BLOCK * MMA_QUERY_TILE * qstride
-        + MMA_KEY_TILE * qstride
-        + head_dim * vstride;
+    let vstride = MMA_VALUE_STRIDE;
+    // No query tile: Q lives in registers, one head per warp. See the kernel.
+    let words = MMA_KEY_TILE * qstride + head_dim * vstride;
     let floats = MMA_HEADS_PER_BLOCK * (MMA_QUERY_TILE * MMA_KEY_TILE + 3 * MMA_QUERY_TILE);
     (words + floats) * size_of::<u32>()
 }
@@ -756,10 +763,22 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 // over `g<8` is {0,12,24,4,16,28,8,20} — eight groups of four consecutive
 // banks, as required.
 #define MMA_QT 16
-#define MMA_HPB 4
+#define MMA_HPB 8
 #define MMA_WPH (8 / MMA_HPB)
 #define MMA_KT (8 * MMA_WPH)
-#define MMA_MAXT 16
+#define MMA_MAXT (256 / (8 * MMA_WPH))
+// `Q K^T` steps at the largest head dimension the dispatch admits. The Q
+// fragments are held in registers across the whole key loop, so every index
+// into them must fold at compile time -- a runtime index puts the array in
+// local memory and costs more than the shared tile it replaced.
+#define MMA_QSTEPS 32
+// Padding for `v_sh`, whose fragment read is `dim * VSTRIDE + 4*oct + tig`
+// with `dim` carrying `g`. That is a bank bijection exactly when
+// `gcd(VSTRIDE, 32) == 4`, so this is the smallest such stride that still
+// holds `MMA_KT/2` words: 4, 12, 20 for key tiles of 8, 16, 32. The obvious
+// `MMA_KT/2 + 4` gives 8 at a key tile of 8, and `gcd(8, 32)` is 8 -- four
+// banks over eight groups, a two-way conflict on every value fragment.
+#define MMA_VSTRIDE (4 + 8 * (((MMA_KT / 2) - 4 + 7) / 8))
 // Value-staging loads issued before the first store. See the staging loop.
 #define MMA_VB 2
 // Prefetch registers per thread, sized for the largest geometry the dispatch
@@ -823,10 +842,14 @@ __global__ void attn_flash_causal_mma(
     unsigned* smem = (unsigned*)smem_f;
     int hd2 = head_dim >> 1;              // 32-bit words per row of a fp16 tile
     int qstride = hd2 + 4;
-    int vstride = (MMA_KT >> 1) + 4;
+    int vstride = MMA_VSTRIDE;
 
-    unsigned* q_sh = smem;                                      // HPB*QT*qstride
-    unsigned* k_sh = q_sh + MMA_HPB * MMA_QT * qstride;         // KT*qstride
+    // No `q_sh`. At `MMA_HPB` 8 it would want 67,584 B on its own against a
+    // 65,536 B carveout, and it is the one staged tile that is read by exactly
+    // one warp -- every warp of a block serves a different head, so nothing is
+    // shared by putting Q in shared memory. In registers it costs 64 of them
+    // and buys the halved block count, which is what the kernel is bound by.
+    unsigned* k_sh = smem;                                      // KT*qstride
     unsigned* v_sh = k_sh + MMA_KT * qstride;                   // head_dim*vstride
     float* s_sh    = (float*)(v_sh + head_dim * vstride);       // HPB*QT*KT
     float* m_sh    = s_sh + MMA_HPB * MMA_QT * MMA_KT;          // HPB*QT
@@ -854,28 +877,35 @@ __global__ void attn_flash_causal_mma(
     int dbase = sub * dpw;
     int ntile = dpw >> 3;             // MMA n-tiles of 8 dims, <= MMA_MAXT
 
-    unsigned* my_q = q_sh + hslot * (MMA_QT * qstride);
     float* my_s = s_sh + hslot * (MMA_QT * MMA_KT);
     float* my_m = m_sh + hslot * MMA_QT;
     float* my_l = l_sh + hslot * MMA_QT;
     float* my_c = corr_sh + hslot * MMA_QT;
 
-    // Q for both heads of the pair, staged once as fp16 in the A layout.
-    for (int t = tid; t < MMA_HPB * MMA_QT * hd2; t += nthr) {
-        int hh = t / (MMA_QT * hd2);
-        int rem = t - hh * (MMA_QT * hd2);
-        int r = rem / hd2;
-        int c = rem - r * hd2;
-        long long qrow = qi0 + r;
-        float lo = 0.0f, hi = 0.0f;
-        if (qrow < (long long)n_query) {
-            const float* qp =
-                q + (qrow * (long long)q_heads + (blockIdx.y * MMA_HPB + hh))
-                    * (long long)head_dim;
-            lo = qp[2 * c];
-            hi = qp[2 * c + 1];
+    // This warp's own Q, in the A fragment layout, held for the whole key
+    // loop. Lane `(g, tig)` owns rows `qi0+g` and `qi0+g+8` at the dimension
+    // pair `4*s + tig`, which is exactly what `mma.m16n8k8` wants in `a0`,
+    // `a1`. Read once per block and never again, so the scatter across eight
+    // rows costs nothing measurable against the key stream.
+    int steps = head_dim >> 3;
+    unsigned qa0[MMA_QSTEPS], qa1[MMA_QSTEPS];
+    {
+        long long r0 = qi0 + g;
+        long long r1 = qi0 + g + 8;
+        const float* qp0 = (r0 < (long long)n_query)
+            ? q + (r0 * (long long)q_heads + h) * (long long)head_dim : 0;
+        const float* qp1 = (r1 < (long long)n_query)
+            ? q + (r1 * (long long)q_heads + h) * (long long)head_dim : 0;
+        #pragma unroll
+        for (int s = 0; s < MMA_QSTEPS; ++s) {
+            qa0[s] = 0u;
+            qa1[s] = 0u;
+            if (s < steps) {
+                int c = 4 * s + tg;
+                if (qp0) qa0[s] = pack_h2(qp0[2 * c], qp0[2 * c + 1]);
+                if (qp1) qa1[s] = pack_h2(qp1[2 * c], qp1[2 * c + 1]);
+            }
         }
-        q_sh[hh * (MMA_QT * qstride) + r * qstride + c] = pack_h2(lo, hi);
     }
     if (tid < MMA_HPB * MMA_QT) {
         m_sh[tid] = neg_inf();
@@ -1021,12 +1051,14 @@ __global__ void attn_flash_causal_mma(
         // covered exactly once.
         {
             float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            int steps = head_dim >> 3;
-            for (int s = 0; s < steps; ++s) {
-                unsigned a0 = my_q[g * qstride + 4 * s + tg];
-                unsigned a1 = my_q[(g + 8) * qstride + 4 * s + tg];
-                unsigned b0 = k_sh[(8 * sub + g) * qstride + 4 * s + tg];
-                mma_m16n8k8(s0, s1, s2, s3, a0, a1, b0);
+            // Compile-time bound so `qa0`/`qa1` stay in registers; the real
+            // step count is the predicate.
+            #pragma unroll
+            for (int s = 0; s < MMA_QSTEPS; ++s) {
+                if (s < steps) {
+                    unsigned b0 = k_sh[(8 * sub + g) * qstride + 4 * s + tg];
+                    mma_m16n8k8(s0, s1, s2, s3, qa0[s], qa1[s], b0);
+                }
             }
             my_s[g * MMA_KT + 8 * sub + 2 * tg]           = s0 * scale;
             my_s[g * MMA_KT + 8 * sub + 2 * tg + 1]       = s1 * scale;
@@ -2023,6 +2055,20 @@ impl AttentionKernels {
         }
     }
 
+    /// Whether [`Self::forward`] partitions the key axis across blocks rather
+    /// than replicating it.
+    ///
+    /// The prefill kernels give every block the whole visible window, so their
+    /// traffic is `blocks * window`. Flash decoding does the opposite: the
+    /// blocks split the key range between them and each reads its slice once,
+    /// so the traffic is `kv_heads * window` however many blocks there are.
+    /// Exposed because a benchmark that applies the prefill model to the decode
+    /// path reports a bandwidth many times the card's, which is how this was
+    /// noticed.
+    pub fn splits_the_key_axis(&self, n_query: usize) -> bool {
+        n_query == 1 && self.decode_split_is_available()
+    }
+
     /// Blocks [`Self::forward`] would launch at this query count.
     ///
     /// Each block streams the whole visible key window for itself, so this is
@@ -2780,14 +2826,43 @@ mod tests {
         // drifted from its mirror would be caught by nothing else: every launch
         // parameter derived here would be self-consistent and wrong.
         assert!(
-            ATTENTION_SRC.contains("#define MMA_HPB 4")
+            ATTENTION_SRC.contains(&format!("#define MMA_HPB {MMA_HEADS_PER_BLOCK}"))
                 && ATTENTION_SRC.contains("#define MMA_WPH (8 / MMA_HPB)")
-                && ATTENTION_SRC.contains("#define MMA_KT (8 * MMA_WPH)"),
+                && ATTENTION_SRC.contains("#define MMA_KT (8 * MMA_WPH)")
+                && ATTENTION_SRC.contains("#define MMA_MAXT (256 / (8 * MMA_WPH))"),
             "the device block shape no longer mirrors the host constants",
         );
+
+        // The value stride is the one constant with a non-obvious formula on
+        // both sides, and a mismatch would be a shared-memory overrun on one
+        // side or a bank conflict on the other. Check the closed forms agree
+        // at every key tile the shape rule can produce.
+        for wph in [1usize, 2, 4] {
+            let kt = 8 * wph;
+            let host = 4 + 8 * (kt / 2 - 4).div_ceil(8);
+            // Transcribed from the `#define` character for character, which is
+            // the whole point: rewriting it as `div_ceil` here would compare
+            // the host formula against itself and prove nothing.
+            #[allow(clippy::manual_div_ceil)]
+            let device = 4 + 8 * (((kt / 2) - 4 + 7) / 8);
+            assert_eq!(host, device, "value stride disagrees at MMA_KT {kt}");
+            let mut a = host;
+            let mut b = 32usize;
+            while b != 0 {
+                let t = b;
+                b = a % b;
+                a = t;
+            }
+            assert_eq!(a, 4, "a value stride of {host} is not a bank bijection");
+            assert!(
+                host >= kt / 2,
+                "a value stride of {host} cannot hold {kt} keys"
+            );
+        }
+        assert_eq!(MMA_VALUE_STRIDE, 4 + 8 * (MMA_KEY_TILE / 2 - 4).div_ceil(8));
         assert!(
-            ATTENTION_SRC.contains(&format!("#define MMA_MAXT {MMA_MAX_TILES}")),
-            "the accumulator bound no longer mirrors MMA_MAX_TILES",
+            ATTENTION_SRC.contains("#define MMA_VSTRIDE (4 + 8 * (((MMA_KT / 2) - 4 + 7) / 8))"),
+            "the value stride no longer mirrors MMA_VALUE_STRIDE",
         );
 
         // The softmax butterfly reduces over the lanes holding one row, so a
@@ -2817,9 +2892,17 @@ mod tests {
         }
         assert_eq!(
             mma_shared_bytes(256),
-            59_392,
+            13_952,
             "the budget at this model's geometry moved; check it still buys \
              what the block shape was widened for",
+        );
+        // Well under 32 KiB now that Q is in registers, so shared memory is no
+        // longer what holds this kernel to one block per SM -- the accumulator
+        // is. Stated because the natural next question is occupancy, and the
+        // answer has moved from "shared" to "registers".
+        assert!(
+            mma_shared_bytes(256) <= 32 * 1024,
+            "two blocks per SM are no longer admitted by shared memory",
         );
     }
 }

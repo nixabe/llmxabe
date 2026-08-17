@@ -45,8 +45,20 @@ const Q_HEADS: usize = 16;
 const KV_HEADS: usize = 2;
 const HEAD_DIM: usize = 256;
 
-/// The chunk width `Forward` prefills at, so a row is one real launch.
-const CHUNK: usize = 512;
+/// Default chunk width `Forward` prefills at, so a row is one real launch.
+///
+/// Overridable with `LLMXABE_ATTN_CHUNK`, because the width is a lever in its
+/// own right: it sets the query-tile count and therefore the grid, and at 512
+/// the tensor-core kernel launches fewer blocks than this card has SMs.
+const DEFAULT_CHUNK: usize = 512;
+
+fn chunk() -> usize {
+    std::env::var("LLMXABE_ATTN_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(DEFAULT_CHUNK)
+}
 
 /// `key_offset` values: the depth already cached when the chunk arrives.
 const DEPTHS: [usize; 7] = [0, 2_048, 8_192, 32_768, 65_536, 98_304, 131_072];
@@ -84,19 +96,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let kernels = AttentionKernels::new(&ctx, Q_HEADS, KV_HEADS, HEAD_DIM)?;
     let mut dec = AttnDecodeScratch::new(&stream, Q_HEADS, HEAD_DIM)?;
 
-    let max_keys = DEPTHS[DEPTHS.len() - 1] + CHUNK;
+    let chunk = chunk();
+    let max_keys = DEPTHS[DEPTHS.len() - 1] + chunk;
     let kv_elems = max_keys * KV_HEADS * HEAD_DIM;
     info!(
-        "cache {:.2} GiB, chunk {CHUNK}, tensor cores: {}",
+        "cache {:.2} GiB, chunk {chunk}, tensor cores: {}",
         (2 * kv_elems * size_of::<u16>()) as f64 / (1 << 30) as f64,
-        kernels.uses_tensor_cores(CHUNK),
+        kernels.uses_tensor_cores(chunk),
     );
 
     // Values, not zeros: the softmax is data-dependent and a cache of zeros
     // would give every key the same score. This is a timing harness, so the
     // numbers only have to be plausible in magnitude — correctness belongs to
     // `tests/attention_differential.rs`.
-    let q_host: Vec<f32> = (0..CHUNK * Q_HEADS * HEAD_DIM)
+    let q_host: Vec<f32> = (0..chunk * Q_HEADS * HEAD_DIM)
         .map(|i| ((i % 97) as f32 - 48.0) / 64.0)
         .collect();
     let kv_host: Vec<u16> = (0..kv_elems)
@@ -106,7 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let q = stream.clone_htod(q_host.as_slice())?;
     let k = stream.clone_htod(kv_host.as_slice())?;
     let v = stream.clone_htod(kv_host.as_slice())?;
-    let mut out = stream.alloc_zeros::<f32>(CHUNK * Q_HEADS * HEAD_DIM)?;
+    let mut out = stream.alloc_zeros::<f32>(chunk * Q_HEADS * HEAD_DIM)?;
     drop(q_host);
     drop(kv_host);
 
@@ -122,7 +135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                       dec: &mut AttnDecodeScratch,
                       out: &mut _|
          -> Result<(), Box<dyn std::error::Error>> {
-            kernels.forward(stream, dec, &q, &k, &v, out, CHUNK, max_keys, &positions)?;
+            kernels.forward(stream, dec, &q, &k, &v, out, chunk, max_keys, &positions)?;
             Ok(())
         };
 
@@ -138,10 +151,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         stream.synchronize()?;
         let ms = start.elapsed().as_secs_f64() * 1e3 / REPS as f64;
 
-        let (issued, minimum) = traffic(&kernels, depth);
-        let flops = causal_flops(depth);
+        let (issued, minimum) = traffic(&kernels, depth, chunk);
+        let flops = causal_flops(depth, chunk);
         info!(
-            "{depth:>10}  {CHUNK:>8}  {ms:>9.3}  {:>9.1}  {:>9.3}  {:>8.3}  {:>8.2}",
+            "{depth:>10}  {chunk:>8}  {ms:>9.3}  {:>9.1}  {:>9.3}  {:>8.3}  {:>8.2}",
             issued as f64 / (ms * 1e6),
             issued as f64 / 1e9,
             minimum as f64 / 1e9,
@@ -158,22 +171,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// the minimum is one pass over the whole window per KV head. Their ratio is
 /// the redundancy the block shape imposes, which is what a change to `MMA_HPB`
 /// moves.
-fn traffic(kernels: &AttentionKernels, depth: usize) -> (usize, usize) {
-    let rows = kernels.query_tile(CHUNK);
-    let tiles = CHUNK.div_ceil(rows);
-    let heads = kernels.blocks_per_launch(CHUNK) / tiles;
+fn traffic(kernels: &AttentionKernels, depth: usize, chunk: usize) -> (usize, usize) {
     let per_key = HEAD_DIM * 2 * size_of::<u16>();
+    let minimum = KV_HEADS * (depth + chunk) * per_key;
 
+    // Flash decoding splits the key range between its blocks instead of giving
+    // each one the whole window, so its traffic is the minimum by construction
+    // and the redundancy is 1. Applying the prefill model here reported 26,581
+    // GB/s against a 672 GB/s card, which is how the distinction got noticed.
+    if kernels.splits_the_key_axis(chunk) {
+        return (minimum, minimum);
+    }
+
+    let rows = kernels.query_tile(chunk);
+    let tiles = chunk.div_ceil(rows);
+    let heads = kernels.blocks_per_launch(chunk) / tiles;
     let issued: usize = (0..tiles)
-        .map(|t| heads * (depth + (rows * (t + 1)).min(CHUNK)) * per_key)
+        .map(|t| heads * (depth + (rows * (t + 1)).min(chunk)) * per_key)
         .sum();
-    (issued, KV_HEADS * (depth + CHUNK) * per_key)
+    (issued, minimum)
 }
 
 /// Multiply-adds under the causal mask, counted as two flops each, over both
 /// `Q K^T` and `P V`.
-fn causal_flops(depth: usize) -> f64 {
+fn causal_flops(depth: usize, chunk: usize) -> f64 {
     // Row `i` of the chunk sees `depth + i + 1` keys.
-    let visible: f64 = (0..CHUNK).map(|i| (depth + i + 1) as f64).sum();
+    let visible: f64 = (0..chunk).map(|i| (depth + i + 1) as f64).sum();
     2.0 * 2.0 * visible * HEAD_DIM as f64 * Q_HEADS as f64
 }

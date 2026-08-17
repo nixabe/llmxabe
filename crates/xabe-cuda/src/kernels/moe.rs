@@ -399,6 +399,20 @@ const MOE_SRC: &str = r#"
 #define MOE_TK   128
 #define MOE_TN   4
 #define MOE_ROWS 8
+// Contraction passes a decode GEMV issues before consuming any of them.
+//
+// These loops are bounded by `hidden` or `intermediate`, both runtime values,
+// so ptxas cannot unroll them on its own: the next pass's dequantization
+// cannot issue until this pass's arithmetic has freed its registers, and each
+// thread keeps one weight tile in flight. That is a memory-parallelism bound
+// rather than a bandwidth one, and it is why these kernels sat at a third of
+// the streaming roofline while the LM head's own GEMV reached 89%.
+//
+// The gate/up kernels keep their own literal 2 -- they dequantize two matrices
+// a pass, so they already had two independent streams before any unrolling,
+// and four measured worse there. The down projections have one stream and need
+// this.
+#define MOE_DOWN_UNROLL 4
 
 // Derived: activation floats each thread stages per pass, and the tile-row
 // stride between the rows one thread owns. Both are compile-time so the
@@ -1488,6 +1502,11 @@ __global__ void moe_expert_down_gemv(
     long long wrow = ((long long)e * hidden + h) * intermediate;
 
     float ad[1] = {0.0f};
+    // One dequantized matrix a pass, against the gate/up kernel's two, so this
+    // loop starts with half the requests in flight and needs the deeper
+    // unroll. Accumulation stays sequential into `ad[0]`, so the result is
+    // bit-identical to the rolled form.
+    #pragma unroll MOE_DOWN_UNROLL
     for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
         float wd[MOE_TN];
         dequant_tile(down_q, down_quant, wrow + j0, lane, wd);
@@ -2413,6 +2432,10 @@ __global__ void moe_shared_ffn_gemv(
 
     float ag[1] = {0.0f};
     float au[1] = {0.0f};
+    // Two streams like the routed gate/up kernel, but its literal 2 was tuned
+    // against a `hidden`-long contraction; this one walks only `hidden /
+    // MOE_SHARED_WARPS`, so it has fewer passes to hide the same latency.
+    #pragma unroll 2
     for (int j0 = warp * chunk; j0 < stop; j0 += MOE_TK) {
         float wg[MOE_TN];
         float wu[MOE_TN];
@@ -2456,6 +2479,8 @@ __global__ void moe_shared_down_gemv(
     long long wrow = (long long)h * intermediate;
 
     float ad[1] = {0.0f};
+    // Same single-stream contraction as the routed down projection above.
+    #pragma unroll MOE_DOWN_UNROLL
     for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
         float wd[MOE_TN];
         dequant_tile(down_q, down_quant, wrow + j0, lane, wd);
