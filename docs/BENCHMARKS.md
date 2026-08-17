@@ -4336,3 +4336,95 @@ either a genuinely new idea against the now-compute-bound (not traffic-bound)
 kernel, or accepting that llama.cpp's `-ub 4096` prefill is the harder target
 of the two and the win is upstream of attention -- in MoE or GDN, which this
 session did not touch.
+
+## A Marlin-style prefetch pipeline for `moe_expert_ffn_mma`: built, and rejected on `ptxas -v` (2026-08-18)
+
+The obvious next target once attention was spent: `moe_expert_ffn_mma` and
+`moe_expert_down_mma` are 17.3% and 10.2% of an 8,192-token chunked pass, and
+the "Integer tensor cores" section above measured the same kernel family's
+split-layout GEMM at 16.1% of the card's 198 TOP/s int8 peak and 31% of
+bandwidth peak -- no longer traffic-bound, and named "a shared-memory staging
+pipeline of the kind Marlin uses" as the way to more of the ceiling.
+
+No bench isolated these two kernels from a full model load, so the first step
+was `bench_moe`: loads one real layer's mixed-quant expert stacks and times
+`MoeKernels::grouped_forward` alone. Baseline, three interleaved rounds:
+
+| tokens | ms | TOP/s |
+|---:|---:|---:|
+| 512 | 4.22 | 6.11 |
+| 8,192 | 37.8-39.3 | 10.5-10.9 |
+
+### The pipeline, built the way `attn_flash_causal_mma`'s was
+
+Turing has no `cp.async`, so `MMA_PREFETCH` in `attention.rs` hand-pipelines
+by loading the next tile into registers a trip ahead of the barrier that
+lands it in shared, so ptxas can keep the DRAM round trip in flight across the
+current tile's MMA passes. The same transform applied to `moe_expert_ffn_mma`:
+every weight and activation staging write got a register-held prefetch one
+`kc` trip ahead, landed after the loop's first barrier, with the next trip's
+loads issued right after -- structurally identical to the attention kernel's
+own loop, two barriers per trip in both the before and after versions.
+
+It compiles, is bit-for-bit the same transform (nothing changes about *what*
+is computed, only *when* it is loaded), and **passes every gate**: all six
+`moe_differential.rs` tests, including
+`device_grouped_forward_matches_the_reference_on_real_expert_weights` at its
+existing `ROUTED_MMA_GATE` tolerance with no loosening.
+
+It is also slower. Three interleaved `bench_moe` pairs against the baseline
+above:
+
+| tokens | baseline ms | +prefetch ms | change |
+|---:|---:|---:|---:|
+| 512 | 4.22 | 5.05 | **20% slower** |
+| 8,192 | ~38.3 | ~39.2 | **~3% slower** |
+
+### Why, found with `nvcc -Xptxas -v` rather than guessed
+
+`moe_expert_ffn_mma` is declared `__launch_bounds__(MOE_MMA_WARPS * 32,
+MOE_MMA_BLOCKS_PER_SM)` with `MOE_MMA_BLOCKS_PER_SM` 3 -- the kernel's own
+comment says why: "This kernel is bandwidth-bound, not compute-bound... what
+it needs from the scheduler is loads in flight, and what puts loads in flight
+is resident warps." Three blocks of 256 threads at Turing's 65,536-register
+file is an 85-register-per-thread budget, and extracting `MOE_SRC` to a
+standalone `.cu` and compiling it with `nvcc -arch=compute_75 -code=sm_75
+-Xptxas -v` shows the **unmodified** kernel already at 80 of those 85
+registers, zero spill. The prefetch version compiles to the *same* 80
+registers -- `__launch_bounds__` caps it there -- but now with **24 bytes of
+spill stores and 24 of spill loads**: the extra live state (roughly 25
+registers across the weight and activation prefetch) does not fit, and ptxas
+is forced to spill to local memory rather than exceed the occupancy target.
+Spilling in the hot loop is exactly the DRAM-latency cost the prefetch exists
+to hide, paid a second time.
+
+Relaxing the target to `MOE_MMA_BLOCKS_PER_SM` 2 (128 registers available)
+removes the spill entirely -- 128 registers used, zero spill -- and closes
+most of the gap: three more interleaved pairs, baseline against prefetch+2
+blocks/SM:
+
+| tokens | baseline ms | +prefetch, 2 blocks/SM | change |
+|---:|---:|---:|---:|
+| 512 | 4.21-4.22 | 4.15-4.16 | ~1.5% *faster* |
+| 8,192 | 37.8-39.3 | 37.0-40.1 | a wash, no consistent direction |
+
+`moe_expert_down_mma` was checked the same way before attempting it: already
+at 64 of the 64 registers `MOE_DOWN_BLOCKS_PER_SM` 4 (65,536 / (256×4))
+allows, zero spill -- an even tighter ceiling than the gate/up kernel's, so
+the same trade was expected to apply and the kernel was not modified.
+
+### The finding
+
+`attn_flash_causal_mma` needed register-based prefetching because it runs one
+block per SM by construction (`MMA_HPB` fills the whole GQA group into one
+block) -- there is no second resident block to hide DRAM latency, so a
+register pipeline was the only lever. Both routed-expert MMA kernels are the
+opposite case: `__launch_bounds__` already tunes them to the register ceiling
+that maximizes *occupancy*-based latency hiding, deliberately, per the
+kernel's own comment. A register prefetch pipeline does not add a second
+latency-hiding mechanism on top of that one; it **competes with it** for the
+same register budget, and on this card it loses -- either as an outright
+spill (3 blocks/SM, 20% slower) or as a wash once occupancy is traded down to
+make room for it (2 blocks/SM). Not shipped. `bench_moe` is kept: it is the
+first isolated harness for either kernel and makes the next attempt here
+measurable in seconds rather than a full `bench_forward` run.
