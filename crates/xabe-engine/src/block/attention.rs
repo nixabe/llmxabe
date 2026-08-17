@@ -1203,6 +1203,7 @@ impl GatedAttentionBlock {
             &mut sc.pregate,
             t,
             cache.max_seq,
+            pos_offset + t,
             positions,
         )?;
 
@@ -1518,6 +1519,7 @@ impl GatedAttentionBlock {
                 &mut pregate_i,
                 1,
                 caches[i].max_seq,
+                pos_offsets[i] + 1,
                 positions[i],
             )?;
         }

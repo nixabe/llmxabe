@@ -5972,3 +5972,261 @@ workstream was asked to close, remain at 1.04x and parity; 65,536 holds
 its incidental win at 1.02x; 131,072 is unchanged within noise, still
 short of parity at 0.94x, and bounded by attention rather than by
 anything MoE-side has left to give.
+
+## The decode tensor-core kernel's register spill, fixed by not doing what `attn_flash_causal_mma` does, and shipped as the default (2026-08-18)
+
+The previous section on `attn_flash_decode_mma` left three things open: a
+255-register spill the correctness fix had introduced, `DMMA_KT` widening
+to match llama.cpp's 64-key softmax trip, and depth-aware dispatch so a
+single `AttentionKernels` instance takes the right kernel at every depth
+instead of one lever fixed for the whole pass. This section closes the
+first and third and explains why the second was not attempted.
+
+### The spill's mechanism, found by reading llama.cpp's Turing path rather than guessing
+
+`attn_flash_decode_mma`'s K/V staging was cross-tile double-buffered the
+same way `attn_flash_causal_mma` pipelines its own staging: a prologue
+load, then each loop trip storing the *previous* trip's already-loaded
+registers to shared and issuing the *next* trip's loads before computing
+on the current tile. That shape needs `kreg`/`vlo`/`vhi` live
+simultaneously with `o`/`qa0`/`qa1` for the whole `Q K^T` + softmax + `P V`
+body, not just across the load-then-store gap. `fattn-mma-f16.cuh`
+(`/home/nixabe/llama.cpp/ggml/src/ggml-cuda/fattn-mma-f16.cuh`) does not do
+this on Turing: `cp_async_available()` in `common.cuh` gates the
+hardware-async copy path behind `GGML_CUDA_CC_AMPERE`, so SM75 always takes
+`flash_attn_ext_f16_load_tile`'s plain-load branch, which is a same-tile
+`ggml_cuda_memcpy_1<16>` straight from global to shared with no register
+array held across a tile boundary at all -- the "prefetch" a Turing kernel
+gets is whatever outstanding-request pipelining the hardware itself does
+across nearby loads, not a programmer-held register buffer. Dropping the
+cross-tile buffering and staging each tile's K/V into a register array
+scoped to that tile alone (load, store to shared, and let the array go out
+of scope before the compute phase begins) matches this, and removes the
+period where the next tile's registers and the current tile's compute both
+need to be live.
+
+`nvcc -arch=sm_75 -cubin -Xptxas -v` on the extracted kernel, before (as
+shipped in the previous section, the correctness fix's own regression) and
+after this restructuring:
+
+| variant | before (cross-tile buffered) | after (same-tile only) |
+|---|---:|---:|
+| `WPO = 4` | 255 registers, 16 B spill (stores + loads) | **235 registers, 0 spill** |
+| `WPO = 2` | 255 registers, 52-56 B spill (stores + loads) | **252 registers, 0 spill** |
+
+Re-verified on the real source, not just the scratchpad extraction: all
+nine `attention_differential` tests pass with the selection forced to each
+width in turn, at numbers identical to the pre-fix kernel's (`n_keys =
+4,096/4,097/61`, `max_abs` unchanged to the printed digit) -- the
+restructuring changed nothing about what the kernel computes, only how
+long each register lives.
+
+### `DMMA_KT` widening: not attempted, and why
+
+The lead's second instruction was to try `DMMA_KT = 64` once registers
+were free, matching llama.cpp's `nbatch_fa`. Freed registers went instead
+to the correctness fix's own increased liveness -- `WPO = 2`, the width
+that wins, is back down to only 3 registers of headroom (252 of 255), the
+same wall the "Widening the softmax-rescale tile" section above hit on the
+*prefill* kernel from a different cause (that kernel's `Q` living in
+registers, not staging liveness). Widening the key trip needs more
+simultaneous score and correction state per trip, which is exactly what
+that section measured as spilling immediately even from a much smaller
+register margin than this. `WPO = 4` has real headroom (20 registers), but
+is the width that loses at every depth measured, both before and after
+this fix -- spending that headroom to try `DMMA_KT` widening on the losing
+width first was not judged worth a session on it; the finding is recorded
+here rather than attempted and left unmeasured.
+
+### Kernel-level performance, `bench_attention`, `LLMXABE_ATTN_CHUNK=1`, GPU 1, 3 interleaved rounds per depth, before vs after this fix
+
+The previous section's crossover sat between 65,536 (0.99x, a wash) and
+98,304 (1.05x). A finer sweep after the fix -- 2,048/8,192/12,288/16,384/
+20,480/24,576/32,768/65,536/131,072 -- narrows it by nearly an order of
+magnitude in depth:
+
+| key_offset | `attn_flash_decode_warp` (ms, 3 rounds) | `WPO=2` (ms, 3 rounds) | ratio | ratio before this fix |
+|---:|---:|---:|---:|---:|
+| 2,048 | 0.074 / 0.076 / 0.074 | 0.095 / 0.095 / 0.094 | 0.79x | 0.74x |
+| 8,192 | 0.125 / 0.126 / 0.126 | 0.137 / 0.136 / 0.135 | 0.92x | 0.73x |
+| 12,288 | 0.160 / 0.160 / 0.159 | 0.167 / 0.167 / 0.168 | 0.95x | -- |
+| 16,384 | 0.191 / 0.192 / 0.192 | 0.191 / 0.191 / 0.192 | **1.00x** | -- |
+| 20,480 | 0.228 / 0.228 / 0.228 | 0.222 / 0.223 / 0.222 | 1.03x | -- |
+| 24,576 | 0.263 / 0.263 / 0.262 | 0.248 / 0.250 / 0.250 | 1.05x | -- |
+| 32,768 | 0.331 / 0.331 / 0.332 | 0.306 / 0.305 / 0.306 | 1.08x | 0.87x |
+| 65,536 | 0.620 / 0.620 / 0.620 | 0.510 / 0.510 / 0.510 | 1.22x | 0.99x |
+| 131,072 | 1.196 / 1.278\* / 1.197 | 0.930 / 0.927 / 0.930 | 1.29x\* | 1.08x |
+
+\*131,072's second `attn_flash_decode_warp` round (1.278) is an outlier
+against its own other two rounds (1.196, 1.197); the ratio column uses the
+two agreeing rounds (1.197/0.929 = 1.29x). Including the outlier would
+read 1.32x -- either way the win at the deepest measured point grew, it
+did not shrink.
+
+Every depth's ratio improved after the fix, and by more than the removed
+spill bytes alone would suggest -- 16-56 B of spill is a handful of local
+loads and stores per trip, not obviously a 9-20 point swing. The staging
+restructuring itself (not carrying `kreg`/`vlo`/`vhi` across a tile
+boundary) plausibly frees the compiler to schedule the load-then-store
+sequence tighter even where it did not force a spill, but this session did
+not `cuobjdump -sass` to confirm that beyond the register/spill counts
+above; `ncu` remains unavailable (`ERR_NVGPUCTRPERM`) to settle it further.
+
+### Depth-aware dispatch, shipped as the default
+
+`AttentionKernels`'s tensor-core lever (`decode_mma`, an `AtomicU8` so it
+stays `Sync` through the `Arc<AttentionKernelSet>` every layer shares)
+changes meaning: `0` was "disabled" and is now `Auto`, `1` is the new
+"disabled" (`ForceWarp`), and `2`/`4` still force that occupancy width at
+every depth for `bench_attention`/`bench_decode`'s A/B levers.
+`disable_decode_mma()` now stores `1`, not `0` -- callers of that method
+are unaffected, only the meaning of the atomic's own zero value changed.
+
+`AttentionKernels::forward` and `decode` gained a `key_depth: usize`
+parameter -- the caller's host-side `positions[0] + n_query`, not
+`max_keys` (the cache's allocated *capacity*, already a parameter, and a
+different number: `bench_attention` fixes `max_keys` at the sweep's
+deepest point for every row while `key_depth` varies per row, and
+`GatedAttentionBlock::forward` already had the equivalent host value on
+hand as `pos_offset + t` without needing to read anything back from the
+device). `active_decode_mma(depth)` compares it against
+`DECODE_MMA_DEPTH_THRESHOLD = 16,384` -- the point in the table above
+where `WPO=2` stops losing (0.1917 ms vs 0.1913 ms, ~1.00x) -- and picks
+`WPO=2` at or above it, `attn_flash_decode_warp` below. `WPO=4` never wins
+at any depth measured before or after the fix, so `Auto` never selects it;
+the forced lever is kept only for benchmarking, per the disposition below.
+
+Threading `key_depth` cost four call sites: `GatedAttentionBlock::forward`
+(passes `pos_offset + t`), its batched-decode sibling
+`forward_batch_decode` (passes `pos_offsets[i] + 1`, per sequence),
+`bench_attention` (passes `depth + chunk`, the same quantity `positions`
+already encoded on the device), and the differential test's `run_device`
+helper (passes `key_offset + n_query`). None of these change what any
+kernel computes -- `key_depth` selects between two already-correct kernels,
+it is not consulted for the bound check, which stays exactly where the
+`forward` doc comment already says it has to live (device-side
+`positions`, checked by the caller before launch).
+
+### Correctness after the depth-aware default, and a coverage gap the default change opened
+
+`device_decode_matches_the_reference_over_a_deep_window` only exercises
+`n_keys = 4,096/4,097/61` -- cheap enough for the `O(n_keys^2)` CPU
+reference to run in a test, but all three are below the new 16,384
+threshold. With `Auto` now the default, that test would silently stop
+exercising `attn_flash_decode_mma_wpo{2,4}` at all: `Auto` would pick
+`attn_flash_decode_warp` for every depth in the loop, same as if the
+tensor-core kernel had never been built. Fixed by wrapping the existing
+three-depth loop in an outer loop over the lever (`Auto`, forced `WPO=2`,
+forced `WPO=4`) rather than raising `n_keys` into the tensor-core kernel's
+own win region, which would have made the CPU reference `O(16,384^2)` --
+tens of billions of multiply-adds per head, not a test. All nine tests
+pass, `GATE` (1e-5) unchanged:
+
+| lever | n_keys | max_abs | cosine |
+|---|---:|---:|---:|
+| auto | 4,096 / 4,097 / 61 | 1.118e-7 / 1.043e-7 / 1.043e-7 | 1.000000000 |
+| `WPO=2` | 4,096 / 4,097 / 61 | 6.660e-6 / 7.276e-6 / 1.043e-7 | 1.000000000 |
+| `WPO=4` | 4,096 / 4,097 / 61 | 6.660e-6 / 7.276e-6 / 1.043e-7 | 1.000000000 |
+
+`the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax` still
+passes, identical argmax and logit (token 25358, 19.998243) to every prior
+recording in this file. That capture is 19 tokens deep, below the
+threshold, so it confirms the `Auto` default did not disturb the
+already-passing warp path rather than exercising the new dispatch branch
+-- the forced-lever rows above are what cover the tensor-core kernel
+itself under this gate.
+
+### End-to-end performance, `bench_decode`, `LLMXABE_DECODE_CHUNK=8192`, 48 steps after 4 warmup, GPU 1, 3 interleaved rounds, `Auto` default against `attn_flash_decode_warp` forced
+
+| depth | warp (ms/step, 3 rounds) | `Auto` (ms/step, 3 rounds) | ratio | warp tok/s | `Auto` tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 32,768 | 12.26 / 12.41 / 12.30 | 12.05 / 12.12 / 12.18 | 1.02x | 81.14 | 82.54 |
+| 65,536 | 14.79 / 14.77 / 14.82 | 14.08 / 14.07 / 14.08 | 1.05x | 67.60 | 71.04 |
+| 131,072 | 19.77 / 20.45\* / 19.79 | 17.64 / 17.70 / 17.64 | 1.13x | 50.01 | 56.62 |
+
+\*131,072's second warp round is again the noisiest of the three (`sd`
+0.53 ms against 0.37-0.39 ms elsewhere in this table); `Auto`'s three
+rounds agree to within 0.06 ms of each other at every depth, for whatever
+that says about the fixed kernel's own run-to-run variance against the
+warp kernel's.
+
+Every depth that used to lose end to end now wins: the previous section's
+`WPO=2` (pre-fix) measured 0.958x at 32,768 and 0.981x at 65,536 -- real
+losses, which is why it shipped disabled by default. Post-fix `Auto`
+measures 1.02x and 1.05x at the same two depths, and 131,072's win grew
+from 1.02x to 1.13x. Kernel-level and end-to-end both grew in the same
+direction, as they should for a fix that touched only the kernel's own
+register behavior and not the split/combine structure around it.
+
+### Bandwidth, updated
+
+The previous section measured `WPO=2` at 243 GB/s (36% of the card) at
+131,072 keys, against llama.cpp's own measured ~589 GB/s (88%) on the
+identical KV-read arithmetic. `bench_attention`'s own issued-GB/s column
+for the fixed kernel at the same depth: 288.6 / 289.6 / 288.6 GB/s across
+the three rounds above, 288.9 GB/s average -- **43% of the card**, up from
+36%. The gap to llama.cpp's ceiling narrowed from 346 GB/s short to 300 GB/s
+short -- real, and still most of the distance. Nothing named in this
+section moves that further; `DMMA_KT` widening (the lever sized to close
+it) is the one explicitly not attempted above, for the register-headroom
+reason given there.
+
+### Against the mission target, and against this session's own baseline
+
+The mission brief's parity target at 131,072 keys is `attn_flash_decode_warp`'s
+1.197 ms cut roughly in half, near 0.6 ms. `WPO=2` now measures 0.929 ms
+kernel-level (`nvcc`'s own three-round average above) -- better than the
+previous section's 1.105 ms, but still about 1.5x the target rather than
+at it.
+
+End to end, this session's own direct A/B (the table above, same binary,
+same prompt, interleaved rounds) is the honest comparison: `Auto` is
+1.02x-1.13x faster than `attn_flash_decode_warp` at 32,768-131,072 keys,
+growing with depth, nothing regressed. Translating to the llama.cpp
+head-to-head this file has tracked from the start of this workstream needs
+a caveat this file has not needed before: the `attn_flash_decode_warp`
+baseline measured *today* (81.14 / 67.60 / 50.01 tok/s at 32,768 / 65,536 /
+131,072) is not the same number this file opened the workstream with
+(82.0 / 62 / 51.2) -- other sections landed in between (MoE's widened `M`,
+GDN's occupancy fix, the narrow decode-shape defects) that move the
+whole-step baseline independently of anything in this section. Against
+today's own warp baseline, `Auto` reaches 82.54 / 71.04 / 56.62 tok/s;
+against llama.cpp's 88.5 / 79.7 / 66.9, that is 0.933x / 0.891x / 0.846x --
+up from the workstream's opening 0.93x / 0.78x / 0.77x, most of the move
+concentrated at the two deeper depths this section's dispatch threshold
+actually reaches. 32,768 barely moves (0.93x either way) because `Auto`'s
+own win there is small (1.02x) against a baseline that was already close
+to parity at that depth before this section existed.
+
+### Disposition
+
+Shipped as the default. `AttentionKernels::new` still constructs with
+`decode_mma` at `0`, but `0` now means `Auto` rather than disabled --
+every caller that does not explicitly call `disable_decode_mma` or
+`set_decode_mma_wpo` gets depth-aware dispatch with no code change on
+their part. Nothing regresses: every depth measured, from 2,048 to
+131,072, either matches `attn_flash_decode_warp` (below 16,384, where
+`Auto` selects it) or beats it (at or above, where `Auto` switches),
+because the threshold was chosen from where the kernel-level measurement
+actually crosses over rather than a round number picked in advance.
+
+### What a follow-up needs
+
+1. **`DMMA_KT` widening is still untried**, and now has a clearer
+   precondition than "try it once registers are free": `WPO=2` needs
+   registers freed *beyond* what this section's fix already recovered
+   before a wider key trip has anywhere to go without spilling. Where
+   those additional registers would come from -- `o[MAXT][4]`, `qa0`/`qa1`
+   and the K/V staging arrays are the only large holders left -- is
+   unexamined.
+2. **The extra 9-20 points of ratio improvement beyond what the spill
+   removal alone would predict is unexplained.** `cuobjdump -sass` with a
+   working per-function instruction count (named as missing in the MoE
+   section above too) would settle whether the same-tile restructuring
+   changed instruction scheduling beyond the register count, or whether
+   something else in the three-round measurements is not fully isolated.
+3. **43% of the card's bandwidth against llama.cpp's 88% on the identical
+   traffic is still a 2x gap**, and this section's own bandwidth
+   accounting gives no further lever to close it beyond `DMMA_KT` --
+   `ncu` would be the direct way to see where the remaining issue slots
+   go, and remains unavailable on this host.

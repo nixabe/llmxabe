@@ -323,6 +323,21 @@ const MMA_SHARED_CEILING: usize = 64 * 1024;
 /// it further only shortens each slice and lengthens the combine.
 const DECODE_SPLITS: usize = 288;
 
+/// Depth, in cached keys, at and above which [`AttentionKernels::decode`]
+/// prefers the tensor-core kernel over `attn_flash_decode_warp` when the
+/// tensor-core lever is left at its default (`Auto`).
+///
+/// From an interleaved `bench_attention` sweep at `LLMXABE_ATTN_CHUNK=1`
+/// (three rounds, CUDA events): the two kernels are within noise of each
+/// other at 16,384 keys (0.1917 ms warp vs 0.1910 ms wpo2, ~1.00x) after the
+/// tensor-core kernel loses at every shallower depth measured (0.79x at
+/// 2,048; 0.92x at 8,192; 0.96x at 12,288) and wins at every deeper one
+/// (1.03x at 20,480, climbing to 1.28x at 131,072). 16,384 is the last point
+/// before the win becomes consistent, so `decode()` takes it as the
+/// threshold rather than a point further out that would strand real
+/// win-region depth on the slower kernel. See `docs/BENCHMARKS.md`.
+const DECODE_MMA_DEPTH_THRESHOLD: usize = 16_384;
+
 /// Keys the flash-decoding split pass stages per trip. Mirrors `DEC_KT`.
 ///
 /// Capped at 32 because the exponential phase gives one key slot to one lane.
@@ -2052,87 +2067,33 @@ __global__ void NAME(                                                           
     int ntile = dpw >> 3;                                                      \
                                                                                 \
     int kw4 = hd2 >> 2;                                                        \
-    uint4 kreg[8];                                                             \
-    /* One entry per key-pair in the tile -- `(8 * WPO) / 2 == 4 * WPO` of */   \
-    /* them, matching the columns `P V`'s fragment read below actually */      \
-    /* covers (`oc` over `WPO` octets times `tg` over 4, `4 * oc + tg`). */     \
-    unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                         \
-    unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                         \
     int dstripes = head_dim / nthr;                                            \
                                                                                 \
-    /* Software-pipelined the same way attn_flash_causal_mma is: a trip */     \
-    /* stores the tile loaded during the previous trip's arithmetic, then */   \
-    /* immediately issues the next tile's loads before computing on this */    \
-    /* one. Both register arrays must be indexed by a compile-time constant */ \
-    /* or they spill to local memory, so the loops below are `#pragma */       \
-    /* unroll`'d over a fixed bound with the real trip count as a predicate.*/ \
-    /* V's staging differs from attn_flash_causal_mma's: that kernel always */ \
-    /* has nthr == head_dim (8 warps, head_dim <= 256), decode's `WPO` */      \
-    /* warps do not, so a thread's assigned output dimension strides by */     \
-    /* `nthr` (`dstripes` times) instead of being fixed for the whole tile. */ \
-    _Pragma("unroll")                                                          \
-    for (int i = 0; i < 8; ++i) {                                              \
-        int t = tid + i * nthr;                                                \
-        kreg[i] = make_uint4(0u, 0u, 0u, 0u);                                  \
-        if (t < (8 * (WPO)) * kw4) {                                           \
-            int r = t / kw4;                                                   \
-            long long key = begin + r;                                        \
-            if (key < end) {                                                  \
-                const uint4* kp = (const uint4*)(                             \
-                    k + (key * (long long)kv_heads + kvh)                     \
-                            * (long long)head_dim);                           \
-                kreg[i] = kp[t - r * kw4];                                     \
-            }                                                                 \
-        }                                                                      \
-    }                                                                          \
-    _Pragma("unroll")                                                          \
-    for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                          \
-        int vd_col = ds * nthr + tid;                                          \
-        bool active = ds < dstripes;                                           \
-        _Pragma("unroll")                                                      \
-        for (int i = 0; i < 4 * (WPO); ++i) {                                  \
-            long long k0 = begin + 2 * i;                                      \
-            vlo[ds][i] = (active && k0 < end)                               \
-                ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
-                : (unsigned short)0;                                          \
-            vhi[ds][i] = (active && k0 + 1 < end)                          \
-                ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
-                : (unsigned short)0;                                          \
-        }                                                                      \
-    }                                                                          \
-                                                                                \
+    /* Same-tile staging only, not the cross-tile register-held double */      \
+    /* buffer attn_flash_causal_mma uses. Measured worse: at WPO=2 the */      \
+    /* cross-tile prefetch held `kreg`/`vlo`/`vhi` live across the whole */     \
+    /* `Q K^T` + softmax + `P V` body simultaneously with `o`/`qa0`/`qa1`, */   \
+    /* forcing 255 registers with 16-56 B of spill; llama.cpp's own Turing */   \
+    /* path (`fattn-mma-f16.cuh`, `use_cp_async = false` branch of */          \
+    /* `flash_attn_ext_f16_load_tile`) does not hold K/V across a tile */       \
+    /* boundary either -- it is a same-tile `memcpy_1<16>` batch straight */    \
+    /* to shared, relying on the hardware's own outstanding-request */         \
+    /* pipelining rather than a programmer-held prefetch register. This */     \
+    /* kernel now does the same: `kreg`/`vlo`/`vhi` live only from this */      \
+    /* tile's own load to its own store, scoped to a block so their */         \
+    /* lifetime cannot leak into the compute phase below. 0 spill at both */    \
+    /* WPO=4 (235 registers) and WPO=2 (252), against 255 with spill before.*/  \
     for (long long j0 = begin; j0 < end; j0 += (8 * (WPO))) {                  \
         __syncthreads();                                                       \
-        _Pragma("unroll")                                                      \
-        for (int i = 0; i < 8; ++i) {                                          \
-            int t = tid + i * nthr;                                            \
-            if (t < (8 * (WPO)) * kw4) {                                       \
-                int r = t / kw4;                                               \
-                *(uint4*)(k_sh + r * qstride + 4 * (t - r * kw4)) = kreg[i];   \
-            }                                                                  \
-        }                                                                      \
-        _Pragma("unroll")                                                      \
-        for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                      \
-            int vd_col = ds * nthr + tid;                                      \
-            if (ds < dstripes) {                                               \
-                _Pragma("unroll")                                              \
-                for (int i = 0; i < 4 * (WPO); ++i) {                          \
-                    v_sh[vd_col * vstride + i] =                              \
-                        (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
-                }                                                              \
-            }                                                                  \
-        }                                                                      \
-        __syncthreads();                                                       \
-                                                                                \
-        long long j1 = j0 + (8 * (WPO));                                       \
-        if (j1 < end) {                                                        \
+        {                                                                       \
+            uint4 kreg[8];                                                     \
             _Pragma("unroll")                                                  \
             for (int i = 0; i < 8; ++i) {                                      \
                 int t = tid + i * nthr;                                        \
                 kreg[i] = make_uint4(0u, 0u, 0u, 0u);                          \
                 if (t < (8 * (WPO)) * kw4) {                                   \
                     int r = t / kw4;                                           \
-                    long long key = j1 + r;                                    \
+                    long long key = j0 + r;                                    \
                     if (key < end) {                                          \
                         const uint4* kp = (const uint4*)(                     \
                             k + (key * (long long)kv_heads + kvh)             \
@@ -2142,21 +2103,49 @@ __global__ void NAME(                                                           
                 }                                                              \
             }                                                                  \
             _Pragma("unroll")                                                  \
+            for (int i = 0; i < 8; ++i) {                                      \
+                int t = tid + i * nthr;                                        \
+                if (t < (8 * (WPO)) * kw4) {                                   \
+                    int r = t / kw4;                                           \
+                    *(uint4*)(k_sh + r * qstride + 4 * (t - r * kw4)) = kreg[i]; \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        {                                                                       \
+            /* One entry per key-pair in the tile -- `(8 * WPO) / 2 == */      \
+            /* `4 * WPO` of them, matching the columns `P V`'s fragment */     \
+            /* read below actually covers (`oc` over `WPO` octets, `tg` */     \
+            /* over 4, `4 * oc + tg`). */                                      \
+            unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                 \
+            unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                 \
+            _Pragma("unroll")                                                  \
             for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
                 int vd_col = ds * nthr + tid;                                  \
                 bool active = ds < dstripes;                                   \
                 _Pragma("unroll")                                              \
                 for (int i = 0; i < 4 * (WPO); ++i) {                          \
-                    long long k0 = j1 + 2 * i;                                 \
-                    vlo[ds][i] = (active && k0 < end)                      \
+                    long long k0 = j0 + 2 * i;                                 \
+                    vlo[ds][i] = (active && k0 < end)                         \
                         ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
                         : (unsigned short)0;                                  \
-                    vhi[ds][i] = (active && k0 + 1 < end)                  \
+                    vhi[ds][i] = (active && k0 + 1 < end)                     \
                         ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
                         : (unsigned short)0;                                  \
                 }                                                              \
             }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
+                int vd_col = ds * nthr + tid;                                  \
+                if (ds < dstripes) {                                           \
+                    _Pragma("unroll")                                          \
+                    for (int i = 0; i < 4 * (WPO); ++i) {                      \
+                        v_sh[vd_col * vstride + i] =                          \
+                            (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
         }                                                                      \
+        __syncthreads();                                                       \
                                                                                 \
         /* Q K^T. Warp `warp` takes key octet `warp` of the tile; the two */   \
         /* fragment halves are the hi/lo score for the SAME real head `g`, */  \
@@ -2572,13 +2561,15 @@ pub struct AttentionKernels {
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
-    /// Which decode path `decode()` takes: `0` for `attn_flash_decode_warp`'s
-    /// per-key online softmax (the default -- the tensor-core kernel is new
-    /// and unproven end to end, so production does not silently switch onto
-    /// it the moment it compiles), or `2`/`4` for the tensor-core kernel at
-    /// that occupancy width. The discriminant doubling as the width is what
-    /// lets [`Self::active_decode_mma`] use it directly with no enum to
-    /// convert. See [`Self::disable_decode_mma`] and
+    /// Which decode path `decode()` takes: `0` for `Auto` (the default --
+    /// depth-aware dispatch against [`DECODE_MMA_DEPTH_THRESHOLD`], see
+    /// [`Self::active_decode_mma`]), `1` to force `attn_flash_decode_warp`'s
+    /// per-key online softmax at every depth, or `2`/`4` to force the
+    /// tensor-core kernel at that occupancy width at every depth. For the
+    /// forced cases the discriminant doubling as the width is what lets
+    /// [`Self::active_decode_mma`] use it directly with no enum to convert;
+    /// `Auto` and `ForceWarp` fall out as the two discriminants (`0`, `1`)
+    /// no real occupancy width can be. See [`Self::disable_decode_mma`] and
     /// [`Self::set_decode_mma_wpo`].
     ///
     /// An atomic, not a plain field: `GatedAttentionBlock` holds its
@@ -2690,20 +2681,22 @@ impl AttentionKernels {
             && Self::dmma_shared_bytes(self.head_dim, wpo) <= MMA_SHARED_CEILING
     }
 
-    /// Force decode off the tensor-core kernel and back onto
-    /// `attn_flash_decode_warp`'s per-key online softmax.
+    /// Force decode off the tensor-core kernel and onto
+    /// `attn_flash_decode_warp`'s per-key online softmax at every depth,
+    /// overriding the default `Auto` dispatch.
     ///
-    /// `&self`, not `&mut self`: see the [`Cell`] note on the field. Meant
-    /// for a benchmark process to pick one configuration and measure it, not
-    /// to flip back and forth mid-pass.
+    /// `&self`, not `&mut self`: see the atomic note on the field. Meant for
+    /// a benchmark process to pick one configuration and measure it, not to
+    /// flip back and forth mid-pass.
     pub fn disable_decode_mma(&self) {
         self.decode_mma
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .store(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Select which occupancy width the tensor-core decode kernel uses, if
-    /// it is not disabled. `wpo` must be 2 or 4; anything else is a no-op.
-    /// Exists for `bench_attention`'s `LLMXABE_DECODE_MMA_WPO` A/B lever.
+    /// Force the tensor-core decode kernel on at a fixed occupancy width at
+    /// every depth, overriding the default `Auto` dispatch. `wpo` must be 2
+    /// or 4; anything else is a no-op. Exists for `bench_attention`'s
+    /// `LLMXABE_DECODE_MMA_WPO` A/B lever.
     pub fn set_decode_mma_wpo(&self, wpo: usize) {
         if wpo == 2 || wpo == 4 {
             self.decode_mma
@@ -2714,6 +2707,12 @@ impl AttentionKernels {
     /// Whether [`Self::decode`] will take the tensor-core kernel this call,
     /// and if so at which occupancy width.
     ///
+    /// `depth` is the number of keys the call will actually read (the
+    /// caller's `pos_offset + n_query`, host-side and known before launch --
+    /// not `max_keys`, which is only the cache's allocated capacity). It
+    /// drives the `Auto` lever's choice against
+    /// [`DECODE_MMA_DEPTH_THRESHOLD`]; a forced lever ignores it.
+    ///
     /// Exposed so a differential test can pick the tolerance the arithmetic
     /// actually warrants without hardcoding the dispatch rule. Unlike
     /// [`Self::uses_tensor_cores`] (prefill's `n_query >= MMA_QUERY_TILE`
@@ -2723,9 +2722,14 @@ impl AttentionKernels {
     /// so this returns `None` rather than a wider gate when it is in use;
     /// `attention_differential.rs` gates it identically to
     /// `attn_flash_decode_warp` either way.
-    fn active_decode_mma(&self) -> Option<usize> {
-        let wpo = self.decode_mma.load(std::sync::atomic::Ordering::Relaxed) as usize;
-        if wpo != 0 && self.decode_mma_is_available(wpo) {
+    fn active_decode_mma(&self, depth: usize) -> Option<usize> {
+        let lever = self.decode_mma.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let wpo = match lever {
+            0 if depth >= DECODE_MMA_DEPTH_THRESHOLD => 2,
+            0 | 1 => return None,
+            forced => forced,
+        };
+        if self.decode_mma_is_available(wpo) {
             Some(wpo)
         } else {
             None
@@ -3076,7 +3080,14 @@ impl AttentionKernels {
     /// untouched rather than merely unused. `q` and `out` stay exact: those
     /// are indexed by the launch geometry, so a wrong length there is a wrong
     /// launch.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `key_depth` is the caller's host-side `positions[0] + n_query` -- the
+    /// number of keys this call actually reads, not `max_keys`'s cache
+    /// *capacity*. It plays no part in correctness (the launch geometry and
+    /// the device-side `positions` already cover that, per the note above on
+    /// why the bound check itself cannot live here) and is used only to pick
+    /// among decode's kernels by depth; see [`Self::decode`] and
+    /// [`DECODE_MMA_DEPTH_THRESHOLD`].
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -3088,6 +3099,7 @@ impl AttentionKernels {
         out: &mut CudaSlice<f32>,
         n_query: usize,
         max_keys: usize,
+        key_depth: usize,
         positions: &CudaSlice<i32>,
     ) -> Result<(), AttentionError> {
         Self::expect_len("attention position", positions.len(), 1)?;
@@ -3107,7 +3119,7 @@ impl AttentionKernels {
         // query row cannot be tiled, so `attn_flash_causal_t1` could only ever
         // launch `q_heads` blocks, and this splits the key axis instead.
         if n_query == 1 && self.decode_split_is_available() {
-            return self.decode(stream, dec, q, k, v, out, positions);
+            return self.decode(stream, dec, q, k, v, out, key_depth, positions);
         }
 
         // Three shapes, narrowest first.
@@ -3214,6 +3226,7 @@ impl AttentionKernels {
         k: &CudaSlice<u16>,
         v: &CudaSlice<u16>,
         out: &mut CudaSlice<f32>,
+        key_depth: usize,
         positions: &CudaSlice<i32>,
     ) -> Result<(), AttentionError> {
         let partials = DECODE_SPLITS * self.q_heads;
@@ -3238,7 +3251,7 @@ impl AttentionKernels {
         // kernel it replaces -- only the block width and shared request
         // change, both driven by `wpo`.
         let warp_split = self.decode_warp_is_available();
-        let mma = self.active_decode_mma();
+        let mma = self.active_decode_mma(key_depth);
         let split_cfg = LaunchConfig {
             grid_dim: (DECODE_SPLITS as u32, self.kv_heads as u32, 1),
             block_dim: (

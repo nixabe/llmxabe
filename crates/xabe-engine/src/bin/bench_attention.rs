@@ -160,7 +160,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                       dec: &mut AttnDecodeScratch,
                       out: &mut _|
          -> Result<(), Box<dyn std::error::Error>> {
-            kernels.forward(stream, dec, &q, &k, &v, out, chunk, max_keys, &positions)?;
+            kernels.forward(
+                stream,
+                dec,
+                &q,
+                &k,
+                &v,
+                out,
+                chunk,
+                max_keys,
+                depth + chunk,
+                &positions,
+            )?;
             Ok(())
         };
 

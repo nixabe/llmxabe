@@ -274,7 +274,16 @@ fn run_device(
     let mut dec = AttnDecodeScratch::new(stream, q_heads, head_dim).expect("decode scratch");
     kernels
         .forward(
-            stream, &mut dec, &d_q, &d_k, &d_v, &mut d_out, n_query, n_keys, &d_pos,
+            stream,
+            &mut dec,
+            &d_q,
+            &d_k,
+            &d_v,
+            &mut d_out,
+            n_query,
+            n_keys,
+            key_offset + n_query,
+            &d_pos,
         )
         .expect("attention launches");
     let out = stream.clone_dtoh(&d_out).expect("read output");
@@ -511,6 +520,15 @@ fn device_attention_matches_the_reference_for_a_mid_sequence_query_block() {
 /// shorter than `DECODE_SPLITS * DEC_KT`, so most slices are empty and the
 /// identity partial (`m = -inf`, `l = 0`) has to fold in as exactly zero rather
 /// than as a NaN out of `exp(-inf - -inf)`.
+///
+/// Run three times over the same depths: once at the `Auto` default (which,
+/// below `DECODE_MMA_DEPTH_THRESHOLD`, takes `attn_flash_decode_warp` for all
+/// three -- the reference `causal_attention_streaming` is `O(n_keys^2)`, so
+/// this suite stays at depths cheap enough to run in a test rather than at
+/// the threshold's own 16,384+), then again with the tensor-core kernel
+/// forced on at each occupancy width. Forcing is what keeps
+/// `attn_flash_decode_mma_wpo{2,4}` under this gate at all now that `Auto`
+/// would otherwise never select it at these depths.
 #[test]
 fn device_decode_matches_the_reference_over_a_deep_window() {
     let Some(ctx) = setup() else { return };
@@ -518,48 +536,59 @@ fn device_decode_matches_the_reference_over_a_deep_window() {
     let stream = ctx.default_stream();
     let kernels = AttentionKernels::new(&ctx, g.q_heads, g.kv_heads, g.head_dim).expect("compiles");
 
-    for n_keys in [4096usize, 4097, 61] {
-        let key_offset = n_keys - 1;
-        let mut rng = Xorshift64Star::new(0x0DEC_0DE0 ^ n_keys as u64);
-        let q_full: Vec<f32> = rng.vec_f32(n_keys * g.q_heads * g.head_dim, -1.0, 1.0);
-        let k = as_cached(&rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0));
-        let v = as_cached(&rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0));
-        let q_row = &q_full[key_offset * g.q_heads * g.head_dim..];
-
-        let device = run_device(
-            &stream, &kernels, q_row, &k, &v, 1, n_keys, key_offset, g.q_heads, g.head_dim,
-        );
-
-        let mut worst_abs = 0.0f32;
-        let mut worst_cos = 1.0f32;
-        for h in 0..g.q_heads {
-            let kvh =
-                kv_head_for_query_head(h as u32, g.q_heads as u32, g.kv_heads as u32) as usize;
-            let q_h = head_rows(&q_full, n_keys, g.q_heads, g.head_dim, h);
-            let k_h = head_rows(&k, n_keys, g.kv_heads, g.head_dim, kvh);
-            let v_h = head_rows(&v, n_keys, g.kv_heads, g.head_dim, kvh);
-            let full = causal_attention_streaming(&q_h, &k_h, &v_h);
-
-            let reference = &full[key_offset];
-            let base = h * g.head_dim;
-            let candidate = &device[base..base + g.head_dim];
-            let result = compare(candidate, reference);
-            worst_abs = worst_abs.max(result.max_abs_error);
-            worst_cos = worst_cos.min(result.cosine_similarity);
-            assert!(
-                candidate.iter().all(|x| x.is_finite()),
-                "head {h} at {n_keys} keys produced a non-finite output; an empty \
-                 slice's identity partial reached the merge as something other \
-                 than zero",
-            );
-            assert_relative_error_is_a_floor_artefact(&result, reference, &format!("head {h}"));
-            assert_matches(candidate, reference, &GATE);
+    for lever in ["auto", "mma wpo=2", "mma wpo=4"] {
+        match lever {
+            "mma wpo=2" => kernels.set_decode_mma_wpo(2),
+            "mma wpo=4" => kernels.set_decode_mma_wpo(4),
+            _ => {}
         }
-        println!(
-            "decode over {n_keys} keys x {} heads: max_abs={worst_abs:.3e} \
-             cosine={worst_cos:.9}",
-            g.q_heads,
-        );
+        for n_keys in [4096usize, 4097, 61] {
+            let key_offset = n_keys - 1;
+            let mut rng = Xorshift64Star::new(0x0DEC_0DE0 ^ n_keys as u64);
+            let q_full: Vec<f32> = rng.vec_f32(n_keys * g.q_heads * g.head_dim, -1.0, 1.0);
+            let k = as_cached(&rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0));
+            let v = as_cached(&rng.vec_f32(n_keys * g.kv_heads * g.head_dim, -1.0, 1.0));
+            let q_row = &q_full[key_offset * g.q_heads * g.head_dim..];
+
+            let device = run_device(
+                &stream, &kernels, q_row, &k, &v, 1, n_keys, key_offset, g.q_heads, g.head_dim,
+            );
+
+            let mut worst_abs = 0.0f32;
+            let mut worst_cos = 1.0f32;
+            for h in 0..g.q_heads {
+                let kvh =
+                    kv_head_for_query_head(h as u32, g.q_heads as u32, g.kv_heads as u32) as usize;
+                let q_h = head_rows(&q_full, n_keys, g.q_heads, g.head_dim, h);
+                let k_h = head_rows(&k, n_keys, g.kv_heads, g.head_dim, kvh);
+                let v_h = head_rows(&v, n_keys, g.kv_heads, g.head_dim, kvh);
+                let full = causal_attention_streaming(&q_h, &k_h, &v_h);
+
+                let reference = &full[key_offset];
+                let base = h * g.head_dim;
+                let candidate = &device[base..base + g.head_dim];
+                let result = compare(candidate, reference);
+                worst_abs = worst_abs.max(result.max_abs_error);
+                worst_cos = worst_cos.min(result.cosine_similarity);
+                assert!(
+                    candidate.iter().all(|x| x.is_finite()),
+                    "{lever}: head {h} at {n_keys} keys produced a non-finite output; \
+                     an empty slice's identity partial reached the merge as something \
+                     other than zero",
+                );
+                assert_relative_error_is_a_floor_artefact(
+                    &result,
+                    reference,
+                    &format!("{lever}: head {h}"),
+                );
+                assert_matches(candidate, reference, &GATE);
+            }
+            println!(
+                "decode ({lever}) over {n_keys} keys x {} heads: max_abs={worst_abs:.3e} \
+                 cosine={worst_cos:.9}",
+                g.q_heads,
+            );
+        }
     }
 }
 
