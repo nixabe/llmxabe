@@ -548,13 +548,30 @@ fn device_dispatch_tables_match_moe_align_block_size_including_padding() {
 
 #[test]
 fn device_grouped_forward_matches_the_reference_on_real_expert_weights() {
+    grouped_forward_matches_the_reference(geometry());
+}
+
+/// Same grouped GEMM, same reference, but at a `block_size` above the
+/// narrow/wide MMA split (`MMA_M_NARROW` in `xabe-cuda`'s moe kernels is 32).
+/// The test above never leaves the narrow (M=32) `moe_expert_ffn_mma` /
+/// `moe_expert_down_mma` variant, since `BLOCK_SIZE` is 16 — this is the
+/// wide (M=64) variant's only correctness gate. See "Two compiled widths
+/// instead of one" in `docs/BENCHMARKS.md`.
+#[test]
+fn device_grouped_forward_matches_the_reference_at_the_wide_mma_width() {
+    grouped_forward_matches_the_reference(MoeGeometry {
+        block_size: 64,
+        ..geometry()
+    });
+}
+
+fn grouped_forward_matches_the_reference(g: MoeGeometry) {
     let Some((ctx, file)) = device_and_model() else {
         return;
     };
     let config = ModelConfig::qwen3_6_35b_a3b();
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema must resolve");
-    let g = geometry();
     let stream = ctx.default_stream();
     let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
     let mut buffers = kernels.buffers(&stream).expect("buffers");

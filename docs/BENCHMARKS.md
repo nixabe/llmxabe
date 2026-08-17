@@ -5763,3 +5763,212 @@ and verify against every accuracy gate in addition to everything above.
 `cuobjdump -sass` with a working per-function instruction-count extraction
 (this session's own attempt was not one) would settle whether instruction
 cache is really the mechanism before spending the effort.
+
+## Two compiled widths instead of one: recovering 512's regression without giving back the deep win (2026-08-18)
+
+The previous section's win (`MMA_M` 32 -> 64 on `moe_expert_ffn_mma`/
+`moe_expert_down_mma`) crossed 8,192 and 32,768 to parity but cost 512
+tokens 7.6% end to end (2,410.7 -> 2,228.6 tok/s, 0.924x), because the
+wider tile's occupancy cut (`MOE_MMA_BLOCKS_PER_SM` 3 -> 2) is paid
+whether or not a batch is wide enough to fill it. That section's own "What
+a follow-up needs" named the fix: compile both widths and pick by token
+count at dispatch time, the same pattern used elsewhere in this file for
+decode's small-bucket case. This section builds that.
+
+### Two kernels from one body, via a template
+
+`moe_expert_ffn_mma`/`moe_expert_down_mma`'s staging-and-MMA bodies moved,
+verbatim apart from a mechanical `MOE_MMA_M` -> `M` / `MOE_MMA_MF` -> `MF`
+substitution, into `template<int M, int MF> __device__ __forceinline__`
+functions (`moe_expert_ffn_mma_impl`/`moe_expert_down_mma_impl`) declared
+outside `extern "C"`, the same shape this file's `tile_gemm_pair<TM>`
+already uses -- a template cannot carry C linkage, so the entry points
+that need one are now thin `extern "C" __global__` wrappers just inside
+it:
+
+```
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, 3)
+moe_expert_ffn_mma_narrow(...) { moe_expert_ffn_mma_impl<32, 4>(...); }
+
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_MMA_BLOCKS_PER_SM)
+moe_expert_ffn_mma(...) { moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF>(...); }
+```
+
+and the same pair for `moe_expert_down_mma`/`moe_expert_down_mma_narrow`.
+The narrow entry points keep the pre-widening occupancy (3 blocks/SM ffn,
+4 down); the unsuffixed ones are byte-for-byte what the previous section
+shipped, since `MOE_MMA_M`/`MOE_MMA_MF` are unchanged at 64/8.
+`moe_expert_ffn_mma_q8` (the Q8_0 exception path, rare and unguarded) was
+left as a direct, unsplit kernel -- it never sees a narrow dispatch in
+practice and splitting it would be doubling a path this session has no
+evidence needs it.
+
+`MoeKernels::new` now picks a module function name and a shared-memory
+size from `geometry.block_size <= MMA_M_NARROW` (32): the narrow pair
+below that, the wide pair above it. This is a construction-time choice,
+not a per-launch one -- `MoeGeometry`/dispatch-table sizing is already
+fixed per `MoeKernels` instance, so the width is chosen once, from
+`xabe_engine::forward::moe_block_size(tokens)`, when a `Forward` is built
+for a given token count.
+
+### Register cost of the split: none
+
+Compiled standalone with `nvcc -arch=sm_75 -Xptxas -v` against the
+`MOE_SRC` string extracted straight from the shipped source (not a stale
+scratch copy):
+
+| kernel | registers | spill |
+|---|---:|---:|
+| `moe_expert_down_mma_narrow` (M=32) | 64 | 0 |
+| `moe_expert_down_mma` (M=64) | 64 | 0 |
+| `moe_expert_ffn_mma_narrow` (M=32, MF=4) | 80 | 0 |
+| `moe_expert_ffn_mma` (M=64, MF=8) | 126 | 0 |
+
+Zero spill on all four. The down kernel's register count does not move
+with `M` -- its accumulator lives in a `[MF][2]` array the compiler folds
+the same way regardless -- and the ffn kernel's is exactly the two prior
+sections' own separately-measured 80 (old, single-variant) and 126 (new,
+single-variant) numbers, unchanged by existing side by side under
+different names.
+
+### NVRTC compile time and module size: not material
+
+The `bench_forward` binary built against this section's dual-variant tree
+is 12,599,184 bytes against 12,595,216 for the single-variant tree it
+branched from -- a 3,968-byte (0.03%) difference, almost all of it the
+second kernel body as a string literal. `Forward::new`'s own reported
+build time (NVRTC compile of every kernel this pass uses, MoE included) at
+512 tokens: 15.6 s single-variant, 15.2 s dual-variant, the difference
+smaller than the run-to-run spread either tree shows on its own. Compiling
+two widths instead of one did not blow either budget the lead's brief
+gated this on, so there is no case for reverting to a single variant here.
+
+### Where the crossover actually is
+
+`bench_moe_mma`, `MoeGeometry.block_size` set explicitly to 32 and 64 at
+each token count rather than through `moe_block_size` (which is what this
+measurement is meant to calibrate), two interleaved rounds, GPU 0:
+
+| tokens | narrow (ms) | wide (ms) | narrow vs wide |
+|---:|---:|---:|---:|
+| 896 | 4.131 / 4.138 | 5.035 / 5.037 | narrow **21.8% faster** |
+| 1,024 | 4.717 / 4.069 | 4.629 / 4.299 | narrow ~1.6% faster (noisy: round 1 says wide, round 2 says narrow) |
+| 1,152 | 4.480 / 4.466 | 4.537 / 4.477 | wash, narrow ~0.8% ahead |
+| 1,280 | 4.765 / 4.878 | 4.521 / 4.532 | wide **6.1% faster** |
+
+The originally-sketched 1,024-token boundary undersold the narrow tile:
+at 1,024 it is still at worst a wash and at best clearly ahead, and 1,152
+is a wash too. Only at 1,280 does the wide tile pull unambiguously clear.
+`moe_block_size` returns 32 for `tokens <= 1,152` and 64 above it -- the
+top of the measured wash rather than the middle of it, so a token count
+landing in the noisy 1,024-1,152 band never picks the tile that measured
+behind at either endpoint.
+
+### A coverage gap the split opened, and closed
+
+`moe_differential.rs`'s grouped-GEMM gate,
+`device_grouped_forward_matches_the_reference_on_real_expert_weights`, has
+always run at the file's fixed `BLOCK_SIZE` (16). Before this section that
+was fine -- 16 fits under the single `MMA_M` (32, at the time) either way
+-- but after the split, 16 always resolves to the *narrow* variant, and
+the wide (M=64) kernel -- the one carrying the 8,192-131,072 win -- had no
+differential-level correctness gate left at all. The test's body is now a
+private helper taking `MoeGeometry` as a parameter, called once at the
+original `geometry()` (narrow) and once more at `block_size: 64` (wide)
+from a new test, `device_grouped_forward_matches_the_reference_at_the_wide_mma_width`.
+Both pass at this file's existing tolerances (`ROUTED_GATE`,
+`ROUTED_MMA_GATE`) with no changes to either.
+
+### End to end, `bench_forward`, GPU 0, `git worktree`-isolated pair
+
+Both binaries built from a `git worktree` at the previous section's commit
+(`890377d`) -- one unmodified (single-variant, the exact tree that
+measured 2,228.6 at 512), one with this section's four-file diff applied
+on top (`moe.rs`, `bench_moe_mma.rs`, `forward.rs`, `moe_differential.rs`)
+-- rather than against the working tree directly, since the working tree
+also carries a sibling agent's unrelated, uncommitted decode-path WIP in
+`attention.rs` that has no business in this comparison.
+
+| tokens | chunk | before (single M=64, tok/s) | after (dual, tok/s) | ratio |
+|---:|---:|---:|---:|---:|
+| 512 | 512 | 2,260.9 (mean of 3) | 2,428.8 (mean of 3) | **1.074** |
+| 8,192 | 8,192 | 3,204.7 (mean of 2) | 3,191.5 (mean of 2) | 0.996 (wash) |
+| 32,768 | 8,192 | 2,484.2 | 2,483.2 | 1.000 (wash) |
+| 65,536 | 8,192 | 1,982.6 | 1,985.6 | 1.002 (wash) |
+| 131,072 | 8,192 | 1,368.5 (mean of 3) | 1,349.9 (mean of 3) | 0.986 (noise, see below) |
+
+512 recovers past even the pre-widening M=32 tree's own historic 2,410.7
+number, within what today's own run-to-run spread accounts for. 8,192 and
+deeper are washes by construction, not by luck: `moe_block_size` selects
+64 at every one of these depths in *both* trees, so the dual-variant
+tree's "wide" kernel and the single-variant tree's only kernel are the
+same compiled code, and every one of these four rows is measuring the
+same kernel against itself. 131,072's 1.4%-low mean is smaller than the
+spread its own three dual-tree rounds showed on their own (1,323.7 ->
+1,356.4 -> 1,369.5 tok/s, a 3.4% span) -- the direct evidence that the
+131,072 gap is measurement noise on a ~95-99 s run, not a regression from
+compiling a second kernel variant.
+
+### Against llama.cpp, both sides fresh, both at their own best width
+
+llama.cpp figures are this workstream's own prior re-measurement at `-b
+8192 -ub 4096` (`-ub 512` at 512), carried over from the previous section
+unchanged:
+
+| tokens | llmxabe (before) | llmxabe (after) | llama.cpp | ratio before | ratio after |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 2,260.9 | 2,428.8 | 2,155.8 | 1.05x | **1.13x** |
+| 8,192 | 3,204.7 | 3,191.5 | 3,077.9 | 1.04x | 1.04x |
+| 32,768 | 2,484.2 | 2,483.2 | 2,506.2 | 0.99x | 0.99x |
+| 65,536 | 1,982.6 | 1,985.6 | 1,935.7 | 1.02x | 1.03x |
+| 131,072 | 1,368.5 | 1,349.9 | 1,439.5 | 0.95x | 0.94x |
+
+512 moves from a 1.05x win to a clean 1.13x, recovering the 7.6%
+end-to-end cost the widening section shipped and named -- and landing
+above the 1.03x the previous section's own `git worktree`-isolated
+measurement of the single-variant tree reported for the same row, which
+this section's fresh 2,260.9 (against that measurement's 2,228.6) is
+within this depth's own run-to-run spread of. 8,192 and
+32,768 -- this workstream's two actual target depths -- hold exactly
+where the previous section left them, at 1.04x and parity. 65,536 holds
+its 1.02x. 131,072 moves from 0.95x to 0.94x, a change the isolated table
+above already attributes to run-to-run noise on the identical wide kernel
+rather than to anything this section built.
+
+### Gates
+
+`moe_differential`: 7/7, including the new wide-path test. Golden:
+`the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax` passes --
+argmax token 25358 at logit 19.998243 against llama.cpp's 19.902241,
+result_output cosine 0.999736, unchanged from before this section (the
+golden prompt is 19 tokens, far below either kernel's dispatch-width
+threshold either way it is set, so this section could not have moved it).
+`cargo fmt --all -- --check` and `cargo clippy -p xabe-cuda -p xabe-engine
+--all-targets` both clean.
+
+### What is left
+
+Deep prefill (65,536-131,072) is unmoved by this section, as expected --
+attention is 71.8% of a deep chunk's kernel time (this workstream's
+opening profile), and MoE's combined share at that depth is too small for
+either the M-widening or this section's dispatch fix to close much of the
+gap by. The one lever this workstream found for attention at depth --
+widening its softmax-rescale tile -- was built, measured, and rejected on
+register spill two sections up: the kernel already sits at 252/255
+registers with zero spill at its shipped configuration, so widening the
+tile trades occupancy away rather than buying anything, and the isolated
+and end-to-end measurements there were a wash trending slightly negative.
+No further named lever remains for 131,072 from this workstream; closing
+it needs a structural change to the kernel (a Marlin-style staged
+pipeline, or the double-buffering this file already ruled out by
+arithmetic for MoE and did not re-attempt for attention), not a dispatch
+choice.
+
+### Disposition
+
+Shipped. 512 recovers fully (0.924x -> effectively 1.0x-plus against its
+own pre-widening baseline); 8,192 and 32,768, the two depths this
+workstream was asked to close, remain at 1.04x and parity; 65,536 holds
+its incidental win at 1.02x; 131,072 is unchanged within noise, still
+short of parity at 0.94x, and bounded by attention rather than by
+anything MoE-side has left to give.

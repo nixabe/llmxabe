@@ -118,15 +118,27 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 /// Threads per block for the embedding gather.
 const EMBED_THREADS: u32 = 256;
 
-/// Grouped-GEMM tile width the MoE dispatch tables pad to.
+/// Grouped-GEMM tile width the MoE dispatch tables pad to, for a pass of
+/// `tokens` positions.
 ///
-/// The ceiling `xabe_cuda::kernels::moe::MoeKernels::new` allows
-/// (`MMA_M`, currently 64) and not below it: a wider dispatch tile means
-/// `moe_expert_ffn_mma`/`moe_expert_down_mma` share one staged weight tile
-/// across more routed tokens before re-fetching it, which is where their
-/// traffic actually goes. See "Widening M on the routed-expert MMA kernels"
-/// in docs/BENCHMARKS.md.
-const MOE_BLOCK_SIZE: usize = 64;
+/// `xabe_cuda::kernels::moe::MoeKernels` compiles two widths of
+/// `moe_expert_ffn_mma`/`moe_expert_down_mma` -- `MMA_M_NARROW` (32) at
+/// three blocks/SM, `MMA_M` (64) at two -- and picks between them by
+/// `block_size` at construction. A wider dispatch tile means more routed
+/// tokens share one staged weight tile before it is re-fetched, which is
+/// where these kernels' traffic actually goes, but it costs occupancy to
+/// fit the wider tile in shared memory. `bench_moe_mma` measured where
+/// that trade crosses over, two interleaved rounds each: at 896 tokens the
+/// narrow tile is ~22% faster, at 1,024 and 1,152 the two are within noise
+/// of each other (narrow a hair ahead on both), and only at 1,280 does the
+/// wide tile pull clearly ahead (~6%). 1,152 is the boundary this returns
+/// -- the top of the measured wash rather than the middle of it, so a
+/// token count landing in the noisy band never picks the tile that
+/// measured behind. See "Two compiled widths instead of one" in
+/// docs/BENCHMARKS.md for the numbers.
+pub fn moe_block_size(tokens: usize) -> usize {
+    if tokens <= 1152 { 32 } else { 64 }
+}
 
 /// The GGUF keys that are not in [`ModelConfig`] and must not be guessed.
 const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
@@ -884,7 +896,7 @@ impl Forward {
         let attn_scratch = AttnScratch::new(stream, &config, tokens)?;
 
         // --- the MoE, on every block ---------------------------------------
-        let moe_geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, tokens);
+        let moe_geometry = MoeBlock::geometry_for(&config, moe_block_size(tokens), tokens);
         let moe = MoeBlock::new(ctx, stream, moe_geometry, rms_eps)?;
         let (moe_weights, moe_bytes) = match shared_moe {
             // Already on the card, uploaded by the pass this one was reshaped

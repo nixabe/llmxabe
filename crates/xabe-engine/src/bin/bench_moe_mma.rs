@@ -52,11 +52,12 @@ const DEFAULT_MODEL_PATH: &str =
 /// `moe_expert_ffn_mma` and `moe_expert_down_mma` are exercised, not just one.
 const LAYER: u32 = 0;
 
-/// Grouped-GEMM dispatch tile width, matching the engine's own.
-const BLOCK_SIZE: usize = 64;
-
 /// Chunk widths a real prefill actually launches at 8,192-token chunking,
-/// plus the 512 row bench_attention and bench_mma already use.
+/// plus the 512 row bench_attention and bench_mma already use. Each gets its
+/// own dispatch tile width from `xabe_engine::forward::moe_block_size` --
+/// the engine's own choice, not a fixed constant, since 512 and 8,192 now
+/// take different compiled kernels. See "Two compiled widths instead of
+/// one" in docs/BENCHMARKS.md.
 const TOKEN_COUNTS: [usize; 2] = [512, 8192];
 
 const WARMUP: usize = 3;
@@ -181,7 +182,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             experts_per_token: config.moe.experts_per_token as usize,
             hidden: config.hidden_size as usize,
             intermediate: config.moe.expert_intermediate as usize,
-            block_size: BLOCK_SIZE,
+            block_size: xabe_engine::forward::moe_block_size(tokens),
             max_tokens: tokens,
         };
         let kernels = MoeKernels::new(&ctx, g)?;

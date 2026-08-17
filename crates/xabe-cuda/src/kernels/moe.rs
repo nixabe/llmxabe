@@ -184,11 +184,25 @@ const MMA_WARPS: u32 = 8;
 const MMA_N: u32 = 8;
 /// Output rows one block covers. Mirrors `MOE_MMA_ROWS`.
 const MMA_ROWS: u32 = MMA_WARPS * MMA_N;
-/// Dispatch slots one block stages. Mirrors `MOE_MMA_M`.
+/// Dispatch slots one block stages, wide variant. Mirrors `MOE_MMA_M` on
+/// `moe_expert_ffn_mma`/`moe_expert_down_mma`.
 ///
 /// A `block_size` above this would have its tail silently dropped, so
 /// [`MoeKernels::new`] rejects such a geometry rather than trusting callers.
 const MMA_M: usize = 64;
+/// Dispatch slots one block stages, narrow variant. Mirrors the `32` bound
+/// to `moe_expert_ffn_mma_impl`/`moe_expert_down_mma_impl` in
+/// `moe_expert_ffn_mma_narrow`/`moe_expert_down_mma_narrow`.
+///
+/// `MMA_M` was this value until "Widening M on the routed-expert MMA
+/// kernels" traded three blocks/SM for two to fit a wider staged tile --
+/// a real win from 8,192 tokens up, and a real loss at 512, where an
+/// average expert's traffic does not fill even the *narrow* tile and the
+/// occupancy cut buys nothing. [`MoeKernels::new`] picks between the two
+/// compiled kernels by `block_size`, at this constant as the boundary --
+/// see "Two compiled widths instead of one" in docs/BENCHMARKS.md for the
+/// crossover measurement.
+const MMA_M_NARROW: usize = 32;
 /// Token count below which the fp32 grouped GEMM is faster.
 ///
 /// Measured per layer at Qwen3.6's geometry, `grouped_forward` end to end
@@ -228,20 +242,26 @@ const MMA_SSTRIDE: usize = 16;
 /// `MOE_MMA_DSTRIDE`: the quants, then one fp32 scale per 32 of them.
 const MMA_DSTRIDE: usize = MMA_KC + (MMA_KC / 32) * 4;
 
-/// Shared bytes the down projection needs: one staged weight tile, the int8
+/// Shared bytes the down projection needs at dispatch-slot ceiling `m`
+/// (`MMA_M` for `moe_expert_down_mma`, `MMA_M_NARROW` for
+/// `moe_expert_down_mma_narrow`): one staged weight tile, the int8
 /// activation tile, its per-32 scales, and one row index plus one slot id per
 /// staged slot.
-const fn mma_down_shared_bytes() -> u32 {
+const fn mma_down_shared_bytes(m: usize) -> u32 {
     (MMA_ROWS as usize * MMA_DSTRIDE
-        + MMA_M * MMA_ASTRIDE
-        + MMA_M * (MMA_KC / 32) * size_of::<f32>()
-        + MMA_M * size_of::<i64>()
-        + MMA_M * size_of::<i32>()) as u32
+        + m * MMA_ASTRIDE
+        + m * (MMA_KC / 32) * size_of::<f32>()
+        + m * size_of::<i64>()
+        + m * size_of::<i32>()) as u32
 }
 
 /// Shared bytes the Q8_0 gate/up tensor-core GEMM needs: two staged weight
 /// tiles in the `MMA_DSTRIDE` layout (quants then fp32 block scales), the int8
 /// activation tile, its per-32 scales, and one activation row index per slot.
+///
+/// `moe_expert_ffn_mma_q8` is not split into narrow/wide variants -- it runs
+/// one layer in forty (block 39's Q8_0 exception) and was never
+/// occupancy-tuned to begin with, so it stays at `MMA_M` unconditionally.
 const fn mma_ffn_q8_shared_bytes() -> u32 {
     (2 * MMA_ROWS as usize * MMA_DSTRIDE
         + MMA_M * MMA_ASTRIDE
@@ -249,15 +269,17 @@ const fn mma_ffn_q8_shared_bytes() -> u32 {
         + MMA_M * size_of::<i64>()) as u32
 }
 
-/// Shared bytes the tensor-core grouped GEMM needs: two staged weight tiles,
-/// their scale tiles, the int8 activation tile, its per-32 scales, and one
-/// activation row index per staged slot.
-const fn mma_shared_bytes() -> u32 {
+/// Shared bytes the tensor-core grouped GEMM needs at dispatch-slot ceiling
+/// `m` (`MMA_M` for `moe_expert_ffn_mma`, `MMA_M_NARROW` for
+/// `moe_expert_ffn_mma_narrow`): two staged weight tiles, their scale tiles,
+/// the int8 activation tile, its per-32 scales, and one activation row index
+/// per staged slot.
+const fn mma_shared_bytes(m: usize) -> u32 {
     (2 * MMA_ROWS as usize * MMA_WSTRIDE
         + 2 * MMA_ROWS as usize * MMA_SSTRIDE
-        + MMA_M * MMA_ASTRIDE
-        + MMA_M * (MMA_KC / 32) * size_of::<f32>()
-        + MMA_M * size_of::<i64>()) as u32
+        + m * MMA_ASTRIDE
+        + m * (MMA_KC / 32) * size_of::<f32>()
+        + m * size_of::<i64>()) as u32
 }
 
 /// Storage format of one expert weight stack.
@@ -813,6 +835,551 @@ __device__ __forceinline__ void store_slot_contribution(
 ) {
     if (flat >= numel) return;
     partial[(long long)flat * hidden + h] = topk_weights[flat] * s;
+}
+
+#define MOE_MMA_WARPS 8
+#define MOE_MMA_N     8
+#define MOE_MMA_ROWS  (MOE_MMA_WARPS * MOE_MMA_N)
+// Slots staged per block. `block_size` must not exceed this; the Rust side
+// checks it, because a larger dispatch block would silently drop its tail.
+//
+// 64, not 32: this kernel is bandwidth-bound on the *weight* tile it stages
+// (see `MOE_MMA_BLOCKS_PER_SM` below), so the arithmetic intensity that
+// matters is how many dispatch slots share one staged weight tile before it
+// is discarded. Doubling `M` halves the weight-tile loads per routed token
+// for any expert with enough traffic to fill more than one tile, at the
+// cost of the occupancy `MOE_MMA_BLOCKS_PER_SM` gives up to make room for
+// the wider `sa`/`sas`/`rows` tiles. See "Widening M on the routed-expert
+// MMA kernels" in docs/BENCHMARKS.md for the traffic argument and the
+// measurement against the occupancy loss.
+#define MOE_MMA_M     64
+#define MOE_MMA_MF    (MOE_MMA_M / 8)
+// Contraction staged per trip: one Q6_K *half*, which is the unit the format's
+// `ql`/`qh` split is addressed in. Half a superblock rather than a whole one
+// halves the shared footprint for no extra loop overhead.
+#define MOE_MMA_KC    128
+
+// Bytes per staged activation row.
+//
+// 144 and not `MOE_MMA_KC`. A 128-byte row stride is exactly 32 shared banks,
+// and the fragment load `sa + (mf * 8 + arow) * stride + kk + quad` varies
+// `arow` over eight rows and `quad` over four words -- so with a 32-word
+// stride all eight rows land on the same four banks and every one of these
+// loads is an **eight-way conflict**, on the kernel that is a quarter of
+// prefill. 144 bytes is 36 words and `36 mod 32 = 4`, so row `i` starts four
+// banks along from row `i - 1` and the eight rows tile the 32 banks exactly
+// once. The sixteen wasted bytes a row buy a conflict-free load.
+#define MOE_MMA_ASTRIDE (MOE_MMA_KC + 16)
+
+// Bytes per staged weight row: 64 of `ql`, then 32 of `qh` at offset 64.
+//
+// 112 and not the 96 the payload needs. The operand load varies the row over
+// eight values and the word within a row over four, so a conflict-free stride
+// has to send each row exactly four banks along from the last: **the stride in
+// words must be 4 mod 32**. 112 bytes is 28 words, `28 * i mod 32` walks
+// 0, 28, 24, ..., 4, and the four words each row contributes fill the gaps, so
+// the warp's 32 lanes tile the 32 banks exactly once.
+//
+// 96 is 24 words and `gcd(24, 32) = 8`, which collapses the eight rows into
+// four bank groups -- a two-way conflict. 100 was the first fix and only
+// spread the rows: 25 is coprime with 32 so the eight row bases are distinct,
+// but they are not four apart, and three of the eight collided once the word
+// offset was added. Worth about nothing next to
+// `MOE_MMA_ASTRIDE`, and kept because it is the shape that is provably right
+// rather than the shape that happened to measure the same.
+#define MOE_MMA_WSTRIDE 112
+// Bytes per staged scale row: 8 int8 sub-scales, then the fp32 superblock
+// delta at offset 8 (which is where the 4-byte alignment requirement lands).
+#define MOE_MMA_SSTRIDE 16
+
+// Two blocks per SM, asked for explicitly.
+//
+// This kernel is bandwidth-bound, not compute-bound: at 512 tokens it moves
+// 470 MB of Q6_K per layer and issues about 5% of the card's int8 throughput
+// doing it, so what it needs from the scheduler is loads in flight, and what
+// puts loads in flight is resident warps. At `MOE_MMA_M` 32 its shared
+// footprint was 21,760 bytes and three blocks fit Turing's 65,536 with 256
+// to spare. At `MOE_MMA_M` 64 -- see that constant's own comment for why --
+// the footprint is 27,136 bytes: three would need 81,408, past the ceiling,
+// so the occupancy target drops to two (54,272, with 11,264 to spare) and
+// ptxas is told to fit registers for two blocks rather than three.
+//
+// The second argument is the one that matters. The first is redundant with the
+// launch's `block_dim` and is stated so the pair cannot drift apart silently.
+#define MOE_MMA_BLOCKS_PER_SM 2
+
+// Bytes per staged weight row: MOE_MMA_KC quants, then one fp32 scale per 32
+// at offset MOE_MMA_KC.
+//
+// 144 is 36 words, and the eight rows a warp reads land on banks
+// `4r + (quad/4)` — thirty-two distinct banks across the warp, no conflict.
+#define MOE_MMA_DSTRIDE (MOE_MMA_KC + (MOE_MMA_KC / 32) * 4)
+
+// Three blocks per SM, for the same reason the gate/up kernel asks for two.
+// Q8_0 stages one weight tile rather than two, so at `MOE_MMA_M` 32 this
+// kernel's footprint was 14,720 bytes and four fit in 65,536 with room left;
+// at `MOE_MMA_M` 64 it is 20,224 bytes, four would need 80,896 past the
+// ceiling, and three fits with 4,864 to spare.
+#define MOE_DOWN_BLOCKS_PER_SM 3
+
+// The routed-expert MMA bodies, templated on the dispatch-slot ceiling
+// `M` (and its accumulator-array size `MF`, always `M/8`) so the two
+// occupancy targets below -- `M` 32 at three blocks/SM, `M` 64 at two --
+// compile from one written body instead of two hand-kept copies of ~300
+// lines of staging and MMA logic apiece. Outside `extern "C"` like every
+// other template in this file (`tile_gemm_pair` above): a template needs
+// C++ linkage, and neither body is ever looked up by name from the host --
+// only the `__global__` wrappers just inside `extern "C"` below are.
+template<int M, int MF>
+__device__ __forceinline__ void
+moe_expert_ffn_mma_impl(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xscale,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    unsigned char* swg = (unsigned char*)xabe_shared;
+    unsigned char* swu = swg + MOE_MMA_ROWS * MOE_MMA_WSTRIDE;
+    unsigned char* ssg = swu + MOE_MMA_ROWS * MOE_MMA_WSTRIDE;
+    unsigned char* ssu = ssg + MOE_MMA_ROWS * MOE_MMA_SSTRIDE;
+    signed char*   sa  = (signed char*)(ssu + MOE_MMA_ROWS * MOE_MMA_SSTRIDE);
+    float*         sas = (float*)(sa + M * MOE_MMA_ASTRIDE);
+    long long*     rows = (long long*)(sas + M * (MOE_MMA_KC / 32));
+
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+    int numel = (*valid_tokens) * top_k;
+
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int r0   = blockIdx.x * MOE_MMA_ROWS;
+
+    if (tid < M) {
+        int flat = tid < block_size
+            ? sorted_token_ids[(long long)blk * block_size + tid]
+            : numel;
+        // The activation *row*, not a byte offset: this tile indexes int8.
+        rows[tid] = flat < numel ? (long long)(flat / top_k) : -1;
+    }
+    __syncthreads();
+
+    // Lane roles. The operand split (stride 4) and the accumulator split
+    // (stride 2) are different, which is the characteristic MMA trap: `nload`
+    // is the row this lane *loads* an operand for, `ccol` the two columns it
+    // *owns* in the accumulator. They are not the same rows.
+    int nload = warp * MOE_MMA_N + (lane >> 2);
+    int arow  = lane >> 2;
+    int quad  = (lane & 3) * 4;
+    int ccol  = warp * MOE_MMA_N + (lane & 3) * 2;
+
+    long long ebase = (long long)e * intermediate * hidden;
+    int kblocks = hidden >> 5;
+
+    float accg[MF][2];
+    float accu[MF][2];
+    #pragma unroll
+    for (int mf = 0; mf < MF; ++mf) {
+        accg[mf][0] = 0.0f; accg[mf][1] = 0.0f;
+        accu[mf][0] = 0.0f; accu[mf][1] = 0.0f;
+    }
+
+    for (int kc = 0; kc < hidden; kc += MOE_MMA_KC) {
+        __syncthreads();
+
+        // Stage the weights. This is the whole point of the rewrite: read
+        // straight from global in the fragment layout and consecutive lanes
+        // land on rows `hidden` elements apart, so every four-byte operand
+        // costs a full 32-byte sector and eight-ninths of the fetch is
+        // thrown away. Here a warp walks one row's bytes contiguously — one
+        // sector per 32 lanes — and the scatter happens in shared, which has
+        // no coalescing to lose.
+        // Eight rows per instruction, not one row per four.
+        //
+        // A warp stages exactly the eight rows it will compute with, and the
+        // lane split is `row = lane & 7`, `chunk = lane >> 3`. That does two
+        // things at once. The global side becomes `int4`: with the device
+        // stride padded to 224 every field of every superblock is 16-byte
+        // aligned, so 8 rows x 64 bytes of `ql` is one load where the 210-byte
+        // file layout forced 16-bit loads and eight of them. The shared side
+        // becomes conflict-free: a 128-bit store is serviced eight lanes at a
+        // time and those eight lanes hold eight *different* rows, so with a
+        // stride of 28 words -- `28 mod 32 = -4` -- each lane's four banks sit
+        // four along from the last and the eight tile the 32 banks exactly.
+        //
+        // Staging measured 32 ms of this kernel's 62 and stayed that expensive
+        // with every byte already in L1, so what it cost was the count of
+        // loads. Four per row per matrix becomes four per *eight* rows.
+        int half = (kc >> 7) & 1;
+        {
+            int jq = lane & 7;
+            int c4 = lane >> 3;
+            int rq = warp * MOE_MMA_N + jq;
+            int nq = r0 + rq;
+            int live = nq < intermediate;
+            long long iq = ebase + (long long)nq * hidden + kc;
+            const unsigned char* gq = gate_q + (iq >> 8) * Q6K_SB;
+            const unsigned char* uq = up_q   + (iq >> 8) * Q6K_SB;
+
+            if (live) {
+                *(uint4*)(swg + rq * MOE_MMA_WSTRIDE + c4 * 16) =
+                    *(const uint4*)(gq + half * 64 + c4 * 16);
+                *(uint4*)(swu + rq * MOE_MMA_WSTRIDE + c4 * 16) =
+                    *(const uint4*)(uq + half * 64 + c4 * 16);
+                if (lane < 16) {
+                    *(uint4*)(swg + rq * MOE_MMA_WSTRIDE + 64 + c4 * 16) =
+                        *(const uint4*)(gq + 128 + half * 32 + c4 * 16);
+                    *(uint4*)(swu + rq * MOE_MMA_WSTRIDE + 64 + c4 * 16) =
+                        *(const uint4*)(uq + 128 + half * 32 + c4 * 16);
+                }
+            }
+            if (lane < 8) {
+                if (live) {
+                    *(uint2*)(ssg + rq * MOE_MMA_SSTRIDE) =
+                        *(const uint2*)(gq + 192 + half * 8);
+                    *(uint2*)(ssu + rq * MOE_MMA_SSTRIDE) =
+                        *(const uint2*)(uq + 192 + half * 8);
+                    *(float*)(ssg + rq * MOE_MMA_SSTRIDE + 8) =
+                        half_bits_to_float(*(const unsigned short*)(gq + 208));
+                    *(float*)(ssu + rq * MOE_MMA_SSTRIDE + 8) =
+                        half_bits_to_float(*(const unsigned short*)(uq + 208));
+                } else {
+                    // A row past `intermediate` contributes nothing, and
+                    // zeroing the *scale* is enough to guarantee that without
+                    // zeroing 96 bytes of quants: every product it feeds is
+                    // multiplied by it.
+                    *(float*)(ssg + rq * MOE_MMA_SSTRIDE + 8) = 0.0f;
+                    *(float*)(ssu + rq * MOE_MMA_SSTRIDE + 8) = 0.0f;
+                }
+            }
+        }
+
+        // Stage the activations as words: `hidden` and `MOE_MMA_KC` are
+        // multiples of 4, so every one of these is aligned. A padding slot
+        // stages zeros, which makes its products exactly zero and keeps the
+        // inner loop branch-free.
+        for (int idx = tid; idx < M * (MOE_MMA_KC / 4); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 4);
+            int k4 = (idx % (MOE_MMA_KC / 4)) * 4;
+            long long row = rows[m];
+            unsigned int v = row >= 0
+                ? *(const unsigned int*)(xq + row * hidden + kc + k4)
+                : 0u;
+            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
+        }
+        for (int idx = tid; idx < M * (MOE_MMA_KC / 32); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 32);
+            int kb = idx % (MOE_MMA_KC / 32);
+            long long row = rows[m];
+            sas[m * (MOE_MMA_KC / 32) + kb] =
+                row >= 0 ? xscale[row * kblocks + (kc >> 5) + kb] : 0.0f;
+        }
+        __syncthreads();
+
+        // Hoisted: the superblock delta moves once per staged half, not once
+        // per sub-block.
+        float dg0 = *(const float*)(ssg + ccol * MOE_MMA_SSTRIDE + 8);
+        float dg1 = *(const float*)(ssg + (ccol + 1) * MOE_MMA_SSTRIDE + 8);
+        float du0 = *(const float*)(ssu + ccol * MOE_MMA_SSTRIDE + 8);
+        float du1 = *(const float*)(ssu + (ccol + 1) * MOE_MMA_SSTRIDE + 8);
+
+        // Two 16-wide sub-blocks per trip, because 32 is the span one
+        // activation scale covers and that is what lets the pair share a
+        // single conversion to float.
+        //
+        // # Why the loop is shaped around `I2F`
+        //
+        // The obvious inner loop converts each MMA result to float and scales
+        // it there: four accumulators times four activation fragments is
+        // sixteen `I2F` per 16 elements of contraction, plus four more for the
+        // sub-scales. SASS says 20 of the loop's 105 instructions were `I2F`,
+        // and on Turing integer-to-float runs on the conversion pipe at a
+        // quarter of the FMA pipe's rate -- so those 20 cost as much as the
+        // other 85 together, in a kernel that is a quarter of prefill.
+        //
+        // The sub-scale is an int8 and the MMA result is at most
+        // `32 * 127 * 16 = 65,024`, so their product fits in 23 bits and the
+        // two sub-blocks' products sum to at most 16.5 M. Accumulating *that*
+        // in int32 is exact, needs one `IMAD` per sub-block, and leaves one
+        // conversion per accumulator per 32 elements where there were four.
+        // The int8 sub-scales never become floats at all.
+        //
+        // The float arithmetic that remains is `(float)acc * (dx * d)`, where
+        // `d` is the superblock delta hoisted above and `dx` the activation
+        // scale for these 32 elements. Against the old expression this is one
+        // rounding instead of three per pair of sub-blocks, so the result is
+        // not bit-identical to what this kernel produced before -- it is
+        // slightly *more* accurate, and `tests/forward_pass.rs` gates the
+        // difference against llama.cpp's own activations.
+        for (int kk = 0; kk < MOE_MMA_KC; kk += 32) {
+            unsigned int bg[2], bu[2];
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                int rp  = kk + 16 * h + quad;
+                int grp = rp >> 5;
+                int l   = rp & 31;
+                int shift = 2 * grp;
+                // `l` is a multiple of 4 and the shared stride is too, so these
+                // are aligned word loads where the equivalent global reads had to
+                // be assembled byte by byte: Q6_K's 210-byte block stride leaves
+                // no alignment to rely on, but a layout this kernel chose does.
+                unsigned int qlg = *(const unsigned int*)(
+                    swg + nload * MOE_MMA_WSTRIDE + ((grp & 1) ? l + 32 : l));
+                unsigned int qhg = *(const unsigned int*)(
+                    swg + nload * MOE_MMA_WSTRIDE + 64 + l);
+                unsigned int qlu = *(const unsigned int*)(
+                    swu + nload * MOE_MMA_WSTRIDE + ((grp & 1) ? l + 32 : l));
+                unsigned int qhu = *(const unsigned int*)(
+                    swu + nload * MOE_MMA_WSTRIDE + 64 + l);
+
+                // Four Q6_K codes to four signed bytes with no per-element work
+                // at all. Every step below acts on all four lanes of the word at
+                // once, and none of them can carry a bit across a byte boundary:
+                //
+                //   nibble   `(q >> 4) & 0x0F0F0F0F` takes bits 4..7 of each byte
+                //   high two `(qh >> shift) & 0x03030303`, shift <= 6, so bits
+                //            shift..shift+1 of each byte and no further
+                //   bias     Q6_K stores `raw - 32` in offset binary, and offset
+                //            binary *is* two's complement with the sign bit
+                //            flipped -- so `^ 0x20` converts all four codes at
+                //            once, leaving a 6-bit signed value per byte
+                //   extend   bit 5 is now the sign; copying it into bits 6 and 7
+                //            with two shifted ORs widens all four to int8
+                //
+                // Nine word operations per matrix where the per-element loop
+                // needed about forty, on the kernel that is 25% of prefill. The
+                // byte patterns are identical, so the MMA sees the same operands
+                // it always did.
+                unsigned int tg = ((((grp < 2) ? qlg : (qlg >> 4)) & 0x0F0F0F0Fu)
+                    | (((qhg >> shift) & 0x03030303u) << 4)) ^ 0x20202020u;
+                unsigned int tu = ((((grp < 2) ? qlu : (qlu >> 4)) & 0x0F0F0F0Fu)
+                    | (((qhu >> shift) & 0x03030303u) << 4)) ^ 0x20202020u;
+                unsigned int sg = tg & 0x20202020u;
+                unsigned int su = tu & 0x20202020u;
+                bg[h] = tg | (sg << 1) | (sg << 2);
+                bu[h] = tu | (su << 1) | (su << 2);
+            }
+
+            int sub = kk >> 4;
+            int cg0[2], cg1[2], cu0[2], cu1[2];
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                cg0[h] = (signed char)ssg[ccol * MOE_MMA_SSTRIDE + sub + h];
+                cg1[h] = (signed char)ssg[(ccol + 1) * MOE_MMA_SSTRIDE + sub + h];
+                cu0[h] = (signed char)ssu[ccol * MOE_MMA_SSTRIDE + sub + h];
+                cu1[h] = (signed char)ssu[(ccol + 1) * MOE_MMA_SSTRIDE + sub + h];
+            }
+
+            #pragma unroll
+            for (int mf = 0; mf < MF; ++mf) {
+                float dx = sas[(mf * 8 + arow) * (MOE_MMA_KC / 32) + (kk >> 5)];
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    unsigned int a = *(const unsigned int*)(
+                        sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + 16 * h + quad);
+                    int g0 = 0, g1 = 0, u0 = 0, u1 = 0;
+                    asm volatile(
+                        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                        "{%0,%1}, {%2}, {%3}, {%0,%1};"
+                        : "+r"(g0), "+r"(g1) : "r"(a), "r"(bg[h]));
+                    asm volatile(
+                        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                        "{%0,%1}, {%2}, {%3}, {%0,%1};"
+                        : "+r"(u0), "+r"(u1) : "r"(a), "r"(bu[h]));
+                    accg[mf][0] += (float)g0 * dx * (dg0 * (float)cg0[h]);
+                    accg[mf][1] += (float)g1 * dx * (dg1 * (float)cg1[h]);
+                    accu[mf][0] += (float)u0 * dx * (du0 * (float)cu0[h]);
+                    accu[mf][1] += (float)u1 * dx * (du1 * (float)cu1[h]);
+                }
+            }
+        }
+    }
+
+    // SwiGLU, written exactly as `xabe_kernels::norm::silu`: x / (1 + exp(-x)),
+    // not the algebraically equal x * sigmoid(x). Padding slots are dropped
+    // rather than written, which is what lets `moe_expert_down` treat an
+    // unwritten `inter` row as unreachable instead of as zero.
+    #pragma unroll
+    for (int mf = 0; mf < MF; ++mf) {
+        int m = mf * 8 + arow;
+        if (m < block_size && rows[m] >= 0) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                int n = r0 + ccol + j;
+                if (n < intermediate) {
+                    float g = (j == 0) ? accg[mf][0] : accg[mf][1];
+                    float u = (j == 0) ? accu[mf][0] : accu[mf][1];
+                    float act = g / (1.0f + expf(-g));
+                    inter[((long long)blk * block_size + m) * intermediate + n] = act * u;
+                }
+            }
+        }
+    }
+}
+
+template<int M, int MF>
+__device__ __forceinline__ void
+moe_expert_down_mma_impl(
+    const unsigned char* __restrict__ down_q,
+    const signed char* __restrict__ iq,
+    const float* __restrict__ iscale,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    unsigned char* sw  = (unsigned char*)xabe_shared;
+    signed char*   sa  = (signed char*)(sw + MOE_MMA_ROWS * MOE_MMA_DSTRIDE);
+    float*         sas = (float*)(sa + M * MOE_MMA_ASTRIDE);
+    long long*     rows = (long long*)(sas + M * (MOE_MMA_KC / 32));
+    int*           slot_flat = (int*)(rows + M);
+
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+    int numel = (*valid_tokens) * top_k;
+
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int r0   = blockIdx.x * MOE_MMA_ROWS;
+
+    if (tid < M) {
+        int m = tid;
+        int flat = m < block_size
+            ? sorted_token_ids[(long long)blk * block_size + m]
+            : numel;
+        slot_flat[m] = flat;
+        // The `inter` row, which is the *slot* index and not the token index:
+        // the ffn kernel wrote one row per dispatch slot.
+        rows[m] = flat < numel ? (long long)blk * block_size + m : -1;
+    }
+    __syncthreads();
+
+    int nload = warp * MOE_MMA_N + (lane >> 2);
+    int arow  = lane >> 2;
+    int quad  = (lane & 3) * 4;
+    int ccol  = warp * MOE_MMA_N + (lane & 3) * 2;
+
+    // [hidden x intermediate] per expert — GGUF `[intermediate, hidden, experts]`.
+    long long ebase = (long long)e * hidden * intermediate;
+    int kblocks = intermediate >> 5;
+
+    float acc[MF][2];
+    #pragma unroll
+    for (int mf = 0; mf < MF; ++mf) { acc[mf][0] = 0.0f; acc[mf][1] = 0.0f; }
+
+    for (int kc = 0; kc < intermediate; kc += MOE_MMA_KC) {
+        __syncthreads();
+
+        for (int r = warp; r < MOE_MMA_ROWS; r += MOE_MMA_WARPS) {
+            int n = r0 + r;
+            if (n < hidden) {
+                const unsigned char* src =
+                    down_q + ((ebase + (long long)n * intermediate + kc) >> 5) * 34;
+                // Each trip reads 32 bytes contiguous within one block, so the
+                // fetch coalesces even though the block stride does not let it
+                // be a word load.
+                // Two bytes per lane. The quants of a Q8_0 block start at
+                // byte 2 of a 34-byte block, so they are even-aligned and
+                // never word-aligned; 16-bit is the widest legal load, and it
+                // halves the instructions this copy costs.
+                for (int t = lane * 2; t < MOE_MMA_KC; t += 64) {
+                    *(unsigned short*)(sw + r * MOE_MMA_DSTRIDE + t) =
+                        *(const unsigned short*)(src + (t >> 5) * 34 + 2 + (t & 31));
+                }
+                if (lane < (MOE_MMA_KC / 32)) {
+                    // One 16-bit load, not `load_half_le`'s two 8-bit ones: a
+                    // Q8_0 block starts on an even byte, so the fp16 scale at
+                    // its head is 2-byte aligned even though the 34-byte
+                    // stride never makes it 4-byte aligned. Staging is what
+                    // this kernel spends its time on, and this is one of the
+                    // four loads a row was costing.
+                    *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) =
+                        half_bits_to_float(*(const unsigned short*)(src + lane * 34));
+                }
+            } else if (lane < (MOE_MMA_KC / 32)) {
+                // Zeroing the scale is enough: every product it feeds is
+                // multiplied by it.
+                *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) = 0.0f;
+            }
+        }
+
+        for (int idx = tid; idx < M * (MOE_MMA_KC / 4); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 4);
+            int k4 = (idx % (MOE_MMA_KC / 4)) * 4;
+            long long row = rows[m];
+            unsigned int v = row >= 0
+                ? *(const unsigned int*)(iq + row * intermediate + kc + k4)
+                : 0u;
+            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
+        }
+        for (int idx = tid; idx < M * (MOE_MMA_KC / 32); idx += blockDim.x) {
+            int m  = idx / (MOE_MMA_KC / 32);
+            int kb = idx % (MOE_MMA_KC / 32);
+            long long row = rows[m];
+            sas[m * (MOE_MMA_KC / 32) + kb] =
+                row >= 0 ? iscale[row * kblocks + (kc >> 5) + kb] : 0.0f;
+        }
+        __syncthreads();
+
+        for (int kk = 0; kk < MOE_MMA_KC; kk += 16) {
+            unsigned int b = *(const unsigned int*)(
+                sw + nload * MOE_MMA_DSTRIDE + kk + quad);
+
+            // One Q8_0 scale spans 32 contraction elements, so it is the same
+            // for this k-step and the next.
+            int sb = kk >> 5;
+            float w0 = *(const float*)(
+                sw + ccol * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+            float w1 = *(const float*)(
+                sw + (ccol + 1) * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
+
+            #pragma unroll
+            for (int mf = 0; mf < MF; ++mf) {
+                unsigned int a = *(const unsigned int*)(
+                    sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + quad);
+                int d0 = 0, d1 = 0;
+                asm volatile(
+                    "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+                    "{%0,%1}, {%2}, {%3}, {%0,%1};"
+                    : "+r"(d0), "+r"(d1) : "r"(a), "r"(b));
+                float dx = sas[(mf * 8 + arow) * (MOE_MMA_KC / 32) + sb];
+                acc[mf][0] += (float)d0 * dx * w0;
+                acc[mf][1] += (float)d1 * dx * w1;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int mf = 0; mf < MF; ++mf) {
+        int m = mf * 8 + arow;
+        if (m < block_size) {
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                int n = r0 + ccol + j;
+                if (n < hidden) {
+                    store_slot_contribution(
+                        partial, topk_weights, slot_flat[m], numel, hidden, n,
+                        (j == 0) ? acc[mf][0] : acc[mf][1]);
+                }
+            }
+        }
+    }
 }
 
 extern "C" {
@@ -1581,76 +2148,33 @@ __global__ void moe_expert_down_gemv(
 // blockDim MOE_MMA_WARPS * 32. One warp owns 8 output rows — one N fragment —
 // and every warp in the block shares the staged activation tile.
 
-#define MOE_MMA_WARPS 8
-#define MOE_MMA_N     8
-#define MOE_MMA_ROWS  (MOE_MMA_WARPS * MOE_MMA_N)
-// Slots staged per block. `block_size` must not exceed this; the Rust side
-// checks it, because a larger dispatch block would silently drop its tail.
-//
-// 64, not 32: this kernel is bandwidth-bound on the *weight* tile it stages
-// (see `MOE_MMA_BLOCKS_PER_SM` below), so the arithmetic intensity that
-// matters is how many dispatch slots share one staged weight tile before it
-// is discarded. Doubling `M` halves the weight-tile loads per routed token
-// for any expert with enough traffic to fill more than one tile, at the
-// cost of the occupancy `MOE_MMA_BLOCKS_PER_SM` gives up to make room for
-// the wider `sa`/`sas`/`rows` tiles. See "Widening M on the routed-expert
-// MMA kernels" in docs/BENCHMARKS.md for the traffic argument and the
-// measurement against the occupancy loss.
-#define MOE_MMA_M     64
-#define MOE_MMA_MF    (MOE_MMA_M / 8)
-// Contraction staged per trip: one Q6_K *half*, which is the unit the format's
-// `ql`/`qh` split is addressed in. Half a superblock rather than a whole one
-// halves the shared footprint for no extra loop overhead.
-#define MOE_MMA_KC    128
 
-// Bytes per staged activation row.
-//
-// 144 and not `MOE_MMA_KC`. A 128-byte row stride is exactly 32 shared banks,
-// and the fragment load `sa + (mf * 8 + arow) * stride + kk + quad` varies
-// `arow` over eight rows and `quad` over four words -- so with a 32-word
-// stride all eight rows land on the same four banks and every one of these
-// loads is an **eight-way conflict**, on the kernel that is a quarter of
-// prefill. 144 bytes is 36 words and `36 mod 32 = 4`, so row `i` starts four
-// banks along from row `i - 1` and the eight rows tile the 32 banks exactly
-// once. The sixteen wasted bytes a row buy a conflict-free load.
-#define MOE_MMA_ASTRIDE (MOE_MMA_KC + 16)
-
-// Bytes per staged weight row: 64 of `ql`, then 32 of `qh` at offset 64.
-//
-// 112 and not the 96 the payload needs. The operand load varies the row over
-// eight values and the word within a row over four, so a conflict-free stride
-// has to send each row exactly four banks along from the last: **the stride in
-// words must be 4 mod 32**. 112 bytes is 28 words, `28 * i mod 32` walks
-// 0, 28, 24, ..., 4, and the four words each row contributes fill the gaps, so
-// the warp's 32 lanes tile the 32 banks exactly once.
-//
-// 96 is 24 words and `gcd(24, 32) = 8`, which collapses the eight rows into
-// four bank groups -- a two-way conflict. 100 was the first fix and only
-// spread the rows: 25 is coprime with 32 so the eight row bases are distinct,
-// but they are not four apart, and three of the eight collided once the word
-// offset was added. Worth about nothing next to
-// `MOE_MMA_ASTRIDE`, and kept because it is the shape that is provably right
-// rather than the shape that happened to measure the same.
-#define MOE_MMA_WSTRIDE 112
-// Bytes per staged scale row: 8 int8 sub-scales, then the fp32 superblock
-// delta at offset 8 (which is where the 4-byte alignment requirement lands).
-#define MOE_MMA_SSTRIDE 16
-
-// Two blocks per SM, asked for explicitly.
-//
-// This kernel is bandwidth-bound, not compute-bound: at 512 tokens it moves
-// 470 MB of Q6_K per layer and issues about 5% of the card's int8 throughput
-// doing it, so what it needs from the scheduler is loads in flight, and what
-// puts loads in flight is resident warps. At `MOE_MMA_M` 32 its shared
-// footprint was 21,760 bytes and three blocks fit Turing's 65,536 with 256
-// to spare. At `MOE_MMA_M` 64 -- see that constant's own comment for why --
-// the footprint is 27,136 bytes: three would need 81,408, past the ceiling,
-// so the occupancy target drops to two (54,272, with 11,264 to spare) and
-// ptxas is told to fit registers for two blocks rather than three.
-//
-// The second argument is the one that matters. The first is redundant with the
-// launch's `block_dim` and is stated so the pair cannot drift apart silently.
-#define MOE_MMA_BLOCKS_PER_SM 2
+// Two compiled variants of the same body, chosen by the host at Forward
+// construction time (see `MoeKernels::new` and `forward.rs`'s
+// `moe_block_size`) rather than by a device-side branch: the two differ in
+// `__launch_bounds__`'s occupancy target, which is a property of the
+// compiled function, not something a runtime branch inside one function
+// could vary per launch. See "Two compiled widths instead of one" in
+// docs/BENCHMARKS.md for why 512 tokens needed this back and 8,192 did not.
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, 3)
+moe_expert_ffn_mma_narrow(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xscale,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_mma_impl<32, 4>(
+        gate_q, up_q, xq, xscale, sorted_token_ids, expert_ids, valid_tokens,
+        top_k, block_size, hidden, intermediate, inter);
+}
 
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_MMA_BLOCKS_PER_SM)
 moe_expert_ffn_mma(
@@ -1667,284 +2191,9 @@ moe_expert_ffn_mma(
     int intermediate,
     float* __restrict__ inter
 ) {
-    unsigned char* swg = (unsigned char*)xabe_shared;
-    unsigned char* swu = swg + MOE_MMA_ROWS * MOE_MMA_WSTRIDE;
-    unsigned char* ssg = swu + MOE_MMA_ROWS * MOE_MMA_WSTRIDE;
-    unsigned char* ssu = ssg + MOE_MMA_ROWS * MOE_MMA_SSTRIDE;
-    signed char*   sa  = (signed char*)(ssu + MOE_MMA_ROWS * MOE_MMA_SSTRIDE);
-    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_ASTRIDE);
-    long long*     rows = (long long*)(sas + MOE_MMA_M * (MOE_MMA_KC / 32));
-
-    int blk = blockIdx.y;
-    int e = expert_ids[blk];
-    if (e < 0) return;
-    int numel = (*valid_tokens) * top_k;
-
-    int tid  = threadIdx.x;
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int r0   = blockIdx.x * MOE_MMA_ROWS;
-
-    if (tid < MOE_MMA_M) {
-        int flat = tid < block_size
-            ? sorted_token_ids[(long long)blk * block_size + tid]
-            : numel;
-        // The activation *row*, not a byte offset: this tile indexes int8.
-        rows[tid] = flat < numel ? (long long)(flat / top_k) : -1;
-    }
-    __syncthreads();
-
-    // Lane roles. The operand split (stride 4) and the accumulator split
-    // (stride 2) are different, which is the characteristic MMA trap: `nload`
-    // is the row this lane *loads* an operand for, `ccol` the two columns it
-    // *owns* in the accumulator. They are not the same rows.
-    int nload = warp * MOE_MMA_N + (lane >> 2);
-    int arow  = lane >> 2;
-    int quad  = (lane & 3) * 4;
-    int ccol  = warp * MOE_MMA_N + (lane & 3) * 2;
-
-    long long ebase = (long long)e * intermediate * hidden;
-    int kblocks = hidden >> 5;
-
-    float accg[MOE_MMA_MF][2];
-    float accu[MOE_MMA_MF][2];
-    #pragma unroll
-    for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
-        accg[mf][0] = 0.0f; accg[mf][1] = 0.0f;
-        accu[mf][0] = 0.0f; accu[mf][1] = 0.0f;
-    }
-
-    for (int kc = 0; kc < hidden; kc += MOE_MMA_KC) {
-        __syncthreads();
-
-        // Stage the weights. This is the whole point of the rewrite: read
-        // straight from global in the fragment layout and consecutive lanes
-        // land on rows `hidden` elements apart, so every four-byte operand
-        // costs a full 32-byte sector and eight-ninths of the fetch is
-        // thrown away. Here a warp walks one row's bytes contiguously — one
-        // sector per 32 lanes — and the scatter happens in shared, which has
-        // no coalescing to lose.
-        // Eight rows per instruction, not one row per four.
-        //
-        // A warp stages exactly the eight rows it will compute with, and the
-        // lane split is `row = lane & 7`, `chunk = lane >> 3`. That does two
-        // things at once. The global side becomes `int4`: with the device
-        // stride padded to 224 every field of every superblock is 16-byte
-        // aligned, so 8 rows x 64 bytes of `ql` is one load where the 210-byte
-        // file layout forced 16-bit loads and eight of them. The shared side
-        // becomes conflict-free: a 128-bit store is serviced eight lanes at a
-        // time and those eight lanes hold eight *different* rows, so with a
-        // stride of 28 words -- `28 mod 32 = -4` -- each lane's four banks sit
-        // four along from the last and the eight tile the 32 banks exactly.
-        //
-        // Staging measured 32 ms of this kernel's 62 and stayed that expensive
-        // with every byte already in L1, so what it cost was the count of
-        // loads. Four per row per matrix becomes four per *eight* rows.
-        int half = (kc >> 7) & 1;
-        {
-            int jq = lane & 7;
-            int c4 = lane >> 3;
-            int rq = warp * MOE_MMA_N + jq;
-            int nq = r0 + rq;
-            int live = nq < intermediate;
-            long long iq = ebase + (long long)nq * hidden + kc;
-            const unsigned char* gq = gate_q + (iq >> 8) * Q6K_SB;
-            const unsigned char* uq = up_q   + (iq >> 8) * Q6K_SB;
-
-            if (live) {
-                *(uint4*)(swg + rq * MOE_MMA_WSTRIDE + c4 * 16) =
-                    *(const uint4*)(gq + half * 64 + c4 * 16);
-                *(uint4*)(swu + rq * MOE_MMA_WSTRIDE + c4 * 16) =
-                    *(const uint4*)(uq + half * 64 + c4 * 16);
-                if (lane < 16) {
-                    *(uint4*)(swg + rq * MOE_MMA_WSTRIDE + 64 + c4 * 16) =
-                        *(const uint4*)(gq + 128 + half * 32 + c4 * 16);
-                    *(uint4*)(swu + rq * MOE_MMA_WSTRIDE + 64 + c4 * 16) =
-                        *(const uint4*)(uq + 128 + half * 32 + c4 * 16);
-                }
-            }
-            if (lane < 8) {
-                if (live) {
-                    *(uint2*)(ssg + rq * MOE_MMA_SSTRIDE) =
-                        *(const uint2*)(gq + 192 + half * 8);
-                    *(uint2*)(ssu + rq * MOE_MMA_SSTRIDE) =
-                        *(const uint2*)(uq + 192 + half * 8);
-                    *(float*)(ssg + rq * MOE_MMA_SSTRIDE + 8) =
-                        half_bits_to_float(*(const unsigned short*)(gq + 208));
-                    *(float*)(ssu + rq * MOE_MMA_SSTRIDE + 8) =
-                        half_bits_to_float(*(const unsigned short*)(uq + 208));
-                } else {
-                    // A row past `intermediate` contributes nothing, and
-                    // zeroing the *scale* is enough to guarantee that without
-                    // zeroing 96 bytes of quants: every product it feeds is
-                    // multiplied by it.
-                    *(float*)(ssg + rq * MOE_MMA_SSTRIDE + 8) = 0.0f;
-                    *(float*)(ssu + rq * MOE_MMA_SSTRIDE + 8) = 0.0f;
-                }
-            }
-        }
-
-        // Stage the activations as words: `hidden` and `MOE_MMA_KC` are
-        // multiples of 4, so every one of these is aligned. A padding slot
-        // stages zeros, which makes its products exactly zero and keeps the
-        // inner loop branch-free.
-        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 4); idx += blockDim.x) {
-            int m  = idx / (MOE_MMA_KC / 4);
-            int k4 = (idx % (MOE_MMA_KC / 4)) * 4;
-            long long row = rows[m];
-            unsigned int v = row >= 0
-                ? *(const unsigned int*)(xq + row * hidden + kc + k4)
-                : 0u;
-            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
-        }
-        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 32); idx += blockDim.x) {
-            int m  = idx / (MOE_MMA_KC / 32);
-            int kb = idx % (MOE_MMA_KC / 32);
-            long long row = rows[m];
-            sas[m * (MOE_MMA_KC / 32) + kb] =
-                row >= 0 ? xscale[row * kblocks + (kc >> 5) + kb] : 0.0f;
-        }
-        __syncthreads();
-
-        // Hoisted: the superblock delta moves once per staged half, not once
-        // per sub-block.
-        float dg0 = *(const float*)(ssg + ccol * MOE_MMA_SSTRIDE + 8);
-        float dg1 = *(const float*)(ssg + (ccol + 1) * MOE_MMA_SSTRIDE + 8);
-        float du0 = *(const float*)(ssu + ccol * MOE_MMA_SSTRIDE + 8);
-        float du1 = *(const float*)(ssu + (ccol + 1) * MOE_MMA_SSTRIDE + 8);
-
-        // Two 16-wide sub-blocks per trip, because 32 is the span one
-        // activation scale covers and that is what lets the pair share a
-        // single conversion to float.
-        //
-        // # Why the loop is shaped around `I2F`
-        //
-        // The obvious inner loop converts each MMA result to float and scales
-        // it there: four accumulators times four activation fragments is
-        // sixteen `I2F` per 16 elements of contraction, plus four more for the
-        // sub-scales. SASS says 20 of the loop's 105 instructions were `I2F`,
-        // and on Turing integer-to-float runs on the conversion pipe at a
-        // quarter of the FMA pipe's rate -- so those 20 cost as much as the
-        // other 85 together, in a kernel that is a quarter of prefill.
-        //
-        // The sub-scale is an int8 and the MMA result is at most
-        // `32 * 127 * 16 = 65,024`, so their product fits in 23 bits and the
-        // two sub-blocks' products sum to at most 16.5 M. Accumulating *that*
-        // in int32 is exact, needs one `IMAD` per sub-block, and leaves one
-        // conversion per accumulator per 32 elements where there were four.
-        // The int8 sub-scales never become floats at all.
-        //
-        // The float arithmetic that remains is `(float)acc * (dx * d)`, where
-        // `d` is the superblock delta hoisted above and `dx` the activation
-        // scale for these 32 elements. Against the old expression this is one
-        // rounding instead of three per pair of sub-blocks, so the result is
-        // not bit-identical to what this kernel produced before -- it is
-        // slightly *more* accurate, and `tests/forward_pass.rs` gates the
-        // difference against llama.cpp's own activations.
-        for (int kk = 0; kk < MOE_MMA_KC; kk += 32) {
-            unsigned int bg[2], bu[2];
-            #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                int rp  = kk + 16 * h + quad;
-                int grp = rp >> 5;
-                int l   = rp & 31;
-                int shift = 2 * grp;
-                // `l` is a multiple of 4 and the shared stride is too, so these
-                // are aligned word loads where the equivalent global reads had to
-                // be assembled byte by byte: Q6_K's 210-byte block stride leaves
-                // no alignment to rely on, but a layout this kernel chose does.
-                unsigned int qlg = *(const unsigned int*)(
-                    swg + nload * MOE_MMA_WSTRIDE + ((grp & 1) ? l + 32 : l));
-                unsigned int qhg = *(const unsigned int*)(
-                    swg + nload * MOE_MMA_WSTRIDE + 64 + l);
-                unsigned int qlu = *(const unsigned int*)(
-                    swu + nload * MOE_MMA_WSTRIDE + ((grp & 1) ? l + 32 : l));
-                unsigned int qhu = *(const unsigned int*)(
-                    swu + nload * MOE_MMA_WSTRIDE + 64 + l);
-
-                // Four Q6_K codes to four signed bytes with no per-element work
-                // at all. Every step below acts on all four lanes of the word at
-                // once, and none of them can carry a bit across a byte boundary:
-                //
-                //   nibble   `(q >> 4) & 0x0F0F0F0F` takes bits 4..7 of each byte
-                //   high two `(qh >> shift) & 0x03030303`, shift <= 6, so bits
-                //            shift..shift+1 of each byte and no further
-                //   bias     Q6_K stores `raw - 32` in offset binary, and offset
-                //            binary *is* two's complement with the sign bit
-                //            flipped -- so `^ 0x20` converts all four codes at
-                //            once, leaving a 6-bit signed value per byte
-                //   extend   bit 5 is now the sign; copying it into bits 6 and 7
-                //            with two shifted ORs widens all four to int8
-                //
-                // Nine word operations per matrix where the per-element loop
-                // needed about forty, on the kernel that is 25% of prefill. The
-                // byte patterns are identical, so the MMA sees the same operands
-                // it always did.
-                unsigned int tg = ((((grp < 2) ? qlg : (qlg >> 4)) & 0x0F0F0F0Fu)
-                    | (((qhg >> shift) & 0x03030303u) << 4)) ^ 0x20202020u;
-                unsigned int tu = ((((grp < 2) ? qlu : (qlu >> 4)) & 0x0F0F0F0Fu)
-                    | (((qhu >> shift) & 0x03030303u) << 4)) ^ 0x20202020u;
-                unsigned int sg = tg & 0x20202020u;
-                unsigned int su = tu & 0x20202020u;
-                bg[h] = tg | (sg << 1) | (sg << 2);
-                bu[h] = tu | (su << 1) | (su << 2);
-            }
-
-            int sub = kk >> 4;
-            int cg0[2], cg1[2], cu0[2], cu1[2];
-            #pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                cg0[h] = (signed char)ssg[ccol * MOE_MMA_SSTRIDE + sub + h];
-                cg1[h] = (signed char)ssg[(ccol + 1) * MOE_MMA_SSTRIDE + sub + h];
-                cu0[h] = (signed char)ssu[ccol * MOE_MMA_SSTRIDE + sub + h];
-                cu1[h] = (signed char)ssu[(ccol + 1) * MOE_MMA_SSTRIDE + sub + h];
-            }
-
-            #pragma unroll
-            for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
-                float dx = sas[(mf * 8 + arow) * (MOE_MMA_KC / 32) + (kk >> 5)];
-                #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    unsigned int a = *(const unsigned int*)(
-                        sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + 16 * h + quad);
-                    int g0 = 0, g1 = 0, u0 = 0, u1 = 0;
-                    asm volatile(
-                        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-                        "{%0,%1}, {%2}, {%3}, {%0,%1};"
-                        : "+r"(g0), "+r"(g1) : "r"(a), "r"(bg[h]));
-                    asm volatile(
-                        "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-                        "{%0,%1}, {%2}, {%3}, {%0,%1};"
-                        : "+r"(u0), "+r"(u1) : "r"(a), "r"(bu[h]));
-                    accg[mf][0] += (float)g0 * dx * (dg0 * (float)cg0[h]);
-                    accg[mf][1] += (float)g1 * dx * (dg1 * (float)cg1[h]);
-                    accu[mf][0] += (float)u0 * dx * (du0 * (float)cu0[h]);
-                    accu[mf][1] += (float)u1 * dx * (du1 * (float)cu1[h]);
-                }
-            }
-        }
-    }
-
-    // SwiGLU, written exactly as `xabe_kernels::norm::silu`: x / (1 + exp(-x)),
-    // not the algebraically equal x * sigmoid(x). Padding slots are dropped
-    // rather than written, which is what lets `moe_expert_down` treat an
-    // unwritten `inter` row as unreachable instead of as zero.
-    #pragma unroll
-    for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
-        int m = mf * 8 + arow;
-        if (m < block_size && rows[m] >= 0) {
-            #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                int n = r0 + ccol + j;
-                if (n < intermediate) {
-                    float g = (j == 0) ? accg[mf][0] : accg[mf][1];
-                    float u = (j == 0) ? accu[mf][0] : accu[mf][1];
-                    float act = g / (1.0f + expf(-g));
-                    inter[((long long)blk * block_size + m) * intermediate + n] = act * u;
-                }
-            }
-        }
-    }
+    moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF>(
+        gate_q, up_q, xq, xscale, sorted_token_ids, expert_ids, valid_tokens,
+        top_k, block_size, hidden, intermediate, inter);
 }
 
 // grid: (ceil(hidden / MOE_ROWS), expert_block_capacity). The same tiling as
@@ -2046,19 +2295,29 @@ __global__ void moe_expert_down(
 // grid: (ceil(hidden / MOE_MMA_ROWS), expert_block_capacity). The contraction
 // runs over `intermediate` rather than `hidden`.
 
-// Bytes per staged weight row: MOE_MMA_KC quants, then one fp32 scale per 32
-// at offset MOE_MMA_KC.
-//
-// 144 is 36 words, and the eight rows a warp reads land on banks
-// `4r + (quad/4)` — thirty-two distinct banks across the warp, no conflict.
-#define MOE_MMA_DSTRIDE (MOE_MMA_KC + (MOE_MMA_KC / 32) * 4)
 
-// Three blocks per SM, for the same reason the gate/up kernel asks for two.
-// Q8_0 stages one weight tile rather than two, so at `MOE_MMA_M` 32 this
-// kernel's footprint was 14,720 bytes and four fit in 65,536 with room left;
-// at `MOE_MMA_M` 64 it is 20,224 bytes, four would need 80,896 past the
-// ceiling, and three fits with 4,864 to spare.
-#define MOE_DOWN_BLOCKS_PER_SM 3
+// Two compiled variants of the same body, for the same reason
+// `moe_expert_ffn_mma`/`moe_expert_ffn_mma_narrow` above are two. See that
+// pair's comment.
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, 4)
+moe_expert_down_mma_narrow(
+    const unsigned char* __restrict__ down_q,
+    const signed char* __restrict__ iq,
+    const float* __restrict__ iscale,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_mma_impl<32, 4>(
+        down_q, iq, iscale, topk_weights, sorted_token_ids, expert_ids,
+        valid_tokens, top_k, block_size, hidden, intermediate, partial);
+}
 
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_DOWN_BLOCKS_PER_SM)
 moe_expert_down_mma(
@@ -2075,144 +2334,9 @@ moe_expert_down_mma(
     int intermediate,
     float* __restrict__ partial
 ) {
-    unsigned char* sw  = (unsigned char*)xabe_shared;
-    signed char*   sa  = (signed char*)(sw + MOE_MMA_ROWS * MOE_MMA_DSTRIDE);
-    float*         sas = (float*)(sa + MOE_MMA_M * MOE_MMA_ASTRIDE);
-    long long*     rows = (long long*)(sas + MOE_MMA_M * (MOE_MMA_KC / 32));
-    int*           slot_flat = (int*)(rows + MOE_MMA_M);
-
-    int blk = blockIdx.y;
-    int e = expert_ids[blk];
-    if (e < 0) return;
-    int numel = (*valid_tokens) * top_k;
-
-    int tid  = threadIdx.x;
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int r0   = blockIdx.x * MOE_MMA_ROWS;
-
-    if (tid < MOE_MMA_M) {
-        int m = tid;
-        int flat = m < block_size
-            ? sorted_token_ids[(long long)blk * block_size + m]
-            : numel;
-        slot_flat[m] = flat;
-        // The `inter` row, which is the *slot* index and not the token index:
-        // the ffn kernel wrote one row per dispatch slot.
-        rows[m] = flat < numel ? (long long)blk * block_size + m : -1;
-    }
-    __syncthreads();
-
-    int nload = warp * MOE_MMA_N + (lane >> 2);
-    int arow  = lane >> 2;
-    int quad  = (lane & 3) * 4;
-    int ccol  = warp * MOE_MMA_N + (lane & 3) * 2;
-
-    // [hidden x intermediate] per expert — GGUF `[intermediate, hidden, experts]`.
-    long long ebase = (long long)e * hidden * intermediate;
-    int kblocks = intermediate >> 5;
-
-    float acc[MOE_MMA_MF][2];
-    #pragma unroll
-    for (int mf = 0; mf < MOE_MMA_MF; ++mf) { acc[mf][0] = 0.0f; acc[mf][1] = 0.0f; }
-
-    for (int kc = 0; kc < intermediate; kc += MOE_MMA_KC) {
-        __syncthreads();
-
-        for (int r = warp; r < MOE_MMA_ROWS; r += MOE_MMA_WARPS) {
-            int n = r0 + r;
-            if (n < hidden) {
-                const unsigned char* src =
-                    down_q + ((ebase + (long long)n * intermediate + kc) >> 5) * 34;
-                // Each trip reads 32 bytes contiguous within one block, so the
-                // fetch coalesces even though the block stride does not let it
-                // be a word load.
-                // Two bytes per lane. The quants of a Q8_0 block start at
-                // byte 2 of a 34-byte block, so they are even-aligned and
-                // never word-aligned; 16-bit is the widest legal load, and it
-                // halves the instructions this copy costs.
-                for (int t = lane * 2; t < MOE_MMA_KC; t += 64) {
-                    *(unsigned short*)(sw + r * MOE_MMA_DSTRIDE + t) =
-                        *(const unsigned short*)(src + (t >> 5) * 34 + 2 + (t & 31));
-                }
-                if (lane < (MOE_MMA_KC / 32)) {
-                    // One 16-bit load, not `load_half_le`'s two 8-bit ones: a
-                    // Q8_0 block starts on an even byte, so the fp16 scale at
-                    // its head is 2-byte aligned even though the 34-byte
-                    // stride never makes it 4-byte aligned. Staging is what
-                    // this kernel spends its time on, and this is one of the
-                    // four loads a row was costing.
-                    *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) =
-                        half_bits_to_float(*(const unsigned short*)(src + lane * 34));
-                }
-            } else if (lane < (MOE_MMA_KC / 32)) {
-                // Zeroing the scale is enough: every product it feeds is
-                // multiplied by it.
-                *(float*)(sw + r * MOE_MMA_DSTRIDE + MOE_MMA_KC + lane * 4) = 0.0f;
-            }
-        }
-
-        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 4); idx += blockDim.x) {
-            int m  = idx / (MOE_MMA_KC / 4);
-            int k4 = (idx % (MOE_MMA_KC / 4)) * 4;
-            long long row = rows[m];
-            unsigned int v = row >= 0
-                ? *(const unsigned int*)(iq + row * intermediate + kc + k4)
-                : 0u;
-            *(unsigned int*)(sa + m * MOE_MMA_ASTRIDE + k4) = v;
-        }
-        for (int idx = tid; idx < MOE_MMA_M * (MOE_MMA_KC / 32); idx += blockDim.x) {
-            int m  = idx / (MOE_MMA_KC / 32);
-            int kb = idx % (MOE_MMA_KC / 32);
-            long long row = rows[m];
-            sas[m * (MOE_MMA_KC / 32) + kb] =
-                row >= 0 ? iscale[row * kblocks + (kc >> 5) + kb] : 0.0f;
-        }
-        __syncthreads();
-
-        for (int kk = 0; kk < MOE_MMA_KC; kk += 16) {
-            unsigned int b = *(const unsigned int*)(
-                sw + nload * MOE_MMA_DSTRIDE + kk + quad);
-
-            // One Q8_0 scale spans 32 contraction elements, so it is the same
-            // for this k-step and the next.
-            int sb = kk >> 5;
-            float w0 = *(const float*)(
-                sw + ccol * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
-            float w1 = *(const float*)(
-                sw + (ccol + 1) * MOE_MMA_DSTRIDE + MOE_MMA_KC + sb * 4);
-
-            #pragma unroll
-            for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
-                unsigned int a = *(const unsigned int*)(
-                    sa + (mf * 8 + arow) * MOE_MMA_ASTRIDE + kk + quad);
-                int d0 = 0, d1 = 0;
-                asm volatile(
-                    "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-                    "{%0,%1}, {%2}, {%3}, {%0,%1};"
-                    : "+r"(d0), "+r"(d1) : "r"(a), "r"(b));
-                float dx = sas[(mf * 8 + arow) * (MOE_MMA_KC / 32) + sb];
-                acc[mf][0] += (float)d0 * dx * w0;
-                acc[mf][1] += (float)d1 * dx * w1;
-            }
-        }
-    }
-
-    #pragma unroll
-    for (int mf = 0; mf < MOE_MMA_MF; ++mf) {
-        int m = mf * 8 + arow;
-        if (m < block_size) {
-            #pragma unroll
-            for (int j = 0; j < 2; ++j) {
-                int n = r0 + ccol + j;
-                if (n < hidden) {
-                    store_slot_contribution(
-                        partial, topk_weights, slot_flat[m], numel, hidden, n,
-                        (j == 0) ? acc[mf][0] : acc[mf][1]);
-                }
-            }
-        }
-    }
+    moe_expert_down_mma_impl<MOE_MMA_M, MOE_MMA_MF>(
+        down_q, iq, iscale, topk_weights, sorted_token_ids, expert_ids,
+        valid_tokens, top_k, block_size, hidden, intermediate, partial);
 }
 
 // The gate/up half of the grouped GEMM when both stacks are Q8_0.
@@ -3042,6 +3166,11 @@ pub struct MoeKernels {
     shared_down_gemv: CudaFunction,
     swiglu: CudaFunction,
     geometry: MoeGeometry,
+    /// The dispatch-slot ceiling `expert_ffn_mma`/`expert_down_mma` were
+    /// compiled and loaded at -- `MMA_M_NARROW` or `MMA_M`, chosen in `new`
+    /// from `geometry.block_size` and needed again at launch to pick the
+    /// matching `shared_mem_bytes`.
+    mma_m: usize,
 }
 
 impl MoeKernels {
@@ -3086,11 +3215,11 @@ impl MoeKernels {
         }
         // The tensor-core path stages a whole dispatch block at once, so a
         // `block_size` past `MMA_M` would drop its tail. Rejected rather than
-        // handled: every slot past the sixteenth would be silently ignored,
-        // and the wrong answer would be finite and plausible.
+        // handled: every slot past the last one staged would be silently
+        // ignored, and the wrong answer would be finite and plausible.
         if geometry.block_size > MMA_M {
             return Err(bad(
-                "block_size exceeds the 16 slots the tensor-core tile stages",
+                "block_size exceeds the slots the tensor-core tile stages",
             ));
         }
         // grid.y is the dispatch-block capacity or a token tile, grid.x a
@@ -3126,6 +3255,17 @@ impl MoeKernels {
 
         let ptx = compile(MOE_SRC, "moe").map_err(MoeError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        // Both compiled kernels stage a whole dispatch block, so the choice
+        // has to match `block_size`, not just fit under it: launching the
+        // wide kernel at a `block_size` the narrow one was sized for would
+        // work (it is only a ceiling), but would pay the wide kernel's
+        // lower occupancy for zero traffic benefit -- the regression "Two
+        // compiled widths instead of one" exists to avoid. Below the
+        // crossover measured there, `block_size` itself is already picked
+        // to fit the narrow ceiling (see `forward.rs`'s `moe_block_size`),
+        // so this reads that choice back rather than making a second one.
+        let narrow = geometry.block_size <= MMA_M_NARROW;
+        let mma_m = if narrow { MMA_M_NARROW } else { MMA_M };
         Ok(Self {
             route: module.load_function("moe_route")?,
             dispatch_t1: module.load_function("moe_dispatch_t1")?,
@@ -3135,7 +3275,11 @@ impl MoeKernels {
             expert_ffn: module.load_function("moe_expert_ffn")?,
             expert_ffn_gemv: module.load_function("moe_expert_ffn_gemv")?,
             expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
-            expert_ffn_mma: module.load_function("moe_expert_ffn_mma")?,
+            expert_ffn_mma: module.load_function(if narrow {
+                "moe_expert_ffn_mma_narrow"
+            } else {
+                "moe_expert_ffn_mma"
+            })?,
             expert_ffn_mma_q8: module.load_function("moe_expert_ffn_mma_q8")?,
             // Compiled eagerly so a device that cannot reach the integer
             // tensor cores fails here, at construction, rather than mid-pass.
@@ -3143,7 +3287,11 @@ impl MoeKernels {
             // launch below falls back to it.
             mma: MmaKernels::new(ctx).ok(),
             expert_down: module.load_function("moe_expert_down")?,
-            expert_down_mma: module.load_function("moe_expert_down_mma")?,
+            expert_down_mma: module.load_function(if narrow {
+                "moe_expert_down_mma_narrow"
+            } else {
+                "moe_expert_down_mma"
+            })?,
             reduce: module.load_function("moe_reduce")?,
             shared_ffn: module.load_function("moe_shared_ffn")?,
             shared_down: module.load_function("moe_shared_down")?,
@@ -3151,6 +3299,7 @@ impl MoeKernels {
             shared_down_gemv: module.load_function("moe_shared_down_gemv")?,
             swiglu: module.load_function("moe_swiglu")?,
             geometry,
+            mma_m,
         })
     }
 
@@ -3553,7 +3702,7 @@ impl MoeKernels {
                 shared_mem_bytes: if q8 {
                     mma_ffn_q8_shared_bytes()
                 } else {
-                    mma_shared_bytes()
+                    mma_shared_bytes(self.mma_m)
                 },
             };
             let f = if q8 {
@@ -3685,7 +3834,7 @@ impl MoeKernels {
                     1,
                 ),
                 block_dim: (MMA_WARPS * 32, 1, 1),
-                shared_mem_bytes: mma_down_shared_bytes(),
+                shared_mem_bytes: mma_down_shared_bytes(self.mma_m),
             };
             let mut builder = stream.launch_builder(&self.expert_down_mma);
             builder
@@ -4041,6 +4190,36 @@ fn check_stack(which: &'static str, t: QuantTensor<'_>, expected: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_narrow_mma_variants_are_mirrored_in_rust() {
+        // `MMA_M_NARROW` picks a Rust-side kernel name and a shared-memory
+        // formula; nothing else ties it to the two device instantiations
+        // that must actually exist at that width. If the device side drifts
+        // -- someone reinstantiates `moe_expert_ffn_mma_narrow` at a
+        // different `M`, say -- `module.load_function` still succeeds
+        // (the name did not change) and the mismatch would show up as a
+        // shared-memory overrun instead of a compile or link error.
+        assert!(
+            MOE_SRC.contains(&format!(
+                "moe_expert_ffn_mma_impl<{MMA_M_NARROW}, {}>(",
+                MMA_M_NARROW / 8
+            )),
+            "moe_expert_ffn_mma_narrow no longer instantiates the impl at MMA_M_NARROW",
+        );
+        assert!(
+            MOE_SRC.contains(&format!(
+                "moe_expert_down_mma_impl<{MMA_M_NARROW}, {}>(",
+                MMA_M_NARROW / 8
+            )),
+            "moe_expert_down_mma_narrow no longer instantiates the impl at MMA_M_NARROW",
+        );
+        assert!(
+            MOE_SRC.contains("moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF>(")
+                && MOE_SRC.contains("moe_expert_down_mma_impl<MOE_MMA_M, MOE_MMA_MF>("),
+            "the wide wrappers no longer instantiate the impl at MOE_MMA_M",
+        );
+    }
 
     fn qwen() -> MoeGeometry {
         MoeGeometry::qwen3_6(16, 64)
