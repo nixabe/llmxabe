@@ -3175,7 +3175,8 @@ would land in local memory and the change would be worse than useless.
 
 ### Where the head-to-head stands
 
-Prefill, one GPU, 512-token chunks, against llama.cpp `-fa 1 -ub 512`:
+Prefill, one GPU, 512-token chunks, against llama.cpp `-fa 1 -ub 512` — **its
+default, not its best; see the correction at the end of this file**:
 
 | tokens | before | after | llama.cpp | ratio |
 |---:|---:|---:|---:|---:|
@@ -3211,3 +3212,86 @@ About 217 registers against a 255 limit — feasible on paper, and the spill is
 the risk. An XOR swizzle removes `q_sh`'s padding and was checked
 (`(4s+tg) ^ 4*(r&7)` keeps the fragment read a bank bijection) but saves only
 1,024 B, which does not change the answer.
+
+## The baseline was llama.cpp's default, not its best (2026-08-17)
+
+Every llama.cpp figure above this line was taken at its **default** `-ub 512`.
+That is not its best. Given `-b 8192 -ub 4096` it is substantially faster, and
+its best setting is prompt-dependent -- at pp512 the wide ubatch *hurts* it, so
+"best settings" has to mean best-per-length on both sides or the comparison is
+rigged in whichever direction the tester prefers.
+
+| prompt | llama.cpp ub 512 | ub 1024 | ub 2048 | ub 4096 |
+|---:|---:|---:|---:|---:|
+| 512 | 2155.8 | | 1808.0 | 1808.8 |
+| 2048 | 2118.0 | | 2925.8 | 2956.9 |
+| 8192 | 1978.7 | | 2862.3 | 3081.6 |
+| 32768 | 1729.9 | | 2307.9 | 2462.8 |
+| 65536 | 1410.4 | | 1881.3 | 1939.8 |
+| 131072 | 1076.6 | 1231.2 | 1364.4 | 1396.5 |
+
+Note also that its pp131072 at the default measures 1076.6 here against the
+1119.3 recorded earlier in this file. At matched 512 that is parity, not the
+0.95x the older row implies.
+
+### Head to head, both sides best-per-length
+
+| prompt | llmxabe | chunk | llama.cpp | ub | ratio |
+|---:|---:|---:|---:|---:|---:|
+| 512 | **2437.7** | 512 | 2155.8 | 512 | **1.13x** |
+| 2048 | **3102.7** | 2048 | 2956.9 | 4096 | **1.05x** |
+| 8192 | 3041.9 | 8192 | 3081.6 | 4096 | 0.99x |
+| 32768 | 2367.8 | 8192 | 2462.8 | 4096 | 0.96x |
+| 65536 | 1831.7 | 8192 | 1939.8 | 4096 | 0.94x |
+| 131072 | 1276.6 | 8192 | 1396.5 | 4096 | 0.91x |
+
+Decode, measured with `llama-bench -d <depth>` rather than interpolated from
+the endpoints, which is what an earlier estimate in this file did:
+
+| depth | llmxabe | llama.cpp | ratio |
+|---:|---:|---:|---:|
+| 0 | ~91 | 96.1 | 0.95x |
+| 32768 | 80.1 | 88.5 | 0.91x |
+| 65536 | 62.2 | 79.7 | 0.78x |
+| 131072 | 47.4 | 66.9 | 0.71x |
+
+Three parallel sequences, `llama-batched-bench -npl 1,3`, 32,768-token prompt:
+
+| | prefill aggregate | decode aggregate | decode per-sequence |
+|---|---:|---:|---:|
+| llama.cpp -np 1 | 2404.7 | 87.98 | 87.98 |
+| llama.cpp -np 3 | 2313.1 | **154.58** | 51.53 |
+| llmxabe (one sequence) | 2304.5 | 77.4 | 77.4 |
+
+Both readings are true and they point opposite ways. **Aggregate decode is a
+2x loss**: llama.cpp's continuous batching nearly doubles throughput across
+three sequences and this engine has no cross-sequence batching at all --
+`Forward::run` takes one `SequenceState` -- so its aggregate is its
+single-stream number. **Per-sequence decode is a 1.5x win**: each of their
+three sequences runs slower than our one. For a serving benchmark the
+aggregate is the standard measure, and by it we lose.
+
+### Claims made earlier in this session that did not survive
+
+- 1.04x at 32,768 and 1.02x at 65,536: against the default ubatch only.
+- 1.03x at 32,768 after widening our chunk to 8192: died the moment llama.cpp
+  was given the same wider batch.
+
+Widening the batch has favoured llama.cpp three times running, and that is the
+finding rather than the accident. Its prefill scales with batch width and ours
+does not: our attention is **flat per token** at every width measured -- 42.1 ms
+at chunk 512, 179.5 at 2048, 205 -> 193 GB/s -- so every gain we get from a
+wider chunk comes from MoE and GDN. Attention is 53% of the 128K pass.
+
+### What each remaining gap needs
+
+- **Deep prefill, +4% to +9%.** Attention is no longer traffic-bound. At
+  `MMA_HPB` 8 its arithmetic intensity is 128 FLOP/B against this card's 96.7
+  balance point, and it runs at ~40% of the fp32-accumulate tensor peak. Every
+  prefill gain in this session came from moving fewer bytes and that lever is
+  spent. Untried: `ldmatrix.sync.aligned.m8n8.x4` (sm_75 has it) to replace one
+  scalar shared load per mma step, and `mma.m8n8k4`, Turing's native shape --
+  `m16n8k8` is emulated as four of them and the emulation may be the 60%.
+- **Deep decode, +41%.** See the warp-split kernel's commit for the four
+  hypotheses already eliminated. `half2` is the next one.
+- **Aggregate decode, +100%.** A missing feature, not a slow kernel.
