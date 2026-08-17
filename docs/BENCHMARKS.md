@@ -4650,3 +4650,111 @@ width, item 1) and this round's own finding added:
 4. Continuous batching, mixed prefill and decode in one step, and KV cache
    pooling -- unchanged from the previous section, still out of scope for
    this workstream.
+
+## GDN's narrow tiles were occupancy-starved, not guard-heavy: RR=1 recovers most of it (2026-08-18)
+
+A same-day follow-up to the section above. The coordinator's read of the
+launch geometry behind "tile-4 costs about what three untiled reads did":
+`GDN_PROJ_TILED`'s grid is `(n_rows.div_ceil(PROJ_WARPS * RR),
+tokens.div_ceil(TT))`, block `(32, PROJ_WARPS)`. At decode widths grid.y
+collapses to 1 (a single token-tile slice), which leaves grid.x as the
+*only* axis with any blocks in it. With `PROJ_WARPS` 4 and `RR` 4 (the value
+every tile inherited from the 512-token sweep that chose it), `n_rows` in
+the 512-2048 range this model's projections actually use gives
+32-128 blocks -- on a 72-SM card, that is SMs sitting idle, not latency
+being hidden. The untiled kernel `project_per_sequence` used to loop reads
+`n_rows.div_ceil(PROJ_WARPS)`, four times as many blocks for the same rows,
+which is why one untiled read was cheap relative to one narrow-tile read: it
+was never the tile's guard costing the difference, it was the grid.
+
+`RR` exists to divide *activation* L2 traffic, and that traffic is
+irrelevant at this width -- ~32 KB total for a 2-4 token batch against the
+2.1 GB/call the 512-token sweep was solving for. Fix: `PROJ_ROWS` for tiles
+2 and 4 drops from 4 to 1, which quadruples their grid.x back to the
+untiled kernel's own geometry. Tiles 8 and 16 (prefill's regime, where
+grid.x is already wide) are untouched.
+
+### Verification: per-launch time and block count, before and after
+
+`nsys --cuda-graph-trace=node`, isolated to each width's own decode phase
+(`LLMXABE_SKIP_SINGLE_STREAM=1`), RR=4 (the previous section's committed
+state) against RR=1, same weights, same layers, same token count -- only
+`RR` differs:
+
+| N | tile | grid.x @ RR=4 | grid.x @ RR=1 | ns/call @ RR=4 | ns/call @ RR=1 | speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 2 | `n_rows/16` | `n_rows/4` | 67,487.6 | 44,238.0 | 1.53x |
+| 3 | 4 | `n_rows/16` | `n_rows/4` | 125,662.3 | 89,041.7 | 1.41x |
+| 4 | 4 | `n_rows/16` | `n_rows/4` | 70,528.9 | 64,026.8 | 1.10x |
+
+Real in every case, and short of the 3-4x the block-count arithmetic alone
+predicts. The gap has a second, distinct explanation, found by reading the
+macro rather than assumed: `GDN_PROJ_TILED`'s fully-live branch (taken when
+`live_t == TT`, N=4's case) is `_Pragma("unroll")`-marked over a
+compile-time `TT`; the guarded branch (`live_t < TT`, N=2 and N=3's case) is
+not, because its bound is the runtime value `live_t`, which the compiler
+cannot unroll. N=4 at RR=4 (70,528.9 ns) already ran faster in absolute
+terms than N=3 at RR=4 (125,662.3 ns) despite doing *more* nominal work --
+one live token more -- which only makes sense if the guarded branch's
+un-unrolled inner loop, repeated once per iteration of the outer `for (b =
+0; b < blocks; ++b)` weight-staging loop (32-64+ iterations depending on the
+projection), is paying real per-element loop overhead that the unrolled
+branch does not. This is why RR=1's win is largest at N=2 (guarded, but the
+smallest live/TT gap) and smallest at N=4 (never guarded at all -- RR=1's
+whole benefit there is the grid.x widening, with no un-unrolled-loop tax to
+also remove). **Not fixed this round** -- named here as the next concrete
+lever, distinct from and additional to the occupancy fix, for whoever picks
+this back up.
+
+### Measured aggregate, both fixes together, GPU 2
+
+Accuracy gates, unchanged tolerances: all three `tests/batch_decode.rs`
+differentials (exact cross-sequence check still **0.000e0**), all 26 GDN
+differential/block tests, and the golden logits test -- llama.cpp's argmax
+still exactly reproduced. No tolerance loosened.
+
+**2,048-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 9.94 | 100.6 | 100.6 |
+| batch 1 | 11.24 | 89.0 | 89.0 |
+| batch 2 | 20.01 | **99.9** | 50.0 |
+| batch 3 | 29.11 | **103.0** | 34.3 |
+| batch 4 | 31.38 | **127.5** | 31.9 |
+| batch 8 | 47.85 | **167.2** | 20.9 |
+
+**32,768-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 11.90 | 84.0 | 84.0 |
+| batch 1 | 13.34 | 75.0 | 75.0 |
+| batch 2 | 24.49 | **81.7** | 40.8 |
+| batch 3 | 35.83 | **83.7** | 27.9 |
+| batch 4 | 40.58 | **98.6** | 24.6 |
+| batch 8 | 64.39 | **124.2** | 15.5 |
+
+N=2 and N=3 now beat single-stream at both contexts for the first time this
+workstream has measured -- N=3 at 2,048 tokens is 103.0 against 100.6
+(1.024x), and at 32,768 tokens is 83.7 against 84.0, parity within
+run-to-run noise rather than the previous section's clear regression.
+
+### Against the target, honestly, a third time
+
+N=3 at the 32,768-token context: **77.8 -> 83.7 tok/s this round (+7.6%)**,
+cumulative from this workstream's 64.1 tok/s start: **+30.6%**. Still short
+of the 109.6 tok/s (1.3x) bar and further short of llama.cpp's 154.58 --
+the predicted "step(3) drops from 38.6 toward ~20ms" did not happen (it
+dropped to 35.8), because the occupancy fix, while real and correctly
+diagnosed, was worth 1.1-1.5x per launch rather than 3-4x once the
+un-unrolled guarded branch took back part of what the wider grid bought.
+
+**N=1 batch-vs-single-stream overhead, noted as asked, not chased:** batch 1
+runs 13.34 ms/step against single_stream's 11.90 (32,768 tokens, -12.1%) and
+11.24 against 9.94 (2,048 tokens, -13.1%) -- consistent with the
+coordinator's ~12% estimate and unmoved by either fix in this section, since
+neither touches whatever the batch-path-at-N=1 vs single-stream-path
+difference actually is. Not investigated this round, per the coordinator's
+own "only after the main fix" framing -- the main fix's own return has not
+yet run out.
