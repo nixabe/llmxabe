@@ -3584,3 +3584,115 @@ nothing here changes them. What it does change is confidence: `DEC_SPLITS`,
 matters, and at 131,072 keys it is now measured to matter more than half the
 decode step -- so the ceiling stays the right thing to keep chasing, even
 though this session did not find the eighth hypothesis that explains it.
+
+## The MoE decode GEMV, re-measured: the lever named for this session was already pulled (2026-08-17)
+
+The follow-up brief for this section quoted `bench_moe`'s decode-shape (n=1)
+number as 129.4 GB/s, 19.3% of the 672 GB/s peak, against `lm_head_gemv_b1`'s
+53%, and asked for a `llama.cpp mmvq.cu`-style pass at
+`moe_expert_ffn_gemv`'s Q6_K unpack. That number is stale. `bench_moe 1`,
+three rounds, GPU 1:
+
+| round | GB/s (unique) | % peak |
+|---:|---:|---:|
+| 1 | 261.6 | 38.9% |
+| 2 | 262.2 | 39.0% |
+| 3 | 260.7 | 38.8% |
+
+**38.9%, double the quoted figure**, and `crates/xabe-cuda/src/kernels/moe.rs`
+already explains why: `763bc69` padded Q6_K to a 224-byte device stride and
+widened the dequant loads to `uint4`, and the kernel's own comments record
+`moe_expert_ffn_gemv` (Q6_K gate/up) individually at 47% of streaming
+roofline and `moe_expert_down_gemv` (Q8_0) at 63%, against `lm_head_gemv_b1`
+at 82-89% depending on which pass measured it. `bench_moe`'s 38.9% is the
+*combined* `grouped_forward` pass — both projections plus the reduce launch —
+which is why it sits below either kernel's own number. None of this was
+known to whoever wrote the follow-up brief because it predates this commit;
+it is recorded here so the next reader does not chase an already-closed gap.
+
+### What was actually tried: hoisting `d * scale` out of the four-element unpack, and finding ptxas got there first
+
+The kernel's own comment already diagnoses `moe_expert_ffn_gemv` as bound by
+the **integer pipe**, not DRAM, at this shape: Q6_K's unpack costs about nine
+integer instructions an element against Q8_0's near-zero. The one piece of
+that unpack that looked untried was `q6k_value(d, sc, si, raw)`: called once
+per element in the four-wide tile, it recomputes `d * (float)sc[si]` fresh
+each time even though `d`, `sc` and `si` do not depend on which of the four
+elements is being unpacked, and `sc[si]` is a one-byte load at a
+lane-scattered address (four lanes to a scale group, not coalesced) — a real
+cost to pay four times if the compiler does not prove the loads identical and
+hoist it itself.
+
+Hoisted it by hand: `q6k_value` now takes the `ds = d * (float)sc[si]`
+product directly rather than `d`, `sc` and `si` separately, computed once
+before the four-element loop instead of inside it. Same multiply order,
+`(d * scale) * q`, so the result is bit-for-bit what it was — confirmed by
+`cuobjdump -sass` on both versions, extracted the same way the decode
+attention section above did (`nvcc -arch=sm_75` on `MOE_SRC` pulled out of the
+Rust source):
+
+| | registers | static instructions |
+|---|---:|---:|
+| before | 47 | 856 |
+| after | 47 | 856 |
+
+**Byte-identical SASS.** `diff` on the disassembly of `moe_expert_ffn_gemv`
+finds nothing at all. `ptxas` was already doing exactly this hoist —
+`sc[si]` not depending on the loop variable is provable from the source as
+written, and the compiler proved it. `bench_moe 1` after the change measured
+260.1-261.1 GB/s against 260.7-262.2 before, the same three-round spread as
+noise. Not applied; the source keeps the more legible `q6k_value(d, sc, si,
+raw)` form since taking it apart bought nothing.
+
+### The next lever is not a free one: it needs a new rounding source
+
+`llama.cpp`'s own Q6_K decode-shape path —
+`vec_dot_q6_K_q8_1_impl_mmvq` in `ggml/src/ggml-cuda/vecdotq.cuh` — is worth
+reading before naming it a target, because it is not the access-pattern
+change it looks like from the outside. It computes the six-bit codes exactly
+as this kernel does (`(vl >> 4i) & 0x0F0F0F0F` merged with a shifted high-bit
+field, then `- 32`), and then reduces four of them against four activation
+values in one `ggml_cuda_dp4a` instruction rather than four scalar FMAs. The
+catch is what `u[i]` is: not the fp32 hidden state this kernel reads, but
+`bq8_1[...].qs` — the activation vector **pre-quantized to Q8_1**, int8 plus
+a per-block scale, by a separate kernel (`quantize_q8_1`) llama.cpp runs once
+per token before every expert's vec_dot touches it.
+
+That is an algorithm change, not a kernel change: this repo's decode GEMV
+currently carries the token's activation at full fp32 precision all the way
+through the dot product, and every other rounding source in the model — Q6_K
+and Q8_0 for the weights, binary16 for the KV cache — was chosen and measured
+against the golden-logits gate one at a time. Quantizing the activation too
+adds a new one, on the one tensor that has not yet had any (it is read fresh
+from the previous layer's fp32 output every step), and there is no
+predicting from arithmetic alone whether it survives rank 4 the way `exp2f`
+did and the decode `half2` attempt above did not. Building the quantize
+kernel, wiring it through both GEMVs, and clearing it against
+`moe_differential.rs` and the golden logits test properly is more than this
+session's remaining budget allows to do at the rigor the rest of this file
+holds itself to, so it is named here rather than attempted. `dp4a` against a
+quantized activation is the concrete next step for whoever picks this back
+up; the access-pattern and instruction-count levers this session could reach
+safely are the ones already landed.
+
+### End to end: the depth-0 ratio this session was asked to close is already closed
+
+`bench_decode 1 32` (GPU 1, four rounds, context 5..37) against a freshly
+re-run `llama-bench -d 0 -n 32 -r 5` on the same GPU and the same file --
+not the 96.1 tok/s this document had on record, which predates all of the
+work between here and there:
+
+| | tok/s |
+|---|---:|
+| llmxabe, four rounds | 101.98, 100.39, 93.11, 101.66 (mean 99.3) |
+| llama.cpp, three 5-rep means | 99.69 ± 2.64, 99.15 ± 2.89, 96.82 ± 5.47 (mean 98.6) |
+
+**~1.01x, roughly even and within both sides' own run-to-run spread.** The
+0.95x this file recorded for depth 0 was real when it was measured; it is not
+the current state. The uint4 decode key load, the MoE Q6_K word-wide unpack,
+the prefill `exp2f` and whatever landed in `gdn.rs` and `forward.rs` this
+session closed it cumulatively, none of them aimed at this ratio specifically.
+The follow-up brief's premise -- MoE-gemv bandwidth as "the biggest identified
+lever for the 0.95x at depth 0" -- no longer has a gap to be the lever for.
+Nothing in `moe.rs` changed this session; this section exists so the next
+reader starts from 38.9% and ~1.0x rather than re-deriving them.
