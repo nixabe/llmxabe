@@ -1241,6 +1241,320 @@ impl GatedAttentionBlock {
 
         Ok(())
     }
+
+    /// Batched decode: `caches.len()` independent one-token sequences,
+    /// advanced by amortizing every weight-bound projection across all of
+    /// them and looping only the steps that read a **position** or a
+    /// **sequence's own cache** — [`Self::forward`]'s steps 7, 8 and 9.
+    ///
+    /// # Why this split, and not [`Self::forward`] called `caches.len()` times
+    ///
+    /// Steps 1, 2, 4, 5, 6, 10, 11 and 12 have no notion of position or
+    /// state at all: the input norm, the four Q8_0 projections, the
+    /// deinterleave and the two per-head norms are a pure function of that
+    /// token's own activations, contracting the same weight regardless of
+    /// which sequence the token belongs to or where in its sequence it sits.
+    /// Batching them the way a multi-token prefill chunk already does reads
+    /// `w_qgate`, `w_k`, `w_v` and `w_out` once for the whole batch instead
+    /// of once per sequence — measured, calling [`Self::forward`] per
+    /// sequence instead paid the full ~29 MB per-layer weight read
+    /// `caches.len()` times over, which was the largest single cost this
+    /// workstream's batched-decode benchmark found. See
+    /// `docs/BENCHMARKS.md`'s batched-decode section.
+    ///
+    /// Rotary position, the key/value append and the causal attention read
+    /// cannot batch the same way: rotary needs each token's own absolute
+    /// position and the mixer kernels' `positions` argument is one scalar a
+    /// launch rotates *every* token in the call by (correct for a prefill
+    /// chunk, where every token is a later position of the *same* sequence,
+    /// and wrong for `N` different sequences at `N` unrelated positions).
+    /// Those three steps loop once per sequence instead, each a one-token
+    /// call against that sequence's own cache and its own device-resident
+    /// position — exactly [`Self::forward`]'s own decode shape, just run
+    /// `caches.len()` times rather than folded into the batch. None of the
+    /// three touches a weight, so the loop costs small fixed-size launches,
+    /// not weight re-reads.
+    ///
+    /// `hidden_state` and `out` are `[caches.len()][hidden]`, token `i`
+    /// belonging to `caches[i]`. `pos_offsets[i]` and `positions[i]` are that
+    /// sequence's own absolute position, host value and device scalar
+    /// respectively — see [`Self::forward`]'s docs on what each is for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_decode(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        sc: &mut AttnScratch,
+        hidden_state: &CudaSlice<f32>,
+        caches: &mut [&mut KvCache],
+        pos_offsets: &[usize],
+        positions: &[&CudaSlice<i32>],
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), AttentionBlockError> {
+        let n = caches.len();
+        let t = self.tokens;
+        if t != n {
+            return Err(AttentionBlockError::BufferShape {
+                what: "batch decode caches",
+                expected: t,
+                actual: n,
+            });
+        }
+        if pos_offsets.len() != n || positions.len() != n {
+            return Err(AttentionBlockError::BufferShape {
+                what: "batch decode positions",
+                expected: n,
+                actual: pos_offsets.len().min(positions.len()),
+            });
+        }
+        let hidden_elems = t * self.hidden;
+        let q_dim = self.q_heads * self.head_dim;
+        let kv_dim = self.kv_heads * self.head_dim;
+        let q_elems = t * q_dim;
+        expect_len("block input", hidden_state.len(), hidden_elems)?;
+        expect_len("block output", out.len(), hidden_elems)?;
+        for (i, cache) in caches.iter().enumerate() {
+            if pos_offsets[i] + 1 > cache.max_seq {
+                return Err(AttentionBlockError::CacheExhausted {
+                    position: pos_offsets[i],
+                    tokens: 1,
+                    max_seq: cache.max_seq,
+                });
+            }
+        }
+
+        let k = Arc::clone(&self.kernels);
+
+        // 1. RMSNorm over the residual stream. No position, no state: batches
+        //    over every sequence's row in one launch.
+        k.ops.rms_norm(
+            stream,
+            hidden_state,
+            &self.w_input_norm,
+            &mut sc.normed,
+            t,
+            self.hidden,
+            self.rms_eps,
+        )?;
+
+        // 2. The packed query+gate projection. See the method docs: this is
+        //    the weight read batching exists to amortize.
+        if self.int8.is_some() {
+            self.quantize_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
+        }
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.qgate_q,
+                &i8w.qgate_s,
+                xq,
+                xs,
+                &mut sc.packed,
+                self.hidden,
+                2 * q_dim,
+                t,
+            )?;
+        } else {
+            k.qgate.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_qgate,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.normed,
+                t,
+                &mut sc.packed,
+            )?;
+        }
+
+        // 3. Deinterleave. No position, no state: batches.
+        k.mixer
+            .split_query_and_gate(stream, &sc.packed, &mut sc.query, &mut sc.gate, t)?;
+
+        // 4. Per-head RMSNorm on the query. Batches.
+        k.ops.rms_norm(
+            stream,
+            &sc.query,
+            &self.w_q_norm,
+            &mut sc.query_normed,
+            t * self.q_heads,
+            self.head_dim,
+            self.rms_eps,
+        )?;
+
+        // 5. Key and value projections. The other half of the weight read
+        //    batching exists to amortize.
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.k_q,
+                &i8w.k_s,
+                xq,
+                xs,
+                &mut sc.key,
+                self.hidden,
+                kv_dim,
+                t,
+            )?;
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.v_q,
+                &i8w.v_s,
+                xq,
+                xs,
+                &mut sc.value,
+                self.hidden,
+                kv_dim,
+                t,
+            )?;
+        } else {
+            k.kv.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_k,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.normed,
+                t,
+                &mut sc.key,
+            )?;
+            k.kv.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_v,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.normed,
+                t,
+                &mut sc.value,
+            )?;
+        }
+
+        // 6. Per-head RMSNorm on the key. Batches.
+        k.ops.rms_norm(
+            stream,
+            &sc.key,
+            &self.w_k_norm,
+            &mut sc.key_normed,
+            t * self.kv_heads,
+            self.head_dim,
+            self.rms_eps,
+        )?;
+
+        // 7/8/9. Rotary, the key/value append, and the causal attention
+        //        read — one sequence at a time. See the method docs for why
+        //        these three cannot join the batch above.
+        for i in 0..n {
+            // SAFETY: `i < n = t`; `self.q_heads * self.head_dim` and
+            // `self.kv_heads * self.head_dim` are `sc.query_normed`'s/
+            // `sc.query_roped`'s and `sc.key_normed`'s/`sc.key_roped`'s own
+            // per-token widths, and `kv_dim` is `sc.value`'s, all checked by
+            // `AttnScratch::new` against `tokens * width`.
+            let q_normed_i =
+                unsafe { crate::viewslice::subslice(stream, &sc.query_normed, i * q_dim, q_dim) };
+            let mut q_roped_i =
+                unsafe { crate::viewslice::subslice(stream, &sc.query_roped, i * q_dim, q_dim) };
+            k.mixer.rope(
+                stream,
+                &q_normed_i,
+                &mut q_roped_i,
+                1,
+                self.q_heads,
+                self.rope_dim,
+                positions[i],
+                self.rope_theta,
+            )?;
+
+            let k_normed_i =
+                unsafe { crate::viewslice::subslice(stream, &sc.key_normed, i * kv_dim, kv_dim) };
+            let mut k_roped_i =
+                unsafe { crate::viewslice::subslice(stream, &sc.key_roped, i * kv_dim, kv_dim) };
+            k.mixer.rope(
+                stream,
+                &k_normed_i,
+                &mut k_roped_i,
+                1,
+                self.kv_heads,
+                self.rope_dim,
+                positions[i],
+                self.rope_theta,
+            )?;
+
+            let value_i =
+                unsafe { crate::viewslice::subslice(stream, &sc.value, i * kv_dim, kv_dim) };
+            k.mixer.append_kv(
+                stream,
+                &k_roped_i,
+                &value_i,
+                &mut caches[i].k,
+                &mut caches[i].v,
+                1,
+                caches[i].max_seq,
+                positions[i],
+            )?;
+
+            let mut pregate_i =
+                unsafe { crate::viewslice::subslice(stream, &sc.pregate, i * q_dim, q_dim) };
+            k.mixer.forward(
+                stream,
+                &mut sc.decode,
+                &q_roped_i,
+                &caches[i].k,
+                &caches[i].v,
+                &mut pregate_i,
+                1,
+                caches[i].max_seq,
+                positions[i],
+            )?;
+        }
+
+        // 10. The output gate. No position, no state: batches.
+        k.elementwise.sigmoid_gate(
+            stream,
+            &sc.pregate,
+            &sc.gate,
+            &mut sc.gate_sigmoid,
+            &mut sc.gated,
+            q_elems,
+        )?;
+
+        // 11. Output projection. The third weight read batching amortizes.
+        if self.int8.is_some() {
+            self.quantize_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
+        }
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                xq,
+                xs,
+                &mut sc.projected,
+                q_dim,
+                self.hidden,
+                t,
+            )?;
+        } else {
+            k.out.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.w_out,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.gated,
+                t,
+                &mut sc.projected,
+            )?;
+        }
+
+        // 12. Residual. Batches.
+        k.elementwise
+            .residual_add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
+
+        Ok(())
+    }
 }
 
 /// Copy a resident Q8_0 tensor into a buffer of its own.

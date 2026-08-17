@@ -97,7 +97,7 @@ use xabe_model::config::{LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role};
 
 use crate::block::attention::{
-    AttentionBlockError, AttentionKernelSet, AttnScratch, GatedAttentionBlock,
+    AttentionBlockError, AttentionKernelSet, AttnScratch, GatedAttentionBlock, KvCache,
 };
 use crate::block::gdn::{
     GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
@@ -633,6 +633,14 @@ pub struct Forward {
     batch_argmax_indices: Option<CudaSlice<i32>>,
     /// One sampled id per sequence.
     batch_argmax_out: Option<CudaSlice<i32>>,
+    /// Every sequence's own position, published in one copy instead of
+    /// `tokens` separate ones. Gated Attention's per-sequence loop reads a
+    /// one-element view of this rather than the [`SequenceState`]'s own
+    /// `d_position` — see [`Self::publish_batch_inputs`].
+    batch_positions: Option<CudaSlice<i32>>,
+    /// Host staging for the copy above, pre-sized once so publishing a step
+    /// never allocates (`AGENTS.md` rule 6).
+    batch_positions_host: Vec<i32>,
 
     report: ForwardReport,
 }
@@ -646,6 +654,19 @@ pub struct Forward {
 /// buffers — which is why neither of those is a parameter of the replay and
 /// why this type carries no way to reach one.
 pub struct StepGraph {
+    graph: CudaGraph,
+}
+
+/// One batched decode step, recorded once and launched as a unit.
+///
+/// Built by [`Forward::capture_batch_step`] and launched by
+/// [`Forward::replay_batch_step`]. It holds device pointers into the
+/// batch-width `Forward` it was captured from and every [`SequenceState`] in
+/// the batch — replaying it against a different pass, a different batch
+/// width, or the states in a different order would read and write the wrong
+/// buffers, the same way [`StepGraph`] cannot be replayed against a
+/// different pass or state.
+pub struct BatchStepGraph {
     graph: CudaGraph,
 }
 
@@ -926,6 +947,8 @@ impl Forward {
             batch_argmax_values: None,
             batch_argmax_indices: None,
             batch_argmax_out: None,
+            batch_positions: None,
+            batch_positions_host: Vec::new(),
             report: ForwardReport {
                 arena_bytes: weights.arena().capacity() as u64,
                 moe_bytes,
@@ -1209,6 +1232,8 @@ impl Forward {
         self.batch_argmax_values = Some(stream.alloc_zeros::<f32>(tokens * ARGMAX_BLOCKS)?);
         self.batch_argmax_indices = Some(stream.alloc_zeros::<i32>(tokens * ARGMAX_BLOCKS)?);
         self.batch_argmax_out = Some(stream.alloc_zeros::<i32>(tokens)?);
+        self.batch_positions = Some(stream.alloc_zeros::<i32>(tokens)?);
+        self.batch_positions_host = vec![0i32; tokens];
         Ok(())
     }
 
@@ -1230,34 +1255,131 @@ impl Forward {
     /// `docs/OPTIMIZATION.md` R2's whole claimed win: a weight is read once
     /// for `states.len()` sequences' next token instead of once per sequence.
     ///
-    /// Gated Attention is the one mixer this pass does not batch: each
-    /// sequence's causal window lives in its own key/value cache, and this
-    /// workstream stops short of a device-side index over per-sequence cache
-    /// base pointers (see `docs/BENCHMARKS.md`'s batched-decode section for
-    /// the reasoning and what a follow-up would need). `attn_step` supplies
-    /// the ten Gated Attention blocks instead, and this calls
-    /// `attn_step.attention[slot].forward` once per sequence against that
-    /// sequence's own cache — unmodified, so it is exactly the kernel path
-    /// `Self::capture_step`'s single-stream decode already exercises.
-    /// `attn_step` must be a pass built for exactly one token, the same shape
-    /// `capture_step` replays, and it is a separate `Forward` from `self`
-    /// because its attention blocks are duplicated copies of their weights
-    /// (see the module docs) sized for one token, not `states.len()`.
+    /// Gated Attention batches the same way, through
+    /// [`GatedAttentionBlock::forward_batch_decode`]: its four Q8_0
+    /// projections, its norms and its output gate run once over the whole
+    /// batch, and only rotary, the key/value append and the causal read loop
+    /// per sequence — those three read a position or a sequence's own cache,
+    /// which nothing here amortizes across sequences (see that method's
+    /// docs). `self.attention` and `self.attn_scratch` are this pass's own,
+    /// built for `tokens = states.len()` at construction like every other
+    /// per-layer field here, so there is no second `Forward` to keep in step
+    /// with this one.
     ///
-    /// Every per-sequence loop here — the attention blocks and the two
-    /// per-sequence Gated DeltaNet steps inside `GdnBlock` — issues
-    /// `states.len()` small launches rather than one, on the host. That cost
-    /// is real and is not hidden by this function; a CUDA graph capture over
-    /// this same sequence of calls would amortize it away the same way
-    /// [`Self::capture_step`] does for a single sequence, and is future work
-    /// rather than something this method does implicitly.
+    /// The per-sequence loops that remain — inside `GatedAttentionBlock` and
+    /// inside `GdnBlock` — issue `states.len()` small launches rather than
+    /// one, on the host. That cost is real and is not hidden by this
+    /// function; [`Self::capture_batch_step`] amortizes it the same way
+    /// [`Self::capture_step`] does for a single sequence.
     pub fn run_batch_decode(
         &mut self,
         stream: &Arc<CudaStream>,
-        attn_step: &mut Forward,
         states: &mut [SequenceState],
         token_ids: &[i32],
     ) -> Result<Vec<i32>, ForwardError> {
+        self.check_batch_shape(states, token_ids)?;
+        self.publish_batch_inputs(stream, states, token_ids)?;
+        self.body_batch_decode(stream, states)?;
+        let host = self.read_batch_sampled(stream)?;
+        for state in states.iter_mut() {
+            state.advance(1);
+        }
+        Ok(host)
+    }
+
+    /// Record one batched decode step — embedding, forty blocks (Gated
+    /// DeltaNet batched, Gated Attention looped per sequence), the LM head
+    /// and every sequence's argmax — as a CUDA graph, for
+    /// [`Self::replay_batch_step`] to launch at every later step.
+    ///
+    /// This is [`Self::capture_step`]'s reasoning, one level up: batched
+    /// decode issues `states.len()` small launches per layer for the two
+    /// steps `GdnBlock::forward_batch_decode` cannot batch and for the three
+    /// steps `GatedAttentionBlock::forward_batch_decode` cannot, on top of
+    /// the calls that are already batched. `bench_decode_batch` shows what
+    /// that costs uncaptured. A graph is the same sequence of launches
+    /// submitted as one object, the same trade `capture_step` already makes
+    /// for a single sequence's ~1,100 operations, at `states.len()` times the
+    /// operation count.
+    ///
+    /// The same constraints apply, for the same reasons: nothing in
+    /// [`Self::body_batch_decode`] may take a value that changes between
+    /// steps as a host argument, which is why every sequence's position lives
+    /// in that [`SequenceState`]'s own device scalar and is read from there,
+    /// not passed in. `self` and `states` must be the exact objects passed to
+    /// every later [`Self::replay_batch_step`] — the graph holds their device
+    /// pointers, not a description of the computation.
+    pub fn capture_batch_step(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+    ) -> Result<BatchStepGraph, ForwardError> {
+        if self.profile.is_some() {
+            return Err(ForwardError::CaptureWhileProfiling);
+        }
+        let n = self.tokens;
+        self.check_batch_shape(states, &vec![0i32; n])?;
+        // As `capture_step`: the capture must already know about the token
+        // ids and every sequence's position before it starts, or the copies
+        // that publish them would be recorded into the graph, and a copy
+        // from pageable host memory cannot be.
+        self.publish_batch_inputs(stream, states, &vec![0i32; n])?;
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+        let recorded = self.body_batch_decode(stream, states);
+        let graph = stream.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
+        );
+        recorded?;
+        let graph = graph?.ok_or(ForwardError::EmptyCapture)?;
+        graph.upload()?;
+        Ok(BatchStepGraph { graph })
+    }
+
+    /// Launch a captured batched step and return one sampled id per sequence,
+    /// in `states` order.
+    ///
+    /// `states` must be the exact states [`Self::capture_batch_step`] was
+    /// called with, in the same order; see [`BatchStepGraph`].
+    pub fn replay_batch_step(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        graph: &BatchStepGraph,
+        token_ids: &[i32],
+    ) -> Result<Vec<i32>, ForwardError> {
+        let n = self.tokens;
+        if token_ids.len() != n {
+            return Err(ForwardError::BatchWidth {
+                expected: n,
+                got: token_ids.len(),
+                what: "token_ids",
+            });
+        }
+        for state in states.iter() {
+            if state.position() + 1 > state.max_seq() {
+                return Err(ForwardError::CacheExhausted {
+                    position: state.position(),
+                    tokens: 1,
+                    max_seq: state.max_seq(),
+                });
+            }
+        }
+        self.publish_batch_inputs(stream, states, token_ids)?;
+        graph.graph.launch()?;
+        let host = self.read_batch_sampled(stream)?;
+        for state in states.iter_mut() {
+            state.advance(1);
+        }
+        Ok(host)
+    }
+
+    /// The shape checks [`Self::run_batch_decode`] and
+    /// [`Self::capture_batch_step`] both make, once.
+    fn check_batch_shape(
+        &self,
+        states: &[SequenceState],
+        token_ids: &[i32],
+    ) -> Result<(), ForwardError> {
         let n = self.tokens;
         if states.len() != n {
             return Err(ForwardError::BatchWidth {
@@ -1273,15 +1395,8 @@ impl Forward {
                 what: "token_ids",
             });
         }
-        if attn_step.tokens != 1 {
-            return Err(ForwardError::BatchWidth {
-                expected: 1,
-                got: attn_step.tokens,
-                what: "attn_step.tokens",
-            });
-        }
-        let (gdn_layers, attn_layers) = (self.gdn_weights.len(), attn_step.attention.len());
-        for state in states.iter() {
+        let (gdn_layers, attn_layers) = (self.gdn_weights.len(), self.attention.len());
+        for state in states {
             if state.gdn_layers() != gdn_layers || state.attention_layers() != attn_layers {
                 return Err(ForwardError::StateShape {
                     expected_gdn: gdn_layers,
@@ -1301,19 +1416,59 @@ impl Forward {
         if self.batch_lm_head.is_none() {
             return Err(ForwardError::BatchDecodeNotEnabled);
         }
+        Ok(())
+    }
 
-        // Publish inputs: the batch's token ids in one copy, and every
-        // sequence's own position -- there is no single `self.d_position`
-        // for a batch, so each state publishes its own, exactly as a
-        // single-sequence pass would for itself.
+    /// The batched decode step's host-touching half: the token ids and every
+    /// sequence's own position. Split out for the same reason
+    /// [`Self::publish_inputs`] is — a copy from pageable host memory cannot
+    /// be recorded into a CUDA graph, so this runs before capture and again
+    /// before every replay.
+    ///
+    /// Every sequence's position is copied in **one** call rather than
+    /// `states.len()` — [`SequenceState::publish_position`] writes each
+    /// state's own single-element device scalar, and looping that per state
+    /// was `states.len()` separate host-to-device copies where one array
+    /// does the same job, which measurably mattered at small batch widths
+    /// where `states.len()` extra host round trips were a bigger fraction of
+    /// a decode step than the compute they were standing in front of. See
+    /// `docs/BENCHMARKS.md`'s batched-decode section. This writes
+    /// [`Self::batch_positions`], not any state's own `d_position` — the
+    /// batch-decode path never reads the latter.
+    fn publish_batch_inputs(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &[SequenceState],
+        token_ids: &[i32],
+    ) -> Result<(), ForwardError> {
+        let n = self.tokens;
         stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
         self.moe.publish_tokens(stream, n)?;
-        for state in states.iter_mut() {
-            state
-                .publish_position(stream)
-                .map_err(ForwardError::State)?;
+        for (dst, state) in self.batch_positions_host.iter_mut().zip(states) {
+            *dst = state.position() as i32;
         }
+        let positions = self
+            .batch_positions
+            .as_mut()
+            .expect("checked by the caller");
+        stream.memcpy_htod(&self.batch_positions_host, positions)?;
+        Ok(())
+    }
 
+    /// Embedding through every sequence's argmax: launches only.
+    ///
+    /// Nothing in here reads host memory, allocates, or synchronizes, which
+    /// is what makes it capturable in [`Self::capture_batch_step`]. The
+    /// per-sequence argmax launches are included, the same way
+    /// [`Self::capture_step`] folds [`Self::launch_argmax`] into its captured
+    /// region — only the four-byte-per-sequence read-back in
+    /// [`Self::read_batch_sampled`] needs the host and stays outside.
+    fn body_batch_decode(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+    ) -> Result<(), ForwardError> {
+        let n = self.tokens;
         self.embed(stream)?;
 
         let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
@@ -1335,41 +1490,50 @@ impl Forward {
                     gdn_slot += 1;
                 }
                 LayerKind::GatedAttention => {
+                    // Every sequence's own cache, collected once so
+                    // `forward_batch_decode` can batch the weight-bound
+                    // steps and loop only the three that read a position or
+                    // a cache. `self.attention` and `self.attn_scratch` are
+                    // this pass's own -- built for `tokens = n` at
+                    // construction, same as every other per-layer field
+                    // here -- so there is no second `Forward` to keep in
+                    // step with this one any more.
+                    //
+                    // Positions come from `self.batch_positions`, published
+                    // once for all `n` sequences by `publish_batch_inputs`,
+                    // not from any state's own `d_position` -- the
+                    // batch-decode path never touches that field.
+                    let batch_positions = self
+                        .batch_positions
+                        .as_ref()
+                        .expect("published by publish_batch_inputs");
+                    let mut caches: Vec<&mut KvCache> = Vec::with_capacity(n);
+                    let mut pos_offsets: Vec<usize> = Vec::with_capacity(n);
+                    let mut position_views = Vec::with_capacity(n);
                     for (i, state) in states.iter_mut().enumerate() {
-                        let pos_offset = state.position();
-                        let (cache, positions) = state.kv_and_position_mut(attn_slot);
-                        // SAFETY: `i < n` and `self.hidden` is both buffers'
-                        // per-token width; `hidden_state` and `mixer_out` are
-                        // both `n * self.hidden` long, checked at
-                        // construction.
-                        let hidden_i = unsafe {
-                            crate::viewslice::subslice(
-                                stream,
-                                &self.hidden_state,
-                                i * self.hidden,
-                                self.hidden,
-                            )
-                        };
-                        let mut out_i = unsafe {
-                            crate::viewslice::subslice(
-                                stream,
-                                &self.mixer_out,
-                                i * self.hidden,
-                                self.hidden,
-                            )
-                        };
-                        attn_step.attention[attn_slot]
-                            .forward(
-                                stream,
-                                &mut attn_step.attn_scratch,
-                                &hidden_i,
-                                cache,
-                                pos_offset,
-                                positions,
-                                &mut out_i,
-                            )
-                            .map_err(ForwardError::Attention)?;
+                        pos_offsets.push(state.position());
+                        let (cache, _) = state.kv_and_position_mut(attn_slot);
+                        caches.push(cache);
+                        // SAFETY: `i < n` and `batch_positions` holds
+                        // exactly `n` elements, allocated by
+                        // `enable_batch_decode`.
+                        position_views.push(unsafe {
+                            crate::viewslice::subslice(stream, batch_positions, i, 1)
+                        });
                     }
+                    let positions: Vec<&CudaSlice<i32>> =
+                        position_views.iter().map(|v| &**v).collect();
+                    self.attention[attn_slot]
+                        .forward_batch_decode(
+                            stream,
+                            &mut self.attn_scratch,
+                            &self.hidden_state,
+                            &mut caches,
+                            &pos_offsets,
+                            &positions,
+                            &mut self.mixer_out,
+                        )
+                        .map_err(ForwardError::Attention)?;
                     attn_slot += 1;
                 }
             }
@@ -1398,8 +1562,8 @@ impl Forward {
 
         let vocab = self.vocab;
         {
-            let lm_head = self.batch_lm_head.as_ref().expect("checked above");
-            let logits = self.batch_logits.as_mut().expect("checked above");
+            let lm_head = self.batch_lm_head.as_ref().expect("checked by the caller");
+            let logits = self.batch_logits.as_mut().expect("checked by the caller");
             lm_head
                 .forward(
                     stream,
@@ -1425,7 +1589,7 @@ impl Forward {
             let row = unsafe {
                 crate::viewslice::subslice(
                     stream,
-                    self.batch_logits.as_ref().expect("checked above"),
+                    self.batch_logits.as_ref().expect("checked by the caller"),
                     i * vocab,
                     vocab,
                 )
@@ -1433,7 +1597,9 @@ impl Forward {
             let mut values = unsafe {
                 crate::viewslice::subslice(
                     stream,
-                    self.batch_argmax_values.as_ref().expect("checked above"),
+                    self.batch_argmax_values
+                        .as_ref()
+                        .expect("checked by the caller"),
                     i * ARGMAX_BLOCKS,
                     ARGMAX_BLOCKS,
                 )
@@ -1441,7 +1607,9 @@ impl Forward {
             let mut indices = unsafe {
                 crate::viewslice::subslice(
                     stream,
-                    self.batch_argmax_indices.as_ref().expect("checked above"),
+                    self.batch_argmax_indices
+                        .as_ref()
+                        .expect("checked by the caller"),
                     i * ARGMAX_BLOCKS,
                     ARGMAX_BLOCKS,
                 )
@@ -1449,7 +1617,9 @@ impl Forward {
             let mut out_one = unsafe {
                 crate::viewslice::subslice(
                     stream,
-                    self.batch_argmax_out.as_ref().expect("checked above"),
+                    self.batch_argmax_out
+                        .as_ref()
+                        .expect("checked by the caller"),
                     i,
                     1,
                 )
@@ -1457,14 +1627,21 @@ impl Forward {
             self.lm_head
                 .argmax(stream, &row, vocab, &mut values, &mut indices, &mut out_one)?;
         }
+        Ok(())
+    }
 
-        let host = stream.clone_dtoh(self.batch_argmax_out.as_ref().expect("checked above"))?;
+    /// Read back the last [`Self::body_batch_decode`]'s sampled ids.
+    ///
+    /// Synchronizes, for the reason [`Self::read_sampled`] does: a step is
+    /// not finished until the host knows what to feed back in for every
+    /// sequence.
+    fn read_batch_sampled(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>, ForwardError> {
+        let host = stream.clone_dtoh(
+            self.batch_argmax_out
+                .as_ref()
+                .expect("checked by the caller"),
+        )?;
         stream.synchronize()?;
-
-        for state in states.iter_mut() {
-            state.advance(1);
-        }
-
         Ok(host)
     }
 

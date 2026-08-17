@@ -217,9 +217,6 @@ fn batched_decode_agrees_with_independent_single_stream_decodes() {
     let mut single_step = prefill
         .reshape(&ctx, &stream, &file, &directory, &weights, 1)
         .expect("the single-stream decode step builds");
-    let mut attn_step = prefill
-        .reshape(&ctx, &stream, &file, &directory, &weights, 1)
-        .expect("the batch's attention step builds");
     let mut batch = prefill
         .reshape(&ctx, &stream, &file, &directory, &weights, BATCH)
         .expect("the batch-width pass builds");
@@ -276,7 +273,7 @@ fn batched_decode_agrees_with_independent_single_stream_decodes() {
     let vocab = batch.vocab();
     for step in 0..DECODE_STEPS {
         let sampled = batch
-            .run_batch_decode(&stream, &mut attn_step, &mut batch_states, &batch_next)
+            .run_batch_decode(&stream, &mut batch_states, &batch_next)
             .expect("batched decode runs");
         assert_eq!(sampled.len(), BATCH);
 
@@ -374,9 +371,6 @@ fn identical_prompts_in_one_batch_produce_bit_identical_rows() {
         PROMPT_LEN,
     )
     .expect("the prefill pass builds");
-    let mut attn_step = prefill
-        .reshape(&ctx, &stream, &file, &directory, &weights, 1)
-        .expect("the batch's attention step builds");
     let mut batch = prefill
         .reshape(&ctx, &stream, &file, &directory, &weights, batch_width)
         .expect("the batch-width pass builds");
@@ -404,7 +398,7 @@ fn identical_prompts_in_one_batch_produce_bit_identical_rows() {
     let vocab = batch.vocab();
     for step in 0..DECODE_STEPS {
         let sampled = batch
-            .run_batch_decode(&stream, &mut attn_step, &mut states, &next)
+            .run_batch_decode(&stream, &mut states, &next)
             .expect("batched decode runs");
         assert_eq!(
             sampled[0], sampled[1],
@@ -427,4 +421,121 @@ fn identical_prompts_in_one_batch_produce_bit_identical_rows() {
 
         next = sampled;
     }
+}
+
+/// A captured batched step must generate exactly the sequence the ordinary
+/// launch path generates -- `graph_decode.rs`'s gate, one level up.
+///
+/// `Forward::capture_batch_step` records the whole batched step -- the
+/// embedding gather, every layer's batched Gated DeltaNet projections and
+/// per-sequence loops, the per-sequence Gated Attention blocks, the LM head
+/// and every sequence's argmax -- as one CUDA graph. That is only correct if
+/// nothing recorded changes between replays; a single host-side value frozen
+/// anywhere on the path (one sequence's position, in particular -- there is
+/// no single `self.d_position` for a batch, each state publishes its own)
+/// would make every later replay reuse the position it was captured at for
+/// that one sequence, while its neighbours advanced normally. That is
+/// invisible in the output's *shape* and is exactly what comparing whole
+/// generated sequences, not single steps, is for.
+#[test]
+fn a_captured_batch_step_generates_the_same_sequence_as_the_launch_path() {
+    let _resident = RESIDENT_MODEL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((ctx, file)) = setup() else {
+        return;
+    };
+
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    // Capture is rejected on the legacy default stream, so this test needs a
+    // created one -- see `graph_decode.rs`'s identical reasoning.
+    let stream = ctx.new_stream().expect("create stream");
+    unsafe { ctx.disable_event_tracking() };
+
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema resolves");
+    let (weights, _load) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
+        .expect("weight load");
+
+    let max_seq = PROMPT_LEN + DECODE_STEPS + 1;
+    let prompts: Vec<Vec<i32>> = (0..BATCH)
+        .map(|seq| prompt(seq, config.vocab_size as usize))
+        .collect();
+
+    let mut prefill = Forward::new(
+        &ctx,
+        &stream,
+        &file,
+        &directory,
+        &weights,
+        config.clone(),
+        PROMPT_LEN,
+    )
+    .expect("the prefill pass builds");
+    let mut batch = prefill
+        .reshape(&ctx, &stream, &file, &directory, &weights, BATCH)
+        .expect("the batch-width pass builds");
+    batch
+        .enable_batch_decode(&ctx, &stream)
+        .expect("batch decode scratch allocates");
+
+    let prefill_states = |prefill: &mut Forward, stream: &Arc<CudaStream>| {
+        let mut states: Vec<SequenceState> = Vec::with_capacity(BATCH);
+        let mut next: Vec<i32> = Vec::with_capacity(BATCH);
+        for p in &prompts {
+            let mut state = prefill.new_state(stream, max_seq).expect("state allocates");
+            prefill
+                .run(stream, &mut state, p, |_, _| {})
+                .expect("prefill runs");
+            next.push(prefill.sample_argmax(stream).expect("prefill argmax"));
+            states.push(state);
+        }
+        (states, next)
+    };
+
+    // ---- reference: the ordinary launch path, one call per step ----------
+    let (mut ref_states, mut ref_next) = prefill_states(&mut prefill, &stream);
+    let mut want_ids: Vec<Vec<i32>> = Vec::with_capacity(DECODE_STEPS);
+    for _ in 0..DECODE_STEPS {
+        ref_next = batch
+            .run_batch_decode(&stream, &mut ref_states, &ref_next)
+            .expect("launched batch decode runs");
+        want_ids.push(ref_next.clone());
+    }
+    let end_positions: Vec<usize> = ref_states.iter().map(SequenceState::position).collect();
+
+    // ---- candidate: the same steps, replayed from one capture -------------
+    //
+    // Fresh states and a fresh prefill, so the replayed run begins where the
+    // reference run began rather than continuing it.
+    let (mut cap_states, mut cap_next) = prefill_states(&mut prefill, &stream);
+
+    let graph = batch
+        .capture_batch_step(&stream, &mut cap_states)
+        .expect("a batched decode step captures");
+    for state in &cap_states {
+        assert_eq!(
+            state.position(),
+            PROMPT_LEN,
+            "capture executes nothing, so it must not advance any state",
+        );
+    }
+
+    let mut got_ids: Vec<Vec<i32>> = Vec::with_capacity(DECODE_STEPS);
+    for _ in 0..DECODE_STEPS {
+        cap_next = batch
+            .replay_batch_step(&stream, &mut cap_states, &graph, &cap_next)
+            .expect("replay runs");
+        got_ids.push(cap_next.clone());
+    }
+
+    let got_positions: Vec<usize> = cap_states.iter().map(SequenceState::position).collect();
+    println!("launched ids per step: {want_ids:?}");
+    println!("replayed ids per step: {got_ids:?}");
+    assert_eq!(
+        got_positions, end_positions,
+        "the replayed run must leave every state where the launched run did",
+    );
+    assert_eq!(
+        got_ids, want_ids,
+        "the captured batched step generated a different sequence than the launch path",
+    );
 }

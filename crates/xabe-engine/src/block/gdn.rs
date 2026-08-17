@@ -1635,6 +1635,25 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
+        } else if tokens < PROJ_TILES[0] as usize {
+            self.project_per_sequence(
+                stream,
+                Projection::Q8_0(&w.qkv),
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project_per_sequence(
+                stream,
+                Projection::Q8_0(&w.gate),
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
         } else {
             self.project(
                 stream,
@@ -1783,6 +1802,17 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
             self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        } else if tokens < PROJ_TILES[0] as usize {
+            self.project_per_sequence(
+                stream,
+                Projection::Q8_0(&w.out),
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
+            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else {
             self.project(
                 stream,
@@ -1794,6 +1824,43 @@ impl GdnBlock {
                 tokens,
             )?;
             self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::project`], looped once per sequence over a one-token slice.
+    ///
+    /// Below the tiled projection's narrowest live tile
+    /// ([`PROJ_TILES`]`[0]`), the guarded path pays close to a full live
+    /// tile's weight-read cost while only a fraction of its lanes produce a
+    /// real answer — measured at a batch width of 2, `gdn_proj_q8_0_t8`
+    /// averaged 142.5 us per call against the untiled kernel's low
+    /// microseconds, because the occupancy the wide accumulator array costs
+    /// is not recovered by amortizing a weight read that few sequences do
+    /// not exist to share. `tokens` separate untiled reads cost `tokens`
+    /// times the weight, but each runs at the untiled kernel's own full
+    /// efficiency, which below the tile width is cheaper in absolute terms.
+    /// See `docs/BENCHMARKS.md`'s batched-decode section for the
+    /// measurement this dispatch is set from.
+    #[allow(clippy::too_many_arguments)]
+    fn project_per_sequence(
+        &self,
+        stream: &Arc<CudaStream>,
+        weight: Projection<'_>,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        for i in 0..tokens {
+            // SAFETY: `i < tokens`, and `k_dim`/`n_rows` are `x`'s and
+            // `out`'s own per-token widths, checked by `project` itself
+            // against `tokens * k_dim` and `tokens * n_rows` immediately
+            // below via the one-token call's own `tokens = 1` check.
+            let xi = unsafe { crate::viewslice::subslice(stream, x, i * k_dim, k_dim) };
+            let mut oi = unsafe { crate::viewslice::subslice(stream, out, i * n_rows, n_rows) };
+            self.project(stream, weight, &xi, &mut oi, k_dim, n_rows, 1)?;
         }
         Ok(())
     }
