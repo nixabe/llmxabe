@@ -3696,3 +3696,200 @@ The follow-up brief's premise -- MoE-gemv bandwidth as "the biggest identified
 lever for the 0.95x at depth 0" -- no longer has a gap to be the lever for.
 Nothing in `moe.rs` changed this session; this section exists so the next
 reader starts from 38.9% and ~1.0x rather than re-deriving them.
+
+## The 33.9% ceiling explained: `attn_flash_decode_warp` was never bandwidth-bound (2026-08-17)
+
+Seven hypotheses were eliminated for this number without finding what it
+actually is: sector amplification (real, worth 1.08x, not the ceiling),
+`DEC_SPLITS`, `DEC_KB`, occupancy, `exp2f`, `half2`, and the grid/parallelism
+fix that did land. Every one of them assumed the kernel was DRAM-bound and
+asked how to move fewer or better-arranged bytes. None of them questioned
+the assumption. It was wrong.
+
+### The combine pass is not blending the number
+
+`nsys`, `attn_flash_decode_warp` and `attn_flash_decode_combine` timed
+separately at `key_offset = 131,072`, seven back-to-back launches (the depth
+`bench_attention`'s sweep ends on):
+
+| kernel | mean ms |
+|---|---:|
+| `attn_flash_decode_warp` | 1.1706 |
+| `attn_flash_decode_combine` | 0.0374 |
+
+Combine is 3.1% of the pair. Recomputing the roofline fraction from the split
+kernel's own time alone moves it from 33.1% (blended) to 34.1% (split only) --
+not the explanation. Combine has its own inefficiency worth naming briefly,
+because the question was asked: its grid is `(q_heads,) = (16,)` -- 16 blocks
+on a 72-SM card, and every one of its 256 threads independently re-reads the
+same 288-entry `part_m`/`part_l` arrays rather than staging them once. Both
+are true and neither matters here: combine moves under 5 MB total against the
+split pass's 268 MB.
+
+### Issued traffic equals necessary traffic, exactly, by construction
+
+The flash-decoding split assigns each of the 288 slices a disjoint
+`[begin, end)` range with `begin = split * per`, `end = min(begin + per,
+n_visible)` and no overlap, so the last (short) slice aside, every key is read
+by exactly one split once. `bench_attention`'s own "issued GB" and "min GB"
+columns already print the same number for this kernel (0.268 both) because
+`traffic()` special-cases `splits_the_key_axis` for exactly this reason. There
+is no hidden re-read to find; the denominator in "33.9% of roofline" was
+already the right one.
+
+### The calibration ladder: the access pattern reaches 90%, the arithmetic is what costs
+
+A 20-line kernel with `attn_flash_decode_warp`'s exact grid
+(`DEC_SPLITS, kv_heads`), exact per-split key range, and exact `uint4` load of
+one key's K and V -- and nothing else, an XOR into a sink to stop the loads
+being optimized away -- calibrates what this access pattern can reach on this
+card, at `n_visible = 131,073`, three rounds:
+
+| variant | GB/s | % of 672 |
+|---|---:|---:|
+| load only | 604.7 / 604.8 / 604.6 | **90.0%** |
+| + 8-head dot product + 5-step shuffle reduce, no softmax | 586.0 / 586.1 / 586.9 | 87.2% |
+| + full online softmax (`expf`, rescale, accumulate), compile-time geometry | 342.8 / 361.9 / 361.9 | ~53% |
+| + full online softmax, `head_dim`/`kv_heads` as runtime args (matching the real kernel's signature) | 306.5 / 329.5 / 329.6 | ~48% |
+| `attn_flash_decode_warp` itself | 226.6 / 226.6 | **33.7-34.1%** |
+
+This is decisive on its own terms: **the access pattern is not the ceiling.**
+A kernel that does nothing but the identical loads reaches 90% of streaming
+roofline over the identical binary16 KV layout -- no layout migration, no
+K/V interleaving change, nothing about *how the bytes sit in memory* is
+costing 66 percentage points. The dot product and its five-step
+`__shfl_xor_sync` reduction, run eight times per key for the eight query
+heads sharing this KV head, cost almost nothing -- 90% to 87%. What collapses
+it is the online-softmax machinery riding on top: `expf`, the
+rescale-guarded correction, and the accumulate loop, take it from 87% to
+about half the card. Making the geometry a runtime argument instead of a
+compile-time one -- `head_dim` and `kv_heads` are kernel parameters in the
+real code, not `#define`s, so the per-key address arithmetic cannot be
+strength-reduced as aggressively -- costs another five points. The remaining
+gap between the closest calibration (~48%) and the real kernel (~34%) is real
+and not fully accounted for; `ncu` would find it in an afternoon and cannot
+run on this host. What is accounted for is the *shape* of where 66 of the 66
+missing points go: essentially none to the load, essentially none to the
+dot product, and the rest to softmax.
+
+### Why this explains the "unusual pair" instead of leaving it stranger
+
+Read against a bandwidth-bound model, `DEC_SPLITS` and `DEC_KB` both being
+invariant to resident-warp count and memory-level parallelism at fixed total
+work was a contradiction nothing resolved. Read against a **transcendental
+throughput** model it stops being one. Turing has a fixed number of SFU units
+per SM; `MUFU.EX2` -- what `expf` and `exp2f` both lower to -- issues through
+them regardless of how many warps are resident or how many memory requests
+are in flight. If that shared, fixed-throughput resource is the actual
+bottleneck:
+
+- More resident warps (`DEC_SPLITS` swept 144-576) cannot help, because they
+  are all queuing for the same SFU throughput rather than hiding DRAM latency
+  that was never the constraint.
+- Deeper memory-level parallelism (`DEC_KB` > 1) cannot help for the same
+  reason, and can hurt by adding register pressure with nothing to spend it
+  on.
+- `exp2f` measuring **slower** than `expf` despite issuing 80 fewer
+  instructions for the *same* `MUFU.EX2` count stops being a puzzle: if the
+  SFU call count is what is bound, the ALU instructions `expf`'s range
+  reduction adds around it are close to free, overlapped with the SFU
+  pipe rather than competing with it -- so removing them removes cost that
+  was never on the critical path, and the small regression is scheduling
+  noise around a change that could not have won.
+
+This is offered as the mechanism the calibration ladder points at, not as a
+measured certainty -- confirming it precisely needs per-SM issue-slot counters
+that `ncu`'s `ERR_NVGPUCTRPERM` puts out of reach on this host. What the
+calibration *does* establish without qualification is the negative: it is not
+DRAM, not the access pattern, not the dot product.
+
+### llama.cpp does not run this shape of kernel here at all
+
+`ggml_cuda_get_best_fattn_kernel` (`ggml/src/ggml-cuda/fattn.cu`) was read
+rather than assumed. At this model's geometry -- `head_dim = 256`,
+`gqa_ratio = 8`, a causal mask, binary16 K/V, `n_visible % FATTN_KQ_STRIDE
+(256) == 0` at 131,072 -- on a Turing device it takes:
+
+```
+turing_mma_available(cc) -> true, head_dim not in {40, 72}
+can_use_vector_kernel -> true (head_dim <= 256, % 64 == 0, != 192)
+  cc < ADA_LOVELACE, so the Ada-only VEC fast path is skipped
+gqa_opt_applies -> true (ratio >= 2, masked, K->ne[1] % 256 == 0, 16-byte strides)
+  -> !gqa_opt_applies && n_query == 1 is false, so VEC is not selected either
+=> BEST_FATTN_KERNEL_MMA_F16
+```
+
+**llama.cpp decodes through its tensor-core prefill kernel, not a vector
+GEMV, at this exact shape.** It does not run an `expf`-per-key scalar
+online-softmax loop at batch 1 at all -- it never takes that code path here.
+The `BEST_FATTN_KERNEL_VEC` GEMV this repo's `attn_flash_decode_warp` most
+resembles is llama.cpp's answer for small head dimensions or Ada-class
+hardware; on Turing with `head_dim = 256` its own dispatch rule steers away
+from it.
+
+Why it can: `fattn-mma-f16.cuh`'s tile is a matrix of `n_query * gqa_ratio`
+query rows, and `gqa_ratio` is 8 here regardless of how many *positions* are
+being decoded. One token still puts 8 rows on the tensor cores' `Q K^T`,
+computes a softmax over a genuine tile the same instruction-efficient way the
+`m16n8k8` fragments handle it for prefill, and never runs a single-lane
+`expf` in a loop over hundreds of keys per warp. This repo's own
+`attn_flash_causal_mma` tiles the *other* axis --
+[`MMA_QUERY_TILE`](crates/xabe-cuda/src/kernels/attention.rs) is 16 query
+*positions*, and decode has exactly one, so `uses_tensor_cores()` can never
+be true for it and the dispatch falls through to the scalar split kernel by
+construction, not by a tuning gap.
+
+**This reframes the whole question.** It is not that
+`attn_flash_decode_warp` is 2.6x slower than it should be at a fixed
+algorithm; it is that llama.cpp does not run this algorithm at this
+geometry, and this repo does not yet have the kernel that would let it avoid
+running it either.
+
+### The fix, specced and not attempted this session
+
+Tiling decode over the GQA-head axis the way `fattn-mma-f16.cuh` does is a
+new kernel, not a tuning knob on the existing one -- the same class of change
+as the GQA-shared prefill rewrite earlier in this file, and it is named here
+rather than built for the same reason: verifying it against the golden-logits
+gate and the differential suite at the rigor the rest of this session held
+itself to is bigger than the time this task had left.
+
+- **Shape.** One block per KV head per key-split, `gqa_ratio` (8) query rows
+  by `head_dim` (256) columns -- an 8x256 `Q` tile instead of one row. Stage
+  it in registers exactly as `attn_flash_decode_warp` already stages `qr`
+  today; nothing about loading Q changes.
+- **`Q K^T`.** `m16n8k8` needs a multiple of 16 rows to fill a fragment.
+  Eight is short by 2x, the same problem `MMA_HPB` solved for prefill by
+  putting more *heads* in a block rather than more query rows -- except here
+  there is only one KV head's worth of heads to put in, so the fragment
+  would run at half occupancy (8 of 16 rows live) unless two KV heads' query
+  groups share a tile, which breaks the "one warp reads one key once" reuse
+  this kernel's whole design rests on. This is the open design question, not
+  a detail: whichever way it is resolved changes the traffic argument this
+  file has made for the shape three times already.
+- **Softmax.** Once scores exist as an 8-row tile the softmax can run the
+  way `attn_flash_causal_mma`'s does -- the per-tile max and normalizer
+  computed once across an `MMA_KT`-wide tile rather than tracked per key --
+  which is the piece the calibration ladder says is worth having: it
+  replaces `n_visible` serial `expf` calls per warp with `n_visible /
+  MMA_KT`. Whether the prefill kernel's `exp2f` swap (folded score scale,
+  see the section above) carries over is a separate question this session's
+  calibration says nothing about -- it was measured *slower* for the
+  existing per-key decode loop, and a tiled softmax is different arithmetic
+  entirely.
+- **`P V`.** Falls out of the same fragment layout prefill already uses --
+  `D`'s layout is `A`'s, so the scores feed back into `P V` with no
+  transpose, exactly as documented for `attn_flash_causal_mma` above.
+- **Combine.** Unchanged; a warp is still a finer split of the same key
+  range, and the merge identity `attn_flash_decode_combine` implements does
+  not care how the partial was produced.
+
+Expected win, from the calibration ladder rather than a guess: closing most
+of the 90% (access) to 34% (measured) gap by removing the per-key `expf`
+loop plausibly lands this kernel near where `attn_flash_causal_mma` already
+sits on the compute side -- call it 2-2.5x on `attn_flash_decode_warp`
+itself, which at ~55% of a 131,072-depth decode step (established two
+sections up) is roughly a 1.3-1.5x step-level win and would put the 0.71x
+ratio at that depth within reach of parity. Not attempted this session; the
+shape above and the fragment-occupancy question are the starting point for
+whoever does.
