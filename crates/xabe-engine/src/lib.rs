@@ -23,6 +23,7 @@ pub mod engine;
 pub mod forward;
 pub mod router;
 pub mod state;
+pub(crate) mod viewslice;
 pub mod weights;
 pub mod worker;
 

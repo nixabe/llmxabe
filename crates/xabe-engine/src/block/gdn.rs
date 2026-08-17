@@ -1491,6 +1491,313 @@ impl GdnBlock {
         Ok(self.mixer)
     }
 
+    /// Batched decode: `states.len()` independent one-token sequences,
+    /// advanced by amortizing every weight-bound projection across all of
+    /// them and looping only the two steps that are intrinsically
+    /// per-sequence.
+    ///
+    /// # Why this is a different method rather than `forward` at `tokens > 1`
+    ///
+    /// [`Self::forward`] treats every token beyond the first as a
+    /// *continuation of the same sequence*: the causal convolution slides one
+    /// window across all of them and the delta rule folds them in temporal
+    /// order into one recurrent matrix (the chunked form, dispatched by
+    /// [`Self::mix`]). That is correct for a prefill and wrong here — a
+    /// four-token batch of four different sequences' next token is not four
+    /// consecutive positions of one sequence, and folding them through one
+    /// state would answer sequence 1's query with sequence 0's history.
+    ///
+    /// What *is* shared across sequences is every weight: the norm, the qkv
+    /// and gate projections, the alpha/beta gate projections and the output
+    /// projection contract the same matrices against every token regardless
+    /// of which sequence it belongs to, and have no notion of state at all.
+    /// Those run once over the whole `[states.len()][hidden]` batch, taking
+    /// the same tiled kernel a `states.len()`-token prefill chunk would (see
+    /// `GDN_PROJ_TILED` in the module source) — the weight is read once
+    /// instead of once per sequence, which is `docs/OPTIMIZATION.md` R2's
+    /// entire claimed win.
+    ///
+    /// The causal convolution and the delta-rule update are the two steps
+    /// that read and write a *sequence's own* state, so they cannot be
+    /// batched into one kernel call without a device-side index into
+    /// `states` that no kernel in this workspace has (see
+    /// `crate::viewslice`). They loop instead, one call per sequence, each
+    /// over a **one-token** slice of the batch buffer — [`GdnKernels::step`]
+    /// is a fixed-size `O(value_heads * head_dim^2)` update with no weight
+    /// traffic at all, so the loop costs `states.len()` small launches, not
+    /// `states.len()` weight re-reads. Every call in the loop is captured
+    /// into the same CUDA graph as the batched calls around it when this
+    /// runs inside [`crate::forward::Forward::capture_batch_step`], so the
+    /// loop's *host* overhead — issuing `states.len()` launches instead of
+    /// one — is paid once, at capture time, not on every replay.
+    ///
+    /// `hidden` and `out` are `[states.len()][hidden]`; token `i` belongs to
+    /// `states[i]` and both must be the same length. Every state must already
+    /// carry that sequence's Gated DeltaNet history, exactly as
+    /// [`Self::forward`] expects — a fresh or [`GdnState`]-reset state starts
+    /// that sequence cold.
+    pub fn forward_batch_decode(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        weights: &GdnLayerWeights,
+        int8: Option<&GdnLayerInt8>,
+        states: &mut [&mut GdnState],
+        hidden: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let tokens = states.len();
+        check_len("batch decode hidden", tokens * g.hidden, hidden.len())?;
+        check_len("batch decode out", tokens * g.hidden, out.len())?;
+        if tokens == 0 {
+            return Ok(());
+        }
+        if tokens > g.max_tokens {
+            return Err(GdnBlockError::Chunked(GdnChunkedError::SequenceTooLong {
+                seq_len: tokens,
+                capacity: g.max_tokens,
+            }));
+        }
+
+        if self.scratch.as_ref().map(|s| s.tokens) != Some(tokens) {
+            self.scratch = Some(Scratch::new(stream, &g, tokens)?);
+        }
+        let mut scratch = self.scratch.take().expect("scratch was just installed");
+        let result =
+            self.run_batch_decode(stream, weights, int8, states, hidden, out, &mut scratch);
+        self.scratch = Some(scratch);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_batch_decode(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        w: &GdnLayerWeights,
+        tc: Option<&GdnLayerInt8>,
+        states: &mut [&mut GdnState],
+        hidden: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        s: &mut Scratch,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let tokens = states.len();
+        // Batched decode never takes the one-token GEMV layout: that kernel
+        // (`gdn_proj_split_gemv`) writes `out[n]` with no token axis at all,
+        // because it exists for the case where there is only ever one token
+        // in the whole call. Here there are `tokens` tokens sharing the call
+        // even though each individually decodes one step, so the tensor-core
+        // path (valid at any token count) or the plain tiled projection is
+        // what applies.
+        let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
+
+        // 1. attn_norm-N, over every sequence's row.
+        self.layer_ops.rms_norm(
+            stream,
+            hidden,
+            &w.input_norm,
+            &mut s.normed,
+            tokens,
+            g.hidden,
+            g.rms_eps,
+        )?;
+
+        // 2. linear_attn_qkv_mixed-N and z-N. No state, so this is exactly
+        //    the batched form `run` already has for a multi-token prefill —
+        //    the weight is read once for the whole batch regardless of how
+        //    many distinct sequences the tokens belong to.
+        if let Some(i8w) = tc {
+            self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.qkv_q,
+                    &i8w.qkv_s,
+                    xq,
+                    xs,
+                    &mut s.qkv,
+                    g.hidden,
+                    g.conv_dim(),
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.gate_q,
+                    &i8w.gate_s,
+                    xq,
+                    xs,
+                    &mut s.z,
+                    g.hidden,
+                    g.value_dim(),
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+        } else {
+            self.project(
+                stream,
+                Projection::Q8_0(&w.qkv),
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project(
+                stream,
+                Projection::Q8_0(&w.gate),
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
+        }
+
+        // 3. conv_output_raw-N, one sequence at a time: the short causal
+        //    convolution reads and advances *that sequence's own* window, so
+        //    it cannot run as one call over tokens that do not share a
+        //    timeline. Each call is one token wide and touches only
+        //    `states[i].conv` and a one-token slice of the batch buffers.
+        let conv_dim = g.conv_dim();
+        for (i, state) in states.iter_mut().enumerate() {
+            // SAFETY: `i < tokens` and `conv_dim` is `s.qkv`'s and
+            // `s.conv_raw`'s per-token width, checked by `Scratch::new`
+            // against the same `tokens * conv_dim` this loop covers.
+            let x = unsafe { crate::viewslice::subslice(stream, &s.qkv, i * conv_dim, conv_dim) };
+            let mut y =
+                unsafe { crate::viewslice::subslice(stream, &s.conv_raw, i * conv_dim, conv_dim) };
+            self.layer_ops.conv1d(
+                stream,
+                &x,
+                &w.conv1d,
+                &mut state.conv,
+                &mut y,
+                1,
+                conv_dim,
+                g.conv_kernel,
+            )?;
+        }
+
+        // 4. conv_output_silu-N and the q/k/v split. No state: every element
+        //    of `s.conv_raw` — now correctly one sequence's own window per
+        //    token, from step 3 — is read exactly once, so this batches over
+        //    every sequence in one launch.
+        self.silu_split_qkv(
+            stream,
+            &s.conv_raw,
+            &mut s.conv_silu,
+            &mut s.q,
+            &mut s.k,
+            &mut s.v,
+            tokens,
+        )?;
+
+        // 5. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N. No
+        //    state, batches the same way step 2 does.
+        self.alpha_beta_gates(
+            stream,
+            &w.alpha,
+            &w.beta,
+            &s.normed,
+            &w.dt_bias,
+            &w.a,
+            &mut s.alpha,
+            &mut s.beta_raw,
+            &mut s.a_softplus,
+            &mut s.log_decay,
+            &mut s.beta,
+            tokens,
+        )?;
+
+        // 6. The delta rule, one sequence at a time — the other half of what
+        //    step 3 could not batch, and for the same reason: it reads and
+        //    writes `states[i].recurrent`, not a shared weight.
+        //    `GdnKernels::step` is the one-token recurrent kernel `run` also
+        //    uses at `tokens == 1`; here it runs once per sequence instead of
+        //    once for the whole call, against that sequence's own state and a
+        //    one-token slice of the batch's q/k/v/gates.
+        let key_dim = g.key_dim();
+        let value_dim = g.value_dim();
+        let value_heads = g.value_heads;
+        for (i, state) in states.iter_mut().enumerate() {
+            // SAFETY: as the convolution loop above, with each buffer's own
+            // per-token width, all checked by `Scratch::new` against
+            // `tokens * width`.
+            let q = unsafe { crate::viewslice::subslice(stream, &s.q, i * key_dim, key_dim) };
+            let k = unsafe { crate::viewslice::subslice(stream, &s.k, i * key_dim, key_dim) };
+            let v = unsafe { crate::viewslice::subslice(stream, &s.v, i * value_dim, value_dim) };
+            let log_decay = unsafe {
+                crate::viewslice::subslice(stream, &s.log_decay, i * value_heads, value_heads)
+            };
+            let beta = unsafe {
+                crate::viewslice::subslice(stream, &s.beta, i * value_heads, value_heads)
+            };
+            let mut core_out =
+                unsafe { crate::viewslice::subslice(stream, &s.core, i * value_dim, value_dim) };
+            self.recurrent.step(
+                stream,
+                &mut self.recurrent_scratch,
+                &mut state.recurrent,
+                &q,
+                &k,
+                &v,
+                &log_decay,
+                &beta,
+                &mut core_out,
+            )?;
+        }
+
+        // 7. final_output-N = ssm_norm(core) * silu(z). No state: batches
+        //    over every sequence's now-correct `core` row from step 6.
+        self.layer_ops.rms_norm_swiglu(
+            stream,
+            &s.core,
+            &w.ssm_norm,
+            &s.z,
+            &mut s.core_norm,
+            &mut s.final_output,
+            tokens * g.value_heads,
+            g.head_dim,
+            g.rms_eps,
+        )?;
+
+        // 8/9. linear_attn_out-N, then attn_residual-N. No state, batches the
+        //      same way step 2 does.
+        if let Some(i8w) = tc {
+            self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.out_q,
+                    &i8w.out_s,
+                    xq,
+                    xs,
+                    &mut s.projected,
+                    g.value_dim(),
+                    g.hidden,
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        } else {
+            self.project(
+                stream,
+                Projection::Q8_0(&w.out),
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
+            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run(
         &mut self,
