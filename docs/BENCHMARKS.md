@@ -3518,3 +3518,69 @@ static instruction count both point away from what actually happened, which
 argues for retiring instruction-counting as a predictor for this kernel
 specifically and treating every future decode change as a measurement
 question from the start rather than an arithmetic one.
+
+## What actually costs at a decode step, measured instead of assumed (2026-08-17)
+
+The brief for this session named the real open question directly: at ctx 512
+attention is small, so the 0.95x depth-0 ratio against llama.cpp is not
+attention's doing, and closing it needs whatever *is* costing at that depth.
+Guessing at that from the kernel source would repeat the mistake the `half2`
+section above just made. `nsys` answers it directly, with one nsys-specific
+trap: decode runs as a captured CUDA graph (`Forward::capture_step` /
+`StepGraph`, `forward.rs`), and `nsys`'s default `--cuda-graph-trace=graph`
+collapses a whole replayed graph into one opaque node -- the per-kernel
+summary comes back nearly empty (ten `attn_flash_causal_gqa` instances, the
+one prefill call, and nothing that looks like 20 decode steps). Passing
+`--cuda-graph-trace=node` expands every replay back into its constituent
+kernels and the picture becomes normal. (A second trap, cheaper to fall into:
+this host's locale renders `nsys stats`' human-readable table with 4-digit
+thousands grouping rather than 3 -- `3672,2526` is 36,722,526 ns, not
+3,672.2526 -- so read the `--format csv` output, or `LC_ALL=C`, not the
+table.)
+
+`bench_decode 8 16`, prefill 8 tokens then 4 warmup + 16 timed decode steps at
+context 12..28 (99.1 tok/s), profiled whole:
+
+| kernel group | us / decode step | share |
+|---|---:|---:|
+| MoE (routed + shared experts, gemv path) | ~2,000 | ~21% |
+| GDN (linear-attention mixer, recurrent path) | ~2,300 | ~25% |
+| LM head (`lm_head_gemv_b1`) | ~1,620 | ~17% |
+| **attention** (`attn_flash_decode_warp` + `_combine`) | **474** | **~5%** |
+| everything else (norms, gates, routing, argmax) | rest | ~32% |
+
+Every one of those kernel names was checked against its instance count before
+being called decode-exclusive: `attn_flash_decode_warp` shows exactly `steps
+* 10` instances (10 is this model's count of full-attention layers out of 40
+total -- the rest are `gdn_*`), with zero contribution from the prefill call,
+in both this profile and a second one taken at context 8192..8204. That
+second profile is the reason the table above is trustworthy rather than a
+one-depth coincidence: the same clean kernel set gives attention **9.92%** of
+a decode step at depth 8192 against **5.08%** at depth ~20 -- growing, as it
+must, while MoE, GDN and the LM head do not (none of them read the KV cache).
+
+Extrapolating with the numbers already in hand rather than a third profile:
+`bench_attention`'s decode mode gives `attn_flash_decode_warp` +
+`_combine` alone, one attention layer, 1.198 ms at `key_offset = 131,072` (the
+uint4-load section above). Ten layers: 11.98 ms. The non-attention part of a
+decode step is ~8.6-9.7 ms and does not grow with depth, so a step at
+131,072 should cost roughly 8.6 + 11.98 ≈ 20.6 ms, or **~48 tok/s** --
+against the **47.4 tok/s** this file already recorded from `llama-bench -d
+131072`, a 2% miss from a two-measurement extrapolation. Attention's share at
+that depth is therefore about **55%** of a decode step, not the ~5% it is at
+depth 0.
+
+That is the whole shape of the problem stated in one sentence: **the 0.95x
+gap at depth 0 is a MoE/GDN/LM-head question, and the 0.71x gap at 131,072 is
+an attention question**, and the two gaps needing different owners is not a
+coincidence -- it is what "attention is the only term whose cost grows with
+context" (established for prefill earlier in this file) also means for
+decode. MoE and GDN kernels are out of this session's scope (owned
+elsewhere, and `crates/xabe-engine/src/block/gdn.rs` had a sibling's
+in-progress edit in this same working tree while this was measured), so
+nothing here changes them. What it does change is confidence: `DEC_SPLITS`,
+`DEC_KB`, occupancy, `exp2f` and now `half2` were all tested against
+*attention's own* 33.9%-of-roofline ceiling on the assumption that closing it
+matters, and at 131,072 keys it is now measured to matter more than half the
+decode step -- so the ceiling stays the right thing to keep chasing, even
+though this session did not find the eighth hypothesis that explains it.
