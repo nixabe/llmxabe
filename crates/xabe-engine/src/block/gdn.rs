@@ -210,7 +210,20 @@ const PROJ_TILES: [u32; 4] = [2, 4, 8, 16];
 /// the weight twice as often and the activation four times less, and the
 /// activation is the larger term. (16, 8) halves the activation traffic again
 /// and gives it back to occupancy.
-const PROJ_ROWS: [u32; 4] = [4, 4, 4, 4];
+///
+/// Tiles 2 and 4 use `RR = 1`, not 4, and for a different reason than the
+/// sweep above: at 512+ tokens grid.x is never the problem, `RR` only trades
+/// activation traffic against it. At decode `n_rows` is 512-2048 and `tokens`
+/// is 2-4, so grid.y is 1 and grid.x is the *only* axis with any blocks in
+/// it — `n_rows.div_ceil(PROJ_WARPS * RR)` is 32-128 blocks at `RR = 4`
+/// against 72 SMs, which leaves SMs with nothing to run rather than latency
+/// to hide. `RR = 1` quadruples grid.x back to the untiled kernel's own
+/// geometry (`n_rows.div_ceil(PROJ_WARPS)`), the one already known to stream
+/// well, at the cost of activation traffic that is ~32 KB total at these
+/// widths and was never the bottleneck to begin with. See
+/// `docs/BENCHMARKS.md`'s batched-decode section for the nsys measurement
+/// that found the collapsed grid axis rather than assuming it.
+const PROJ_ROWS: [u32; 4] = [1, 1, 4, 4];
 
 /// Which specialization to launch for `tokens`, and its width.
 ///
@@ -551,8 +564,8 @@ __global__ void NAME(                                                         \
     }                                                                         \
 }
 
-GDN_PROJ_TILED(gdn_proj_q8_0_t2,  2,  4)
-GDN_PROJ_TILED(gdn_proj_q8_0_t4,  4,  4)
+GDN_PROJ_TILED(gdn_proj_q8_0_t2,  2,  1)
+GDN_PROJ_TILED(gdn_proj_q8_0_t4,  4,  1)
 GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8,  4)
 GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
