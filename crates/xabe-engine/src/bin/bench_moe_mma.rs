@@ -37,7 +37,9 @@ use std::time::Instant;
 use cudarc::driver::CudaContext;
 use tracing::{error, info, warn};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_cuda::kernels::moe::{ExpertQuant, MoeGeometry, MoeKernels, QuantTensor, to_device_layout};
+use xabe_cuda::kernels::moe::{
+    ExpertQuant, MoeGeometry, MoeKernels, QuantTensor, to_device_layout,
+};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::{Role, WeightSchema};
