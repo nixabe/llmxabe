@@ -1485,10 +1485,20 @@ __global__ void attn_flash_causal_gqa(
 // parallelism; and the tile already keeps ~24 KiB in flight per SM against the
 // ~4 KiB Little's law asks for, so it is not memory-level parallelism.
 //
+// That splits sweep says more than it was first credited with. It varies the
+// resident warps 3.5x at *fixed* total work and moves the time 1.7%, which
+// rules out a latency bound as surely as it rules out a parallelism one: more
+// warps would hide more latency. Invariance to parallelism at fixed work is
+// the signature of a saturated per-SM resource, and the sector amplification
+// documented at the `wpl == 4` branch below is one. The datum sat here for
+// some time labelled "no effect" because nothing yet explained it.
+//
 // ## The shape
 //
 // A lane holds `head_dim/32` **consecutive** dimensions, so the 32 lanes of one
-// warp cover a whole key and load it as one coalesced run straight from global.
+// warp cover a whole key and can load it as one coalesced run straight from
+// global -- though only if the load is written as a single wide access, which
+// for a long time it was not; see the `wpl == 4` branch below.
 // The warp then owns *every* query head of its KV head, reusing that key
 // `gqa` times out of registers. K and V are read exactly once each, by exactly
 // one warp, and shared memory disappears along with every barrier.
@@ -1574,10 +1584,45 @@ __global__ void attn_flash_decode_warp(
             long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim;
             const unsigned* kp = (const unsigned*)(k + at);
             const unsigned* vp = (const unsigned*)(v + at);
-            #pragma unroll
-            for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
-                kw[jj][p] = (live && p < wpl) ? kp[wpl * lane + p] : 0u;
-                vw[jj][p] = (live && p < wpl) ? vp[wpl * lane + p] : 0u;
+            // A lane owns `wpl` consecutive words, so `kp[wpl * lane + p]` is a
+            // stride-`wpl` access across the warp -- not the single `uint4` the
+            // partition above describes. At head_dim 256 that is a 16-byte
+            // stride: each of the four loads touches all sixteen 32-byte
+            // sectors of the 512-byte key and takes four bytes from each, and
+            // the four loads then request the same sixteen sectors again. Four
+            // times the sector traffic for the same bytes, which caps the
+            // kernel near a quarter of peak -- 27.5% was measured.
+            //
+            // ptxas cannot rescue it: `wpl` comes from the runtime `head_dim`
+            // argument, so neither `wpl == 4` nor 16-byte alignment is provable
+            // at compile time, and the per-element `p < wpl` predicate blocks
+            // vectorisation on its own. `cuobjdump -sass` confirmed the kernel
+            // emitted no `LDG.E.128` at all while `attn_flash_causal_mma` in
+            // this same file emits two, so the compiler vectorises here when
+            // the pattern permits and this pattern did not permit it.
+            //
+            // Naming the width restores it. `at` is a multiple of `head_dim`,
+            // so at head_dim 256 the address is 512-byte aligned and a `uint4`
+            // load is legal; lane `l` takes bytes `[16l, 16l+16)`, which is the
+            // same eight binary16 dimensions `[8l, 8l+8)` it read before as
+            // four strided words. Identical data, one instruction, and the warp
+            // now covers 512 contiguous bytes with every sector fully consumed.
+            if (wpl == 4) {
+                const uint4* kp4 = (const uint4*)kp;
+                const uint4* vp4 = (const uint4*)vp;
+                uint4 kq = make_uint4(0u, 0u, 0u, 0u);
+                uint4 vq = make_uint4(0u, 0u, 0u, 0u);
+                if (live) { kq = kp4[lane]; vq = vp4[lane]; }
+                kw[jj][0] = kq.x; kw[jj][1] = kq.y;
+                kw[jj][2] = kq.z; kw[jj][3] = kq.w;
+                vw[jj][0] = vq.x; vw[jj][1] = vq.y;
+                vw[jj][2] = vq.z; vw[jj][3] = vq.w;
+            } else {
+                #pragma unroll
+                for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+                    kw[jj][p] = (live && p < wpl) ? kp[wpl * lane + p] : 0u;
+                    vw[jj][p] = (live && p < wpl) ? vp[wpl * lane + p] : 0u;
+                }
             }
         }
         #pragma unroll

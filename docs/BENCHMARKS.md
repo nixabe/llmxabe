@@ -3295,3 +3295,114 @@ wider chunk comes from MoE and GDN. Attention is 53% of the 128K pass.
 - **Deep decode, +41%.** See the warp-split kernel's commit for the four
   hypotheses already eliminated. `half2` is the next one.
 - **Aggregate decode, +100%.** A missing feature, not a slow kernel.
+
+## Corrections to the three items above
+
+All three were written before the experiments they propose were run. Kept
+rather than deleted, because what a wrong prediction was based on is worth as
+much as the number that replaced it.
+
+**The tensor peak was measured, and it is not what that paragraph assumes.** A
+standalone microbenchmark on this card gives `mma.m16n8k8` **97.6 TFLOP/s** and
+`mma.m8n8k4` **49.1 TFLOP/s**. This Quadro does not halve the fp32-accumulate
+rate, so prefill attention runs at **27%** of the real ceiling, not 40% -- and
+`m8n8k4`, Turing's "native" shape, is half the throughput rather than the
+hidden headroom the paragraph guessed at. Ruled out without writing the kernel.
+
+**`ldmatrix` was implemented and rejected on measurement.** Both fragment
+layouts were verified on hardware first (plain gives the A-fragment order,
+`.trans` the transpose, so V could carry K's layout and its staging collapse to
+one 16-byte load feeding one 16-byte store). Correct, and **0.8% slower**:
+42.37/42.37/42.40 ms against 41.97/42.06/42.09. The kernel is not bound by
+shared-load instruction count, so replacing four scalar loads with one buys
+nothing and the address computation costs a little.
+
+**"Flat per token as the batch widens" was not a defect.** 512 -> 2048 is 4x
+the work and measured 4.26x the time. That is ordinary scaling. The inference
+that llama.cpp gains a wider-batch reuse we lack does not follow from it.
+
+**A two-deep staged K/V tile lost by 15%** (48.26 vs 41.97 ms), which rules out
+memory-level parallelism as the prefill constraint -- doubling the bytes in
+flight made it worse.
+
+## The decode key load was never the `uint4` its comment claimed
+
+`attn_flash_decode_warp` indexed K and V as `kp[wpl * lane + p]`. Across the
+warp that is a stride of `wpl` words -- 16 bytes at head_dim 256 -- so each of
+the four loads touched all sixteen 32-byte sectors of the 512-byte key and took
+four bytes from each, and the four loads then requested the same sixteen
+sectors again.
+
+`cuobjdump -sass` settles it without a profiler, which matters here because
+`ncu` fails with `ERR_NVGPUCTRPERM` on this machine and cannot be used at all:
+
+| kernel | `LDG.E.128` | scalar `LDG.E` |
+|---|---:|---:|
+| `attn_flash_causal_mma` (prefill) | 2 | 129 |
+| `attn_flash_decode_warp`, before | **0** | 73 |
+| `attn_flash_decode_warp`, after | **2** | 73 |
+
+The prefill kernel in the same file vectorises, so the compiler does it when
+the pattern permits; this pattern did not permit it. `wpl` comes from the
+runtime `head_dim`, so neither `wpl == 4` nor the alignment is provable at
+compile time, and the per-element `p < wpl` predicate blocks vectorisation on
+its own.
+
+Naming the width restores the wide load. Lane `l` takes bytes `[16l, 16l+16)`,
+which is the same eight binary16 dimensions it read before as four strided
+words -- **bit-identical data**, which the golden logits test confirms.
+
+| | ms @ 131,072 | GB/s |
+|---|---:|---:|
+| before | 1.285 | 208.9 |
+| after | **1.188** | **226.0** |
+
+Three interleaved pairs, spread under 0.3%. **1.082x.**
+
+### What it did not do
+
+Sector amplification predicted a **4x** traffic-efficiency recovery. It
+delivered **1.08x**: L1 was absorbing nearly all of the redundant sector
+requests. The diagnosis was real and the SASS proved it; the magnitude was
+wrong, and decode attention is still at only 33.9% of roofline.
+
+Both earlier null results were re-measured under the fixed load, since both had
+been taken under the broken one and might have meant something different:
+
+| `DEC_SPLITS` | 288 | 576 | 864 | 1152 |
+|---|---:|---:|---:|---:|
+| ms | **1.179** | 1.242 | 1.290 | 1.335 |
+
+| `DEC_KB` | 1 | 2 | 4 |
+|---|---:|---:|---:|
+| ms | **1.180** | 1.360 | 1.400 |
+
+More parallelism hurts and more memory-level parallelism hurts, at 33.9% of
+roofline. Occupancy and latency-hiding are both excluded, together, which is an
+unusual pair. The decode gap remains unexplained after six hypotheses.
+
+One datum was under-read for a long time and is worth re-stating: the
+`DEC_SPLITS` sweep varies resident warps 3.5x at *fixed total work* and moves
+the time 1.7%. That excludes a latency bound as firmly as a parallelism one.
+It sat in the rejected pile labelled "no effect" because nothing then explained
+it.
+
+## `__expf` in the prefill softmax: faster, and rejected on accuracy
+
+Substituting `__expf` for `expf` in `attn_flash_causal_mma` measured **1.075x**
+on attention in isolation (39.03/39.21/39.20 against 42.00/42.06/42.29 ms) and
+passed all nine attention differential tests.
+
+It fails `the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`, which
+was confirmed to be cause and not coincidence by stashing the change and
+re-running: green at HEAD, red with it. At rank 4 llama.cpp separates the two
+candidates by 0.153701 while the two implementations differ by at most 0.120058
+on a shared logit -- a real ranking error, not a tie inside the noise. The
+argmax still agrees and leads by 39x the noise, so greedy decoding would not
+have noticed; sampling would.
+
+The reasoning that justified it -- that a 2^-21 relative error is invisible
+next to the 2^-11 already accepted by rounding K and V to binary16 -- is
+plausible and was wrong in effect. The end-to-end gain was never confirmed
+above the harness's 13% run-to-run spread either, so this traded a measured
+accuracy regression for an unmeasured speedup. Not shipped.
