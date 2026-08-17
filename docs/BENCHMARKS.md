@@ -6642,3 +6642,185 @@ has for the wider key trip is spent. Closing the remaining bandwidth gap
 (43% against llama.cpp's 88%, per the previous section) needs a
 structural change neither section's own tools could evaluate without
 `ncu` -- both close on the same request.
+## A precomputed `bm`, a real but modest win, and a lesson about which cost was actually being paid (2026-08-18)
+
+Both of the previous two sections' rejects shared a root cause: the
+`bm`-determination cost. Inline, it widened the register floor by dragging
+in the tiled fallback's frame; split, it doubled the per-bucket bookkeeping
+because `expert_block_capacity()` at N<=4 is small and nearly all live, so a
+second kernel walking `sorted_token_ids` a second time was real work, not a
+cheap early exit. This section attacks the shared root directly: precompute
+`bm` once, during dispatch-table construction, so every consumer reads it
+instead of deriving it.
+
+### The table
+
+An expert's tokens land at a *contiguous* prefix of its span --
+`moe_align_block_size`'s phase 3 scatter always advances `written` from
+zero, in ascending flat order, and never touches a slot past `counts[e]`.
+That means a bucket's live-row count is a closed form of two values the
+kernel already has at phase 4 (`counts[e]` and the bucket's own offset from
+`first`), not something that needs a second pass over `sorted_token_ids` to
+discover:
+
+```c
+int c = counts[e];
+for (int b = first + tid; b < last && b < expert_capacity; b += blockDim.x) {
+    expert_ids[b] = e;
+    int live = c - (b - first) * block_size;
+    if (live < 0) live = 0;
+    if (live > block_size) live = block_size;
+    bucket_live[b] = live;
+}
+```
+
+`bucket_live` is a new array, `expert_block_capacity` ints, written
+alongside `expert_ids` in the loop that already claims each bucket for its
+expert -- one more global store per bucket the kernel was already visiting,
+not a new pass. Additive throughout: `sorted_token_ids` and `expert_ids`
+keep their exact shape and meaning, `moe_align_block_size` gained one
+trailing parameter, and `MoeBuffers` gained one field
+(`buffers.bucket_live()`) alongside `expert_ids()`. No other array was
+reshaped.
+
+`moe_expert_ffn_narrow`/`moe_expert_down_narrow` are the only converted
+consumers, per this session's brief (narrow kernels first, since they are
+this workstream's own code). Each now loads `bucket_live[blk]` once, before
+its `m0` loop, and gets every sub-tile's `bm` from a clamp:
+
+```c
+int bucket_bm = bucket_live[blk];
+for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+    int bm = bucket_bm - m0;
+    if (bm < 0) bm = 0;
+    if (bm > MOE_TM) bm = MOE_TM;
+    if (bm == 0) continue;
+    __syncthreads();
+    ... populate rows[]/slot_flat[] only now, and only because bm > 0 ...
+```
+
+The `bm == 0` check moved *ahead* of both `__syncthreads()` calls and the
+`rows[]`/`slot_flat[]` populate. At `N <= MOE_NARROW_DECODE_MAX` (4),
+`counts[e] <= 4 < MOE_TM` (16) always, so every bucket's *second* sub-tile
+(`m0 == 16`) is unconditionally empty -- previously that discovery cost a
+full populate-and-scan cycle every single decode step, on every bucket, for
+nothing. It now costs one register compare against a value already in a
+register.
+
+`moe_expert_ffn`/`moe_expert_down` (unconverted, per "narrow kernels
+first") still derive `bm` from `live_tile_rows(rows)` exactly as before --
+they do not read `bucket_live` at all, so nothing about their behavior or
+performance was expected to change, and the SASS check below confirms it
+did not.
+
+### Blast radius: three functions touched, seventeen untouched
+
+`cuobjdump -sass`, `nvcc -arch=sm_75 -cubin` against the shipped `MOE_SRC`
+string extracted straight from source (not a stale scratch copy), diffed
+per function against the landed tree (`cd35d38`) this section built on:
+
+| function | SASS |
+|---|---|
+| `moe_align_block_size` | differs (expected: new trailing store) |
+| `moe_expert_ffn_narrow` | differs (expected: converted) |
+| `moe_expert_down_narrow` | differs (expected: converted) |
+| every other of the 17 remaining kernels, including all four of `moe_expert_ffn_mma`/`_mma_narrow`/`moe_expert_down_mma`/`_mma_narrow` | byte-identical |
+
+Exactly the three touched functions differ; every kernel this session did
+not mean to touch, including the dual-width MMA pair the previous
+workstream landed, is untouched all the way to the instruction encoding.
+
+Register cost of the two converted kernels, `ptxas -v` on the same
+standalone compile:
+
+| kernel | before | after |
+|---|---:|---:|
+| `moe_expert_ffn_narrow` | 80 | 79 |
+| `moe_expert_down_narrow` | 74 | 80 |
+| `moe_align_block_size` | 25 | 25 |
+
+`moe_expert_down_narrow` picked up 6 registers -- the `bucket_bm` local and
+the loop's extra bookkeeping outlive more of the kernel body than they cost
+in the old derivation, which freed its registers every iteration. Zero
+spill either side, and both land in the same occupancy bracket at
+`GEMM_THREADS` (256): `65536 / (256 * 80) = 3.2`, still 3 blocks/SM, same as
+before at 74. `moe_align_block_size` does not move at all -- the new store
+is folded into a loop it already ran.
+
+### Accuracy gates
+
+`cargo test --release -p xabe-engine --test moe_differential`: 7/7,
+including `device_dispatch_tables_match_moe_align_block_size_including_
+padding`, which is the one that would have caught a `bucket_live` formula
+that disagreed with `live_tile_rows`'s runtime derivation on any input the
+test's routing distributions cover.
+`cargo test --release -p xabe-engine --test batch_decode`: 3/3, including
+`identical_prompts_in_one_batch_produce_bit_identical_rows` at the
+narrow-kernel widths. The golden test
+(`the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`) still
+passes at the same logit and rank-4 noise-floor swap this file's precedent
+already accepts.
+
+### Throughput: real, reproducible, and far short of what the occupancy math predicted
+
+Interleaved A/B, CUDA events via `bench_decode_batch`, 32 decode steps after
+4 warmup, GPU 2, `LLMXABE_SKIP_SINGLE_STREAM=1`, before/after binaries built
+from a `git stash`-free checkout of the same worktree so both share every
+other line of code:
+
+| N | context | before (tok/s) | after (tok/s) | delta |
+|---:|---:|---:|---:|---:|
+| 2 | 2,048 | 107.6-109.5 | 110.0-110.6 | +0.9% to +2.7% |
+| 3 | 2,048 | 118.3-120.1 | 121.4-121.8 | +1.1% to +2.9% |
+| 4 | 2,048 | 135.3-136.4 | 138.9-139.3 | +1.8% to +2.9% |
+| 8 | 2,048 | 169.4-170.4 | 169.3-169.7 | flat (unconverted path) |
+| 2 | 32,768 | 87.1 | 89.5-89.7 | +2.8% to +3.0% |
+| 3 | 32,768 | 95.0 | 97.6-97.7 | +2.7% to +2.8% |
+| 4 | 32,768 | 104.3-104.6 | 107.9-108.0 | +3.4% to +3.5% |
+| 8 | 32,768 | 127.3 | 128.0 | +0.5% (noise) |
+
+Every narrow width (N 2-4) improves, consistently, across 2-3 interleaved
+rounds at both contexts; N 8 is flat within run-to-run noise at both, which
+is exactly what byte-identical SASS on its consuming kernels predicts --
+`moe_align_block_size` runs for N 8 too and now does marginally more work
+per bucket, but that cost is buried in a kernel that was never the
+bottleneck. N=3 at 32,768 reaches 97.6-97.7 tok/s: a real step past the
+previous section's baseline, but short of the 100 tok/s this lever was
+predicted to clear.
+
+The prediction that motivated this lever was sized on the wrong term. The
+occupancy math from the split-kernel reject correctly showed that a
+`bm > 1`-only kernel at ~56-58 registers would land 4 blocks/SM against the
+combined kernel's 3 -- but that reject's *own* measurement had already shown
+the down projection was flat, not slow, when split; the regression was
+entirely the *doubled derivation cost*, not a missed-occupancy tax on the
+arithmetic. Precomputing `bm` removes exactly that doubled-derivation cost
+and no more: what it buys back is one skipped populate-and-sync cycle per
+bucket's guaranteed-empty second sub-tile, which is real (2-3.5% is not
+nothing) but is not the same lever as "give the `bm == 1` path the GEMV
+kernels' occupancy," because the narrow kernels were never occupancy-bound
+in the first place -- they are bandwidth-bound on the same dequant-and-
+stream traffic the combined kernel pays, `bm == 1` or not. The 38.2%/31.0%
+roofline gap this section's predecessor measured is still there because
+nothing in this section touched how many bytes the kernel streams per
+useful row.
+
+### What a follow-up needs
+
+Re-testing the split-kernel design against *this* baseline (not the
+pre-precompute one) is the next cheap experiment the brief asked for, and
+was not run this session: with `bm` a load rather than a derivation, a
+`bm > 1`-only kernel's bookkeeping cost per bucket drops to the same clamp
+this section's narrow kernels now pay, so the doubled-derivation objection
+that sank the original split should indeed no longer apply. What this
+section's own numbers argue against is the *size* of the win a working
+split should be expected to produce: if precomputing `bm` for the combined
+kernel bought 2-3.5%, a split kernel's own gain is bounded by the same
+mechanism (fewer wasted syncthreads-and-populate cycles, better register
+occupancy at the arithmetic ptxas already emits) rather than by the deeper
+bandwidth win "down 31% -> 63%" implied. Reaching that would need fewer
+bytes streamed per live row, not a cheaper way to find out how many rows
+are live -- the unroll-pragma reject two sections back already ruled out
+the cheap version of that (register cliff from carrying the tiled
+fallback's frame), so a real fix likely needs the fallback path itself
+restructured, not just the dispatch around it. Not attempted this session.

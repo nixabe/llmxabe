@@ -1905,7 +1905,16 @@ __global__ void moe_align_block_size(
     int expert_capacity,
     int* __restrict__ sorted_token_ids,
     int* __restrict__ expert_ids,
-    int* __restrict__ num_tokens_post_pad
+    int* __restrict__ num_tokens_post_pad,
+    // Additive: live-row count for each `block_size`-wide dispatch bucket,
+    // `bucket_live[b] = clamp(counts[expert_ids[b]] - (b - first) *
+    // block_size, 0, block_size)`. An expert's tokens land at a *contiguous*
+    // prefix of its span (phase 3's scatter always advances `written` from
+    // zero), so a consuming kernel can get any sub-tile's live-row count from
+    // one load and a clamp instead of walking `sorted_token_ids` and scanning
+    // for the sentinel itself. Untouched kernels never read this array, so
+    // this is a pure addition to the table, not a reshape of it.
+    int* __restrict__ bucket_live
 ) {
     int* cumsum = (int*)xabe_shared;              // num_experts + 1
     int* scan   = cumsum + num_experts + 1;       // blockDim.x
@@ -1958,10 +1967,21 @@ __global__ void moe_align_block_size(
         __syncthreads();
     }
 
-    // 4. claim this expert's blocks.
+    // 4. claim this expert's blocks, and record each one's live-row count
+    //    alongside: `counts[e]` real tokens fill the prefix of expert e's
+    //    span from phase 3's scatter, so bucket `b`'s live count is
+    //    `counts[e]` less however many of those already fell in the buckets
+    //    before it.
     int first = cumsum[e] / block_size;
     int last  = cumsum[e + 1] / block_size;
-    for (int b = first + tid; b < last && b < expert_capacity; b += blockDim.x) expert_ids[b] = e;
+    int c = counts[e];
+    for (int b = first + tid; b < last && b < expert_capacity; b += blockDim.x) {
+        expert_ids[b] = e;
+        int live = c - (b - first) * block_size;
+        if (live < 0) live = 0;
+        if (live > block_size) live = block_size;
+        bucket_live[b] = live;
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -2096,6 +2116,7 @@ __global__ void moe_expert_ffn_narrow(
     const float* __restrict__ hidden_states,
     const int* __restrict__ sorted_token_ids,
     const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
     const int* __restrict__ valid_tokens,
     int top_k,
     int block_size,
@@ -2116,8 +2137,19 @@ __global__ void moe_expert_ffn_narrow(
     int r = blockIdx.x * MOE_ROWS + warp;
     int live = r < intermediate;
     long long wrow = ((long long)e * intermediate + r) * hidden;
+    int bucket_bm = bucket_live[blk];
 
     for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        // `bm` is a load and a clamp now, not a populate-then-scan: see
+        // `bucket_live`'s own comment on `moe_align_block_size`. This is
+        // what lets a wholly-empty sub-tile (every bucket's second one,
+        // below `MOE_NARROW_DECODE_MAX`) skip both `__syncthreads()` below
+        // rather than pay them to discover there is nothing to do.
+        int bm = bucket_bm - m0;
+        if (bm < 0) bm = 0;
+        if (bm > MOE_TM) bm = MOE_TM;
+        if (bm == 0) continue;
+
         __syncthreads();
         if (threadIdx.x < MOE_TM) {
             int m = m0 + threadIdx.x;
@@ -2129,8 +2161,6 @@ __global__ void moe_expert_ffn_narrow(
         }
         __syncthreads();
 
-        int bm = live_tile_rows(rows);
-        if (bm == 0) continue;
         float ag[MOE_TM];
         float au[MOE_TM];
         if (bm == 1) {
@@ -2477,6 +2507,7 @@ __global__ void moe_expert_down_narrow(
     const float* __restrict__ topk_weights,
     const int* __restrict__ sorted_token_ids,
     const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
     const int* __restrict__ valid_tokens,
     int top_k,
     int block_size,
@@ -2498,8 +2529,17 @@ __global__ void moe_expert_down_narrow(
     int h = blockIdx.x * MOE_ROWS + warp;
     int live = h < hidden;
     long long wrow = ((long long)e * hidden + h) * intermediate;
+    int bucket_bm = bucket_live[blk];
 
     for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        // See `moe_expert_ffn_narrow`: `bm` is a precomputed load and a
+        // clamp, so a fully-empty sub-tile skips both `__syncthreads()`
+        // rather than paying them to find that out.
+        int bm = bucket_bm - m0;
+        if (bm < 0) bm = 0;
+        if (bm > MOE_TM) bm = MOE_TM;
+        if (bm == 0) continue;
+
         __syncthreads();
         if (threadIdx.x < MOE_TM) {
             int m = m0 + threadIdx.x;
@@ -2513,8 +2553,6 @@ __global__ void moe_expert_down_narrow(
         }
         __syncthreads();
 
-        int bm = live_tile_rows(rows);
-        if (bm == 0) continue;
         float ad[MOE_TM];
         if (bm == 1) {
             tile_gemm_single_direct1(
@@ -3235,6 +3273,13 @@ pub struct MoeBuffers {
     topk_weights: CudaSlice<f32>,
     sorted_token_ids: CudaSlice<i32>,
     expert_ids: CudaSlice<i32>,
+    /// Live-row count for each `block_size`-wide dispatch bucket, written
+    /// alongside `expert_ids` by `moe_align_block_size`. Additive: no
+    /// existing array's shape or meaning changes, and only the kernels
+    /// converted to read it (`moe_expert_ffn_narrow`, `moe_expert_down_narrow`)
+    /// do so — everything else still derives its own `bm` from
+    /// `sorted_token_ids` as before. See that kernel's own comment.
+    bucket_live: CudaSlice<i32>,
     /// Per-expert selection counts, handed from the dispatch kernel's
     /// counting pass to its scatter pass. Device-side only: no host ever
     /// reads it, which is what lets the two passes be separate launches
@@ -3297,6 +3342,12 @@ impl MoeBuffers {
         &self.expert_ids
     }
 
+    /// Live-row count for each `block_size`-sized run. See the field's own
+    /// comment.
+    pub fn bucket_live(&self) -> &CudaSlice<i32> {
+        &self.bucket_live
+    }
+
     /// The single-element device scalar holding `num_tokens_post_pad`.
     pub fn num_tokens_post_pad(&self) -> &CudaSlice<i32> {
         &self.num_tokens_post_pad
@@ -3323,6 +3374,7 @@ impl MoeBuffers {
         (self.topk_ids.len()
             + self.sorted_token_ids.len()
             + self.expert_ids.len()
+            + self.bucket_live.len()
             + self.expert_counts.len()
             + self.num_tokens_post_pad.len()
             + self.valid_tokens.len())
@@ -3592,6 +3644,7 @@ impl MoeKernels {
             topk_weights: stream.alloc_zeros::<f32>(g.max_flat_pairs())?,
             sorted_token_ids: stream.alloc_zeros::<i32>(g.sorted_capacity())?,
             expert_ids: stream.alloc_zeros::<i32>(g.expert_block_capacity())?,
+            bucket_live: stream.alloc_zeros::<i32>(g.expert_block_capacity())?,
             expert_counts: stream.alloc_zeros::<i32>(g.num_experts)?,
             num_tokens_post_pad: stream.alloc_zeros::<i32>(1)?,
             valid_tokens: stream.alloc_zeros::<i32>(1)?,
@@ -3865,11 +3918,13 @@ impl MoeKernels {
             .arg(&expert_capacity)
             .arg(&mut buffers.sorted_token_ids)
             .arg(&mut buffers.expert_ids)
-            .arg(&mut buffers.num_tokens_post_pad);
+            .arg(&mut buffers.num_tokens_post_pad)
+            .arg(&mut buffers.bucket_live);
         // SAFETY: one block per expert; the shared array is `num_experts + 1`
         // ints for the prefix sum plus one per thread for the placement scan,
         // and every global write is bounds-checked against the capacities
-        // passed in.
+        // passed in. `bucket_live` is `expert_block_capacity` ints, the same
+        // bound `expert_ids` writes under in the same loop.
         unsafe { builder.launch(scatter_cfg) }?;
         Ok(())
     }
@@ -4028,37 +4083,60 @@ impl MoeKernels {
             // way, since both kernels tile the same `intermediate x
             // expert_block_capacity` shape. See `MOE_NARROW_DECODE_MAX`'s
             // comment for why this stayed a second kernel rather than a
-            // runtime gate inside one.
-            let f = if narrow {
-                &self.expert_ffn_narrow
+            // runtime gate inside one. `expert_ffn_narrow` also takes
+            // `bucket_live`, which `expert_ffn` does not, so the two launches
+            // no longer share one argument list -- see `bucket_live`'s own
+            // comment on `moe_align_block_size`.
+            if narrow {
+                let mut builder = stream.launch_builder(&self.expert_ffn_narrow);
+                builder
+                    .arg(gate.bytes)
+                    .arg(&gate_code)
+                    .arg(up.bytes)
+                    .arg(&up_code)
+                    .arg(hidden_states)
+                    .arg(&buffers.sorted_token_ids)
+                    .arg(&buffers.expert_ids)
+                    .arg(&buffers.bucket_live)
+                    .arg(&buffers.valid_tokens)
+                    .arg(&top_k)
+                    .arg(&block_size)
+                    .arg(&hidden)
+                    .arg(&intermediate)
+                    .arg(&mut buffers.inter);
+                // SAFETY: grid.y is the dispatch-block capacity, exactly what
+                // `expert_ids` and `bucket_live` hold and `block_size` times
+                // fewer than what `sorted_token_ids` holds; `inter` is
+                // `sorted_capacity * intermediate` floats, the range `(blk *
+                // block_size + m, r)` covers. Shared memory covers the
+                // activation tile plus one slot id per tile row. Weight
+                // indexing is bounded by the element-count check above.
+                unsafe { builder.launch(ffn_cfg) }?;
             } else {
-                &self.expert_ffn
-            };
-            let mut builder = stream.launch_builder(f);
-            builder
-                .arg(gate.bytes)
-                .arg(&gate_code)
-                .arg(up.bytes)
-                .arg(&up_code)
-                .arg(hidden_states)
-                .arg(&buffers.sorted_token_ids)
-                .arg(&buffers.expert_ids)
-                .arg(&buffers.valid_tokens)
-                .arg(&top_k)
-                .arg(&block_size)
-                .arg(&hidden)
-                .arg(&intermediate)
-                .arg(&mut buffers.inter);
-            // SAFETY: grid.y is the dispatch-block capacity, exactly what
-            // `expert_ids` holds and `block_size` times fewer than what
-            // `sorted_token_ids` holds; `inter` is `sorted_capacity *
-            // intermediate` floats, the range `(blk * block_size + m, r)`
-            // covers. Shared memory covers the activation tile plus one slot id
-            // per tile row. Weight indexing is bounded by the element-count
-            // check above. `expert_ffn_narrow` shares `expert_ffn`'s exact
-            // argument list and bounds -- it is `expert_ffn`'s own body with
-            // one branch changed.
-            unsafe { builder.launch(ffn_cfg) }?;
+                let mut builder = stream.launch_builder(&self.expert_ffn);
+                builder
+                    .arg(gate.bytes)
+                    .arg(&gate_code)
+                    .arg(up.bytes)
+                    .arg(&up_code)
+                    .arg(hidden_states)
+                    .arg(&buffers.sorted_token_ids)
+                    .arg(&buffers.expert_ids)
+                    .arg(&buffers.valid_tokens)
+                    .arg(&top_k)
+                    .arg(&block_size)
+                    .arg(&hidden)
+                    .arg(&intermediate)
+                    .arg(&mut buffers.inter);
+                // SAFETY: grid.y is the dispatch-block capacity, exactly what
+                // `expert_ids` holds and `block_size` times fewer than what
+                // `sorted_token_ids` holds; `inter` is `sorted_capacity *
+                // intermediate` floats, the range `(blk * block_size + m, r)`
+                // covers. Shared memory covers the activation tile plus one
+                // slot id per tile row. Weight indexing is bounded by the
+                // element-count check above.
+                unsafe { builder.launch(ffn_cfg) }?;
+            }
         }
 
         // Every valid flat id is written exactly once by the down kernel, so
@@ -4165,30 +4243,48 @@ impl MoeKernels {
             // `use_mma`, so `narrow` (computed off `use_mma`) is exactly
             // right here too: at `max_tokens <= MOE_NARROW_DECODE_MAX` (4,
             // below 8) neither `down_mma` nor `use_mma` can be true regardless
-            // of `down.quant`.
-            let f = if narrow {
-                &self.expert_down_narrow
+            // of `down.quant`. `expert_down_narrow` also takes `bucket_live`,
+            // which `expert_down` does not, so (as for the ffn half above)
+            // the two launches no longer share one argument list.
+            if narrow {
+                let mut builder = stream.launch_builder(&self.expert_down_narrow);
+                builder
+                    .arg(down.bytes)
+                    .arg(&down_code)
+                    .arg(&buffers.inter)
+                    .arg(&buffers.topk_weights)
+                    .arg(&buffers.sorted_token_ids)
+                    .arg(&buffers.expert_ids)
+                    .arg(&buffers.bucket_live)
+                    .arg(&buffers.valid_tokens)
+                    .arg(&top_k)
+                    .arg(&block_size)
+                    .arg(&hidden)
+                    .arg(&intermediate)
+                    .arg(&mut buffers.partial);
+                // SAFETY: as above, plus `bucket_live` holds `expert_block_
+                // capacity` ints, the same bound `expert_ids` is read under.
+                unsafe { builder.launch(down_cfg) }?;
             } else {
-                &self.expert_down
-            };
-            let mut builder = stream.launch_builder(f);
-            builder
-                .arg(down.bytes)
-                .arg(&down_code)
-                .arg(&buffers.inter)
-                .arg(&buffers.topk_weights)
-                .arg(&buffers.sorted_token_ids)
-                .arg(&buffers.expert_ids)
-                .arg(&buffers.valid_tokens)
-                .arg(&top_k)
-                .arg(&block_size)
-                .arg(&hidden)
-                .arg(&intermediate)
-                .arg(&mut buffers.partial);
-            // SAFETY: as above; `partial` is `max_flat_pairs * hidden` floats and
-            // is indexed by `flat * hidden + h` with `flat < valid_tokens *
-            // top_k <= max_flat_pairs`.
-            unsafe { builder.launch(down_cfg) }?;
+                let mut builder = stream.launch_builder(&self.expert_down);
+                builder
+                    .arg(down.bytes)
+                    .arg(&down_code)
+                    .arg(&buffers.inter)
+                    .arg(&buffers.topk_weights)
+                    .arg(&buffers.sorted_token_ids)
+                    .arg(&buffers.expert_ids)
+                    .arg(&buffers.valid_tokens)
+                    .arg(&top_k)
+                    .arg(&block_size)
+                    .arg(&hidden)
+                    .arg(&intermediate)
+                    .arg(&mut buffers.partial);
+                // SAFETY: as above; `partial` is `max_flat_pairs * hidden`
+                // floats and is indexed by `flat * hidden + h` with `flat <
+                // valid_tokens * top_k <= max_flat_pairs`.
+                unsafe { builder.launch(down_cfg) }?;
+            }
         }
 
         Ok(())
