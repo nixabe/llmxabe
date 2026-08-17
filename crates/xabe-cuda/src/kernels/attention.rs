@@ -227,6 +227,15 @@ const ROPE_TOKENS: u32 = 16;
 /// a compile-time constant and `head_dim` is rejected above `32 * ATTN_MAXD`.
 const ATTN_MAXD: usize = 8;
 
+/// Query heads per KV head the warp-per-split decode kernel carries. Mirrors
+/// `DEC_MAXG`.
+///
+/// One warp owns every head of its KV head so that a key it has loaded is
+/// reused `gqa` times out of registers rather than re-read from shared. The
+/// cost is `2 * this * ATTN_MAXD` registers of query and accumulator, which is
+/// what bounds it.
+const DECODE_MAX_GQA: usize = 8;
+
 /// Query rows one GQA-shared block carries. Mirrors `GQA_QT`.
 ///
 /// This is exactly the factor by which that kernel divides K/V traffic, so
@@ -312,7 +321,7 @@ const MMA_SHARED_CEILING: usize = 64 * 1024;
 /// the block count that replaces decode's old sixteen. 64 gives 128 blocks
 /// against 72 SMs, which is where the card stops being the constraint; raising
 /// it further only shortens each slice and lengthens the combine.
-const DECODE_SPLITS: usize = 144;
+const DECODE_SPLITS: usize = 288;
 
 /// Keys the flash-decoding split pass stages per trip. Mirrors `DEC_KT`.
 ///
@@ -1451,7 +1460,187 @@ __global__ void attn_flash_causal_gqa(
 // and write the identity partial — `m = -inf`, `l = 0`, `acc = 0` — which the
 // combine folds in as `exp(-inf - gm) = 0`, exactly.
 #define DEC_KT 8
-#define DEC_SPLITS 144
+#define DEC_SPLITS 288
+
+// ---------------------------------------------------------------------------
+// Flash decoding again, with a warp as the whole split and no shared memory.
+//
+// grid: (DEC_SPLITS, kv_heads). block: one warp.
+//
+// ## Why the kernel below it was not enough
+//
+// `attn_flash_decode_split` gives a warp one query head, so a warp needs every
+// dimension of every key and the tile has to be staged in shared for the eight
+// warps of a KV group to share. Measured at a 131,072-key window it moved
+// 184.8 GB/s -- 27.5% of this card -- and the reason is arithmetic rather than
+// mystery:
+//
+//   shared per block-tile = 8 warps * 2 * DEC_KT * head_dim * 4 B = 128 KiB
+//   DRAM   per block-tile =           2 * DEC_KT * head_dim * 2 B =   8 KiB
+//
+// At 128 B/cycle the shared traffic is ~1,152 cycles against ~1,224 for the
+// DRAM it is meant to be hiding behind. The staging *is* the bottleneck. Two
+// cheaper explanations were measured and rejected first: `DEC_SPLITS` at 144,
+// 288, 432 and 576 gives 1.453, 1.453, 1.466, 1.477 ms, so it is not block
+// parallelism; and the tile already keeps ~24 KiB in flight per SM against the
+// ~4 KiB Little's law asks for, so it is not memory-level parallelism.
+//
+// ## The shape
+//
+// A lane holds `head_dim/32` **consecutive** dimensions, so the 32 lanes of one
+// warp cover a whole key and load it as one coalesced run straight from global.
+// The warp then owns *every* query head of its KV head, reusing that key
+// `gqa` times out of registers. K and V are read exactly once each, by exactly
+// one warp, and shared memory disappears along with every barrier.
+//
+// The partition is the point. "One lane per dimension" would also reuse the
+// key, but then each of the `gqa * DEC_KT` dot products reduces across 32 lanes
+// separately -- eight times the shuffles. Holding `head_dim/32` dims per lane
+// makes the inner sum sequential and free, and leaves the shuffle count per
+// warp exactly what the staged kernel already paid.
+//
+// ## Rescaling is rare, not per key
+//
+// The online softmax rescales when the running maximum moves, which after the
+// first few keys is O(log n) of them. Guarding the rescale on `nm != m` costs a
+// warp-uniform branch -- the score is identical in every lane after the
+// reduction -- and removes both an `expf` and a `head_dim/32`-wide multiply
+// from the common path. Without that guard this shape would pay two `expf` per
+// key per head where the staged kernel pays one per *tile*.
+//
+// A warp is simply a finer split, so `attn_flash_decode_combine` merges these
+// with the identity it already implements and needs no change.
+#define DEC_MAXG 8
+// Keys whose loads are issued before any of them is consumed.
+#define DEC_KB 1
+
+__global__ void attn_flash_decode_warp(
+    const float* __restrict__ q,
+    const unsigned short* __restrict__ k,
+    const unsigned short* __restrict__ v,
+    float* __restrict__ part_acc,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    const int* __restrict__ key_offset,
+    float scale
+) {
+    int gqa = q_heads / kv_heads;
+    int dpl = head_dim >> 5;          // dimensions this lane owns
+    int wpl = dpl >> 1;               // packed 32-bit words behind them
+    int lane = threadIdx.x;
+    int split = blockIdx.x;
+    int kvh = blockIdx.y;
+
+    long long n_visible = (long long)(*key_offset) + 1;
+    long long per = (n_visible + DEC_SPLITS - 1) / DEC_SPLITS;
+    long long begin = (long long)split * per;
+    long long end = begin + per;
+    if (end > n_visible) end = n_visible;
+
+    float qr[DEC_MAXG][ATTN_MAXD];
+    float acc[DEC_MAXG][ATTN_MAXD];
+    float m[DEC_MAXG], l[DEC_MAXG];
+    #pragma unroll
+    for (int hh = 0; hh < DEC_MAXG; ++hh) {
+        m[hh] = neg_inf();
+        l[hh] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < ATTN_MAXD; ++i) { qr[hh][i] = 0.0f; acc[hh][i] = 0.0f; }
+        if (hh < gqa) {
+            const float* qp =
+                q + (long long)(kvh * gqa + hh) * (long long)head_dim;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpl) qr[hh][i] = qp[dpl * lane + i];
+            }
+        }
+    }
+
+    // Keys are taken `DEC_KB` at a time with every load issued before any of
+    // the arithmetic. The loop bound is a runtime value, so ptxas cannot
+    // unroll it and the next key's loads would otherwise wait on this key's
+    // registers -- one key in flight per warp, which is the same
+    // memory-parallelism bound that held the prefill staging to a third of
+    // peak. A batch of `DEC_KB` puts `8 * DEC_KB` requests in flight instead.
+    for (long long j0 = begin; j0 < end; j0 += DEC_KB) {
+        unsigned kw[DEC_KB][ATTN_MAXD / 2], vw[DEC_KB][ATTN_MAXD / 2];
+        #pragma unroll
+        for (int jj = 0; jj < DEC_KB; ++jj) {
+            long long key = j0 + jj;
+            bool live = key < end;
+            long long at = (key * (long long)kv_heads + kvh) * (long long)head_dim;
+            const unsigned* kp = (const unsigned*)(k + at);
+            const unsigned* vp = (const unsigned*)(v + at);
+            #pragma unroll
+            for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+                kw[jj][p] = (live && p < wpl) ? kp[wpl * lane + p] : 0u;
+                vw[jj][p] = (live && p < wpl) ? vp[wpl * lane + p] : 0u;
+            }
+        }
+        #pragma unroll
+        for (int jj = 0; jj < DEC_KB; ++jj) {
+        if (j0 + jj >= end) break;
+        float kk[ATTN_MAXD], vv[ATTN_MAXD];
+        #pragma unroll
+        for (int p = 0; p < (ATTN_MAXD >> 1); ++p) {
+            if (p < wpl) {
+                h2f2(kw[jj][p], &kk[2 * p], &kk[2 * p + 1]);
+                h2f2(vw[jj][p], &vv[2 * p], &vv[2 * p + 1]);
+            }
+        }
+        #pragma unroll
+        for (int hh = 0; hh < DEC_MAXG; ++hh) {
+            if (hh < gqa) {
+                float part = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < ATTN_MAXD; ++i) {
+                    if (i < dpl) part += qr[hh][i] * kk[i];
+                }
+                for (int off = 16; off > 0; off >>= 1) {
+                    part += __shfl_xor_sync(0xffffffff, part, off);
+                }
+                // Identical in every lane from here, so the branch below is
+                // warp-uniform and the scalars need no broadcast.
+                float s = part * scale;
+                float nm = fmaxf(m[hh], s);
+                if (nm != m[hh]) {
+                    float corr = (m[hh] == neg_inf()) ? 0.0f : expf(m[hh] - nm);
+                    l[hh] *= corr;
+                    #pragma unroll
+                    for (int i = 0; i < ATTN_MAXD; ++i) acc[hh][i] *= corr;
+                    m[hh] = nm;
+                }
+                float e = expf(s - nm);
+                l[hh] += e;
+                #pragma unroll
+                for (int i = 0; i < ATTN_MAXD; ++i) {
+                    if (i < dpl) acc[hh][i] += e * vv[i];
+                }
+            }
+        }
+        }
+    }
+
+    #pragma unroll
+    for (int hh = 0; hh < DEC_MAXG; ++hh) {
+        if (hh < gqa) {
+            int h = kvh * gqa + hh;
+            float* pa =
+                part_acc + ((long long)split * q_heads + h) * (long long)head_dim;
+            #pragma unroll
+            for (int i = 0; i < ATTN_MAXD; ++i) {
+                if (i < dpl) pa[dpl * lane + i] = acc[hh][i];
+            }
+            if (lane == 0) {
+                part_m[split * q_heads + h] = m[hh];
+                part_l[split * q_heads + h] = l[hh];
+            }
+        }
+    }
+}
 
 __global__ void attn_flash_decode_split(
     const float* __restrict__ q,
@@ -1906,6 +2095,7 @@ pub struct AttentionKernels {
     flash_gqa: CudaFunction,
     flash_mma: CudaFunction,
     decode_split: CudaFunction,
+    decode_warp: CudaFunction,
     decode_combine: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
@@ -1951,6 +2141,7 @@ impl AttentionKernels {
                 f
             },
             decode_split: module.load_function("attn_flash_decode_split")?,
+            decode_warp: module.load_function("attn_flash_decode_warp")?,
             decode_combine: module.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
@@ -2094,6 +2285,18 @@ impl AttentionKernels {
     ///
     /// Same three conditions as the GQA-shared kernel — it is the same block
     /// shape with one query row instead of four.
+    /// Whether the warp-per-split decode kernel can service this geometry.
+    ///
+    /// A lane holds `head_dim / 32` dimensions and they must be a whole number
+    /// of packed pairs, and one warp carries every query head of its KV head,
+    /// which bounds the register arrays at `DEC_MAXG`.
+    fn decode_warp_is_available(&self) -> bool {
+        self.gqa_ratio() >= 2
+            && self.gqa_ratio() <= DECODE_MAX_GQA
+            && self.head_dim.is_multiple_of(64)
+            && self.head_dim / 32 <= ATTN_MAXD
+    }
+
     fn decode_split_is_available(&self) -> bool {
         self.gqa_ratio() >= 2
             && self.gqa_ratio() * 32 <= 1024
@@ -2446,12 +2649,34 @@ impl AttentionKernels {
         let head_dim = self.head_dim as i32;
         let scale = self.scale();
 
+        // One warp per split when the geometry allows it: it reads K and V
+        // once each instead of staging them for a KV group to share, which at
+        // a 128K window is the difference between 27% and most of the card's
+        // bandwidth. See the kernel comment.
+        let warp_split = self.decode_warp_is_available();
         let split_cfg = LaunchConfig {
             grid_dim: (DECODE_SPLITS as u32, self.kv_heads as u32, 1),
-            block_dim: ((self.gqa_ratio() * 32) as u32, 1, 1),
-            shared_mem_bytes: self.shared_bytes_decode() as u32,
+            block_dim: (
+                if warp_split {
+                    32
+                } else {
+                    (self.gqa_ratio() * 32) as u32
+                },
+                1,
+                1,
+            ),
+            shared_mem_bytes: if warp_split {
+                0
+            } else {
+                self.shared_bytes_decode() as u32
+            },
         };
-        let mut builder = stream.launch_builder(&self.decode_split);
+        let f = if warp_split {
+            &self.decode_warp
+        } else {
+            &self.decode_split
+        };
+        let mut builder = stream.launch_builder(f);
         builder
             .arg(q)
             .arg(k)
