@@ -5627,6 +5627,13 @@ targets do not need it.
 
 ## MoE's small-bucket GEMV at batch decode: a real win through N=4, a real regression at N=8, and rejected on the second one (2026-08-18)
 
+**Superseded by the next section.** The "What a follow-up needs" close of
+this section named the fix exactly: a genuinely separate `__global__`
+kernel rather than a same-function runtime branch. That was built, and it
+does what this section predicted -- N=8 is bit-identical SASS and pure
+noise, N=2-4 keep the win. Left in place rather than deleted, per this
+file's own append-only convention.
+
 This session's brief named the batched-decode aggregate at N=3 (89.2 tok/s
 against llama.cpp's 154.58) as the largest remaining gap and asked for
 `grouped_forward`'s decode-width GEMV shape to be re-profiled at N=3
@@ -6230,3 +6237,108 @@ actually crosses over rather than a round number picked in advance.
    accounting gives no further lever to close it beyond `DMMA_KT` --
    `ncu` would be the direct way to see where the remaining issue slots
    go, and remains unavailable on this host.
+## MoE's small-bucket GEMV, take two: a separate kernel, bit-identical SASS on everything it did not touch, and N=8 stops regressing (2026-08-18)
+
+The previous section's own "What a follow-up needs" named this exactly.
+Built it: `moe_expert_ffn_narrow`/`moe_expert_down_narrow` are new,
+standalone `__global__` entry points, not branches inside `moe_expert_ffn`/
+`moe_expert_down`. Their `bm == 1` case calls `tile_gemm_pair_direct1`/
+`tile_gemm_single_direct1` (new functions, no staging, same reasoning as
+before); `bm > 1` falls through to the *unmodified* `tile_gemm_pair`/
+`tile_gemm_single` templates -- copy-pasted dispatch, not a shared branch.
+`tile_gemm_pair`, `tile_gemm_single` and `MOE_TILE_DISPATCH` are not edited
+by a single character. The host picks the narrow kernel by `1 < N <=
+MOE_NARROW_DECODE_MAX` (4, below `MMA_MIN_TOKENS`'s 8 so there is no overlap
+with the integer path) in `grouped_forward_partial`, a launch-time decision
+from `g.max_tokens` -- host-known already, the same value that picks
+`moe_expert_ffn_gemv` at `N == 1`.
+
+This landed after `890377d` ("Widen M on the routed-expert MoE MMA
+kernels"), which touches `MOE_MMA_M`/`MOE_MMA_BLOCKS_PER_SM` -- a different
+part of the same file, no textual overlap with this change, and the numbers
+below are against that commit, not the one two sections up.
+
+### Why N=8 regressed even fully gated off: `moe_expert_ffn_mma`, not `moe_expert_ffn`
+
+The previous section's `ptxas -v` check looked at `moe_expert_ffn`/
+`moe_expert_down` and found nothing -- correctly, but at the wrong kernel.
+`MMA_MIN_TOKENS` is 8, and this model's gate/up are Q6_K, so N=8 decodes
+through `moe_expert_ffn_mma`/`moe_expert_down_mma`, never through the tiled
+kernels either version of this change edited. Confirmed rather than assumed:
+`nsys --cuda-graph-trace=node` over an isolated N=8 replay (2,048-token
+context, GPU 2) shows `moe_expert_ffn_mma` (1,324 calls) and
+`moe_expert_down_mma` (1,358 calls) and **zero** instances of
+`moe_expert_ffn`/`moe_expert_down` in the same window.
+
+`ptxas -v` on `moe_expert_ffn_mma` -- pulled from the same two `MOE_SRC`
+extractions the previous section built, not re-derived -- is the answer the
+previous section was looking for and did not know where to look: **80
+registers on the pre-`bm==1` tree, 126 after.** Adding text anywhere in
+`tile_gemm_pair`/`tile_gemm_single` (a function `moe_expert_ffn_mma` never
+calls, has no template relationship to, and is not adjacent to in the file)
+moved `ptxas`'s register allocation for a wholly unrelated `__global__`
+function compiled from the same `nvrtc` module. Neither register pressure
+nor shared memory explained the regression in the previous section's own
+check because that check was pointed at kernels the regressed width does
+not run.
+
+### The fix, verified the way the previous section asked for
+
+`cuobjdump -sass` on both trees (`890377d` alone, and `890377d` plus this
+change), same extraction and `nvcc -arch=sm_75 --ptxas-options=-v` pipeline
+the project already uses in place of `ncu`. Every kernel that existed before
+this change -- `moe_expert_ffn`, `moe_expert_down`, `moe_expert_ffn_mma`,
+`moe_expert_down_mma`, `moe_expert_ffn_gemv`, `moe_expert_down_gemv` --
+diffs **byte-identical**, register counts and all (`moe_expert_ffn_mma`:
+126 registers both trees, matching `890377d`'s own widened `MOE_MMA_M`
+number, not the 80 this change's earlier attempt disturbed). The `ptxas -v`
+log's only difference between the two trees is two new lines: `Compiling
+entry function 'moe_expert_ffn_narrow'` and `'moe_expert_down_narrow'`.
+
+`bench_decode_batch`, GPU 2, three interleaved rounds each, against
+`890377d` (not the pre-widening baseline two sections up -- see the note
+above):
+
+| N | ctx | before (mean, 3 rounds) | after | change |
+|---:|---:|---:|---:|---:|
+| 2 | 2,048 | 96.0 | 102.7 | **+7.0%** |
+| 3 | 2,048 | 106.0 | 112.5 | **+6.1%** |
+| 3 | 32,768 | 85.6 | 89.6 | **+4.7%** |
+| 4 | 2,048 | 121.7 | 128.7 | **+5.7%** |
+| 8 | 2,048 | 153.0 | 152.7 | **noise** (-0.2%, three rounds each: 154.0/152.9/152.2 vs 153.3/152.6/152.1) |
+
+N=8's own baseline moved with `890377d` (170.7 -> ~153, that commit's own
+trade for its prefill target) -- this change does not touch it either
+direction, which the bit-identical SASS above already predicts and the
+measurement confirms.
+
+### Correctness
+
+`tests/moe_differential.rs`: 6/6. `tests/batch_decode.rs`: 3/3, including
+the bit-exact `identical_prompts_in_one_batch_produce_bit_identical_rows` --
+and unlike the previous section's own coverage note, this one is not a
+formality: `BATCH` in that file is 3, squarely inside `1 < N <=
+MOE_NARROW_DECODE_MAX`, so all three differentials exercise
+`moe_expert_ffn_narrow`/`moe_expert_down_narrow` directly, not just the
+kernels this change left alone. `tests/moe_differential.rs`'s own
+`NUM_TOKENS` is 37, above the narrow threshold, so it does not reach the new
+kernels -- its 6/6 is evidence the untouched paths still agree with the CPU
+reference, not evidence for the new ones. N=2 and N=4 share the identical
+`bm == 1` code path as N=3 and are covered by the throughput A/B above, not
+by a dedicated differential at those widths.
+
+The golden test (`the_forward_pass_reproduces_llama_cpps_logits_and_its_
+argmax`) passes at the same logit (19.998243 against llama.cpp's 19.902241)
+and the same rank-4 noise-floor swap this file's precedent already accepts
+-- expected, since it runs single-stream (`N == 1`) and never reaches the
+narrow kernels either.
+
+### What is left
+
+`MOE_NARROW_DECODE_MAX` is 4 because that is where this session's own
+measurements stop, not because 5-7 are known to behave like 8. Widening it
+would need N=5-7 measured the same way before trusting them. The shared
+expert (`moe_shared_ffn`/`moe_shared_down`) deliberately keeps the original
+three-way dispatch -- its `bm` is the literal token count with no sparse
+routing, so `bm == 1` there only happens at `N == 1`, already served by
+`moe_expert_ffn_gemv` before `grouped_forward_partial` reaches it.
