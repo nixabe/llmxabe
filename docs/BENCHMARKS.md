@@ -6530,3 +6530,115 @@ floor. Closing it further needs a shape that pays neither -- reducing the
 by `moe_align_block_size` rather than re-derived by every kernel that reads
 `sorted_token_ids`, is the obvious next place to look) rather than another
 way of routing around it. Not attempted this session.
+
+## Staging `Q` to shared to free `DMMA_KT` headroom: real registers freed, and a real loss anyway (2026-08-18)
+
+The previous section's close named `WPO=2`'s 3-register margin (252 of 255)
+as what blocks `DMMA_KT` widening. The lead's proposed fix: `Q`'s `q_hi`/
+`q_lo` fragment (`qa0[DMMA_QSTEPS]`/`qa1[DMMA_QSTEPS]`, 64 registers per
+lane) is identical across every warp in a block -- `g`/`tg` depend only on
+`lane`, not `warp`, and the pointer into `q` depends only on `kvh`/`g`, both
+warp-independent -- so `WPO` warps were each separately computing and
+holding the same 64 registers' worth of data. Staging it to shared once,
+read by every warp's `Q K^T` phase instead, trades that redundant register
+residency for shared reads the prefill kernel's own `q_sh` already proves
+the pattern for on this card.
+
+### The shared-memory arithmetic the lead asked to be verified first, verified, and it does not hold at `WPO=2`
+
+`Q`'s staged size is `2 * 8 * (head_dim / 2)` words (`q_hi_sh`/`q_lo_sh`,
+8 real rows, `head_dim / 2` packed columns each) = 8,192 B at `head_dim`
+256, independent of `WPO`. Added to `dmma_shared_bytes`:
+
+| WPO | shared before | shared after (+8,192 B) | blocks/SM before | blocks/SM after |
+|---:|---:|---:|---:|---:|
+| 2 | 21,344 B (20.8 KiB) | 29,536 B (28.8 KiB) | 3 | **2** |
+| 4 | 38,496 B (37.6 KiB) | 46,688 B (45.6 KiB) | 1 | 1 |
+
+The lead's own sizing note ("stays within 3 blocks/SM... verify the
+arithmetic first") does not hold at `WPO=2`: `65,536 / 29,536 = 2.22`,
+floor 2, not 3. `WPO=2`'s entire advantage over `WPO=4` in every earlier
+section is the extra resident block hiding K/V staging latency that
+`WPO=4`'s single block cannot; this change spends part of that same
+margin to buy the register space back. `WPO=4` is unaffected (still
+1 block/SM, shared-limited both before and after) but is also the width
+that has never won at any depth measured, so it was not built or
+benchmarked separately -- spending session time on the losing width's
+numbers was judged not worth it under this experiment's own bound.
+
+### Built, correct, and registers freed by far more than the 15-register bar
+
+Implemented as a block-wide cooperative write: `q_hi_sh`/`q_lo_sh` filled
+by a `for (int idx = tid; idx < 8 * hd2; idx += nthr)` loop before the key
+loop starts (the loop's own first statement is already `__syncthreads()`,
+which covers the write-then-read ordering with no new barrier needed), then
+each trip's `Q K^T` phase reads `q_hi_sh[g * hd2 + c]`/`q_lo_sh[g * hd2 +
+c]` in place of the old `qa0[s]`/`qa1[s]` register reads. `nvcc -arch=sm_75
+-cubin -Xptxas -v` on the extracted kernel:
+
+| variant | registers before | registers after | spill |
+|---|---:|---:|---:|
+| `WPO=2` | 252 | **179** | 0 -> 0 |
+| `WPO=4` | 235 | **126** | 0 -> 0 |
+
+73 and 109 registers freed respectively -- far past the lead's own
+`>= 15` bar for "real headroom," at 0 spill both before and after. On
+registers alone this looks like exactly the win the previous section's
+close was waiting for. `device_decode_matches_the_reference_over_a_deep_window`,
+forced to both widths, reproduces the pre-change numbers exactly
+(`n_keys = 4,096`: 6.660e-6; `4,097`: 7.276e-6; `61`: 1.043e-7; all
+cosine 1.000000000) -- moving `Q` to shared changed nothing about what
+the kernel computes.
+
+### Measured anyway, and it is not a wash
+
+`bench_attention`, `LLMXABE_ATTN_CHUNK=1`, `LLMXABE_DECODE_MMA_WPO=2`, GPU 1,
+three interleaved rounds against a `git worktree` build of the unmodified
+`WPO=2` kernel (the same isolation hazard-avoidance the MoE workstream
+used earlier in this file, for the same reason -- this checkout has
+sibling edits landing and being reverted in the same file while this
+session runs):
+
+| key_offset | register-`Q` (ms, 3 rounds) | shared-`Q` (ms, 3 rounds) | shared-`Q` vs register-`Q` |
+|---:|---:|---:|---:|
+| 32,768 | 0.305 / 0.306 / 0.306 | 0.417 / 0.417 / 0.418 | 1.37x slower |
+| 65,536 | 0.508 / 0.508 / 0.515 | 0.710 / 0.709 / 0.710 | 1.39x slower |
+| 98,304 | 0.726 / 0.721 / 0.725 | 0.999 / 0.995 / 0.997 | 1.38x slower |
+| 131,072 | 0.923 / 0.927 / 0.932 | 1.297 / 1.299 / 1.300 | 1.40x slower |
+
+Consistent, decisive, and not close: 37-40% slower at every depth
+measured, agreeing to within a percent of itself across all three rounds
+on both sides. Freeing 73 registers with 0 spill did not translate into a
+win -- the two candidate mechanisms this session did not isolate between
+(no `ncu`, the same limitation named throughout this file) are the
+occupancy drop measured above (3 -> 2 resident blocks/SM losing exactly
+the latency-hiding margin `WPO=2` depended on) and the new per-trip cost
+the register version never paid: 32 unrolled `q_hi_sh`/`q_lo_sh` reads
+apiece, 64 shared loads per warp per trip, on every trip through the
+whole key loop rather than once. The near-uniform ~37-40% slowdown across
+every depth (not concentrated at the deepest, most-trip-heavy end) is
+weak evidence for the per-trip-read explanation over the occupancy one,
+but this session did not confirm it against `cuobjdump -sass` or `ncu`.
+
+### Disposition
+
+Reverted (`git checkout -- crates/xabe-cuda/src/kernels/attention.rs`,
+zero diff against the parent commit). Per this experiment's own bound: a
+loss here means `DMMA_KT=64` was not attempted -- there was nothing to
+widen a key trip on top of, since the one lever this section had for
+freeing `WPO=2`'s register margin made the kernel slower than the margin
+was worth recovering. `DECODE_MMA_DEPTH_THRESHOLD` (16,384) is unchanged;
+the reverted kernel is bit-for-bit the one it was measured against.
+
+### What this closes
+
+`DMMA_KT` widening has now been tried from both register-freeing angles
+available without a block-shape change: the "Widening the softmax-rescale
+tile" section's `MMA_KEY_TRIPS` did it on the *prefill* kernel and spilled
+immediately from 252 registers; this section freed decode's own registers
+first and still lost, on shared-memory occupancy and per-trip read cost
+rather than a spill. Between the two, every register-side lever this file
+has for the wider key trip is spent. Closing the remaining bandwidth gap
+(43% against llama.cpp's 88%, per the previous section) needs a
+structural change neither section's own tools could evaluate without
+`ncu` -- both close on the same request.
