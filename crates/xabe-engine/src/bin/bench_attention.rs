@@ -29,6 +29,19 @@
 //! `TFLOP/s` counts the causal half only, so it is comparable to the ~22
 //! TFLOP/s llama.cpp reaches on this card and to the ~65 the fp16 tensor cores
 //! peak at.
+//!
+//! ## Decode
+//!
+//! `LLMXABE_ATTN_CHUNK=1` runs this at `n_query = 1`, which is decode's shape
+//! and routes through [`AttentionKernels::forward`]'s two-pass split rather
+//! than any prefill kernel — `traffic()` below already special-cases it via
+//! `splits_the_key_axis`. Every `DEPTHS` row then times
+//! `attn_flash_decode_warp` + `attn_flash_decode_combine` alone, in seconds
+//! rather than the `bench_decode` minute a full model load costs. It does not
+//! cover the rest of a decode step: at shallow depth attention is a small
+//! fraction of one (~5% measured with `nsys --cuda-graph-trace=node` at
+//! context 12..28 — MoE and GDN's per-token kernels dominate there), and its
+//! share only grows large at depth. See docs/BENCHMARKS.md.
 
 use std::process::ExitCode;
 use std::sync::Arc;

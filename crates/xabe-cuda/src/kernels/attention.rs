@@ -1545,6 +1545,16 @@ __global__ void attn_flash_causal_gqa(
 // Keys whose loads are issued before any of them is consumed.
 #define DEC_KB 1
 
+// `half2` accumulation for `P V` was tried and measured slower -- 1.334 vs
+// 1.198 ms at a 131,072-key window, +11.3%, despite compiling to *fewer*
+// registers (155 vs 195) and *fewer* static instructions (1,424 vs 1,536).
+// `fma.rn.f16x2`/`mul.f16x2` replace the eight-wide fp32 FMA with a four-wide
+// f16x2 one straight against the `uint4` load's packed word, no `h2f2` unpack
+// needed. That accounting made it look free; the measurement says the
+// packing (`F2F`+`PRMT` per head per key, to broadcast the scalar softmax
+// weight into a `half2`) costs more than the FMAs it removes, and where that
+// cost lands is still open -- `ncu` cannot run on this host. See
+// docs/BENCHMARKS.md for the SASS breakdown. Not applied.
 __global__ void attn_flash_decode_warp(
     const float* __restrict__ q,
     const unsigned short* __restrict__ k,

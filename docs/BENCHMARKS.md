@@ -3455,3 +3455,66 @@ Decode keeps `expf`; only `attn_flash_causal_mma` changed.
 Landed as a separate commit from the rest of this session's decode work,
 scoped to the three hunks inside `attn_flash_causal_mma` and its `ATTN_LOG2E`
 `#define`.
+
+## `half2` on the `P V` accumulator: fewer registers, fewer instructions, 11.3% slower (2026-08-17)
+
+The named next hypothesis for decode's 33.9%-of-roofline ceiling was `half2`
+arithmetic: K and V are stored binary16, `attn_flash_decode_warp` converts
+both to fp32 before using them, and the value path -- `acc[hh][i] += e *
+vv[i]`, `ATTN_MAXD` scalar FMAs per head per key -- looked like it could run
+as `ATTN_MAXD/2` packed `f16x2` FMAs straight against the `uint4` load's
+already-packed word, with no `h2f2` unpack at all.
+
+Built exactly that: the accumulator became `unsigned accp[DEC_MAXG][ATTN_MAXD
+/ 2]`, `vw`'s packed words went into `fma.rn.f16x2` (via inline PTX,
+`hfma2_raw`) unconverted, the rescale multiply used `mul.f16x2`, and the
+per-key scalar softmax weight `e` was broadcast into a packed word with the
+`pack_h2` helper the tensor-core kernel already had. K stayed fp32 -- it
+feeds the score the softmax exponentiates, and the `exp2f` result two
+sections up already found that budget too tight for a coarser unit.
+
+Three rebuild-and-measure rounds each, alternating, `LLMXABE_ATTN_CHUNK=1`
+(`bench_attention`'s decode mode -- see its module doc, added this session),
+`key_offset = 131,072`, ms:
+
+| round | before | after |
+|---:|---:|---:|
+| 1 | 1.198 | 1.333 |
+| 2 | 1.199 | 1.334 |
+| 3 | 1.199 | 1.334 |
+
+**11.3% slower**, and consistent to three significant figures across rounds
+in both directions -- not noise.
+
+That was the surprising result, so it was checked against `ptxas -v` and
+`cuobjdump -sass` (offline, via `nvcc -arch=sm_75` on the extracted kernel
+source -- NVRTC's cache is in-process only, see `kernels::mod::compile`) two
+ways, both pointing the same direction as the timing rather than away from
+it:
+
+| | registers | static instructions | spills |
+|---|---:|---:|---:|
+| before | 195 | 1,536 | 0 |
+| after | **155** | **1,424** | 0 |
+
+Fewer registers, fewer instructions, no spilling -- by the accounting that
+predicted the change, it should have won. `cuobjdump -sass` shows what the
+instruction count alone did not: 32 `HFMA2` + 32 `HMUL2` replaced FMAs as
+designed, but `PRMT` went from 0 to 40 and `F2F.F16.F32` from 0 to 16 --
+`pack_h2`'s broadcast of the scalar softmax weight into a `half2` costs real
+instructions on a value that was already sitting in a register for free in
+the scalar version, and the accounting that only compared FMA counts never
+saw it. Where exactly that cost lands -- issue-slot contention with the
+`MUFU.EX2` `expf` already on the critical path is the obvious guess, given
+`half2` conversions and transcendentals both tend toward the SFU pipe on
+Turing -- is not settled, because `ncu` cannot run on this host and this is
+as far as `cuobjdump` and arithmetic go. Not applied; `attn_flash_decode_warp`
+is unchanged from before this section except a comment recording the result.
+
+This is now the seventh hypothesis eliminated for the 33.9% ceiling (sector
+amplification, `DEC_SPLITS`, `DEC_KB`, occupancy, `exp2f`, and now `half2`,
+alongside the grid/parallelism fix that did land). Register pressure and
+static instruction count both point away from what actually happened, which
+argues for retiring instruction-counting as a predictor for this kernel
+specifically and treating every future decode change as a measurement
+question from the start rather than an arithmetic one.
