@@ -197,6 +197,18 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A/B lever for the tensor-core decode kernel against
+    // `attn_flash_decode_warp`'s per-key online softmax, which `decode()`
+    // otherwise prefers by default. Set `LLMXABE_DISABLE_DECODE_MMA` to force
+    // the warp kernel, or `LLMXABE_DECODE_MMA_WPO` (2 or 4) to pick the
+    // occupancy width — see docs/BENCHMARKS.md.
+    if std::env::var("LLMXABE_DISABLE_DECODE_MMA").is_ok() {
+        step.disable_decode_mma();
+    } else if let Ok(wpo) = std::env::var("LLMXABE_DECODE_MMA_WPO")
+        && let Ok(wpo) = wpo.parse::<usize>()
+    {
+        step.set_decode_mma_wpo(wpo);
+    }
     debug!("built 2 shapes in {:.1} s", built.elapsed().as_secs_f64());
 
     let max_seq = prompt_len + WARMUP + steps;

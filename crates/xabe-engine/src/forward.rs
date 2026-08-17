@@ -1198,6 +1198,25 @@ impl Forward {
         self.moe.disable_tensor_cores();
     }
 
+    /// Force decode off `attn_flash_decode_mma_wpo{4,2}` and back onto
+    /// `attn_flash_decode_warp`'s per-key online softmax, in every attention
+    /// block. Exists for `bench_decode`'s A/B lever; see
+    /// `AttentionKernels::disable_decode_mma`.
+    pub fn disable_decode_mma(&mut self) {
+        for block in &mut self.attention {
+            block.disable_decode_mma();
+        }
+    }
+
+    /// Select which occupancy width the tensor-core decode kernel uses, in
+    /// every attention block, if it is not disabled. `wpo` must be 2 or 4.
+    /// Exists for `bench_decode`'s A/B lever.
+    pub fn set_decode_mma_wpo(&mut self, wpo: usize) {
+        for block in &mut self.attention {
+            block.set_decode_mma_wpo(wpo);
+        }
+    }
+
     /// Whether this pass has the repacked int8 weights resident, in both
     /// mixers. A pass with one side repacked and not the other is a bug, so
     /// this reports the conjunction rather than either half.

@@ -837,6 +837,19 @@ impl GatedAttentionBlock {
         self.int8.is_some()
     }
 
+    /// Force this block's decode step off the tensor-core split-precision
+    /// kernel and back onto `attn_flash_decode_warp`'s per-key online
+    /// softmax. See [`crate::forward::Forward::disable_decode_mma`].
+    pub fn disable_decode_mma(&mut self) {
+        self.kernels.mixer.disable_decode_mma();
+    }
+
+    /// Select which occupancy width this block's tensor-core decode kernel
+    /// uses. See [`crate::forward::Forward::set_decode_mma_wpo`].
+    pub fn set_decode_mma_wpo(&mut self, wpo: usize) {
+        self.kernels.mixer.set_decode_mma_wpo(wpo);
+    }
+
     /// Quantize one scratch buffer to int8 for the projections that read it.
     ///
     /// Called twice per pass: once over `normed` for the three projections

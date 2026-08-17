@@ -107,6 +107,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream = ctx.default_stream();
     let kernels = AttentionKernels::new(&ctx, Q_HEADS, KV_HEADS, HEAD_DIM)?;
+    // A/B levers for the tensor-core decode kernel against
+    // `attn_flash_decode_warp`'s per-key online softmax, which `decode()`
+    // otherwise prefers by default. Set `LLMXABE_DISABLE_DECODE_MMA` to force
+    // the warp kernel, or `LLMXABE_DECODE_MMA_WPO` (2 or 4) to pick the
+    // occupancy width — see docs/BENCHMARKS.md.
+    if std::env::var("LLMXABE_DISABLE_DECODE_MMA").is_ok() {
+        kernels.disable_decode_mma();
+    } else if let Ok(wpo) = std::env::var("LLMXABE_DECODE_MMA_WPO")
+        && let Ok(wpo) = wpo.parse::<usize>()
+    {
+        kernels.set_decode_mma_wpo(wpo);
+    }
     let mut dec = AttnDecodeScratch::new(&stream, Q_HEADS, HEAD_DIM)?;
 
     let chunk = chunk();

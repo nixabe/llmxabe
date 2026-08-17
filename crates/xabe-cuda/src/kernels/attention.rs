@@ -1909,6 +1909,382 @@ __global__ void attn_flash_decode_combine(
     out[(long long)h * (long long)head_dim + d] = num / den;
 }
 
+// ---------------------------------------------------------------------------
+// Flash decoding on the tensor cores, with Q split into a fp16 high half and
+// a fp16 residual instead of the single fp16 rounding attn_flash_causal_mma
+// accepts under MMA_GATE.
+//
+// grid: (DEC_SPLITS, kv_heads), same as attn_flash_decode_warp/_split. block:
+// WPO warps.
+//
+// ## Why Q needs the split and K/V do not
+//
+// `mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32` takes fp16 operands and
+// accumulates fp32, so every operand it touches is rounded once. K and V are
+// already binary16 in the cache -- `as_cached` rounds the differential test's
+// host reference through the identical format before comparing, so that
+// budget is spent by every decode kernel equally and is not new. Q is fp32
+// end to end in every other kernel in this file; feeding it to `mma` the way
+// attn_flash_causal_mma does for its 16-row query tile is what a prior
+// attempt at this kernel did, and it broke the differential gate decode
+// holds to -- 1.11e-5 against a 1e-5 tolerance, on the `n_keys = 61` case, see
+// docs/BENCHMARKS.md. `Q K^T`'s fp32 dot product is a sum of 256 signed
+// terms; halving it to 128 terms, each already close to cancelling before the
+// rounding is even applied, is what pushed one element over the line.
+//
+// The fix costs no extra `mma` calls. `m16n8k8`'s A operand is 16 rows and
+// this geometry only has `gqa` (8) real query heads to fill it with, so a
+// prior attempt zero-padded the dead second half -- computed, then thrown
+// away. Filling that second half with `q - f16(q)`'s own fp16 rounding
+// instead reuses exactly those otherwise-wasted multiply-adds: row `g` of the
+// A fragment carries `q_hi[g] = f16(q[g])`, row `g + 8` carries
+// `q_lo[g] = f16(q[g] - f32(q_hi[g]))`, and `D[g] + D[g+8]` (the two halves of
+// the same `mma` call's output, for the same real head `g`) is `Q K^T` at
+// `q_hi + q_lo` precision -- `q`'s own value to within `q_lo`'s fp16 rounding
+// of a residual already two orders of magnitude smaller than `q` itself,
+// roughly `2^-22` relative rather than `2^-11`. `K` is unchanged; the residual
+// trick only ever touches the operand that was rounding badly.
+//
+// ## Shape
+//
+// One block per (split, KV head), same as attn_flash_decode_warp/_split.
+// `WPO` warps split `8 * WPO` keys per trip during `Q K^T` -- one key octet
+// per warp, mirroring attn_flash_causal_mma's `MMA_WPH` -- and split the
+// output head dimension the same way during `P V`. Unlike that kernel there
+// is only one logical head-group per block (the 8 real heads all live in one
+// `m16n8k8` M-dimension), so every warp of the block cooperates on the same
+// score tile and the barriers below are `__syncthreads()` rather than the
+// per-group `bar_group`/`__syncwarp` split prefill needs for its several
+// independent head-groups.
+//
+// `P V` pads the dead second half of *its* A operand with zero rather than
+// reusing it for anything -- `P` and `V` are already accepted under
+// `MMA_GATE` for the fully-tiled prefill kernel, and the calibration ladder
+// in docs/BENCHMARKS.md already established `P V` was never the expensive
+// half here. The `q_hi`/`q_lo` trick is `Q K^T`-only because `Q K^T`'s
+// rounding was the one that broke the gate.
+//
+// Templated on `WPO` (`ATTN_DECODE_MMA` below) so the occupancy knob named in
+// docs/BENCHMARKS.md ("what this leaves for a future attempt") can be
+// measured without a second hand-written copy of this kernel: `WPO = 4` was
+// the value the original attempt built and measured 1.73x slower than
+// attn_flash_decode_warp at a 131,072-key window, diagnosed as one resident
+// block per SM against Turing's ~64 KiB shared-memory budget with nothing
+// else to hide the K/V staging latency behind.
+#define ATTN_DECODE_MMA(NAME, WPO)                                                \
+__global__ void NAME(                                                            \
+    const float* __restrict__ q,                                                \
+    const unsigned short* __restrict__ k,                                       \
+    const unsigned short* __restrict__ v,                                       \
+    float* __restrict__ part_acc,                                               \
+    float* __restrict__ part_m,                                                 \
+    float* __restrict__ part_l,                                                 \
+    int q_heads,                                                                \
+    int kv_heads,                                                               \
+    int head_dim,                                                               \
+    const int* __restrict__ key_offset,                                        \
+    float scale                                                                \
+) {                                                                            \
+    extern __shared__ float smem_f[];                                          \
+    unsigned* smem = (unsigned*)smem_f;                                        \
+    int hd2 = head_dim >> 1;                                                   \
+    int qstride = hd2 + 4;                                                     \
+    int vstride = 4 + 8 * (((4 * (WPO) - 4) + 7) / 8);                         \
+    unsigned* k_sh = smem;                                    /* KT*qstride */ \
+    unsigned* v_sh = k_sh + (8 * (WPO)) * qstride;             /* head_dim*vstride */ \
+    float* s_sh    = (float*)(v_sh + head_dim * vstride);      /* 8*KT */      \
+    float* m_sh    = s_sh + 8 * (8 * (WPO));                   /* 8 */         \
+    float* l_sh    = m_sh + 8;                                 /* 8 */         \
+    float* corr_sh = l_sh + 8;                                 /* 8 */         \
+                                                                                \
+    int gqa = q_heads / kv_heads;                                              \
+    int tid = threadIdx.x;                                                     \
+    int lane = tid & 31;                                                       \
+    int warp = tid >> 5;                                                       \
+    int nthr = (WPO) * 32;                                                     \
+    int g = lane >> 2;                                                         \
+    int tg = lane & 3;                                                         \
+                                                                                \
+    int split = blockIdx.x;                                                    \
+    int kvh = blockIdx.y;                                                      \
+                                                                                \
+    /* This warp's own `Q K^T` fragment, held for the whole key loop -- see */ \
+    /* the module comment for what a0/a1 carry. */                             \
+    int steps = head_dim >> 3;                                                 \
+    unsigned qa0[DMMA_QSTEPS], qa1[DMMA_QSTEPS];                               \
+    {                                                                          \
+        const float* qp = (g < gqa)                                           \
+            ? q + (long long)(kvh * gqa + g) * (long long)head_dim : 0;        \
+        _Pragma("unroll")                                                      \
+        for (int s = 0; s < DMMA_QSTEPS; ++s) {                                \
+            qa0[s] = 0u;                                                       \
+            qa1[s] = 0u;                                                       \
+            if (s < steps && qp) {                                             \
+                int c = 4 * s + tg;                                            \
+                float v0 = qp[2 * c];                                          \
+                float v1 = qp[2 * c + 1];                                      \
+                float hi0 = h2f(f2h(v0));                                      \
+                float hi1 = h2f(f2h(v1));                                      \
+                qa0[s] = pack_h2(v0, v1);                                      \
+                qa1[s] = pack_h2(v0 - hi0, v1 - hi1);                          \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+    if (tid < 8) {                                                             \
+        m_sh[tid] = neg_inf();                                                 \
+        l_sh[tid] = 0.0f;                                                      \
+    }                                                                          \
+                                                                                \
+    float o[DMMA_MAXT_((WPO))][4];                                             \
+    _Pragma("unroll")                                                          \
+    for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                              \
+        o[t][0] = 0.0f; o[t][1] = 0.0f; o[t][2] = 0.0f; o[t][3] = 0.0f;        \
+    }                                                                          \
+                                                                                \
+    long long n_visible = (long long)(*key_offset) + 1;                       \
+    long long per = (n_visible + DEC_SPLITS - 1) / DEC_SPLITS;                 \
+    long long begin = (long long)split * per;                                  \
+    long long end = begin + per;                                               \
+    if (end > n_visible) end = n_visible;                                      \
+                                                                                \
+    int dpw = head_dim / (WPO);            /* output dims this warp owns */    \
+    int dbase = warp * dpw;                                                    \
+    int ntile = dpw >> 3;                                                      \
+                                                                                \
+    int kw4 = hd2 >> 2;                                                        \
+    uint4 kreg[8];                                                             \
+    /* One entry per key-pair in the tile -- `(8 * WPO) / 2 == 4 * WPO` of */   \
+    /* them, matching the columns `P V`'s fragment read below actually */      \
+    /* covers (`oc` over `WPO` octets times `tg` over 4, `4 * oc + tg`). */     \
+    unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                         \
+    unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                         \
+    int dstripes = head_dim / nthr;                                            \
+                                                                                \
+    /* Software-pipelined the same way attn_flash_causal_mma is: a trip */     \
+    /* stores the tile loaded during the previous trip's arithmetic, then */   \
+    /* immediately issues the next tile's loads before computing on this */    \
+    /* one. Both register arrays must be indexed by a compile-time constant */ \
+    /* or they spill to local memory, so the loops below are `#pragma */       \
+    /* unroll`'d over a fixed bound with the real trip count as a predicate.*/ \
+    /* V's staging differs from attn_flash_causal_mma's: that kernel always */ \
+    /* has nthr == head_dim (8 warps, head_dim <= 256), decode's `WPO` */      \
+    /* warps do not, so a thread's assigned output dimension strides by */     \
+    /* `nthr` (`dstripes` times) instead of being fixed for the whole tile. */ \
+    _Pragma("unroll")                                                          \
+    for (int i = 0; i < 8; ++i) {                                              \
+        int t = tid + i * nthr;                                                \
+        kreg[i] = make_uint4(0u, 0u, 0u, 0u);                                  \
+        if (t < (8 * (WPO)) * kw4) {                                           \
+            int r = t / kw4;                                                   \
+            long long key = begin + r;                                        \
+            if (key < end) {                                                  \
+                const uint4* kp = (const uint4*)(                             \
+                    k + (key * (long long)kv_heads + kvh)                     \
+                            * (long long)head_dim);                           \
+                kreg[i] = kp[t - r * kw4];                                     \
+            }                                                                 \
+        }                                                                      \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                          \
+        int vd_col = ds * nthr + tid;                                          \
+        bool active = ds < dstripes;                                           \
+        _Pragma("unroll")                                                      \
+        for (int i = 0; i < 4 * (WPO); ++i) {                                  \
+            long long k0 = begin + 2 * i;                                      \
+            vlo[ds][i] = (active && k0 < end)                               \
+                ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
+                : (unsigned short)0;                                          \
+            vhi[ds][i] = (active && k0 + 1 < end)                          \
+                ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
+                : (unsigned short)0;                                          \
+        }                                                                      \
+    }                                                                          \
+                                                                                \
+    for (long long j0 = begin; j0 < end; j0 += (8 * (WPO))) {                  \
+        __syncthreads();                                                       \
+        _Pragma("unroll")                                                      \
+        for (int i = 0; i < 8; ++i) {                                          \
+            int t = tid + i * nthr;                                            \
+            if (t < (8 * (WPO)) * kw4) {                                       \
+                int r = t / kw4;                                               \
+                *(uint4*)(k_sh + r * qstride + 4 * (t - r * kw4)) = kreg[i];   \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("unroll")                                                      \
+        for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                      \
+            int vd_col = ds * nthr + tid;                                      \
+            if (ds < dstripes) {                                               \
+                _Pragma("unroll")                                              \
+                for (int i = 0; i < 4 * (WPO); ++i) {                          \
+                    v_sh[vd_col * vstride + i] =                              \
+                        (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+                                                                                \
+        long long j1 = j0 + (8 * (WPO));                                       \
+        if (j1 < end) {                                                        \
+            _Pragma("unroll")                                                  \
+            for (int i = 0; i < 8; ++i) {                                      \
+                int t = tid + i * nthr;                                        \
+                kreg[i] = make_uint4(0u, 0u, 0u, 0u);                          \
+                if (t < (8 * (WPO)) * kw4) {                                   \
+                    int r = t / kw4;                                           \
+                    long long key = j1 + r;                                    \
+                    if (key < end) {                                          \
+                        const uint4* kp = (const uint4*)(                     \
+                            k + (key * (long long)kv_heads + kvh)             \
+                                    * (long long)head_dim);                   \
+                        kreg[i] = kp[t - r * kw4];                            \
+                    }                                                         \
+                }                                                              \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
+                int vd_col = ds * nthr + tid;                                  \
+                bool active = ds < dstripes;                                   \
+                _Pragma("unroll")                                              \
+                for (int i = 0; i < 4 * (WPO); ++i) {                          \
+                    long long k0 = j1 + 2 * i;                                 \
+                    vlo[ds][i] = (active && k0 < end)                      \
+                        ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
+                        : (unsigned short)0;                                  \
+                    vhi[ds][i] = (active && k0 + 1 < end)                  \
+                        ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
+                        : (unsigned short)0;                                  \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+                                                                                \
+        /* Q K^T. Warp `warp` takes key octet `warp` of the tile; the two */   \
+        /* fragment halves are the hi/lo score for the SAME real head `g`, */  \
+        /* not two different rows, so they are summed before being stored. */  \
+        {                                                                       \
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;                  \
+            _Pragma("unroll")                                                  \
+            for (int s = 0; s < DMMA_QSTEPS; ++s) {                            \
+                if (s < steps) {                                               \
+                    unsigned b0 = k_sh[(8 * warp + g) * qstride + 4 * s + tg]; \
+                    mma_m16n8k8(s0, s1, s2, s3, qa0[s], qa1[s], b0);           \
+                }                                                              \
+            }                                                                  \
+            /* Natural-log scale, not the `exp2f`/ATTN_LOG2E fold prefill's */  \
+            /* kernel uses: this kernel's (m, l) partials feed */              \
+            /* attn_flash_decode_combine's cross-split merge, which reduces */ \
+            /* with plain `expf` to match attn_flash_decode_warp's own */      \
+            /* partials -- mixing that with a base-2-scaled m/l here would */  \
+            /* cancel invisibly for a single real split (`f = exp(m - gm)` */  \
+            /* is always 1 when there is only one) and corrupt the merge */    \
+            /* the moment two real splits combine. Caught by */                \
+            /* `debug_decode_mma_probe`: exact at n_keys=1, 9.8e-2 wrong at */  \
+            /* n_keys=2. */                                                    \
+            if (g < gqa) {                                                    \
+                s_sh[g * (8 * (WPO)) + 8 * warp + 2 * tg]     = (s0 + s2) * scale; \
+                s_sh[g * (8 * (WPO)) + 8 * warp + 2 * tg + 1] = (s1 + s3) * scale; \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+                                                                                \
+        /* The online softmax: one lane per key, as many of the 8 real rows */ \
+        /* at a time as a warp has lanes to spare. Mirrors */                  \
+        /* attn_flash_causal_mma's rat/krow/kcol split exactly, with 8 real */ \
+        /* rows split over WPO warps instead of MMA_QT over MMA_WPH. */        \
+        {                                                                       \
+            const int kt = 8 * (WPO);                                         \
+            const int rpw = 8 / (WPO);           /* rows this warp owns */    \
+            const int rat = 32 / kt;              /* rows covered at once */  \
+            int krow = lane / kt;                                             \
+            int kcol = lane % kt;                                             \
+            int r0 = rpw * warp;                                               \
+            _Pragma("unroll")                                                  \
+            for (int rr = 0; rr < rpw / rat; ++rr) {                          \
+                int row = r0 + rr * rat + krow;                                \
+                if (row < gqa) {                                               \
+                    bool live = (j0 + kcol < end);                             \
+                    float sv = live ? s_sh[row * kt + kcol] : neg_inf();       \
+                    float tmax = sv;                                           \
+                    for (int off = kt >> 1; off > 0; off >>= 1) {              \
+                        tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off, kt)); \
+                    }                                                          \
+                    float m0 = m_sh[row];                                      \
+                    float nm = fmaxf(m0, tmax);                                \
+                    float corr = (m0 == neg_inf()) ? 0.0f : expf(m0 - nm);     \
+                    float e = live ? expf(sv - nm) : 0.0f;                     \
+                    float lsum = e;                                            \
+                    for (int off = kt >> 1; off > 0; off >>= 1) {              \
+                        lsum += __shfl_xor_sync(0xffffffff, lsum, off, kt);    \
+                    }                                                          \
+                    s_sh[row * kt + kcol] = e;                                 \
+                    if (kcol == 0) {                                           \
+                        m_sh[row] = nm;                                        \
+                        l_sh[row] = l_sh[row] * corr + lsum;                   \
+                        corr_sh[row] = corr;                                   \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+                                                                                \
+        /* P V. The dead second half of this operand is zero -- unlike */      \
+        /* Q K^T, P and V are already accepted under MMA_GATE elsewhere in */  \
+        /* this file, so there is no precision trick to spend here. */         \
+        {                                                                       \
+            float cg = (g < gqa) ? corr_sh[g] : 0.0f;                          \
+            _Pragma("unroll")                                                  \
+            for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                      \
+                o[t][0] *= cg; o[t][1] *= cg;                                   \
+            }                                                                  \
+            for (int oc = 0; oc < (8 * (WPO)) / 8; ++oc) {                     \
+                unsigned a0 = (g < gqa) ? pack_h2(                             \
+                    s_sh[g * (8 * (WPO)) + 8 * oc + 2 * tg],                   \
+                    s_sh[g * (8 * (WPO)) + 8 * oc + 2 * tg + 1]) : 0u;         \
+                unsigned a1 = 0u;                                              \
+                _Pragma("unroll")                                              \
+                for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                  \
+                    if (t < ntile) {                                           \
+                        unsigned b0 =                                          \
+                            v_sh[(dbase + 8 * t + g) * vstride + 4 * oc + tg]; \
+                        mma_m16n8k8(o[t][0], o[t][1], o[t][2], o[t][3], a0, a1, b0); \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+                                                                                \
+    /* Write the raw (unnormalized) partial: attn_flash_decode_combine */      \
+    /* merges these across DEC_SPLITS blocks with the same log-sum-exp */      \
+    /* identity attn_flash_decode_warp's partials already use, unmodified. */  \
+    _Pragma("unroll")                                                          \
+    for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                              \
+        if (t < ntile && g < gqa) {                                            \
+            int d = dbase + 8 * t + 2 * tg;                                    \
+            int h = kvh * gqa + g;                                             \
+            float* pa =                                                       \
+                part_acc + ((long long)split * q_heads + h) * (long long)head_dim; \
+            pa[d]     = o[t][0];                                               \
+            pa[d + 1] = o[t][1];                                               \
+        }                                                                      \
+    }                                                                          \
+    if (tid == 0) {                                                            \
+        _Pragma("unroll")                                                      \
+        for (int gg = 0; gg < 8; ++gg) {                                       \
+            if (gg < gqa) {                                                    \
+                int h = kvh * gqa + gg;                                        \
+                part_m[split * q_heads + h] = m_sh[gg];                        \
+                part_l[split * q_heads + h] = l_sh[gg];                        \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+
+#define DMMA_QSTEPS 32
+#define DMMA_MAXT_(WPO) (256 / (8 * (WPO)))
+
+ATTN_DECODE_MMA(attn_flash_decode_mma_wpo4, 4)
+ATTN_DECODE_MMA(attn_flash_decode_mma_wpo2, 2)
+
 __global__ void attn_flash_causal_t1(
     const float* __restrict__ q,
     const unsigned short* __restrict__ k,
@@ -2188,12 +2564,29 @@ pub struct AttentionKernels {
     flash_mma: CudaFunction,
     decode_split: CudaFunction,
     decode_warp: CudaFunction,
+    decode_mma_wpo4: CudaFunction,
+    decode_mma_wpo2: CudaFunction,
     decode_combine: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
+    /// Which decode path `decode()` takes: `0` for `attn_flash_decode_warp`'s
+    /// per-key online softmax (the default -- the tensor-core kernel is new
+    /// and unproven end to end, so production does not silently switch onto
+    /// it the moment it compiles), or `2`/`4` for the tensor-core kernel at
+    /// that occupancy width. The discriminant doubling as the width is what
+    /// lets [`Self::active_decode_mma`] use it directly with no enum to
+    /// convert. See [`Self::disable_decode_mma`] and
+    /// [`Self::set_decode_mma_wpo`].
+    ///
+    /// An atomic, not a plain field: `GatedAttentionBlock` holds its
+    /// `AttentionKernels` behind an `Arc` shared across every layer of the
+    /// same geometry, so toggling this lever cannot go through `&mut self`
+    /// -- and unlike a `Cell`, this keeps `AttentionKernelSet` `Sync`, which
+    /// `Arc<AttentionKernelSet>` already promises callers across threads.
+    decode_mma: std::sync::atomic::AtomicU8,
 }
 
 impl AttentionKernels {
@@ -2234,13 +2627,109 @@ impl AttentionKernels {
             },
             decode_split: module.load_function("attn_flash_decode_split")?,
             decode_warp: module.load_function("attn_flash_decode_warp")?,
+            decode_mma_wpo4: {
+                let f = module.load_function("attn_flash_decode_mma_wpo4")?;
+                f.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    MMA_SHARED_CEILING as i32,
+                )?;
+                f
+            },
+            decode_mma_wpo2: {
+                let f = module.load_function("attn_flash_decode_mma_wpo2")?;
+                // WPO=2 fits under the default 48 KiB carveout, but opting in
+                // anyway costs nothing and is what buys the third resident
+                // block per SM the occupancy experiment is measuring --
+                // without it the driver would cap the block scheduler at the
+                // default ceiling's math, not the opted-in one.
+                f.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    MMA_SHARED_CEILING as i32,
+                )?;
+                f
+            },
             decode_combine: module.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
             q_heads,
             kv_heads,
             head_dim,
+            decode_mma: std::sync::atomic::AtomicU8::new(0),
         })
+    }
+
+    /// Dynamic shared memory `attn_flash_decode_mma_wpo{4,2}` requests: the
+    /// staged K/V tiles at `8 * wpo` keys, plus the 8-real-row score, maximum,
+    /// normalizer and correction scratch. Mirrors [`mma_shared_bytes`]'s
+    /// `qstride`/`vstride` formula; see that kernel's own comment for why
+    /// those exact strides keep every fragment read conflict-free.
+    const fn dmma_shared_bytes(head_dim: usize, wpo: usize) -> usize {
+        let qstride = head_dim / 2 + 4;
+        let vstride = 4 + 8 * ((4 * wpo + 3) / 8);
+        let kt = 8 * wpo;
+        let words = kt * qstride + head_dim * vstride;
+        let floats = 8 * kt + 24; // s_sh + m_sh/l_sh/corr_sh, 8 rows each
+        (words + floats) * size_of::<u32>()
+    }
+
+    /// Whether the tensor-core decode kernel can service this geometry at the
+    /// given occupancy width.
+    ///
+    /// The design packs exactly 8 real query heads into one `m16n8k8` M
+    /// dimension's first half (the second half carries their fp16 residual,
+    /// not a ninth through sixteenth head), so `gqa_ratio()` above 8 has
+    /// nowhere to go. `head_dim` must divide into whole key-octets per warp
+    /// (`8 * wpo`) for `P V`'s output-dimension split and into whole `nthr`-
+    /// wide stripes for `V`'s staging loop -- both hold for this model's 256
+    /// at wpo 2 and 4, and are checked rather than assumed for any other.
+    fn decode_mma_is_available(&self, wpo: usize) -> bool {
+        self.gqa_ratio() >= 1
+            && self.gqa_ratio() <= 8
+            && self.head_dim.is_multiple_of(8 * wpo)
+            && self.head_dim.is_multiple_of(32 * wpo)
+            && Self::dmma_shared_bytes(self.head_dim, wpo) <= MMA_SHARED_CEILING
+    }
+
+    /// Force decode off the tensor-core kernel and back onto
+    /// `attn_flash_decode_warp`'s per-key online softmax.
+    ///
+    /// `&self`, not `&mut self`: see the [`Cell`] note on the field. Meant
+    /// for a benchmark process to pick one configuration and measure it, not
+    /// to flip back and forth mid-pass.
+    pub fn disable_decode_mma(&self) {
+        self.decode_mma
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Select which occupancy width the tensor-core decode kernel uses, if
+    /// it is not disabled. `wpo` must be 2 or 4; anything else is a no-op.
+    /// Exists for `bench_attention`'s `LLMXABE_DECODE_MMA_WPO` A/B lever.
+    pub fn set_decode_mma_wpo(&self, wpo: usize) {
+        if wpo == 2 || wpo == 4 {
+            self.decode_mma
+                .store(wpo as u8, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether [`Self::decode`] will take the tensor-core kernel this call,
+    /// and if so at which occupancy width.
+    ///
+    /// Exposed so a differential test can pick the tolerance the arithmetic
+    /// actually warrants without hardcoding the dispatch rule. Unlike
+    /// [`Self::uses_tensor_cores`] (prefill's `n_query >= MMA_QUERY_TILE`
+    /// gate) this kernel's `Q K^T` is not a single fp16 rounding of `Q` --
+    /// the `q_hi`/`q_lo` split is designed to land back inside the same
+    /// tight tolerance the scalar decode kernels hold to, not `MMA_GATE` --
+    /// so this returns `None` rather than a wider gate when it is in use;
+    /// `attention_differential.rs` gates it identically to
+    /// `attn_flash_decode_warp` either way.
+    fn active_decode_mma(&self) -> Option<usize> {
+        let wpo = self.decode_mma.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        if wpo != 0 && self.decode_mma_is_available(wpo) {
+            Some(wpo)
+        } else {
+            None
+        }
     }
 
     /// Query heads sharing each KV head.
@@ -2744,12 +3233,18 @@ impl AttentionKernels {
         // One warp per split when the geometry allows it: it reads K and V
         // once each instead of staging them for a KV group to share, which at
         // a 128K window is the difference between 27% and most of the card's
-        // bandwidth. See the kernel comment.
+        // bandwidth. See the kernel comment. The tensor-core kernel, when
+        // active, takes the same (DECODE_SPLITS, kv_heads) grid as the warp
+        // kernel it replaces -- only the block width and shared request
+        // change, both driven by `wpo`.
         let warp_split = self.decode_warp_is_available();
+        let mma = self.active_decode_mma();
         let split_cfg = LaunchConfig {
             grid_dim: (DECODE_SPLITS as u32, self.kv_heads as u32, 1),
             block_dim: (
-                if warp_split {
+                if let Some(wpo) = mma {
+                    (wpo * 32) as u32
+                } else if warp_split {
                     32
                 } else {
                     (self.gqa_ratio() * 32) as u32
@@ -2757,13 +3252,21 @@ impl AttentionKernels {
                 1,
                 1,
             ),
-            shared_mem_bytes: if warp_split {
+            shared_mem_bytes: if let Some(wpo) = mma {
+                Self::dmma_shared_bytes(self.head_dim, wpo) as u32
+            } else if warp_split {
                 0
             } else {
                 self.shared_bytes_decode() as u32
             },
         };
-        let f = if warp_split {
+        let f = if let Some(wpo) = mma {
+            if wpo == 4 {
+                &self.decode_mma_wpo4
+            } else {
+                &self.decode_mma_wpo2
+            }
+        } else if warp_split {
             &self.decode_warp
         } else {
             &self.decode_split

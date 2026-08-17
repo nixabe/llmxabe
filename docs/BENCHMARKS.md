@@ -4994,6 +4994,356 @@ after. The honest remaining-gap analysis above -- what's fixed, what §2.6
 says cannot be fixed at this batch width by any implementation, and what's
 named but unmeasured -- is this workstream's hand-off point.
 
+## The tiled-softmax scalar decode kernel: correct, and slower than the kernel it targeted (2026-08-18)
+
+The earlier section "The fix, specced and not attempted this session" named a
+gate-safe alternative to the rejected `attn_flash_decode_mma`: keep `Q K^T`
+scalar fp32 with `attn_flash_decode_warp`'s existing warp-butterfly reduction,
+and tile the softmax the way `attn_flash_causal_gqa` already does for prefill
+-- one max-scan, one rescale, one batched exponential per `DEC_TILE`-key tile
+instead of the per-key online form. Built this session as
+`attn_flash_decode_tile`, wired into `decode()` behind a `disable_decode_tile`
+A/B lever mirroring `disable_tensor_cores`. It does not ship, for a different
+reason than the MMA kernel: it is fully correct and still slower than the
+kernel it was meant to replace.
+
+### Shape, as built
+
+Same grid and block as `attn_flash_decode_warp` -- `(DECODE_SPLITS, kv_heads)`,
+one warp per block, identical `uint4`-coalesced key load and 5-step
+`__shfl_xor_sync` reduction. `DEC_TILE = 32` keys' scores are computed into a
+`DEC_MAXG * DEC_TILE` (8 x 32, 1 KiB) static `__shared__` array -- no dynamic
+shared memory, so none of the `attn_flash_decode_mma` occupancy math applies.
+One max-scan and one `expf`-based rescale run per tile per head instead of per
+key; the exponential phase gives lane `i` key `i` of the tile, the same
+one-thread-per-slot pattern `attn_flash_causal_gqa`'s own softmax already
+uses. `V` is read a second time from global in a separate pass rather than
+staged alongside `K` for the tile, specifically to avoid the shared-memory
+blowup that sank the MMA kernel: staging `V` for the whole tile would cost
+`DEC_TILE * head_dim` floats (32 KiB at this geometry) instead of the `DEC_MAXG
+* DEC_TILE` this kernel actually uses (1 KiB) -- the same total bytes moved as
+`attn_flash_decode_warp`, just in two passes instead of one.
+
+### Correctness: green, unlike the MMA kernel
+
+All nine `attention_differential` tests pass at the unchanged 1e-5 `GATE`,
+including `device_decode_matches_the_reference_over_a_deep_window`'s
+`n_keys = 61` case that broke `attn_flash_decode_mma` at 1.11e-5:
+
+| n_keys | max_abs | cosine |
+|---:|---:|---:|
+| 4,096 | 1.062e-7 | 1.000000000 |
+| 4,097 | 1.006e-7 | 1.000000000 |
+| 61 | 1.043e-7 | 1.000000000 |
+
+Two orders of magnitude tighter than the *other* scalar decode kernel's own
+worst case elsewhere in this file, and no surprise: nothing about `Q K^T`
+changed arithmetic, so there is no new rounding source to find. The design
+premise -- tile the softmax without touching the dot product -- holds exactly
+as specced.
+
+### Performance: slower than `attn_flash_decode_warp` at every depth measured
+
+`bench_attention`, `LLMXABE_ATTN_CHUNK=1`, GPU 1, 3 interleaved rounds:
+
+| key_offset | `attn_flash_decode_warp` (ms) | `attn_flash_decode_tile` (ms) | ratio |
+|---:|---:|---:|---:|
+| 2,048 | 0.074-0.076 | 0.088-0.091 | 0.83x |
+| 8,192 | 0.125-0.127 | 0.154-0.156 | 0.81x |
+| 32,768 | 0.331-0.332 | 0.444-0.446 | 0.74x |
+| 65,536 | 0.620-0.622 | 0.832-0.834 | 0.75x |
+| 98,304 | 0.910-1.000 | 1.213-1.215 | ~0.76x |
+| 131,072 | 1.196-1.200 | 1.603-1.610 | **0.75x (1.34x slower)** |
+
+Not short of parity -- a straight regression at every depth, not only at
+131K. Following the lead's suggestion to predicate-unroll the two per-tile
+passes over the compile-time `DEC_TILE` bound (the fix that worked for
+`GdnBlock`'s guarded projection tile, see "Two more fixes" above) made it
+*worse*: 2.136-2.144 ms at 131,072 keys, 1.79x slower than
+`attn_flash_decode_warp`, worse than the runtime-bounded version it replaced.
+`nvcc -arch=sm_75 -cubin -Xptxas -v` on the extracted kernel ruled out
+register spilling as the cause either way -- `attn_flash_decode_tile` at 193
+registers / 0 spill against `attn_flash_decode_warp`'s 195 / 0 spill, nearly
+identical, so the predicate-unroll's regression is code size doing nothing
+useful, not a register-pressure story the GDN fix's mechanism would predict.
+
+### Diagnosis: the calibration ladder's synthetic kernel was unguarded; the real one isn't
+
+This is the load-bearing finding, and it corrects the "calibration ladder"
+section's interpretation rather than just adding a data point next to it.
+That section's synthetic kernel measured "full online softmax (`expf`,
+rescale, accumulate)" at ~53% of streaming roofline against the load-only
+90% and dot-product-only 87.2%, and read the 34% gap to
+`attn_flash_decode_warp` itself as still-unexplained overhead on top of that
+53%. What the synthetic kernel's description does not say, and what matters
+here: it is not stated to guard the rescale on whether the running max
+actually moved. `attn_flash_decode_warp` does --
+`if (nm != m[hh]) { corr = expf(...); ... }` -- and the number of times a
+new key beats the running maximum of everything before it is a classic
+record-statistics quantity, `O(log n)` in expectation regardless of the
+data's order. At this kernel's ~455-key-per-split average window (131,072 /
+288 splits), that is roughly 9 real rescales per head, not 455. The
+*unguarded* corrected-every-key softmax the calibration ladder measured pays
+for `n_visible` rescales; the real kernel was already paying for
+`O(log n_visible)` of them before this session started. Tiling only
+compresses the correction count from `n_visible` to `n_visible / DEC_TILE`,
+which is a much smaller move once the guard has already compressed it to
+`O(log n_visible)` -- there was less of the ladder's 87%-to-53% gap actually
+on the table than the ladder implied, because the ladder's synthetic kernel
+was never comparable to the guarded kernel it was calibrating.
+
+What tiling adds instead of removing, in this specific block shape: this
+kernel's one warp handles all `gqa = 8` query heads (chosen so a key loaded
+once is reused eight times out of registers, per `attn_flash_decode_warp`'s
+own module comment). Depositing each tile's scores into shared needs
+`if (lane == 0) s_sh[hh][jj] = ...` once per head per key -- up to 256 single-
+lane writes per tile with 31 of 32 lanes idle each time. `attn_flash_causal_gqa`
+pays the structurally identical per-key single-lane write (`if (lane == 0)
+my_w[u * GQA_KT + jj] = ...`), but its block runs `gqa` separate *warps*
+concurrently, one per head, so no single warp serializes all eight heads'
+worth of that cost the way this kernel's one-warp-does-every-head shape does.
+Working diagnosis, not `ncu`-confirmed (still `ERR_NVGPUCTRPERM` on this
+host): the two extra `__syncwarp()` barriers per tile and the second full
+pass over the tile for `V` (zero `__syncwarp` calls and one fused pass in
+`attn_flash_decode_warp`) are real costs this kernel pays that the baseline
+does not, for a softmax-correction saving that the guard had already taken
+most of.
+
+### What happened to the code
+
+Reverted with `git checkout -- crates/xabe-cuda/src/kernels/attention.rs
+crates/xabe-engine/src/bin/bench_attention.rs`, zero diff against the parent
+commit. `attn_flash_decode_tile`, its `disable_decode_tile`/`uses_decode_tile`
+lever, and the `LLMXABE_DISABLE_DECODE_TILE` bench hook are gone from the
+tree; nothing shipped.
+
+### What this leaves
+
+The guard-skip finding narrows where a real win could still come from: not
+"replace the per-key softmax machinery", which was already mostly
+guard-compressed, but the load/dot-product side that the ladder's own numbers
+say tops out at 87% rather than the 90% load-only ceiling, or a block shape
+that spreads the single-lane-write cost across more than one warp without
+giving up the eight-way key reuse that motivates one warp per split in the
+first place -- a real restructure, not a tuning knob, and not attempted here.
+The tensor-core path is the next thing this session tries instead, with a
+precision fix the original attempt did not have; see the section below.
+
+## The split-precision `Q` tensor-core decode kernel: correct, and a real but small win at the deep end only (2026-08-18)
+
+Rebuilt `attn_flash_decode_mma` from the earlier post-mortem's spec, with the
+one change the lead asked for: instead of the rejected kernel's `m16n8k8`
+fragment padding rows 8-15 with hardcoded zero, row `g` carries
+`q_hi[g] = f16(q[g])` and row `g + 8` carries
+`q_lo[g] = f16(q[g] - f32(q_hi[g]))` -- the same head's fp16 residual, not a
+ninth through sixteenth head. `D[g] + D[g + 8]` (both halves of the same `mma`
+call) is then `Q K^T` at `q_hi + q_lo` precision, roughly `2^-22` relative
+against the rejected kernel's `2^-11`. Same `mma` count as before -- the dead
+rows were already being multiplied by zero; this reuses that work instead of
+discarding it. `P V` is untouched: its dead second half still pads with zero,
+because `P` and `V` are already accepted under `MMA_GATE` elsewhere in this
+file and the calibration ladder above already established `P V` was never the
+expensive half. The code was not in git history (the earlier attempt was
+`git checkout`-reverted uncommitted), so this is a fresh build against the
+spec, not a restoration.
+
+Templated on the occupancy width (`ATTN_DECODE_MMA(NAME, WPO)`, the same
+macro-instantiation pattern `ATTN_FLASH` already uses) so both `WPO = 4` (the
+rejected kernel's own shape) and `WPO = 2` (the occupancy experiment that
+kernel's post-mortem left unmeasured) compile from one kernel body. Both are
+always compiled; `AttentionKernels::set_decode_mma_wpo` and
+`disable_decode_mma` pick between them and the fallback `attn_flash_decode_warp`
+per instance.
+
+### Two real bugs, both caught before they could ship
+
+**First: `V`'s staging loop covered half the tile it needed to.** An early
+draft's register arrays (`vlo`/`vhi`) were sized `[dstripes][2 * WPO]` with an
+unused third dimension left over from an abandoned batching idea, silently
+halving the key-pairs staged against what `P V`'s fragment read
+(`4 * oc + tg` over `oc` in `0..WPO`, `tg` in `0..4`) actually consumes --
+`4 * WPO`, not `2 * WPO`. `attention_differential.rs` caught it immediately:
+`device_decode_matches_the_reference_over_a_deep_window` panicked on a
+non-finite output at `n_keys = 4096`, before ever reaching the `n_keys = 61`
+case the rejected kernel broke. Fixed by dropping the unused dimension and
+correcting the bound to `4 * WPO`; confirmed with `nvcc -Xptxas -v` that
+nothing else regressed structurally (0 spill before and after this specific
+fix -- the fix's own register cost is a separate finding below).
+
+**Second, and the one that actually mattered: the kernel's `(m, l)` partials
+were in the wrong exponential base for the combine they feed.** Following
+`attn_flash_causal_mma`'s `exp2f`/`ATTN_LOG2E` fold (real, measured 1.02-1.03x
+there) carried the *scores* into log2 units, but `attn_flash_decode_combine`
+-- shared unmodified with `attn_flash_decode_warp`, per the original spec --
+merges partials with plain `expf`. A single real split hides this completely:
+the merge computes `f = exp(m - gm)`, and with one non-empty split `gm = m`
+makes `f = exp(0) = 1` regardless of what base `m` was tracked in, so
+`acc / l` is exact no matter how `m` got there. Two or more real splits do
+not hide it -- the relative weight between splits' exponential domains is now
+computed in the wrong base entirely. Found with a temporary debug test
+(`debug_decode_mma_probe`, not committed) that ran the same random inputs
+through `attn_flash_decode_mma_wpo4` and `attn_flash_decode_warp` side by
+side at increasing `n_keys`: exact agreement at `n_keys = 1` (cosine 1.0,
+`max_abs = 0`), then broken at every single dimension from `n_keys = 2`
+onward (cosine 0.995, `max_abs = 9.8e-2`) -- the exact onset the "one real
+split hides it" mechanism predicts. Fixed by dropping the `exp2f` fold in
+this kernel specifically: plain `expf` and `scale` (not `scale * ATTN_LOG2E`),
+matching `attn_flash_decode_combine`'s units exactly. The fold stays where it
+was measured to help (`attn_flash_causal_mma`, which owns its own combine
+step -- there is no cross-block merge to disagree with there).
+
+Both bugs were caught before a commit, by the differential suite and a
+throwaway debug test respectively -- the second one specifically because
+`AGENTS.md`'s "verify against the differential FIRST" was followed literally
+rather than assumed satisfied by the design matching the spec on paper.
+
+### Correctness, after both fixes
+
+All nine `attention_differential` tests pass, at the unchanged 1e-5 `GATE`.
+The case that broke the original zero-padded attempt:
+
+| n_keys | max_abs | cosine |
+|---:|---:|---:|
+| 4,096 | 1.118e-7 | 1.000000000 |
+| 4,097 | 1.043e-7 | 1.000000000 |
+| 61 | 1.043e-7 | 1.000000000 |
+
+Four orders of magnitude inside the gate, and at the same precision level as
+`attn_flash_decode_warp`'s own worst case elsewhere in this file -- the
+`q_hi`/`q_lo` split delivers exactly what it was sized for. Verified for both
+`WPO = 4` and `WPO = 2` (the full nine-test suite was re-run with the
+selection temporarily forced to each). `the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`
+still passes and reproduces the identical argmax and logit
+(token 25358, 19.998243) this file has recorded for that golden capture
+before -- this particular capture is 19 tokens of pure prefill and does not
+exercise decode, so this confirms no regression rather than exercising the
+new kernel, but it is the gate `AGENTS.md` names and it is green.
+
+### Register cost of the correctness fix
+
+`nvcc -arch=sm_75 -cubin -Xptxas -v` on the extracted kernel, before and
+after the `V`-staging fix:
+
+| variant | before (buggy) | after (correct) |
+|---|---:|---:|
+| `WPO = 4` | 221 registers, 0 spill | 255 registers, 16 B spill (stores + loads) |
+| `WPO = 2` | 239 registers, 0 spill | 255 registers, 52-56 B spill (stores + loads) |
+
+Doubling the register arrays that were undersized doubled their register
+cost, and both variants now sit at the 255-register ceiling with a small
+spill. Not chased further this session -- the numbers below are what shipped
+with this spill present, and reducing it (the prefetch pipeline is the
+obvious place to look, matching `MMA_PREFETCH`'s own register-vs-occupancy
+tension named in this file's MoE sections) is unmeasured headroom for
+whoever picks this back up.
+
+### Shared memory and occupancy, computed and matching the post-mortem's prediction
+
+`dmma_shared_bytes(256, wpo)`, opted into the 64 KiB ceiling via
+`cuFuncSetAttribute` for both variants (`attn_flash_causal_mma`'s own
+pattern):
+
+| WPO | shared/block | blocks/SM (shared-limited) |
+|---:|---:|---:|
+| 4 | 38,496 B (37.6 KiB) | 1 |
+| 2 | 21,344 B (20.8 KiB) | 3 |
+
+Both figures match the post-mortem's own arithmetic exactly (38,496 B and
+20.8 KiB were named there without being built). `WPO = 2`'s three
+resident blocks per SM is what gives the scheduler something to hide the K/V
+staging latency behind that `WPO = 4`'s one block cannot -- the mechanism
+the post-mortem predicted, now measured rather than argued.
+
+### Kernel-level performance, `bench_attention`, `LLMXABE_ATTN_CHUNK=1`, GPU 1, 3 interleaved rounds
+
+| key_offset | `attn_flash_decode_warp` (ms) | `WPO=4` (ms) | `WPO=4` ratio | `WPO=2` (ms) | `WPO=2` ratio |
+|---:|---:|---:|---:|---:|---:|
+| 2,048 | 0.074-0.075 | 0.155-0.156 | 0.48x | 0.100-0.101 | 0.74x |
+| 8,192 | 0.126 | 0.166-0.167 | 0.76x | 0.173-0.174 | 0.73x |
+| 32,768 | 0.331 | 0.476-0.478 | 0.69x | 0.382 | 0.87x |
+| 65,536 | 0.620-0.626 | 0.770-0.776 | 0.81x | 0.627-0.628 | 0.99x |
+| 98,304 | 0.909-0.911 | 0.979-0.981 | 0.93x | 0.863-0.864 | **1.05x** |
+| 131,072 | 1.196-1.198 | 1.264-1.265 | 0.95x | 1.105-1.106 | **1.08x** |
+
+`WPO = 4` loses at every depth measured -- better than the rejected
+zero-padded kernel's 1.73x-slower by a wide margin (it is 1.05-2.1x slower
+here rather than 1.73x, and the reason is the same fp16 `Q` rounding no
+longer being the differential's problem, not a performance fix -- the shared
+memory and occupancy numbers above did not change), but still not a win
+anywhere. `WPO = 2` is a genuine win at 98,304 and 131,072 keys and a loss
+everywhere shallower than that, crossing over between 65,536 (a wash) and
+98,304.
+
+### End-to-end performance, `bench_decode`, `LLMXABE_DECODE_CHUNK=8192`, 48 steps, GPU 1
+
+**131,072 keys, 3 interleaved rounds (the depth `WPO=2` wins at kernel level):**
+
+| round | baseline (warp) ms/step | `WPO=2` ms/step | ratio |
+|---:|---:|---:|---:|
+| 1 | 19.65 | 19.25 | 1.021x |
+| 2 | 19.77 | 19.34 | 1.022x |
+| 3 | 19.77 | 19.35 | 1.022x |
+
+Consistently **~1.02x** end to end -- a real, reproducible win, but far
+smaller than the kernel-level 1.08x: attention is a fraction of a decode
+step even at this depth, exactly as `AGENTS.md`'s "~5% measured... at context
+12..28" note and this file's own "attention increment is ~9.8 ms/step" sizing
+imply for how much of the whole step a kernel-level win can move.
+
+**65,536 and 32,768 keys, one round each (the depths kernel level already
+predicted a loss):**
+
+| depth | baseline (warp) ms/step | `WPO=2` ms/step | ratio |
+|---:|---:|---:|---:|
+| 65,536 | 14.70 | 14.99 | 0.981x |
+| 32,768 | 12.13 | 12.66 | 0.958x |
+
+Confirms the kernel-level crossover end to end: `WPO=2` costs 2-4% at these
+two depths rather than saving anything.
+
+### Against the target, honestly
+
+The lead's own sizing: parity at 131,072 needs the kernel near 0.6 ms against
+`attn_flash_decode_warp`'s 1.197 ms, roughly 2x. `WPO=2` measured 1.105 ms --
+1.08x, an order of magnitude short of the 2x this would need to matter
+against llama.cpp. Translated to the head-to-head this file tracks, 131,072
+moves from roughly 51.2 to roughly 51.7-52.0 tok/s against llama.cpp's 66.9 --
+the ratio moves from 0.766x to about 0.773-0.778x, not a visible change at
+the precision this file reports ratios to. This is a real, correctness-
+verified, reproducible kernel win at the two deepest measured contexts and
+not the fix that closes the deep-context gap.
+
+### Disposition
+
+Not made the default. `AttentionKernels::decode_mma` stays `0`
+(`attn_flash_decode_warp`) unless a caller explicitly opts in via
+`disable_decode_mma`/`set_decode_mma_wpo` -- both kernels are net regressions
+below roughly 98,304 keys, and this codebase has no depth-aware dispatch
+inside a single `AttentionKernels` instance to route only the deep steps onto
+it. The kernel, its correctness gate, and the `LLMXABE_DECODE_MMA_WPO`/
+`LLMXABE_DISABLE_DECODE_MMA` benchmark levers all ship; nothing is reverted,
+because unlike the tiled-softmax attempt above this one has a real, if narrow,
+place it wins.
+
+### What a follow-up needs
+
+1. **The 255-register spill is unexamined.** Both variants hit it only after
+   the correctness fix widened `vlo`/`vhi`; whether it is costing `WPO=2` any
+   of its margin, or whether removing it would turn `WPO=4` into a win too,
+   is not measured. `MMA_PREFETCH`'s own history in this file (register
+   pressure fighting `__launch_bounds__` occupancy) is the first thing to
+   check before assuming less register pressure is strictly better.
+2. **Depth-aware dispatch.** `WPO=2`'s crossover sits between 65,536 and
+   98,304; a real deployment wants `decode()` choosing per call by depth, not
+   one lever fixed at construction for the whole pass. Nothing in
+   `AttentionKernels` currently reads `key_offset` before picking a kernel --
+   it would have to.
+3. **`ncu` would resolve why `WPO=4` is so much worse than `WPO=2` beyond the
+   occupancy story alone** -- 1 vs 3 blocks/SM predicts *some* of the gap,
+   but 0.95x vs 1.08x at 131,072 is a 14-point swing from a 3x occupancy
+   change, which is plausible but not verified against per-SM issue-slot
+   counters this host cannot read.
+
 ## Widening the softmax-rescale tile: built, and rejected on register spill (2026-08-18)
 
 Profiling task for the deep-prefill gap: `nsys --delay --duration` windows
@@ -5274,3 +5624,142 @@ for narrow batches, selected by token count the way the fp32/int8
 crossover at `MMA_MIN_TOKENS` already is -- specified here, not attempted,
 because 512 remains a win against llama.cpp and this session's two named
 targets do not need it.
+
+## MoE's small-bucket GEMV at batch decode: a real win through N=4, a real regression at N=8, and rejected on the second one (2026-08-18)
+
+This session's brief named the batched-decode aggregate at N=3 (89.2 tok/s
+against llama.cpp's 154.58) as the largest remaining gap and asked for
+`grouped_forward`'s decode-width GEMV shape to be re-profiled at N=3
+specifically rather than assumed from N=1's numbers. `nsys
+--cuda-graph-trace=node` over an isolated N=3 batch-decode replay (`LLMXABE_
+SKIP_SINGLE_STREAM=1`, GPU 2, 32,768-token context), kernel time summed per
+36-replay window and divided by step count: MoE (`moe_expert_ffn` +
+`moe_expert_down` + shared-expert + routing) is **43.7%** of a decode step at
+this width -- 19.0% and 14.9% for the two routed projections alone -- ahead
+of GDN's 23.0% and attention's 24.9%, confirming the brief's own ranking
+without assuming it.
+
+### The idea: `MOE_TILE_DISPATCH`'s `bm == 1` case does not need to stage
+
+`tile_gemm_pair`/`tile_gemm_single` (`crates/xabe-cuda/src/kernels/moe.rs`)
+already specialize to `TM` 2, 8 or 16 by the live row count `bm` a dispatch
+bucket carries, per "Two more decode-shape defects at N=2-4" above. At N=3,
+`D(3) = 23.26` distinct experts per layer against `3 * 8 = 24` routed
+token-expert pairs means almost every touched expert's bucket holds exactly
+one real token -- `bm == 1` -- and that bucket still takes the `TM` 2
+specialization, which stages its (at most two) activation rows through
+shared memory behind two block-wide `__syncthreads()` per 128-element pass.
+That staging exists to save `MOE_ROWS`-fold (8x) re-reads of a *wide*
+activation slice at `TM` 8 or 16; at `TM` 1 the slice is one `float4`, small
+enough that the redundant per-warp reads should hit L2 for free, and the two
+barriers are pure overhead paid for nothing. `moe_expert_ffn_gemv` -- the
+existing dedicated N=1 kernel -- already proves the no-staging, redundant-
+read pattern works at 46-63% of roofline; this added a `TM == 1` branch
+inside `tile_gemm_pair`/`tile_gemm_single` themselves (used by the *batched*
+`bm == 1` case, not the single-token dispatch) that does the same thing:
+reads `rows[0]` directly from the already-synced shared array, then loads
+its activation with `*(const float4*)(src + rows[0] + j0 + 4*lane)` instead
+of through `prefetch_tile`/`commit_tile`. Bit-exact with the staged form by
+construction -- same `float4` value either way, same accumulation order,
+`x + 0.0f == x` for a zero-filled padding contribution -- confirmed by
+`tests/moe_differential.rs` (6/6) and all three `tests/batch_decode.rs`
+differentials, including the bit-exact one, both before and after every
+revision below.
+
+### First measurement: a real win, N=3 through N=4
+
+Built in an isolated `git worktree` with its own `target/` -- this session's
+own working tree had a sibling's concurrent, uncommitted edits to
+`attention.rs` land and vanish mid-session, and an earlier nsys profile
+silently absorbed one of them into this session's own binary and produced an
+unrelated 39%-slower attention kernel choice that had nothing to do with
+this change; the worktree isolates the measurement from that shared-checkout
+hazard. `bench_decode_batch`, 2,048-token context, three interleaved rounds
+against an unmodified baseline built the same way:
+
+| N | before (mean, 3 rounds) | after | change |
+|---:|---:|---:|---:|
+| 1 | 101.8 | 101.6 | flat (noise) |
+| 2 | 101.5 | 107.0 | +5.4% |
+| 3 | 89.9 (32,768 ctx, separate rounds) | 93.2 | +3.7% |
+| 4 | 129.2 | 136.6 | +5.7% |
+| 8 | 170.7 | 154.4 | **-9.5%** |
+
+N=3's own number is from the 32,768-token context this session's brief
+targets, not 2,048; three interleaved rounds each side, mean 89.9 -> 93.2.
+
+### The regression, and why the obvious fix does not fix it
+
+N=8 is one of this project's five standard batch widths and the brief's own
+"never regress" clause covers it, so a change that helps 1-4 and hurts 8 is
+not a fix. The first guess was the same class of defect `bm == 2`'s
+redundant *second* `float4` read would have -- more simultaneous buckets at
+higher `N` (`D(8) = 57.42` against `D(3) = 23.26`) meaning more blocks
+competing for L2 capacity with their redundant per-warp reads, worse at two
+rows than at one. Restricting the no-staging path to `bm == 1` only (`bm ==
+2` falls back to the unchanged staged `TM` 2 path) did not fix it: N=8 stayed
+at 154.4 tok/s, unchanged from the unrestricted version.
+
+A device-side-only gate cannot fix a device-side-only cause, so the next
+attempt made the gate a host-known one: `valid_tokens` (the batch's real
+token count, already a kernel argument, written once per step by
+`MoeKernels::set_valid_tokens`) is `N` directly, and a `narrow =
+(*valid_tokens) <= MOE_NARROW_DECODE_MAX` (4) local, computed once per kernel
+invocation and threaded into `MOE_TILE_DISPATCH`'s `bm == 1` arm (`bm > 1 ||
+!narrow`), disables the no-staging path entirely above the threshold --
+falling back to *exactly* the original three-specialization dispatch,
+verified against `set_valid_tokens`'s own definition rather than assumed.
+N=4 kept its win (135.5-136.6 tok/s, both builds). **N=8 stayed regressed:
+153.8-154.4 tok/s**, run three times, fresh GPU (37 C, 0% util before each
+run) to rule out thermal drift as the cause.
+
+That the runtime-gated build regresses identically to the ungated one, at a
+batch width where the new branch is provably never taken, says the cost is
+not in taking the branch -- it is in the branch *existing* in the compiled
+kernel. `ptxas -v` on the extracted `MOE_SRC` (both versions, `nvcc -arch=
+sm_75 --ptxas-options=-v`, the offline substitute this project already uses
+where `ncu` fails with `ERR_NVGPUCTRPERM`) ruled out the specific mechanism
+the project's own prior register-cliff note would predict: `moe_expert_ffn`
+held at 80 registers before and after, `moe_expert_down` **dropped** from 77
+to 75. No spill either side. The fourth-specialization register cliff this
+file already documented in `MOE_TILE_DISPATCH`'s own comment does not
+explain this one -- the registers did not move the wrong way, they barely
+moved at all.
+
+### Rejected, not root-caused
+
+Whatever costs 9.5% at N=8 from a branch that is never taken there is real,
+reproducible (three separate fresh measurements, same number to within
+0.6%), and not explained by the two mechanisms this project's toolchain can
+see without `ncu` -- register pressure and shared memory, both checked and
+both clear. Instruction-cache pressure from a larger compiled function body
+is the remaining plausible candidate, unconfirmed: `cuobjdump -sass`
+per-function instruction counts were attempted and abandoned this session
+after the extraction script produced obviously-wrong counts (18 and 30
+instructions for kernels that are hundreds of instructions long), which is a
+tooling gap here rather than a finding.
+
+Reverted in full: `crates/xabe-cuda/src/kernels/moe.rs` is unchanged from
+before this section. The N=3/N=4 win was real but conditioned on a
+regression this project's own stated bar does not allow to ship. Recorded
+here, with both sets of numbers, so the next attempt starts from "N=8 is the
+wall, and registers/shared memory are cleared" instead of re-deriving it --
+and does not re-try the `bm == 2` or host-known-`narrow` gates, both tried,
+both insufficient on their own.
+
+### What a follow-up needs
+
+A genuinely separate `__global__` kernel (its own cubin entry, own register
+allocation, selected by the host the way `max_tokens == 1` already selects
+`moe_expert_ffn_gemv` over the tiled kernel) rather than a same-function
+runtime branch is the next thing to try, following this file's own
+"512-token MoE throughput could recover its regression with a second kernel
+variant... selected by token count" precedent two sections up -- the same
+pattern, applied to decode's `bm == 1` case instead of prefill's `M` 64
+regression. That doubles the compiled code for `moe_expert_ffn`/
+`moe_expert_down` (and, if it is worth carrying there too, the shared-expert
+pair), which is a real cost this session did not have the budget to build
+and verify against every accuracy gate in addition to everything above.
+`cuobjdump -sass` with a working per-function instruction-count extraction
+(this session's own attempt was not one) would settle whether instruction
+cache is really the mechanism before spending the effort.
