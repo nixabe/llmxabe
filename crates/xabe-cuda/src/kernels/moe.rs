@@ -223,6 +223,15 @@ const MMA_M_NARROW: usize = 32;
 /// decode step of one token, where the integer path loses.
 const MMA_MIN_TOKENS: usize = 8;
 
+/// Batch width at or below which `grouped_forward_partial` picks
+/// `expert_ffn_narrow`/`expert_down_narrow` over `expert_ffn`/`expert_down`
+/// for `N > 1`. Below `MMA_MIN_TOKENS`, so there is no overlap with the
+/// integer-tensor-core path's own threshold. See `moe_expert_ffn_narrow`'s
+/// own comment in `MOE_SRC` for the measurement this bound comes from
+/// (a real win through `N` 4, and why `N` 8 needed a separate compiled
+/// kernel rather than a runtime-gated branch to stay unregressed).
+const MOE_NARROW_DECODE_MAX: usize = 4;
+
 /// Bytes per staged activation row. Mirrors `MOE_MMA_ASTRIDE`.
 ///
 /// 16 more than the contraction it holds: a 128-byte stride is 32 shared
@@ -821,6 +830,103 @@ __device__ __forceinline__ void tile_gemm_single(
     if      (bm > 8) { CALL(16); }     \
     else if (bm > 2) { CALL(8);  }     \
     else             { CALL(2);  }
+
+// -------------------------------------------------------------------------
+// 2a. The `bm == 1` case of the routed FFN/down tiles, without staging.
+// -------------------------------------------------------------------------
+//
+// A first attempt at this added a `TM == 1` branch *inside*
+// `tile_gemm_pair`/`tile_gemm_single` themselves (the templates just above),
+// reasoning that a leaner branch could not cost more than the register-cliff
+// a fourth *tiled* specialization already measured. It was wrong, and not
+// for that reason: `moe_expert_ffn`/`moe_expert_down`'s own register counts
+// did not move (`ptxas -v`: 80 and 77->75), but the change regressed N=8 by
+// 9.5% anyway (170.7 -> 154.4 tok/s, `bench_decode_batch`, ctx 2,048) --
+// even gated fully off at that width by a host-known `valid_tokens`
+// threshold, so the branch was provably never *taken* there. `ptxas -v` on
+// `moe_expert_ffn_mma`, a kernel this change's diff never touched a line
+// of, explains it: 80 registers before, **126 after** -- adding text to
+// `tile_gemm_pair`/`tile_gemm_single` shifted register allocation for an
+// unrelated `__global__` function compiled from the same `MOE_SRC` string,
+// and N=8 with Q6_K gate/up (`MMA_MIN_TOKENS` is 8) decodes through
+// `moe_expert_ffn_mma`, not the tiled kernels the earlier diff's own
+// differential and benchmark coverage was checking. See "MoE's small-bucket
+// GEMV..." in docs/BENCHMARKS.md for the full account.
+//
+// These two functions are new code with no existing caller, so nothing
+// above this point in the file changes: `tile_gemm_pair`, `tile_gemm_single`
+// and `MOE_TILE_DISPATCH` are untouched, byte for byte, from what they were
+// before this section existed. Whether keeping the *addition* itself out of
+// `moe_expert_ffn_mma`'s register allocation requires more than that --
+// e.g. a separate compilation unit, since `ptxas`'s allocator has now been
+// measured to cross `__global__` function boundaries within one `nvrtc`
+// module -- is exactly what this session's `cuobjdump -sass` A/B (recorded
+// in BENCHMARKS.md) exists to answer, not assumed here.
+//
+// One live row, read directly rather than staged through
+// `prefetch_tile`/`commit_tile` -- the same pattern `moe_expert_ffn_gemv`
+// already proves at N=1, generalized to the batched `bm == 1` case `N` 2-4
+// hits almost every dispatch bucket. `bm == 1` (see `live_tile_rows`) is
+// only reachable with `rows[0] >= 0`: the defensive `rows[0] < 0` branch
+// below can never execute, kept only because a future change to
+// `live_tile_rows`'s contract should fail loud rather than read garbage.
+// Bit-exact with what `tile_gemm_pair<1>`/`tile_gemm_single<1>` would
+// produce: the same `float4` value at row 0, position `j0 + 4*lane`, either
+// staged through shared memory first or read directly, the same
+// accumulation order, and `x + 0.0f == x` in IEEE 754 for a padding
+// contribution either way.
+__device__ __forceinline__ void tile_gemm_pair_direct1(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ src, const long long* rows,
+    long long wrow, int k_len, int lane, int live, float* ag, float* au
+) {
+    ag[0] = 0.0f;
+    au[0] = 0.0f;
+    if (!live) return;
+    if (rows[0] < 0) {
+        warp_reduce_tile<1>(ag);
+        warp_reduce_tile<1>(au);
+        return;
+    }
+    for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
+        float wg[MOE_TN];
+        float wu[MOE_TN];
+        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
+        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+        float4 xv = *(const float4*)(src + rows[0] + j0 + 4 * lane);
+        ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
+        ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
+        ag[0] += wg[2] * xv.z;  au[0] += wu[2] * xv.z;
+        ag[0] += wg[3] * xv.w;  au[0] += wu[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ag);
+    warp_reduce_tile<1>(au);
+}
+
+// As above for a single weight matrix: the down projection.
+__device__ __forceinline__ void tile_gemm_single_direct1(
+    const unsigned char* __restrict__ w_q, int w_quant,
+    const float* __restrict__ src, const long long* rows,
+    long long wrow, int k_len, int lane, int live, float* ad
+) {
+    ad[0] = 0.0f;
+    if (!live) return;
+    if (rows[0] < 0) {
+        warp_reduce_tile<1>(ad);
+        return;
+    }
+    for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
+        float wd[MOE_TN];
+        dequant_tile(w_q, w_quant, wrow + j0, lane, wd);
+        float4 xv = *(const float4*)(src + rows[0] + j0 + 4 * lane);
+        ad[0] += wd[0] * xv.x;
+        ad[0] += wd[1] * xv.y;
+        ad[0] += wd[2] * xv.z;
+        ad[0] += wd[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ad);
+}
 
 // Write one slot's weighted contribution, or nothing at all if the slot is
 // padding.
@@ -1968,6 +2074,92 @@ __global__ void moe_expert_ffn(
     }
 }
 
+// `moe_expert_ffn`'s own body, unchanged, with one difference: `bm == 1`
+// takes `tile_gemm_pair_direct1` instead of the staged `TM` 2 tile. A
+// separate `__global__` entry point rather than a branch inside
+// `moe_expert_ffn` itself -- see "2a." above for why the branch-inside
+// version was rejected, and `moe_shared_ffn`/`moe_shared_down` deliberately
+// keep the original three-way `MOE_TILE_DISPATCH` unchanged rather than
+// gaining a `_narrow` twin of their own: the shared expert's `bm` is the
+// live token count directly (no sparse routing), so `bm == 1` there means
+// `N == 1`, already served by `moe_expert_ffn_gemv`'s dedicated one-token
+// path before this function is ever reached.
+//
+// The host picks this over `moe_expert_ffn` by batch width
+// (`MoeKernels::grouped_forward_partial`, gated `1 < max_tokens <=
+// MOE_NARROW_DECODE_MAX`), a launch-time decision from a host-known value,
+// not a device readback -- unchanged from how `max_tokens == 1` already
+// picks `moe_expert_ffn_gemv` over both.
+__global__ void moe_expert_ffn_narrow(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    float*     xs   = xabe_shared;                              // [MOE_TM][MOE_TK]
+    long long* rows = (long long*)(xs + MOE_TM * MOE_TK);       // [MOE_TM]
+
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    int live = r < intermediate;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        __syncthreads();
+        if (threadIdx.x < MOE_TM) {
+            int m = m0 + threadIdx.x;
+            int flat = m < block_size
+                ? sorted_token_ids[(long long)blk * block_size + m]
+                : numel;
+            rows[threadIdx.x] =
+                flat < numel ? (long long)(flat / top_k) * hidden : -1;
+        }
+        __syncthreads();
+
+        int bm = live_tile_rows(rows);
+        if (bm == 0) continue;
+        float ag[MOE_TM];
+        float au[MOE_TM];
+        if (bm == 1) {
+            tile_gemm_pair_direct1(
+                gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
+                wrow, hidden, lane, live, ag, au);
+        } else {
+#define MOE_FFN_TILE_NARROW(TM) tile_gemm_pair<TM>(                          \
+                gate_q, gate_quant, up_q, up_quant, hidden_states, rows, xs, \
+                wrow, hidden, lane, live, ag, au)
+            if      (bm > 8) { MOE_FFN_TILE_NARROW(16); }
+            else if (bm > 2) { MOE_FFN_TILE_NARROW(8);  }
+            else             { MOE_FFN_TILE_NARROW(2);  }
+#undef MOE_FFN_TILE_NARROW
+        }
+
+        if (live && lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (m < bm) {
+                    float act = ag[m] / (1.0f + expf(-ag[m]));
+                    inter[((long long)blk * block_size + m0 + m) * intermediate + r] =
+                        act * au[m];
+                }
+            }
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // 3a. The same two projections when there is exactly one token.
 // -------------------------------------------------------------------------
@@ -2261,6 +2453,81 @@ __global__ void moe_expert_down(
             wrow, intermediate, lane, live, ad)
         MOE_TILE_DISPATCH(MOE_DOWN_TILE)
 #undef MOE_DOWN_TILE
+
+        if (live && lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (m < bm) {
+                    store_slot_contribution(
+                        partial, topk_weights, slot_flat[m], numel, hidden, h, ad[m]);
+                }
+            }
+        }
+    }
+}
+
+// `moe_expert_down`'s own body, unchanged, with `bm == 1` taking
+// `tile_gemm_single_direct1` instead of the staged `TM` 2 tile. See
+// `moe_expert_ffn_narrow` just above `moe_expert_ffn` for why this is a
+// separate `__global__` entry point rather than a branch inside
+// `moe_expert_down` itself.
+__global__ void moe_expert_down_narrow(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    float*     xs        = xabe_shared;                          // [MOE_TM][MOE_TK]
+    long long* rows      = (long long*)(xs + MOE_TM * MOE_TK);   // [MOE_TM]
+    int*       slot_flat = (int*)(rows + MOE_TM);                // [MOE_TM]
+
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    int live = h < hidden;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        __syncthreads();
+        if (threadIdx.x < MOE_TM) {
+            int m = m0 + threadIdx.x;
+            int flat = m < block_size
+                ? sorted_token_ids[(long long)blk * block_size + m]
+                : numel;
+            slot_flat[threadIdx.x] = flat;
+            rows[threadIdx.x] = flat < numel
+                ? ((long long)blk * block_size + m) * intermediate
+                : -1;
+        }
+        __syncthreads();
+
+        int bm = live_tile_rows(rows);
+        if (bm == 0) continue;
+        float ad[MOE_TM];
+        if (bm == 1) {
+            tile_gemm_single_direct1(
+                down_q, down_quant, inter, rows, wrow, intermediate, lane, live, ad);
+        } else {
+#define MOE_DOWN_TILE_NARROW(TM) tile_gemm_single<TM>(                       \
+                down_q, down_quant, inter, rows, xs,                         \
+                wrow, intermediate, lane, live, ad)
+            if      (bm > 8) { MOE_DOWN_TILE_NARROW(16); }
+            else if (bm > 2) { MOE_DOWN_TILE_NARROW(8);  }
+            else             { MOE_DOWN_TILE_NARROW(2);  }
+#undef MOE_DOWN_TILE_NARROW
+        }
 
         if (live && lane == 0) {
             #pragma unroll
@@ -3152,6 +3419,13 @@ pub struct MoeKernels {
     expert_ffn: CudaFunction,
     expert_ffn_gemv: CudaFunction,
     expert_down_gemv: CudaFunction,
+    /// `1 < N <= MOE_NARROW_DECODE_MAX` batch-decode path: `moe_expert_ffn`'s
+    /// own body, `bm == 1` read directly instead of staged. A separate
+    /// compiled entry point from `expert_ffn`, not a runtime branch inside
+    /// it — see the CUDA source's own comment above `moe_expert_ffn_narrow`
+    /// for why a same-function branch was tried first and rejected.
+    expert_ffn_narrow: CudaFunction,
+    expert_down_narrow: CudaFunction,
     expert_ffn_mma: CudaFunction,
     expert_ffn_mma_q8: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
@@ -3275,6 +3549,8 @@ impl MoeKernels {
             expert_ffn: module.load_function("moe_expert_ffn")?,
             expert_ffn_gemv: module.load_function("moe_expert_ffn_gemv")?,
             expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
+            expert_ffn_narrow: module.load_function("moe_expert_ffn_narrow")?,
+            expert_down_narrow: module.load_function("moe_expert_down_narrow")?,
             expert_ffn_mma: module.load_function(if narrow {
                 "moe_expert_ffn_mma_narrow"
             } else {
@@ -3648,6 +3924,12 @@ impl MoeKernels {
         };
         let use_mma = self.mma.is_some() && g.max_tokens >= MMA_MIN_TOKENS && mma_quant.is_some();
 
+        // `1 < N <= MOE_NARROW_DECODE_MAX`: below the integer-tensor-core
+        // threshold, where almost every dispatch bucket the batch touches
+        // still holds exactly one live token. See `MOE_NARROW_DECODE_MAX`'s
+        // own comment.
+        let narrow = !gemv && !use_mma && g.max_tokens <= MOE_NARROW_DECODE_MAX;
+
         if gemv {
             let cfg = LaunchConfig {
                 grid_dim: (
@@ -3740,7 +4022,19 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: shared,
             };
-            let mut builder = stream.launch_builder(&self.expert_ffn);
+            // `narrow` picks a separate compiled entry point
+            // (`expert_ffn_narrow`), not a branch inside `expert_ffn`'s own
+            // launch — same grid, block and shared-memory geometry either
+            // way, since both kernels tile the same `intermediate x
+            // expert_block_capacity` shape. See `MOE_NARROW_DECODE_MAX`'s
+            // comment for why this stayed a second kernel rather than a
+            // runtime gate inside one.
+            let f = if narrow {
+                &self.expert_ffn_narrow
+            } else {
+                &self.expert_ffn
+            };
+            let mut builder = stream.launch_builder(f);
             builder
                 .arg(gate.bytes)
                 .arg(&gate_code)
@@ -3761,7 +4055,9 @@ impl MoeKernels {
             // intermediate` floats, the range `(blk * block_size + m, r)`
             // covers. Shared memory covers the activation tile plus one slot id
             // per tile row. Weight indexing is bounded by the element-count
-            // check above.
+            // check above. `expert_ffn_narrow` shares `expert_ffn`'s exact
+            // argument list and bounds -- it is `expert_ffn`'s own body with
+            // one branch changed.
             unsafe { builder.launch(ffn_cfg) }?;
         }
 
@@ -3865,7 +4161,17 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: shared,
             };
-            let mut builder = stream.launch_builder(&self.expert_down);
+            // `MMA_MIN_TOKENS` bounds `down_mma` the same way it bounds
+            // `use_mma`, so `narrow` (computed off `use_mma`) is exactly
+            // right here too: at `max_tokens <= MOE_NARROW_DECODE_MAX` (4,
+            // below 8) neither `down_mma` nor `use_mma` can be true regardless
+            // of `down.quant`.
+            let f = if narrow {
+                &self.expert_down_narrow
+            } else {
+                &self.expert_down
+            };
+            let mut builder = stream.launch_builder(f);
             builder
                 .arg(down.bytes)
                 .arg(&down_code)
