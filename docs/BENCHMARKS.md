@@ -3059,3 +3059,155 @@ mapping and a 64-register output accumulator — and named barriers, so the two
 head groups stop waiting on each other at the two barriers that are per-head
 rather than per-block. Neither is a constant change; both are specified here
 rather than attempted half-way.
+
+## The staging loops were the bottleneck, not the barriers (2026-08-17)
+
+The section above blamed the 32K-128K gap on latency the kernel could not
+cover: one block per SM, four `__syncthreads` per 32-key tile, no second block
+to hide them. That was an elimination argument with an unmeasured premise, and
+it was wrong. Attention was not close to any compute bound at all — it was at
+36% of this card's memory bandwidth, and every explanation involving tensor
+cores or barriers was reasoning about the wrong limit.
+
+What made that visible was measuring attention on its own.
+
+### `bench_attention`
+
+Every attention measurement before this one came out of a whole forward pass: a
+30 GiB model load and a minute of wall clock per A/B, expensive enough that the
+honest response to a small kernel change was to not measure it. `cargo run
+--release -p xabe-engine --bin bench_attention` runs the attention launch and
+nothing else, at this model's real geometry, across seven context depths. An A/B
+is about six seconds.
+
+It reports the traffic the launch *issues* — one pass over the causal window per
+block, summed per query tile, taken from the dispatch rule rather than a copy of
+it — next to the traffic the problem needs. The redundancy the block shape
+imposes is then a column rather than an inference, and it turned out to be the
+number that mattered most.
+
+### Four changes, measured at 131,072 keys
+
+| change | ms | GB/s | issued GB |
+|---|---:|---:|---:|
+| starting point | 141.18 | 243.9 | 34.43 |
+| K staged as `uint4` | 119.06 | 289.2 | 34.43 |
+| ... V batched in place | **152.32** | 226.0 | 34.43 |
+| ... V batched, division removed | 92.81 | 371.0 | 34.43 |
+| `MMA_HPB` 2 -> 4, `MMA_KT` 32 -> 16 | 78.65 | 219.5 | **17.21** |
+| per-head named barriers | 70.60 | 243.8 | 17.21 |
+| software-pipelined prefetch | **62.16** | 276.9 | 17.21 |
+
+**2.27x on attention alone**, and the bandwidth column is now flat across depth
+where before it drifted.
+
+#### 1. Memory-level parallelism
+
+Both staged-tile loops are bounded by `hd2`, a runtime value. ptxas cannot
+unroll a loop whose trip count it does not know, so each iteration's shared
+store depended on the global load directly above it and each thread kept **one
+4-byte request in flight**.
+
+Little's law fixes the requirement: an SM's share of 672 GB/s at 1.4 GHz is
+6.7 B/cycle, and at roughly 600 cycles of DRAM latency that is about 4 KiB in
+flight per SM, or 16 B across 256 threads. One word per thread is a quarter of
+that, predicting 25% of peak against the 36% measured — the right size, with the
+slack being L2 hits among the blocks sharing a KV head.
+
+K is the easy half: two adjacent binary16 dimensions of one key are already the
+packed `B` operand, so a `uint4` is four operands in one request, and `qstride`
+is a multiple of four so the matching 128-bit shared store is quarter-warp
+phased and conflict-free.
+
+V cannot take the same trick. A `uint4` there is eight consecutive dimensions,
+which land eight *rows* apart in `v_sh`; the fragment read needs
+`gcd(vstride, 32) == 4`, and `8 * vstride` is then a multiple of 32 for every
+admissible stride, so all 32 lanes would hit one bank. Widening the load costs
+more in the store than it buys.
+
+The third row of the table is why this is written down. Batching the flattened
+`[key-pair][dim]` loop in place **lost 11% against doing nothing**: that loop
+needs `idx / head_dim` per element against a runtime divisor, and batching pays
+the division `2 * MMA_VB` times a trip instead of once. Putting the dimension on
+the thread index and the key-pair on a compile-time-bounded inner loop removes
+every division from the staging body, and that — not the batching — is most of
+the 92.81. `MMA_VB` swept interleaved: 1 -> 93.96, **2 -> 92.81**, 4 -> 100.76,
+8 -> 100.70.
+
+#### 2. Traffic, which is what actually binds
+
+The redundancy column made the next move obvious: the launch issued 34.4 GB
+where the problem needs 0.27, because `n_query/16 * q_heads/2` = 256 blocks each
+stream the whole prefix. Four query heads per block instead of two halves that,
+and the issued figure halved exactly as predicted.
+
+`MMA_HPB`, `MMA_WPH` and `MMA_KT` look like three tunables and are not: the
+block is eight warps split evenly among the heads it serves, and `Q K^T` gives
+each warp of a head exactly one key octet. So `MMA_HPB * MMA_WPH == 8` and
+`MMA_KT == 8 * MMA_WPH`, and `MMA_HPB` 4 forces a 16-key tile. Both relations
+now have a unit test, because breaking either still compiles and returns a
+finite, plausible, wrong answer.
+
+The 16-key tile doubles the barriers per key, and the bandwidth column shows it:
+371 -> 219 GB/s. Halving the traffic was still worth 1.18x net.
+
+#### 3. Named barriers
+
+Two of the four barriers per tile fence `s_sh`, `m_sh`, `l_sh` and `corr_sh`,
+all of which are sliced per head — the warps of head A have nothing to say to
+the warps of head B between `Q K^T` and `P V`. Those became `bar.sync id, 64`.
+Measured interleaved, three pairs: 77.43 / 77.72 / 77.79 block-wide against
+70.60 / 70.55 / 70.96 per-head, **+9.6%**.
+
+#### 4. Software pipelining
+
+With one block per SM there is no second block to cover staging latency, so the
+DRAM round trip sat between two barriers with the tensor cores idle. The loop is
+now pipelined: a trip stores the tile loaded during the previous trip's
+arithmetic, then issues the next tile's loads, then computes. Nothing between
+the issue and the following barrier touches the prefetch registers, so they stay
+in flight across `Q K^T`, the softmax and `P V`.
+
+Both register arrays are indexed by compile-time constants with the real trip
+count as a *predicate* rather than a bound — indexed by a runtime value they
+would land in local memory and the change would be worse than useless.
+**62.16 ms, and bandwidth back to 276.9 GB/s.**
+
+### Where the head-to-head stands
+
+Prefill, one GPU, 512-token chunks, against llama.cpp `-fa 1 -ub 512`:
+
+| tokens | before | after | llama.cpp | ratio |
+|---:|---:|---:|---:|---:|
+| 512 | 2,436.1 | 2,437.7 | 2,155.8 | **1.13x** |
+| 2,048 | 2,311.4 | 2,346.2 | 2,118.0 | **1.11x** |
+| 8,192 | 1,957.0 | 2,114.7 | 1,978.7 | **1.07x** |
+| 32,768 | 1,204.7 | 1,630.8 | 1,729.9 | 0.94x |
+| 65,536 | 810.3 | 1,227.4 | 1,410.4 | 0.87x |
+| 131,072 | 505.8 | 855.2 | 1,119.3 | 0.76x |
+
+8,192 crossed over; 131,072 went from 0.45x to 0.76x.
+
+### What is left, with the arithmetic that says so
+
+With the prefetch in place, reverting only the block shape measures 111.03 and
+111.88 ms at `MMA_HPB` 2 against 61.35 and 61.65 at 4 — **1.81x from halving
+traffic**, with bandwidth roughly flat (310 against 280 GB/s). The kernel is
+still traffic-bound, so the next factor is another halving of the block count
+and not more latency hiding.
+
+Taking the per-depth attention cost from `bench_attention` and integrating it
+over a chunked prefill puts attention at about 80 s of the 153 s pass at
+131,072, leaving roughly 74 s that is not attention. Beating llama.cpp there
+needs the whole pass under 117 s, so attention has to reach about 43 s: a
+further 1.85x. At 32,768 attention is only about 5 s of 20 s, so the same 1.8x
+would put that depth at roughly 1,834 tok/s — ahead.
+
+The way to it is `MMA_HPB` 8, and the obstacle is exact: `q_sh` alone would be
+67,584 B against a 65,536 B carveout. It fits only if Q leaves shared for
+registers, which costs 64 registers of fragments plus a 128-register
+accumulator, because one warp would then own a whole head's 16x256 output.
+About 217 registers against a 255 limit — feasible on paper, and the spill is
+the risk. An XOR swizzle removes `q_sh`'s padding and was checked
+(`(4s+tg) ^ 4*(r&7)` keeps the fragment read a bank bijection) but saves only
+1,024 B, which does not change the answer.

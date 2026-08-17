@@ -9,7 +9,7 @@
 | Gated DeltaNet, chunked (reference) | 30 | **critical** | Forward substitution per chunk, not explicit inverses; retained and tested, not on the forward path | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
 | GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
 | MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference; tiled, 9.3× at 512 tokens** |
-| Flash attention, prefill (GQA 16:2, head 256) | 10 | medium | Online softmax, KV head on the grid and one warp per query head, K/V staged in shared; scalar fp32 (no tensor cores yet) | **sm_75 kernel, max_abs 1.60e-6 at a 128K window; 4x less K/V traffic, +37% at 64K** |
+| Flash attention, prefill (GQA 16:2, head 256) | 10 | medium | Online softmax on `m16n8k8` fp16 tensor cores with an fp32 accumulator; four query heads and a 16-key tile per block, binary16 KV staged through a register prefetch, per-head named barriers | **sm_75 kernel, gated at 8x the binary16 half-ulp; 2.27x on attention alone at a 128K window, 277 GB/s of 672** |
 | Flash attention, decode (split-K) | 10 | medium | Key range split across blocks, partial `(m, l, acc)` merged in a second pass — the only axis a one-row query has | **sm_75 kernel, gated at 4,096 keys against the scalar reference; +114% at ctx 8192** |
 | Flash attention, one-row fallback | 10 | low | Pre-tiling kernel, kept for geometries the split path cannot service | **sm_75 kernel, unchanged** |
 | LM head GEMV (2048 × 248,320) | 1 | medium | ~~split-K~~ — one warp per row; dominates weight bandwidth | **sm_75 kernel, argmax exact, 81–89% of roofline** |
@@ -48,14 +48,25 @@ the MoE path has been tuned (see [As landed](#as-landed-2026-08-16-and-where-the
 the rest are correct and untouched. Three limits are worth stating so the
 numbers above are not read as more than they are:
 
-- **No tensor cores anywhere.** Attention is the scalar fp32 path. The
-  `m16n8k8` MMA family that `compute_75` makes reachable runs at roughly 8×
-  the fp32 FMA rate, and none of that is in hand. It is also unreachable at
-  the current `BM = 1` shape — `m16n8k8` needs 16 query rows resident, which
-  means re-tiling — and fp16 operands would end the fp32 comparison the kernel
-  is gated on. The re-tiling that unlocks MMA is the same change that raises
-  arithmetic intensity, and at ~0.5 FLOP/byte attention is bandwidth-bound, so
-  the intensity is the half that pays.
+- ~~**No tensor cores anywhere.**~~ Fixed: prefill attention runs on
+  `m16n8k8` with fp32 accumulation, and the re-tiling it needed (16 resident
+  query rows) is what made the traffic reductions since possible. The
+  prediction in this bullet was half right and half wrong, which is worth
+  keeping rather than deleting. Right: attention is bandwidth-bound, and
+  arithmetic intensity is the half that pays — every gain since has come from
+  moving fewer bytes or moving them with more requests in flight, none from
+  the tensor cores being faster. Wrong: "fp16 operands would end the fp32
+  comparison the kernel is gated on". The error against a scalar fp32 CPU
+  reference did rise, but the error against **llama.cpp** — which runs the
+  same fp16 tensor cores, and is the thing being reproduced — fell sharply.
+  The gate moved to a tolerance derived from the binary16 half-ulp instead of
+  being abandoned. See docs/BENCHMARKS.md.
+- **Attention is still traffic-bound, by a factor of 64.** The launch issues
+  17.2 GB at a 128K window where one pass per KV head would be 0.27 GB,
+  because every block streams the whole prefix for its own query tile. Halving
+  the block count has measured close to its full 2x twice now. The next
+  halving needs Q out of shared memory and into registers; the budget for it
+  is worked out in docs/BENCHMARKS.md.
 - ~~**The MoE dispatch kernel is single-block.**~~ Fixed: dispatch is now
   parallelized across `num_experts` blocks in two launches
   (`moe_align_count`, then `moe_align_block_size`). It was worth **0.12% of

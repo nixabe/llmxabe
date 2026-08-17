@@ -240,27 +240,62 @@ const GQA_QUERY_TILE: usize = 4;
 /// to gain from using fewer.
 const MMA_QUERY_TILE: usize = 16;
 
-/// Keys the tensor-core kernel stages per trip. Mirrors `MMA_KT`.
-///
-/// Four octets, one per `Q K^T` warp. Raising it past 32 would need more warps
-/// on that phase or a second octet each, and the staged tiles already sit just
-/// under the 48 KiB a block gets without opting in.
-const MMA_KEY_TILE: usize = 32;
-
 /// Query heads one tensor-core block serves. Mirrors `MMA_HPB`.
 ///
-/// Both heads of a pair sit under the same KV head, so one staged K/V tile
-/// feeds all eight warps — which is what keeps this kernel's DRAM traffic equal
-/// to the KV-head-major scalar kernel's instead of twice it. Four warps per
-/// head also means every warp has an octet in `Q K^T` rather than half of them
-/// idling through it.
-const MMA_HEADS_PER_BLOCK: usize = 2;
+/// All of them sit under the same KV head, so one staged K/V tile feeds all
+/// eight warps. DRAM traffic is one pass over the visible window per block and
+/// blocks are `n_query/MMA_QUERY_TILE * q_heads/this`, so this is the direct
+/// lever on the traffic the launch issues — which is what the kernel is bound
+/// by at long context.
+const MMA_HEADS_PER_BLOCK: usize = 4;
+
+/// Warps serving one query head. Mirrors `MMA_WPH`.
+///
+/// The block is eight warps and they divide evenly among the heads, so this is
+/// `8 / MMA_HEADS_PER_BLOCK` and not an independent choice. Within a group the
+/// warps split the output head dimension, so fewer warps per head is a larger
+/// output accumulator: `head_dim / (8 * this)` tiles of four floats each.
+const MMA_WARPS_PER_HEAD: usize = 8 / MMA_HEADS_PER_BLOCK;
+
+/// Keys the tensor-core kernel stages per trip. Mirrors `MMA_KT`.
+///
+/// One octet per `Q K^T` warp of a head group, so this is pinned to
+/// `8 * MMA_WARPS_PER_HEAD`: every warp busy, every octet covered once.
+const MMA_KEY_TILE: usize = 8 * MMA_WARPS_PER_HEAD;
+
+/// Output accumulator tiles a warp can hold. Mirrors `MMA_MAXT`.
+///
+/// The unroll bound on `o[MMA_MAXT][4]`, so it is four registers apiece whether
+/// or not a geometry uses them all. `head_dim / (8 * MMA_WARPS_PER_HEAD)` must
+/// not exceed it; at head_dim 256 and two warps per head it is exactly 16.
+const MMA_MAX_TILES: usize = 16;
+
+/// Dynamic shared memory one tensor-core block needs at a head dimension.
+///
+/// The staged Q, K and V tiles in fp16, plus the score tile and the three
+/// per-row softmax scalars in fp32. Q and K carry four words of padding per row
+/// and V four per dimension; see the kernel comment for why those exact strides
+/// are what make every fragment read conflict-free.
+///
+/// Free-standing rather than a method so a unit test can check the budget
+/// without a device to build an [`AttentionKernels`] against — the launch does
+/// fail loudly past the ceiling, but it fails at the first long prefill rather
+/// than at `cargo test`.
+const fn mma_shared_bytes(head_dim: usize) -> usize {
+    let qstride = head_dim / 2 + 4;
+    let vstride = MMA_KEY_TILE / 2 + 4;
+    let words = MMA_HEADS_PER_BLOCK * MMA_QUERY_TILE * qstride
+        + MMA_KEY_TILE * qstride
+        + head_dim * vstride;
+    let floats = MMA_HEADS_PER_BLOCK * (MMA_QUERY_TILE * MMA_KEY_TILE + 3 * MMA_QUERY_TILE);
+    (words + floats) * size_of::<u32>()
+}
 
 /// Dynamic shared memory the tensor-core kernel is allowed to opt in to.
 ///
 /// A block gets 48 KiB without asking; Turing will hand out up to 64 KiB if the
 /// function declares it, which the staged Q, K and V tiles need at
-/// [`MMA_HEADS_PER_BLOCK`] 2. The opt-in is a `cuFuncSetAttribute` done once at
+/// this block shape. The opt-in is a `cuFuncSetAttribute` done once at
 /// construction, not per launch.
 const MMA_SHARED_CEILING: usize = 64 * 1024;
 
@@ -685,13 +720,29 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 //
 // ## Shape
 //
-// One block is one query tile of 16 rows for one query head. The eight warps
-// split the *output* head dimension, 32 each, so the output accumulator is
-// `head_dim/64` tiles of 4 floats — 16 registers, not the 128 a single warp
-// owning all 256 dimensions would need. That is the constraint that sets this
-// shape. Warps 0-3 additionally each take one octet of the 32 staged keys for
-// `Q K^T`; warps 4-7 idle through that phase, which is the price of the
-// register bound and is still far cheaper than what it buys.
+// One block is one query tile of `MMA_QT` rows for `MMA_HPB` query heads that
+// share a KV head. The eight warps divide into `MMA_HPB` groups of `MMA_WPH`,
+// one group per head, and within a group the warps split the *output* head
+// dimension. Two things are set by that split and pull against each other:
+//
+//   - The output accumulator is `head_dim / (8 * MMA_WPH)` tiles of 4 floats.
+//     Fewer warps per head is more registers each: at `MMA_WPH` 2 and
+//     head_dim 256 it is 64, and a single warp owning all 256 dimensions would
+//     need 128.
+//   - DRAM traffic is one pass over the visible window *per block*, and blocks
+//     are `n_query/MMA_QT * q_heads/MMA_HPB`. More heads per block is
+//     proportionally less traffic, and traffic is what this kernel is bound by.
+//
+// In `Q K^T` each warp of a group takes one octet of the staged keys, so
+// `MMA_KT` is pinned to `8 * MMA_WPH` — every warp busy, every octet covered
+// once. That makes the three constants one choice, not three:
+//
+//     MMA_HPB * MMA_WPH == 8       (the block is eight warps)
+//     MMA_KT == 8 * MMA_WPH        (one key octet per warp)
+//
+// `MMA_HPB` 4 therefore means `MMA_WPH` 2 and `MMA_KT` 16, which halves the
+// block count against the 2/4/32 shape it replaced and pays for it in twice as
+// many barriers per key. See docs/BENCHMARKS.md for both numbers.
 //
 // ## Shared strides
 //
@@ -700,13 +751,22 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 // `row * STRIDE + 4*step + tig` with `row` carrying `g`: stride `hd2 + 4` makes
 // the bank `(4g + tig) mod 32`, which is a bijection on `g<8, tig<4`. `v_sh` is
 // indexed `dim * VSTRIDE + 4*oct + tig` with `dim` carrying `g`: stride
-// `MMA_KT/2 + 4` = 20 makes it `(20g + tig) mod 32`, and 20g mod 32 over g<8 is
-// {0,20,8,28,16,4,24,12} — eight groups of four consecutive banks, so again a
-// bijection.
+// `MMA_KT/2 + 4` makes it `(VSTRIDE*g + tig) mod 32`, a bijection whenever
+// `gcd(VSTRIDE, 32)` is 4. At `MMA_KT` 16 that stride is 12 and `12g mod 32`
+// over `g<8` is {0,12,24,4,16,28,8,20} — eight groups of four consecutive
+// banks, as required.
 #define MMA_QT 16
-#define MMA_KT 32
-#define MMA_HPB 2
-#define MMA_MAXT 8
+#define MMA_HPB 4
+#define MMA_WPH (8 / MMA_HPB)
+#define MMA_KT (8 * MMA_WPH)
+#define MMA_MAXT 16
+// Value-staging loads issued before the first store. See the staging loop.
+#define MMA_VB 2
+// Prefetch registers per thread, sized for the largest geometry the dispatch
+// admits (head_dim 256, so `kw4` is at most 32 and a block is 256 threads).
+// Both must be compile-time bounds or the arrays spill to local memory.
+#define MMA_KREG ((MMA_KT * 32 + 255) / 256)
+#define MMA_VREG ((MMA_KT / 2) / MMA_VB)
 
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     unsigned r;
@@ -716,6 +776,21 @@ __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
         "  mov.b32 %0, {a, b}; }\n"
         : "=r"(r) : "f"(lo), "f"(hi));
     return r;
+}
+
+// A barrier only the warps of one head group wait on.
+//
+// Two of the four barriers per key tile fence `s_sh`, `m_sh`, `l_sh` and
+// `corr_sh`, and all four of those are sliced per head: the warps of head A
+// have nothing to say to the warps of head B between `Q K^T` and `P V`. A
+// `__syncthreads` there makes every head wait for the slowest, which at
+// `MMA_HPB` 4 is four independent groups rendezvousing for no reason.
+//
+// `id` must differ per group and the count must be the exact number of threads
+// that will arrive -- `MMA_WPH * 32`, with no divergent exit between here and
+// there, or the barrier deadlocks rather than degrading.
+__device__ __forceinline__ void bar_group(int id, int nthreads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(nthreads));
 }
 
 __device__ __forceinline__ void mma_m16n8k8(
@@ -769,13 +844,13 @@ __global__ void attn_flash_causal_mma(
     // heads of a pair sit under the same KV head, so one staged K/V tile feeds
     // all eight warps -- that is the whole reason for the pairing, and it puts
     // the traffic back where the KV-head-major scalar kernel had it.
-    int hslot = warp >> 2;
-    int sub = warp & 3;
+    int hslot = warp / MMA_WPH;
+    int sub = warp % MMA_WPH;
     long long qi0 = (long long)blockIdx.x * MMA_QT;
     int h = blockIdx.y * MMA_HPB + hslot;
     int kvh = h / (q_heads / kv_heads);
 
-    int dpw = head_dim >> 2;          // output dims this warp owns
+    int dpw = head_dim / MMA_WPH;     // output dims this warp owns
     int dbase = sub * dpw;
     int ntile = dpw >> 3;             // MMA n-tiles of 8 dims, <= MMA_MAXT
 
@@ -817,46 +892,129 @@ __global__ void attn_flash_causal_mma(
     if (qt_live > MMA_QT) qt_live = MMA_QT;
     long long n_visible = (long long)(*key_offset) + qi0 + qt_live;
 
+    // Value staging, decomposed once rather than once per tile.
+    //
+    // A thread owns one output dimension and a slice of the key-pairs. The
+    // dimension goes on the fast axis so consecutive lanes still read
+    // consecutive dimensions -- the coalescing this kernel already had -- and
+    // the key-pair goes on a loop with a compile-time bound, so the staging
+    // body contains no integer division at all. Splitting the key-pairs across
+    // `head_dim / nthr` slices keeps every thread busy when `head_dim` is
+    // smaller than the block, which it is for every geometry but this model's.
+    int vcap = (MMA_KT >> 1) / MMA_VB;      // batches of key-pairs to hand out
+    int vslices = nthr / head_dim;
+    if (vslices < 1) vslices = 1;
+    if (vslices > vcap) vslices = vcap;
+    // Round down to a divisor of `vcap` so the batches partition exactly; a
+    // slice count that does not divide it would leave key-pairs unstaged, and
+    // the resulting wrong answer would be finite and plausible.
+    while (vcap % vslices != 0) --vslices;
+    int vd_col = tid % head_dim;
+    int vslice = tid / head_dim;
+    bool vactive = vslice < vslices;
+    int vk0 = vslice * MMA_VB;
+    int vkstep = vslices * MMA_VB;
+    const unsigned short* vd =
+        v + (long long)kvh * (long long)head_dim + vd_col;
+    long long vrow = (long long)kv_heads * (long long)head_dim;
+
+    // The staged tile, in flight.
+    //
+    // The loop below is software-pipelined: a trip stores the tile that was
+    // loaded during the *previous* trip's arithmetic, then immediately issues
+    // the loads for the next one, then computes. With one block per SM there is
+    // no second block to cover the staging latency, so without this the DRAM
+    // round trip sits between two barriers with the tensor cores idle -- which
+    // is what held the kernel to a third of peak bandwidth even after each
+    // request was widened to 16 bytes.
+    //
+    // Both arrays must be indexed by a compile-time constant or they land in
+    // local memory and the whole point is lost, so the loops are `#pragma
+    // unroll` over a fixed bound with the real trip count as a predicate rather
+    // than as the bound.
+    int kw4 = hd2 >> 2;                              // uint4s per key row
+    uint4 kreg[MMA_KREG];
+    unsigned short vlo[MMA_VREG][MMA_VB], vhi[MMA_VREG][MMA_VB];
+
+    // K in the B layout of Q K^T, [key][dim/2]: dimensions 2c and 2c+1 of one
+    // key are already adjacent binary16 in the cache, which is exactly the B
+    // operand's packing -- no conversion, four operands per request.
+    //
+    // V in the B layout of P V, which contracts over keys: the two halves of a
+    // word are two consecutive *keys* at one dimension, so it is the transpose
+    // of K's tile and cannot take K's wide-load trick. A `uint4` there is eight
+    // consecutive dimensions, and those land eight *rows* apart in `v_sh`; the
+    // fragment read needs `gcd(vstride, 32) == 4`, and `8 * vstride` is then a
+    // multiple of 32, so all 32 lanes would hit one bank.
+#define MMA_PREFETCH(jj)                                                       \
+    do {                                                                       \
+        _Pragma("unroll")                                                      \
+        for (int i = 0; i < MMA_KREG; ++i) {                                   \
+            int t = tid + i * nthr;                                            \
+            kreg[i] = make_uint4(0u, 0u, 0u, 0u);                              \
+            if (t < MMA_KT * kw4) {                                            \
+                int r = t / kw4;                                               \
+                long long key = (jj) + r;                                      \
+                if (key < n_visible) {                                         \
+                    const uint4* kp = (const uint4*)(                          \
+                        k + (key * (long long)kv_heads + kvh)                  \
+                                * (long long)head_dim);                        \
+                    kreg[i] = kp[t - r * kw4];                                 \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        _Pragma("unroll")                                                      \
+        for (int i = 0; i < MMA_VREG; ++i) {                                   \
+            int kk0 = vk0 + i * vkstep;                                        \
+            bool ok = vactive && kk0 < (MMA_KT >> 1);                          \
+            _Pragma("unroll")                                                  \
+            for (int u = 0; u < MMA_VB; ++u) {                                 \
+                long long k0 = (jj) + 2 * (kk0 + u);                           \
+                vlo[i][u] = (ok && k0 < n_visible)                             \
+                                ? vd[k0 * vrow] : (unsigned short)0;           \
+                vhi[i][u] = (ok && k0 + 1 < n_visible)                         \
+                                ? vd[(k0 + 1) * vrow] : (unsigned short)0;     \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
+
+    MMA_PREFETCH(0);
+
     for (long long j0 = 0; j0 < n_visible; j0 += MMA_KT) {
         __syncthreads();
-        // K in the B layout of Q K^T: [key][dim/2].
-        for (int t = tid; t < MMA_KT * hd2; t += nthr) {
-            int r = t / hd2;
-            int c = t - r * hd2;
-            long long key = j0 + r;
-            unsigned word = 0;
-            if (key < n_visible) {
-                // Dimensions 2c and 2c+1 of one key are already adjacent
-                // binary16 in the cache, which is exactly the B operand's
-                // packing -- one aligned 32-bit load, no conversion.
-                const unsigned* kp = (const unsigned*)(
-                    k + (key * (long long)kv_heads + kvh) * (long long)head_dim);
-                word = kp[c];
+        // Land the tile the previous trip loaded. `qstride` is `hd2 + 4` and
+        // `hd2` is a multiple of 16, so both the row base and `4*c4` are
+        // 16-byte aligned; a 128-bit shared store is serviced in quarter-warp
+        // phases, so the eight lanes of a phase cover all 32 banks.
+        #pragma unroll
+        for (int i = 0; i < MMA_KREG; ++i) {
+            int t = tid + i * nthr;
+            if (t < MMA_KT * kw4) {
+                int r = t / kw4;
+                *(uint4*)(k_sh + r * qstride + 4 * (t - r * kw4)) = kreg[i];
             }
-            k_sh[r * qstride + c] = word;
         }
-        // V in the B layout of P V, which contracts over keys: the two halves
-        // of a word are two consecutive *keys* at one dimension, so this is the
-        // transpose of K's tile. Indexed by dimension on the inside so the
-        // global reads stay coalesced; the scattered shared writes happen once
-        // per tile against four reads.
-        for (int t = tid; t < head_dim * (MMA_KT >> 1); t += nthr) {
-            int kk = t / head_dim;
-            int d = t - kk * head_dim;
-            long long k0 = j0 + 2 * kk;
-            unsigned short lo = 0, hi = 0;
-            if (k0 < n_visible) {
-                lo = v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + d];
+        #pragma unroll
+        for (int i = 0; i < MMA_VREG; ++i) {
+            int kk0 = vk0 + i * vkstep;
+            if (vactive && kk0 < (MMA_KT >> 1)) {
+                #pragma unroll
+                for (int u = 0; u < MMA_VB; ++u) {
+                    v_sh[vd_col * vstride + kk0 + u] =
+                        (unsigned)vlo[i][u] | ((unsigned)vhi[i][u] << 16);
+                }
             }
-            if (k0 + 1 < n_visible) {
-                hi = v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + d];
-            }
-            // The two halves are two different *keys*, so unlike K this one
-            // still has to be assembled -- but from binary16 loads, not from
-            // floats needing a convert each.
-            v_sh[d * vstride + kk] = (unsigned)lo | ((unsigned)hi << 16);
         }
         __syncthreads();
+
+        // Issue the next tile's loads now, so the DRAM round trip overlaps the
+        // arithmetic below instead of preceding it. Nothing between here and
+        // the next barrier reads `kreg`/`vlo`/`vhi`, so the scheduler is free
+        // to leave them in flight for the whole of `Q K^T`, the softmax and
+        // `P V`.
+        if (j0 + MMA_KT < n_visible) {
+            MMA_PREFETCH(j0 + MMA_KT);
+        }
 
         // Q K^T. Warp (hslot, sub) takes key octet `sub` of its own head, so
         // all eight warps are busy and the four octets of both heads are
@@ -875,29 +1033,39 @@ __global__ void attn_flash_causal_mma(
             my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg]     = s2 * scale;
             my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg + 1] = s3 * scale;
         }
-        __syncthreads();
+        // Per head: `my_s` is this head's slice and no other group reads it.
+        bar_group(hslot + 1, MMA_WPH * 32);
 
-        // The online softmax, one lane per key and four query rows per warp.
+        // The online softmax: one lane per key, and as many query rows at a
+        // time as a warp has lanes to spare.
         //
-        // `MMA_KT` is 32, so a row's whole tile lands one element per lane and
-        // the max and the normalizer are warp butterflies. The obvious version
-        // -- one thread per row, serial over the tile, matching the reduction
-        // order of the scalar kernels -- left 240 of 256 threads idle between
-        // two barriers once per 32 keys, and measured 9% slower overall. The
-        // tree order is a different rounding than the reference's serial sweep,
-        // which is immaterial next to the fp16 operands this kernel already
-        // rounds to.
+        // A row's tile is `MMA_KT` wide, so a warp covers `32 / MMA_KT` rows at
+        // once and the max and the normalizer are butterflies over the `MMA_KT`
+        // lanes holding one row. `__shfl_xor_sync` with an offset below
+        // `MMA_KT` never crosses into the neighbouring row's lanes, so the two
+        // reductions stay independent without a mask.
+        //
+        // The obvious version -- one thread per row, serial over the tile,
+        // matching the reduction order of the scalar kernels -- left 240 of 256
+        // threads idle between two barriers once per tile, and measured 9%
+        // slower overall. The tree order is a different rounding than the
+        // reference's serial sweep, which is immaterial next to the fp16
+        // operands this kernel already rounds to.
         {
-            int r0 = 4 * sub;
+            const int rpw = MMA_QT / MMA_WPH;      // rows this warp owns
+            const int rat = 32 / MMA_KT;           // rows it covers at once
+            int krow = lane / MMA_KT;
+            int kcol = lane % MMA_KT;
+            int r0 = rpw * sub;
             #pragma unroll
-            for (int rr = 0; rr < 4; ++rr) {
-                int row = r0 + rr;
+            for (int rr = 0; rr < rpw / rat; ++rr) {
+                int row = r0 + rr * rat + krow;
                 long long limit = (long long)(*key_offset) + qi0 + row;
-                bool live = (j0 + lane <= limit) && (j0 + lane < n_visible);
-                float sv = live ? my_s[row * MMA_KT + lane] : neg_inf();
+                bool live = (j0 + kcol <= limit) && (j0 + kcol < n_visible);
+                float sv = live ? my_s[row * MMA_KT + kcol] : neg_inf();
 
                 float tmax = sv;
-                for (int off = 16; off > 0; off >>= 1) {
+                for (int off = MMA_KT >> 1; off > 0; off >>= 1) {
                     tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffff, tmax, off));
                 }
                 float m0 = my_m[row];
@@ -906,21 +1074,23 @@ __global__ void attn_flash_causal_mma(
 
                 float e = live ? expf(sv - nm) : 0.0f;
                 float lsum = e;
-                for (int off = 16; off > 0; off >>= 1) {
+                for (int off = MMA_KT >> 1; off > 0; off >>= 1) {
                     lsum += __shfl_xor_sync(0xffffffff, lsum, off);
                 }
-                my_s[row * MMA_KT + lane] = e;
-                if (lane == 0) {
+                my_s[row * MMA_KT + kcol] = e;
+                if (kcol == 0) {
                     my_m[row] = nm;
                     my_l[row] = my_l[row] * corr + lsum;
                     my_c[row] = corr;
                 }
             }
         }
-        __syncthreads();
+        // Per head, for the same reason: `P V` reads this head's weights and
+        // correction factors, both written just above by this group alone.
+        bar_group(hslot + 1, MMA_WPH * 32);
 
         // P V. Each warp accumulates over every key octet of its own head, for
-        // the quarter of the output head dimension it owns.
+        // the share of the output head dimension it owns.
         float cg = my_c[g];
         float cg8 = my_c[g + 8];
         #pragma unroll
@@ -1801,25 +1971,20 @@ impl AttentionKernels {
     /// row and V four per dimension; see the kernel comment for why those exact
     /// strides are what make every fragment read conflict-free.
     pub fn shared_bytes_mma(&self) -> usize {
-        let hd2 = self.head_dim / 2;
-        let qstride = hd2 + 4;
-        let vstride = MMA_KEY_TILE / 2 + 4;
-        let words = MMA_HEADS_PER_BLOCK * MMA_QUERY_TILE * qstride
-            + MMA_KEY_TILE * qstride
-            + self.head_dim * vstride;
-        let floats = MMA_HEADS_PER_BLOCK * (MMA_QUERY_TILE * MMA_KEY_TILE + 3 * MMA_QUERY_TILE);
-        (words + floats) * size_of::<u32>()
+        mma_shared_bytes(self.head_dim)
     }
 
     /// Whether the tensor-core kernel can service this geometry.
     ///
-    /// Eight warps split the output head dimension, so it must divide into
-    /// eight whole `m16n8k8` n-tiles of 8 — that is `head_dim % 64 == 0` — and
-    /// the per-warp share must fit `MMA_MAXT` tiles. The staged tiles must also
-    /// fit the 48 KiB a block gets without opting in.
+    /// The warps of a head group split the output head dimension, so it must
+    /// divide into whole `m16n8k8` n-tiles of 8 per warp, and that share must
+    /// fit [`MMA_MAX_TILES`]. The head group must exist — the heads a block
+    /// serves have to share a KV head — and the staged tiles must fit the
+    /// carveout the function opts in to.
     fn mma_is_available(&self) -> bool {
-        self.head_dim.is_multiple_of(32)
-            && self.head_dim / 32 <= 8
+        let per_warp = 8 * MMA_WARPS_PER_HEAD;
+        self.head_dim.is_multiple_of(per_warp)
+            && self.head_dim / per_warp <= MMA_MAX_TILES
             && self.gqa_ratio().is_multiple_of(MMA_HEADS_PER_BLOCK)
             && self.q_heads.is_multiple_of(MMA_HEADS_PER_BLOCK)
             && self.shared_bytes_mma() <= MMA_SHARED_CEILING
@@ -1833,6 +1998,50 @@ impl AttentionKernels {
     /// instead of hardcoding the dispatch rule and silently drifting from it.
     pub fn uses_tensor_cores(&self, n_query: usize) -> bool {
         n_query >= MMA_QUERY_TILE && self.mma_is_available()
+    }
+
+    /// Query rows one block of [`Self::forward`] covers at this query count.
+    ///
+    /// Together with [`Self::blocks_per_launch`] this pins down the launch's
+    /// traffic exactly: the grid is `ceil(n_query / this)` tiles by
+    /// `blocks / tiles` heads, and a tile at query offset `o` streams
+    /// `key_offset + o + rows` keys rather than the whole window. Exposed for
+    /// `bench_attention`, which would otherwise have to approximate the causal
+    /// bound and would overstate the shallow rows by a factor of two.
+    pub fn query_tile(&self, n_query: usize) -> usize {
+        // Decode and the one-row kernel both carry a single query row, by
+        // different routes: the first splits the key axis instead of the query
+        // axis, the second has fewer rows than a tile to begin with.
+        if n_query < GQA_QUERY_TILE {
+            1
+        } else if self.uses_tensor_cores(n_query) {
+            MMA_QUERY_TILE
+        } else if self.gqa_shared_is_available() {
+            GQA_QUERY_TILE
+        } else {
+            QUERY_TILE
+        }
+    }
+
+    /// Blocks [`Self::forward`] would launch at this query count.
+    ///
+    /// Each block streams the whole visible key window for itself, so this is
+    /// the multiplier on the launch's DRAM traffic over the one pass per KV
+    /// head the problem actually needs. Exposed so `bench_attention` can report
+    /// that redundancy from the dispatch rule rather than from a copy of it
+    /// that would quietly go stale the next time the block shape moves.
+    pub fn blocks_per_launch(&self, n_query: usize) -> usize {
+        if n_query == 1 && self.decode_split_is_available() {
+            DECODE_SPLITS * self.kv_heads
+        } else if n_query < GQA_QUERY_TILE {
+            n_query * self.q_heads
+        } else if self.uses_tensor_cores(n_query) {
+            n_query.div_ceil(MMA_QUERY_TILE) * (self.q_heads / MMA_HEADS_PER_BLOCK)
+        } else if self.gqa_shared_is_available() {
+            n_query.div_ceil(GQA_QUERY_TILE) * self.kv_heads
+        } else {
+            n_query.div_ceil(QUERY_TILE) * self.q_heads
+        }
     }
 
     /// Whether flash decoding can service this geometry.
@@ -2545,6 +2754,72 @@ mod tests {
         assert!(
             ATTENTION_SRC.contains("float qr[QT][ATTN_MAXD];"),
             "the query tile is no longer a register array",
+        );
+    }
+
+    #[test]
+    fn the_tensor_core_block_shape_is_one_choice_and_not_three() {
+        // `MMA_HPB`, `MMA_WPH` and `MMA_KT` look like three tunables and are
+        // not. The block is eight warps split evenly among the heads it serves,
+        // and `Q K^T` gives each warp of a head exactly one octet of the staged
+        // keys. Break either relation and the kernel still compiles: it either
+        // leaves warps with no octet to score or leaves octets unscored, and
+        // the wrong answer is finite and plausible rather than a crash.
+        assert_eq!(
+            MMA_HEADS_PER_BLOCK * MMA_WARPS_PER_HEAD,
+            8,
+            "the head groups no longer partition the block's eight warps",
+        );
+        assert_eq!(
+            MMA_KEY_TILE,
+            8 * MMA_WARPS_PER_HEAD,
+            "the staged key tile is no longer one octet per warp of a head",
+        );
+
+        // The device sees these through `#define`s, and a Rust constant that
+        // drifted from its mirror would be caught by nothing else: every launch
+        // parameter derived here would be self-consistent and wrong.
+        assert!(
+            ATTENTION_SRC.contains("#define MMA_HPB 4")
+                && ATTENTION_SRC.contains("#define MMA_WPH (8 / MMA_HPB)")
+                && ATTENTION_SRC.contains("#define MMA_KT (8 * MMA_WPH)"),
+            "the device block shape no longer mirrors the host constants",
+        );
+        assert!(
+            ATTENTION_SRC.contains(&format!("#define MMA_MAXT {MMA_MAX_TILES}")),
+            "the accumulator bound no longer mirrors MMA_MAX_TILES",
+        );
+
+        // The softmax butterfly reduces over the lanes holding one row, so a
+        // row's tile must not be wider than a warp and must divide it.
+        assert!(
+            MMA_KEY_TILE <= 32 && 32_usize.is_multiple_of(MMA_KEY_TILE),
+            "a key tile of {MMA_KEY_TILE} does not divide a warp",
+        );
+        // And a warp's share of the query rows must divide into whole passes.
+        let rows_per_warp = MMA_QUERY_TILE / MMA_WARPS_PER_HEAD;
+        assert!(
+            rows_per_warp.is_multiple_of(32 / MMA_KEY_TILE),
+            "{rows_per_warp} rows per warp is not a whole number of softmax passes",
+        );
+    }
+
+    #[test]
+    fn the_staged_tiles_fit_the_shared_memory_that_was_opted_in_to() {
+        // 59,392 B at this model's head dimension of 256.
+        for head_dim in [32, 64, 128, 256] {
+            let bytes = mma_shared_bytes(head_dim);
+            assert!(
+                bytes <= MMA_SHARED_CEILING,
+                "head_dim {head_dim}: {bytes} B of staged tiles exceeds the \
+                 {MMA_SHARED_CEILING} B carveout",
+            );
+        }
+        assert_eq!(
+            mma_shared_bytes(256),
+            59_392,
+            "the budget at this model's geometry moved; check it still buys \
+             what the block shape was widened for",
         );
     }
 }
