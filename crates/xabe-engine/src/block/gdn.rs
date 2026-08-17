@@ -1655,13 +1655,21 @@ impl GdnBlock {
     ) -> Result<(), GdnBlockError> {
         let g = self.geometry;
         let tokens = states.len();
-        // Batched decode never takes the one-token GEMV layout: that kernel
-        // (`gdn_proj_split_gemv`) writes `out[n]` with no token axis at all,
-        // because it exists for the case where there is only ever one token
-        // in the whole call. Here there are `tokens` tokens sharing the call
-        // even though each individually decodes one step, so the tensor-core
-        // path (valid at any token count) or the plain tiled projection is
-        // what applies.
+        // `gdn_proj_split_gemv` writes `out[n]` with no token axis at all --
+        // wrong for `tokens > 1`, where a real per-token axis exists even
+        // though each token is a different sequence's single step. At
+        // exactly one sequence, though, "no token axis" and "the batch's
+        // one token" are the same buffer layout, so `run`'s own `gemv` path
+        // applies unchanged. Measured with `nsys --cuda-graph-trace=node`:
+        // without this, batch(1)'s qkv/gate/out projections took the generic
+        // tiled path's `tokens == 1` fallback (`gdn_proj_q8_0`, the untiled
+        // kernel with no split-layout repack) at 38,608.3 ns/call average
+        // against `gdn_proj_split_gemv`/`_add`'s 24,967 ns/call blended
+        // average in `run` -- 94.7% of the entire measured N=1 batch-vs-
+        // single-stream gap, 1.23 ms of 1.30 ms/step. See
+        // `docs/BENCHMARKS.md`'s batched-decode section for the nsys-diff
+        // that found it kernel by kernel rather than assuming it.
+        let gemv = tc.filter(|_| tokens == 1);
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
         // 1. attn_norm-N, over every sequence's row.
@@ -1708,6 +1716,25 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
+        } else if let Some(i8w) = gemv {
+            self.project_split_gemv(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+            )?;
+            self.project_split_gemv(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+            )?;
         } else {
             self.project(
                 stream,
@@ -1856,6 +1883,23 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
             self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        } else if let Some(i8w) = gemv {
+            // The residual add rides out of the projection's own warp, as in
+            // `run` -- at one token/one sequence, `hidden` and `out` are
+            // exactly the buffers `project_split_gemv_add`'s `residual` and
+            // `summed` expect: `n_rows` long, no token axis, because there
+            // is only one token in the whole call.
+            self.project_split_gemv_add(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &s.final_output,
+                hidden,
+                &mut s.projected,
+                out,
+                g.value_dim(),
+                g.hidden,
+            )?;
         } else {
             self.project(
                 stream,
