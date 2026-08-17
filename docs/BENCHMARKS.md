@@ -6443,3 +6443,90 @@ Building and verifying two more kernel pairs against every accuracy gate is
 more than this session's remaining budget allows; specified here rather than
 attempted, the same call this file made for MoE's `M` 32 narrow-batch
 variant two sections up.
+
+## The two-kernel split: built, register budget landed as predicted, and rejected on a cost the register math did not carry (2026-08-18)
+
+The previous section's "what closing this needs" was built: `moe_expert_
+ffn_bm1`/`moe_expert_down_bm1`, standalone `__global__` kernels generalizing
+`moe_expert_ffn_gemv`/`moe_expert_down_gemv`'s "assume slot 0" to "check
+`bm` per dispatch bucket via `live_tile_rows`, process only if it is exactly
+1" -- the `moe_expert_ffn_narrow`/`moe_expert_down_narrow` pair changed
+alongside them to skip `bm <= 1` instead of `bm == 0`, so the two kernels of
+each pair partition every bucket exactly once. `moe_expert_ffn`/
+`moe_expert_down`/`_mma`/`_mma`/both original `_gemv` kernels stayed
+byte-identical (`cuobjdump -sass`, six kernels, all matching `890377d`
+exactly) -- the isolation held.
+
+### The register budget landed almost exactly where the previous section's math said it would
+
+`ptxas -v`: `moe_expert_ffn_bm1` **58 registers** (4 blocks/SM) against
+`moe_expert_ffn_gemv`'s 47 (5) and the un-split narrow kernel's 80 (3) --
+most of the gap closed. `moe_expert_down_bm1` **56 registers** (4 blocks/SM),
+*below* `moe_expert_down_gemv`'s own 64, matching its 4 blocks/SM exactly.
+`moe_expert_ffn_narrow`/`moe_expert_down_narrow`, relieved of the `bm == 1`
+branch, dropped back to `moe_expert_ffn`/`moe_expert_down`'s own 80/77
+registers -- confirming the previous section's read that the combined
+kernel's register floor was set by the tiled fallback, not by anything
+`bm == 1` itself needed.
+
+### The throughput did not follow, and reading the actual grid shape says why
+
+`bench_decode_batch`, N=3, 32,768-token context, interleaved against the
+un-split build, three rounds: **90.6 tok/s (pre-split) vs 85.4-85.9
+(post-split), a real -5.2 to -5.7% regression**, not the >100 tok/s the
+register math alone predicted. Per-kernel (`nsys`, isolated N=3 replay):
+
+| | pre-split (combined) | post-split (`bm1` + rest) | change |
+|---|---:|---:|---:|
+| ffn total/step | 6.23 ms | 6.19 ms (4.25 `bm1` + 1.94 rest) | ~flat |
+| down total/step | 4.98 ms | 6.92 ms (3.67 `bm1` + 3.25 rest) | **+39%** |
+
+Ffn is a wash; down is the whole regression, and it is not a fluke of the
+particular kernels involved -- `MoeGeometry::expert_block_capacity` explains
+it structurally. It is `sorted_capacity() / block_size`, and `sorted_
+capacity` is bounded by `numel` (the batch's actual token-expert pair
+count: `N * top_k`), not by `num_experts` -- at N=3 that is 24 buckets, not
+a sparse 256-wide capacity most of which exits on `if (e < 0) return`
+before touching anything else. Nearly every one of those 24 buckets is
+genuinely live. Splitting into two kernels means **both** now walk
+`sorted_token_ids`, populate `rows[]` and cross two `__syncthreads()` per
+`block_size`-wide bucket to compute `bm`, for every bucket, and only one of
+the two ever finds a use for the answer -- real, doubled bookkeeping work,
+not a redundant early-exit. `moe_expert_down`'s grid is `ceil(hidden /
+MOE_ROWS)` = 256 blocks wide per bucket (down tiles `hidden`, 2,048); `moe_
+expert_ffn`'s is `ceil(intermediate / MOE_ROWS)` = 64 (ffn tiles
+`intermediate`, 512) -- four times fewer blocks paying the doubled cost,
+which is why ffn stayed flat while down's total time grew by more than a
+third.
+
+### Rejected; the un-split kernel from the previous two sections is what ships
+
+Reverted in full: `crates/xabe-cuda/src/kernels/moe.rs` is back to the
+state the two previous sections landed (`moe_expert_ffn_narrow`/`moe_
+expert_down_narrow` handling `bm == 1` inline via `tile_gemm_pair_direct1`/
+`tile_gemm_single_direct1`, no `_bm1` kernels). Confirmed via `git diff`
+against that commit: empty. The register-budget analysis was correct as
+far as it went -- occupancy really did improve to the GEMV kernels' own
+class -- but it was not the only cost the split kernel pays, and the second
+cost scales with exactly the axis (`grid.x`, i.e. `hidden` vs
+`intermediate`) that makes down the more attractive target on paper and the
+worse outcome in practice. A hybrid -- split ffn only, leave down as the
+combined kernel -- was not built: the per-kernel table above already gives
+its expected total (6.19 + 4.98 = 11.17 ms) to two decimal places, indistin-
+guishable from the un-split baseline's 6.23 + 4.98 = 11.21 ms, so it is not
+worth the second kernel pair's own maintenance and register-count
+verification burden for a sub-0.4% step-time change.
+
+### What is left
+
+The narrow-width GEMV bandwidth gap this section and the previous one both
+measured (38.2%/31.0% against the GEMV kernels' 47%/63%) is now bounded from
+two directions without being closed from either: giving the fast path its
+own function moves registers into the GEMV kernels' class but adds
+bucket-bookkeeping cost proportional to `grid.x`, and leaving it inline
+keeps the bookkeeping cost but inherits the tiled fallback's wider register
+floor. Closing it further needs a shape that pays neither -- reducing the
+`bm`-determination cost itself (a per-bucket precomputed table, built once
+by `moe_align_block_size` rather than re-derived by every kernel that reads
+`sorted_token_ids`, is the obvious next place to look) rather than another
+way of routing around it. Not attempted this session.
