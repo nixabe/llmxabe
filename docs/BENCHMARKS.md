@@ -4202,3 +4202,137 @@ row/lane assignment rather than a fragment layout) is the version of this
 that was not tried and does not carry the rounding cost -- worth naming for
 whoever picks this back up, since it keeps the "softmax per tile, not per
 key" win without the operand the current gate rejects.
+
+## `MMA_HPB` 8 was already the current lever, not the next one, and a smaller one was found instead (2026-08-17)
+
+Handed a brief calling `MMA_HPB` 4 -> 8 ("all 16 query heads... the full GQA
+group per block") the next unattempted lever, obstacle and all: `q_sh` would
+be 67,584 B against a 65,536 B carveout. That obstacle and its resolution --
+Q in registers -- are real, and already shipped. `git blame` puts `#define
+MMA_HPB 8` at commit `6dced61`, "Put Q in registers, and measure against
+llama.cpp's best rather than its default", earlier this same day: 62.16 ->
+41.55 ms at 131,072 keys, and the 1.13x/1.05x/0.99x/0.96x/0.94x/0.91x
+best-per-length ratios this file already carries are *with* that change, not
+without it. Re-deriving it would have cost a session for zero net delta.
+What was actually still open, after checking every item the "already
+rejected" list named against the code: the exp2f fold above, and one more
+step past it.
+
+### The barrier `MMA_HPB` 8 left behind
+
+`MMA_WPH` is `8 / MMA_HPB`. The block-shape comment from the `MMA_HPB` 4 era
+still describes "the block is eight warps split evenly among the heads it
+serves" and fences `my_s`/`my_m`/`my_l`/`my_c` with `bar_group(hslot + 1,
+MMA_WPH * 32)` between `Q K^T` and the softmax, and again between the softmax
+and `P V` -- a named `bar.sync` sized to the warps sharing one head. At
+`MMA_HPB` 8, `MMA_WPH` is 1: one warp per head, and the two barriers each
+synchronize a single warp against writes only that warp made. `bar.sync` is a
+block-wide hardware resource that tracks arrivals across warps; there was
+nothing left to track.
+
+Replaced with `__syncwarp()` behind `#if MMA_WPH == 1`, falling back to the
+named barrier otherwise so the kernel stays correct at any `MMA_HPB` a future
+session might dial back down. Three interleaved `bench_attention` pairs,
+bar.sync/`__syncwarp` mean of three, ms:
+
+| key_offset | bar.sync | `__syncwarp` | speedup |
+|---:|---:|---:|---:|
+| 0 | 0.240 | 0.235 | 1.02x |
+| 2,048 | 1.043 | 1.017 | 1.03x |
+| 8,192 | 3.478 | 3.387 | 1.03x |
+| 98,304 | 29.09 | 28.36 | 1.03x |
+| 131,072 | 38.97 | 38.11 | 1.02x |
+
+32,768 and 65,536 were too noisy this session to call either way -- one
+bar.sync round at 32,768 read 10.9 ms against its other two rounds' 13.25,
+a bigger swing than the change itself -- so they are left unclaimed rather
+than folded into the average.
+
+Correctness: all nine `attention_differential` tests pass. The golden-logits
+test was run in a clean worktree at this change's parent commit plus only
+this patch, isolated from unrelated decode work landing in the same file
+concurrently this session. Same argmax token; the winning logit moved from
+20.017208 to 19.998243, reproduced identically on a second run in the same
+worktree -- deterministic, not a race, and consistent with different
+instruction scheduling around a lighter-weight primitive changing FMA
+contraction on an unrelated float, the same class of harmless drift the
+kernel's own comment already documents for the tree-order softmax reduction.
+The rank-4 noise-floor swap this file tracks stays on the passing side of its
+assertion (separation 0.153701 against 0.308814 of implementation noise, up
+from 0.205439 before -- wider, not narrower).
+
+### Both changes, re-measured end to end and against llama.cpp fresh, GPU 0
+
+`bench_forward`'s isolated attention win does not translate one for one into
+the whole pass, because attention is a fraction of it. Three git worktrees
+at three commits (baseline before this session's two changes, exp2f alone,
+exp2f + `__syncwarp`) sidestep the decode work landing concurrently in the
+same file rather than risk measuring a moving target:
+
+| tokens | chunk | baseline | +exp2f | +exp2f+syncwarp |
+|---:|---:|---:|---:|---:|
+| 512 | 512 | 2,442.1 | 2,445.2 | 2,423.1 |
+| 2,048 | 2,048 | -- | -- | 3,068.7 |
+| 8,192 | 8,192 | 3,031.7 | 3,059.4 | 3,054.8 |
+| 32,768 | 8,192 | 2,332.5 | 2,399.2 | 2,437.7 |
+| 65,536 | 8,192 | 1,757.1 | 1,794.6 | 1,862.1 |
+| 131,072 | 8,192 | 1,280.8 | 1,311.7 | 1,318.8 |
+
+(131,072's two right columns are the mean of two properly interleaved
+mid/after rounds, because the first non-interleaved reading of the combined
+build came in *below* the exp2f-alone number -- 1,316.9 against 1,337.2 --
+which looked like `__syncwarp` costing something end to end despite winning
+in isolation. Interleaved, it did not: 1,321.5/1,320.3 then 1,301.9/1,317.3,
+a wash inside the session's own drift. The lesson already in this file's
+first page -- measure interleaved or the thermal trend measures you --
+applies to worktree A/Bs exactly as much as to in-place ones.)
+
+512 and 8,192 barely move, as expected: attention is a small fraction of a
+short pass. 32,768 through 131,072 gain 3-6% end to end, roughly a third to
+a half of the isolated attention win once diluted by the rest of the pass.
+
+llama.cpp, `-b 8192 -ub 4096` (512 at its own best, `-ub 512`), GPU 0,
+measured fresh in this same session rather than trusted from an earlier one:
+
+| tokens | llama.cpp t/s |
+|---:|---:|
+| 512 | 2,055.1 ± 121 (noisy -- short prompts run within one llama-bench call vary this much on this card) |
+| 2,048 | 2,951.2 |
+| 8,192 | 3,077.9 |
+| 32,768 | 2,506.2 |
+| 65,536 | 1,935.7 |
+| 131,072 | 1,439.5 |
+
+### Head to head, both sides best-per-length, both sides fresh
+
+| tokens | llmxabe (exp2f+syncwarp) | llama.cpp | ratio | previous ratio |
+|---:|---:|---:|---:|---:|
+| 512 | 2,423.1 | 2,055.1 | **1.18x** | 1.13x |
+| 2,048 | 3,068.7 | 2,951.2 | **1.04x** | 1.05x |
+| 8,192 | 3,054.8 | 3,077.9 | 0.99x | 0.99x |
+| 32,768 | 2,437.7 | 2,506.2 | 0.97x | 0.96x |
+| 65,536 | 1,862.1 | 1,935.7 | 0.96x | 0.94x |
+| 131,072 | 1,318.8 | 1,439.5 | 0.92x | 0.91x |
+
+Every depth from 32,768 down moved up, by 1-2 points of ratio, from the two
+changes landed this session. None crossed 1.0x. 8,192 is unchanged to two
+digits -- its llama.cpp figure barely moved between sessions (3,081.6 ->
+3,077.9) and this depth's own gain was small enough (0.8%) to round away
+against that. 512's jump to 1.18x is mostly llama.cpp measuring lower this
+run (2,055 against 2,155.8 recorded earlier) on a depth where its own spread
+is ~120 t/s; treat the two short-prompt rows as noisier than the rest of
+this table, not as a session-over-session win.
+
+### What is left
+
+The traffic lever (`MMA_HPB` 8) and the two arithmetic levers found this
+session (`exp2f`, `__syncwarp`) are what this file currently knows how to
+pull, and pulling all three still leaves 8,192-131,072 short of parity by
+1-8%. Every other prefill idea named as untried earlier in this file --
+`ldmatrix`, `mma.m8n8k4`, a two-deep staged tile, a grid-axis swap, wider
+query or key tiles, `__maxnreg__` -- was already tried and rejected on
+measurement before this session started. Closing the remaining gap needs
+either a genuinely new idea against the now-compute-bound (not traffic-bound)
+kernel, or accepting that llama.cpp's `-ub 4096` prefill is the harder target
+of the two and the win is upstream of attention -- in MoE or GDN, which this
+session did not touch.
