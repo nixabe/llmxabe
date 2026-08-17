@@ -6342,3 +6342,104 @@ expert (`moe_shared_ffn`/`moe_shared_down`) deliberately keeps the original
 three-way dispatch -- its `bm` is the literal token count with no sparse
 routing, so `bm == 1` there only happens at `N == 1`, already served by
 `moe_expert_ffn_gemv` before `grouped_forward_partial` reaches it.
+
+## What `moe_expert_ffn_narrow`/`moe_expert_down_narrow` actually achieve, and why they fall short of the GEMV kernels they were modeled on (2026-08-18)
+
+The previous section's `bm == 1` fix closes dispatch -- the right kernel
+family runs -- but does not by itself close *bandwidth*. Measured on the
+isolated N=3 replay (`bench_decode_batch 32768 32`, `LLMXABE_SKIP_SINGLE_
+STREAM=1`, `nsys --cuda-graph-trace=node`, GPU 2): `moe_expert_ffn_narrow`
+averages 155,738 ns/call (1,440 calls, 40/step) and `moe_expert_down_narrow`
+124,529 ns/call. Converting to GB/s with `D(3) = 23.26` distinct experts/
+layer x 40 layers x each expert's own weight bytes (gate+up Q6_K 1.7204 MB,
+down Q8_0 1.1141 MB, `docs/OPTIMIZATION.md` §2.1/2.2's own numbers):
+
+| kernel | GB/s | % of 672 GB/s roofline | the GEMV kernel it was modeled on |
+|---|---:|---:|---:|
+| `moe_expert_ffn_narrow` | 257.0 | **38.2%** | `moe_expert_ffn_gemv`, 47% |
+| `moe_expert_down_narrow` | 208.2 | **31.0%** | `moe_expert_down_gemv`, 63% |
+
+Both real gaps toward the GEMV kernels' own numbers, and down's is the
+larger one in relative terms -- the opposite of N=1, where down (63%) beats
+ffn (47%). `D(N)` is a uniform-routing upper bound and real routing measures
+~16% below it at moderate batch (§2.5), so these percentages are more likely
+a few points optimistic than pessimistic; the ranking between the two
+kernels and against their GEMV counterparts is what this section trusts, not
+the third significant figure.
+
+### Tried: giving the direct1 helpers the GEMV kernels' own unroll pragmas, and it made both slower
+
+`moe_expert_ffn_gemv`/`moe_expert_down_gemv` each carry a tuned
+`#pragma unroll` (2 and `MOE_DOWN_UNROLL` = 4) that `tile_gemm_pair_direct1`/
+`tile_gemm_single_direct1` do not -- same dequant/accumulate body, same
+trip count (`k_len` is `hidden`/`intermediate` either way), so the tuning
+looked like it should transfer directly. Added both pragmas, rebuilt,
+`tests/moe_differential.rs` and all three `tests/batch_decode.rs`
+differentials still passed (unrolling does not change accumulation order),
+then measured: **`moe_expert_ffn_narrow` went from 155,738 to 187,768 ns/call
+-- slower, not faster** -- and `moe_expert_down_narrow` was flat (124,529 ->
+125,948 ns/call).
+
+`ptxas -v` explains it, and it is the same class of defect
+`MOE_TILE_DISPATCH`'s own comment already names for a fourth tiled
+specialization: a register cliff. `moe_expert_ffn_narrow` without the
+pragma is 80 registers (2^16 / (80 x 256 threads) = 3 blocks/SM); with it,
+96 registers (2 blocks/SM). `moe_expert_down_narrow`: 74 -> 76 registers,
+a smaller move, matching its smaller (flat, not regressed) timing change.
+The mechanism is different from the previous section's cross-kernel
+register-cliff surprise, but the mistake is the same shape: `moe_expert_
+ffn_gemv`'s 47-register, unroll-2-tuned budget is a *standalone* kernel's
+number. `moe_expert_ffn_narrow` is not standalone -- it carries `bm > 1`'s
+full tiled fallback (`tile_gemm_pair<2/8/16>`) in the same function, so its
+register floor already sits at `moe_expert_ffn`'s own 80 before the `bm ==
+1` branch adds anything, and the GEMV kernel's unroll depth was tuned
+against a register budget this kernel does not have room for. Reverted;
+`tile_gemm_pair_direct1`/`tile_gemm_single_direct1` are unchanged from the
+previous section.
+
+### The structural gap this explains, and the part it does not
+
+Register counts, `2^16 / (registers x 256)` blocks/SM, `ptxas -v` on both
+kernel families:
+
+| kernel | registers | blocks/SM |
+|---|---:|---:|
+| `moe_expert_ffn_gemv` (standalone) | 47 | 5 |
+| `moe_expert_ffn_narrow` (carries `bm > 1`'s fallback) | 80 | 3 |
+| `moe_expert_down_gemv` (standalone) | 64 | 4 |
+| `moe_expert_down_narrow` (carries `bm > 1`'s fallback) | 74 | 3 |
+
+Ffn's occupancy drops 40% (5 -> 3 blocks/SM) against a bandwidth drop from
+47% to 38.2% (19% relative) -- occupancy explains a real fraction of the
+gap, not all of it. Down's occupancy drops 25% (4 -> 3) against a bandwidth
+drop from 63% to 31.0% (51% relative) -- occupancy alone does not explain a
+gap that size, and this section does not have a confirmed second mechanism
+for the remainder. One unquantified candidate, named rather than measured:
+`moe_expert_down_narrow`'s write epilogue is `moe_expert_down`'s own
+`#pragma unroll` 16-wide loop over `m < bm`, shared code the `bm == 1`
+branch does not get its own leaner version of -- fifteen of those sixteen
+unrolled comparisons are dead whenever `bm == 1`, and `moe_expert_down_gemv`
+has none of them (one unconditional write). Not measured in isolation this
+session.
+
+### What closing this needs, specified and not attempted
+
+The register floor is structural, not a tuning knob: as long as `bm == 1`'s
+fast path and `bm > 1`'s tiled fallback share one `__global__` function, the
+fast path can never see the standalone GEMV kernel's register budget. The
+fix this points to is the same shape as the previous section's own --
+another separate compiled kernel, not a branch -- but split along a
+different axis: a truly standalone `bm == 1` kernel (`moe_expert_ffn_gemv`'s
+own body, generalized from "assume slot 0, unconditionally" to "check `bm`
+per dispatch bucket, skip if not 1") running over the *whole* grid, paired
+with a second kernel that is `moe_expert_ffn`'s existing tiled body with one
+line changed (`if (bm == 0) continue;` becoming `if (bm <= 1) continue;`) so
+the two together partition every bucket exactly once. That is two kernel
+launches per projection instead of one, each with the leaner register
+budget its own shape earns, at the cost of both re-walking `sorted_token_ids`
+independently to compute `bm` -- cheap relative to the dequant/GEMM work it
+gates, per this file's own `bm == 0` skip precedent, but unmeasured here.
+Building and verifying two more kernel pairs against every accuracy gate is
+more than this session's remaining budget allows; specified here rather than
+attempted, the same call this file made for MoE's `M` 32 narrow-batch
+variant two sections up.
