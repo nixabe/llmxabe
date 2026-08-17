@@ -3893,3 +3893,186 @@ sections up) is roughly a 1.3-1.5x step-level win and would put the 0.71x
 ratio at that depth within reach of parity. Not attempted this session; the
 shape above and the fragment-occupancy question are the starting point for
 whoever does.
+
+## Batched decode across sequences: correct, and short of the aggregate target (2026-08-17)
+
+The number this project has never had an answer to: **aggregate decode
+across parallel sequences.** The two sections above measure single-stream
+decode getting faster; this section is the first attempt at the structural
+gap next to it -- `Forward::run` takes one `SequenceState`, so this engine's
+aggregate has always equaled its single-stream number while llama.cpp's
+continuous batching very nearly doubles it. `docs/OPTIMIZATION.md`'s R2 names
+the mechanism (an M dimension in MoE, a per-sequence state index in GDN, a
+per-sequence block table in attention) and estimates a 2.6-4.6x per-token
+byte reduction; this is the first measurement of what that mechanism is
+actually worth end to end.
+
+### What landed
+
+`Forward::run_batch_decode` / `capture_batch_step` / `replay_batch_step`
+advance `N` independent one-token sequences in a single pass, with the same
+CUDA-graph capture `capture_step` already gives single-stream decode.
+Weight-bound work batches across all `N` sequences in one launch each --
+`GdnBlock::forward_batch_decode` and the new
+`GatedAttentionBlock::forward_batch_decode` both split their steps into "no
+state, batches" (every projection, every norm, the output gate, the
+residual) and "reads a position or a sequence's own cache, loops" (GDN's
+causal convolution and delta-rule update; attention's rotary, key/value
+append, and causal read). Nothing outside `xabe-engine` changed: the
+per-sequence loops call the exact same kernel entry points single-stream
+decode already exercises, in `crates/xabe-cuda/src/kernels/attention.rs` and
+`gdn.rs`, unmodified.
+
+Correctness is two differential tests in `tests/batch_decode.rs`, deliberately
+asking two different questions at two different tolerances:
+
+- **`identical_prompts_in_one_batch_produce_bit_identical_rows`** is the
+  exact, load-bearing check. Two sequences given the same prompt inside the
+  same batch call run through literally the same kernels; the only thing
+  that can differ is which memory address each read from. Measured: **0.000e0**
+  max-abs difference between the two rows, at every step -- no indexing
+  defect, no state crossing a sequence boundary.
+- **`batched_decode_agrees_with_independent_single_stream_decodes`** compares
+  against `N` independent single-stream runs, and is *not* exact: a batch of
+  `N > 1` takes a different compiled Q8_0 projection kernel (tiled) than
+  single-stream decode's one-token kernel, and the two are not required to
+  round identically. Measured: 8.631e-5 max-abs logit disagreement against
+  activations of magnitude ~10, cosine 1.000000000, argmax always agrees.
+- **`a_captured_batch_step_generates_the_same_sequence_as_the_launch_path`**
+  is `graph_decode.rs`'s gate one level up: the captured graph must generate
+  the *identical* sequence the uncaptured launch path does. It does, bit for
+  bit, across 3 steps and 3 sequences.
+
+The existing golden test
+(`the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`) and the
+single-stream `decode.rs`/`graph_decode.rs` suite are untouched and stay
+green -- batched decode is new methods, not a changed code path for the
+sequence-of-one case.
+
+### Measured aggregate, GPU 2, `bench_decode_batch`
+
+Synthetic distinct prompts (so a cross-sequence indexing bug would change
+the answer rather than hide behind identical inputs), 32 decode steps timed
+after 4 warmup, `single_stream` via `capture_step`/`replay_step` and
+`batch N` via `capture_batch_step`/`replay_batch_step` -- both graph-captured,
+so the comparison is kernels against kernels, not against host dispatch
+overhead.
+
+**2,048-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 9.86 | 101.4 | 101.4 |
+| batch 1 | 11.17 | 89.6 | 89.6 |
+| batch 2 | 29.10 | 68.7 | 34.4 |
+| batch 3 | 39.95 | 75.1 | 25.0 |
+| batch 4 | 49.34 | 81.1 | 20.3 |
+| batch 8 | 47.60 | **168.1** | 21.0 |
+
+**32,768-token context, the shape `docs/BENCHMARKS.md`'s existing head-to-head
+uses:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 11.86 | 84.3 | 84.3 |
+| batch 1 | 13.32 | 75.1 | 75.1 |
+| batch 2 | 33.77 | 59.2 | 29.6 |
+| batch 3 | 46.79 | 64.1 | 21.4 |
+| batch 4 | 59.31 | 67.4 | 16.9 |
+| batch 8 | 64.57 | **123.9** | 15.5 |
+
+(`single_stream` here reads 84.3 against the 77.4 recorded in the head-to-head
+section above; the gap is the intervening decode-kernel work in this
+session's earlier sections, re-measured incidentally by running the same
+baseline again.)
+
+### Against the target, honestly
+
+The target was **≥1.7x single-stream at N=3, ideally beating llama.cpp's
+154.58.** Neither happened. At N=3, aggregate is 64.1 tok/s -- **below**
+single-stream's 84.3, a regression, not a win. Batching only overtakes
+single-stream at N=8 (123.9 vs 84.3, a genuine 1.47x), and even there it
+falls short of both the 1.7x bar (143.3) and llama.cpp's -np3 154.58.
+`AGENTS.md` asks for what was measured, not what was hoped, so: **this
+session's batched decode does not clear the target at the shape the target
+was set for.**
+
+### Why N=2-4 cost more per sequence than N=1, diagnosed rather than guessed
+
+Two rounds of fixes landed before these numbers, and both are real,
+measured wins over the naive first version -- they are why N=8 beats
+single-stream at all. Neither closed the gap at N=3.
+
+**First: `GdnBlock`'s Q8_0 projections took the tiled kernel unconditionally
+for any `tokens > 1`.** `gdn_proj_q8_0_t8`/`_t16` are built for prefill,
+where a chunk is typically far wider than the tile; at a *decode* batch of
+2-3, the tile is 25-38% full and the guarded path pays close to a full live
+tile's register and occupancy cost for a fraction of its lanes' worth of
+answer. Measured with `nsys --cuda-graph-trace=node`: `gdn_proj_q8_0_t8`
+averaged **142.5 us/call** at batch width 2, against the untiled kernel's
+single-digit microseconds. Fix: `GdnBlock::project_per_sequence` loops the
+untiled kernel once per sequence whenever `tokens < PROJ_TILES[0]` (8),
+trading `N` separate weight reads for `N` efficient ones instead of one
+inefficient shared one. This is the improvement that took a first,
+uncaptured version of this feature from *worse than the naive per-sequence
+loop it was replacing* to something worth capturing at all.
+
+**Second: `GatedAttentionBlock::forward` was called once per sequence in
+full, including its four Q8_0 weight reads (~29 MB/layer), which is exactly
+the redundant-read pattern batching exists to remove.**
+`GatedAttentionBlock::forward_batch_decode` batches those the same way GDN's
+projections do -- `LmHeadKernels` already compiles one exact kernel per
+token tile from 1 to 8, so unlike GDN there was no guarded-tile penalty to
+find, and the four projections batch cleanly at any `N` in range.
+
+**What remains, measured rather than assumed:** `nsys --cuda-graph-trace=node`
+over the last ~600 kernels of a captured N=3 replay shows the GPU **98.6%
+busy** (17.17 ms busy of a 17.42 ms span) -- so the remaining cost is not
+host dispatch overhead sneaking past the graph capture, and it is not an
+inter-kernel dispatch gap either. It is real GPU time spent across a large
+number of small kernels: a batched decode step launches on the order of
+1,000-1,300 device operations (30 GDN layers x ~16 launches, 10 attention
+layers x ~9 batched + `4N` per-sequence, 40 MoE layers x ~15 launches, plus
+embedding/norm/head/argmax), and at `N` = 2-4 many of those -- MoE's
+`moe_expert_ffn`/`moe_expert_down` chief among them -- are not yet known to
+be free of the same small-batch tile inefficiency `GdnBlock`'s projections
+had. `docs/OPTIMIZATION.md`'s R3 (landed 2026-08-16) fixed MoE's redundant
+weight reads at prefill widths and named `BLOCK_SIZE_M` 1-2 as the
+*correct* choice for decode batches specifically, but this session did not
+verify that the landed kernel actually took that tile at `N` = 2-8 rather
+than a prefill-tuned wider one -- that is the first thing a follow-up should
+check, with the same `nsys --cuda-graph-trace=node` methodology this section
+used to find `GdnBlock`'s equivalent defect.
+
+### What a follow-up needs, in order
+
+1. **Audit `moe_expert_ffn`/`moe_expert_down`'s tile width at `N` = 2-8**,
+   the same way this session found and fixed `GdnBlock`'s. If MoE is paying
+   a guarded-tile tax at small `N` the way GDN's projections were, this is
+   plausibly the largest remaining lever -- MoE is 40 of 40 layers, GDN's
+   fix touched 30.
+2. **Fused, device-side-indexed multi-sequence kernels for the loops that
+   remain** -- GDN's causal convolution and delta-rule update, attention's
+   rotary/append/read. Each is currently `N` separate launches against `N`
+   separate state/cache pointers; a single kernel indexing an on-device
+   array of those pointers (`AGENTS.md` rule 5's own anticipated pattern)
+   would turn `N` small launches into one, which the 1,000+-launch figure
+   above says matters at this batch width even under CUDA graph capture.
+   This is real kernel work in `xabe-cuda`, coordinated with whoever owns
+   `attention.rs` at the time.
+3. **Continuous batching, not fixed-`N` batching.** This session's `N` is
+   fixed at `Forward` construction, matching the "block per shape" precedent
+   the rest of this codebase already uses for prefill vs. decode -- a real
+   scheduler needs a batch width that changes step to step as requests
+   arrive and finish, which means either a family of pre-built shapes
+   (`N` = 1, 2, 4, 8, ...) selected per step, or a genuinely dynamic launch
+   shape, which is a different problem from anything `AGENTS.md` rule 5 has
+   solved for this codebase yet.
+4. **Mixed prefill and decode in one step** (`docs/OPTIMIZATION.md`'s R4) is
+   still completely separate work: this session's batches are pure decode,
+   `N` sequences each contributing exactly one token, and chunked prefill is
+   not wired into the same pass at all.
+5. **KV cache pooling.** Every sequence in this session's benchmark holds its
+   own fixed-size `KvCache`, allocated for the whole run up front -- fine for
+   a controlled benchmark, not what a server admitting and evicting requests
+   needs. That is `xabe-cache`'s two-group pager, not this workstream's.
