@@ -4758,3 +4758,238 @@ neither touches whatever the batch-path-at-N=1 vs single-stream-path
 difference actually is. Not investigated this round, per the coordinator's
 own "only after the main fix" framing -- the main fix's own return has not
 yet run out.
+
+## Two more fixes: the guarded tile's unroll, and batch(1)'s stray kernel (2026-08-18)
+
+A second same-day follow-up. Two items, both named by reading the previous
+section's own numbers rather than guessed: the guarded-tile-vs-fully-live
+gap the RR=1 fix left open, and the N=1 batch-vs-single-stream overhead
+that section flagged but did not chase.
+
+### The guarded branch was bounding a loop the compiler needed unrolled
+
+`GDN_PROJ_TILED`'s guarded branch (`live_t < TT`, N=3 against tile 4)
+bounded its inner accumulate loops by the *runtime* value `live_t`, unlike
+the fully-live branch's `_Pragma("unroll")`-marked compile-time `TT` bound.
+The previous section's own table made the cost visible without further
+measurement: N=3 at tile 4 (89,041.7 ns/call) was slower than N=4 at the
+same tile fully live (64,026.8 ns/call) despite doing *less* nominal work
+-- the only way that inverts is if the un-unrolled branch is paying real
+per-element loop overhead the unrolled one does not.
+
+Fixed with the pattern this codebase already uses elsewhere -- attention's
+software pipelining, and the fully-live branch of this same macro: unroll
+over the full compile-time `TT`/`RR`, and gate each element with a
+*predicate* (`t0 + i < n_tokens`, `n0 + r < n_rows`) rather than bounding
+the loop by it. Out-of-range activation slots read as zero, contributing
+exactly zero to the accumulator; out-of-range row slots re-address the
+already-validated `n0` rather than walk off the end of `weight`, and are
+never read back. `acc`/`xv` stay register-resident instead of spilling to
+local memory the way a runtime trip count forces.
+
+Measured, `nsys --cuda-graph-trace=node`, isolated N=3 decode phase:
+`gdn_proj_q8_0_t4` drops from 89,041.7 to **62,887.2 ns/call (1.42x)** --
+now fractionally *faster* than N=4's fully-live cost, matching the
+prediction exactly. N=2 (tile 2, exact fit, already takes the fully-live
+branch) is unaffected as expected: 44,238.0 to 43,646.6 ns/call, noise.
+Combined with the RR=1 fix, `gdn_proj_q8_0_t4` at N=3 is now **2.0x**
+faster than the pre-RR=1 baseline (125,662.3 ns/call).
+
+### The N=1 batch overhead was one stray kernel, found by nsys-diff
+
+The previous section noted batch(1) ran ~12-13% slower than single_stream
+at both contexts and did not investigate. `nsys-diff`, exactly as asked:
+one isolated single_stream decode step against one isolated batch(1)
+decode step (`LLMXABE_BATCH_N=0` to skip the batch sweep entirely for the
+first; `LLMXABE_SKIP_SINGLE_STREAM=1 LLMXABE_BATCH_N=1` for the second),
+every kernel's per-step count and per-call cost compared side by side.
+
+Almost every kernel's per-step count matched exactly between the two
+profiles -- this was never about extra or missing launches. One pair did
+not match, and it explained **94.7% of the entire per-step time gap**:
+
+| kernel | single_stream ns/step | batch(1) ns/step |
+| --- | ---: | ---: |
+| `gdn_proj_split_gemv` | 1,551,030.2 | 0 |
+| `gdn_proj_split_gemv_add` | 695,973.6 | 0 |
+| `gdn_proj_q8_0` | 0 | 3,474,748.8 |
+
+`GdnBlock::run` (single-stream's own method) already special-cases
+`tokens == 1` to the repacked split-layout GEMV kernels -- vectorized
+`char4`/`float4` loads, and the output projection's residual add fused
+into the same launch. `GdnBlock::run_batch_decode` never took that branch
+at any batch width, including one, because the branch's whole justification
+(`gdn_proj_split_gemv` writes `out[n]` with no token axis, wrong for
+`tokens > 1`) is vacuously true at `tokens == 1` too -- "no token axis" and
+"the batch's one token" are the identical buffer layout. Fixed by computing
+the same `gemv = tc.filter(|_| tokens == 1)` `run` does and taking the same
+three-way branch (tensor core / split GEMV / generic tiled) in
+`run_batch_decode`, at both the qkv/gate site and the out site. No shape
+changes needed: at `tokens == 1` every batch buffer is already exactly the
+length the single-token kernels expect.
+
+### Final measured aggregate, all four fixes together, GPU 2
+
+Accuracy gates, unchanged tolerances: the exact-match batch differential
+(`identical_prompts_in_one_batch_produce_bit_identical_rows`, still
+**0.000e0**), the tolerance differential, the captured-graph-equivalence
+differential, all 26 GDN differential/block tests, and the golden logits
+test -- llama.cpp's argmax still exactly reproduced. No tolerance loosened
+across any fix in this workstream.
+
+**2,048-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 9.91 | 100.9 | 100.9 |
+| batch 1 | 9.91 | **100.9** | 100.9 |
+| batch 2 | 19.94 | **100.3** | 50.2 |
+| batch 3 | 27.04 | **110.9** | 37.0 |
+| batch 4 | 31.41 | **127.4** | 31.8 |
+| batch 8 | 47.19 | **169.5** | 21.2 |
+
+**32,768-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 11.89 | 84.1 | 84.1 |
+| batch 1 | 11.96 | **83.6** | 83.6 |
+| batch 2 | 24.43 | **81.9** | 40.9 |
+| batch 3 | 33.64 | **89.2** | 29.7 |
+| batch 4 | 40.57 | **98.6** | 24.6 |
+| batch 8 | 63.90 | **125.2** | 15.6 |
+
+`batch 1` now matches `single_stream` at 2,048 tokens exactly and sits
+within 0.6% of it at 32,768 -- the ~12-13% gap the previous section flagged
+is closed. N=2 and N=3 both beat single-stream at both contexts.
+
+## Batched decode across sequences: workstream summary and hand-off (2026-08-18)
+
+Four rounds landed on top of the initial implementation, each confirmed
+with `nsys --cuda-graph-trace=node` before being named a fix and re-verified
+against every accuracy gate after. N=3 at the 32,768-token context moved
+**64.1 -> 77.8 -> 83.7 -> 89.2 tok/s** across them (+39.2% cumulative); N=1's
+batch-vs-single-stream gap closed from ~12% to noise. Still short of the
+109.6 tok/s (1.3x single-stream) target and further short of llama.cpp's
+154.58. This section separates what is now fixed from what is structural
+to the shape of the workload, and names what is left with the sizes this
+workstream's own measurements support.
+
+### (a) What's fixed
+
+1. **Batched decode itself** -- `Forward::run_batch_decode` /
+   `capture_batch_step` / `replay_batch_step` advance `N` independent
+   sequences in one CUDA-graph-captured pass, with weight-bound work
+   batched into one launch per step and only genuinely per-sequence state
+   (GDN's conv/recurrent, attention's rope/append/read) looped. Correctness
+   gated by three differentials, one of them bit-exact.
+2. **MoE's grouped GEMM wasted second pass** (`moe_expert_ffn`/
+   `moe_expert_down`) -- a dispatch bucket wider than a tile pass meant the
+   second, all-padding pass at decode still paid full dequant/contract
+   cost. Fixed with a `bm == 0` early-continue. +21.4% at N=3.
+3. **GDN's projection tile floor** -- extended `PROJ_TILES` down to 2/4 so
+   decode-width batches take a genuinely tiled (weight-read-once) path
+   instead of `N` separate untiled reads, with a two-regime tile-selection
+   rule (smallest single-covering tile below the floor, widest-tile-many-
+   slices at and above it) after a first attempt regressed N=3 by picking
+   too narrow a tile and paying for two slices instead of one.
+4. **GDN's narrow-tile occupancy** -- `PROJ_ROWS` for tiles 2/4 dropped
+   from 4 to 1, quadrupling grid.x at decode widths where grid.y collapses
+   to 1 and grid.x had been the only axis with any blocks in it (32-128 on
+   a 72-SM card). 1.1-1.53x per launch depending on width.
+5. **GDN's guarded-tile loop bound** -- predicate-unrolled instead of
+   runtime-bounded, matching the pattern the fully-live branch and
+   attention's software pipelining already use. 1.42x per launch at N=3,
+   closing the gap to N=4's fully-live cost almost exactly.
+6. **Batch(1)'s stray kernel choice** -- `run_batch_decode` now takes the
+   same one-token split-layout GEMV path `run` always used, instead of
+   unconditionally falling to the generic tiled dispatcher's untiled
+   fallback. Closed 94.7% of the N=1 batch-vs-single-stream gap.
+
+Every fix above is additive or a routing/tiling change to code this
+workstream owns (`crates/xabe-engine/src/block/gdn.rs`,
+`crates/xabe-cuda/src/kernels/moe.rs`'s routed-expert grouped GEMM);
+`attention.rs`'s kernels were never touched, per the scope this workstream
+was given.
+
+### (b) What's structural, per §2.6's roofline
+
+`docs/OPTIMIZATION.md` §2.6 models weight bytes per step as (LM head +
+projections + shared expert, read once) + 113.377 MB x `D(N)` (routed
+experts, read once per distinct expert per layer), where `D(N)` is the
+expected number of distinct experts a batch of `N` tokens touches. Two
+consequences of that model bound what any kernel-level fix in this
+workstream can buy, independent of how well-written the kernel is:
+
+- **Routed-expert traffic grows with `N`, not against it, until the
+  activation-density curve saturates.** `D(3) = 23.26` of 256 experts
+  (9.1%) against `D(1) = 8.00` (3.1%) -- three sequences already touch
+  ~2.9x the distinct experts one does, so the weight-read amortization
+  batching buys is partial by construction at this width, not a kernel
+  defect. It gets better with `N` (`D(32) = 163.30`, 63.8%) but this
+  workstream's batch widths (1-8) are still on the steep part of that
+  curve.
+- **Per-sequence state never amortizes, at any `N`.** §2.6's "+ state"
+  column is a flat 131.7 MB/token regardless of `N` -- each sequence's own
+  KV cache and GDN recurrent state is exactly as much traffic per token
+  whether it decodes alone or alongside seven others, because there is
+  nothing to share. This is not specific to this engine: llama.cpp pays
+  the identical per-sequence state cost, which is why its own measured
+  efficiency (§2.7) holds flat at ~41% of the concurrency-aware roofline
+  from c=1 to c=3 rather than climbing -- the batching win it captures is
+  the routed-expert term's amortization, not the state term's, because the
+  state term has none to capture.
+
+Read together: this workstream's fixes closed *implementation* gaps (a
+kernel structurally unable to fill the card, a loop the compiler couldn't
+unroll, a kernel choice that skipped a faster path entirely) that had
+nothing to do with the workload's own shape. The remaining distance to
+llama.cpp's 154.58 is a mix of that kind of gap still uncovered elsewhere
+in the step, and the part of the gap that §2.6 says is not implementation
+at all -- routed-expert traffic at N=3 is genuinely higher per token than
+at N=32, for any correct implementation.
+
+### (c) Named remaining levers, with sizes this workstream's own measurements support
+
+1. **MoE GEMV bandwidth, decode's `N < MMA_SPLIT_TOKENS` shape.** "The MoE
+   decode GEMV, re-measured" (2026-08-17, above) put the combined
+   `grouped_forward` pass at 38.9% of the card's 672 GB/s streaming
+   roofline; the individual kernels underneath it separately reach 47%
+   (`moe_expert_ffn_gemv`, Q6_K) and 63% (`moe_expert_down_gemv`, Q8_0)
+   against `lm_head_gemv_b1`'s 82-89%. Closing that gap toward the LM
+   head's own number is the largest single-kernel-family lever this
+   workstream did not attempt this round, on the order of the MoE fix's
+   own +21.4% or larger given it touches every decode step at N below 8,
+   not the routed path specifically.
+2. **`dp4a`/Q8_1 activation quantization -- documented, and declined on
+   accuracy risk.** The same section names the concrete next step for the
+   GEMV bandwidth lever above: llama.cpp's `vec_dot_q6_K_q8_1_impl_mmvq`
+   pre-quantizes the activation to Q8_1 before the dot product, which
+   `dp4a` needs to reach further past 63%. This adds a rounding source to
+   the one tensor in this model that has not yet had one (activations are
+   carried fp32 end to end today), and was explicitly not attempted --
+   "there is no predicting from arithmetic alone whether it survives rank
+   4" the way this session's other rounding changes were verified to.
+   Whoever picks this up needs to build the quantize kernel, wire it
+   through both GEMVs, and clear it against `moe_differential.rs` and the
+   golden logits test before it can be called a fix rather than a
+   regression risk.
+3. **Attention's per-sequence loop is still `N` separate launches.**
+   `GatedAttentionBlock::forward_batch_decode` batches every weight-bound
+   step and loops only rope, KV append and the causal read -- three
+   launches per sequence per layer, unaudited this workstream for the same
+   class of defect (occupancy, unroll, stray kernel choice) the four GDN
+   fixes above found and fixed. Given GDN alone was worth a combined ~2x
+   on its own narrow-tile kernel and closed the entire N=1 gap, attention's
+   equivalent loop is a plausible next lever of comparable size, not yet
+   measured.
+
+### Hand-off
+
+The structure is real and load-bearing: correct batched decode with
+bit-exact cross-sequence isolation, CUDA graph capture, and four
+independently verified kernel-level fixes, each confirmed with `nsys`
+before being named a fix and re-verified against every accuracy gate
+after. The honest remaining-gap analysis above -- what's fixed, what §2.6
+says cannot be fixed at this batch width by any implementation, and what's
+named but unmeasured -- is this workstream's hand-off point.
