@@ -4432,3 +4432,221 @@ spill (3 blocks/SM, 20% slower) or as a wash once occupancy is traded down to
 make room for it (2 blocks/SM). Not shipped. `bench_moe_mma` is kept: it is
 the first isolated harness for either kernel and makes the next attempt here
 measurable in seconds rather than a full `bench_forward` run.
+
+## Two more decode-shape defects at N=2-4, both real, and N=3 still short (2026-08-18)
+
+A follow-up round on "Batched decode across sequences" above, aimed at the
+gap that section left open: at N=3 aggregate was 64.1 tok/s, below
+single-stream's 84.3. Two things were named as candidates and both turned
+out to be real, measured defects with real fixes -- and neither one, alone
+or together, closes the N=3 gap. This section records both, honestly,
+including the one that made things worse before it made them better.
+
+### First: MoE's routed-expert grouped GEMM was doing a wasted second pass at decode
+
+`docs/OPTIMIZATION.md`'s R2 predicted this and the previous section's "what a
+follow-up needs" named it first: audit `moe_expert_ffn`/`moe_expert_down`'s
+tile width at N = 2-8 before assuming GDN's fix generalizes. Profiled first,
+per that instruction, rather than assumed: `nsys --cuda-graph-trace=node`
+over a captured N=3 replay at a 32,768-token context put `moe_expert_ffn` at
+294,357.97 ns/call and `moe_expert_down` at 175,700.90 ns/call, 39 calls each
+-- 18.33 ms of roughly 40 ms, ~45% of the step, dwarfing every other kernel
+including the now-fixed `gdn_proj_q8_0`.
+
+Reading the kernel found the defect was not the tile width itself --
+`MOE_TILE_DISPATCH` already specializes to `TM` 2, 8 or 16 by `live_tile_rows`,
+which is the "M tile of 1-2" R2 asked for. The defect is one level up: a
+dispatch bucket (`block_size`, 32 in `forward.rs`) is wider than a tile pass
+(`MOE_TM`, 16), so the kernel's `for (m0 = 0; m0 < block_size; m0 += MOE_TM)`
+loop runs twice per bucket, and at decode a bucket usually holds one real
+token in the first half and nothing in the second. `live` in that loop only
+bounds-checks the output row (`r < intermediate`), not whether the current
+`m0` slice has any live rows (`bm`) -- so the second, entirely-padding slice
+still dequantizes and contracts the full weight stack for a result that can
+only be zero. Fix, in both `moe_expert_ffn` and `moe_expert_down`:
+
+```c
+int bm = live_tile_rows(rows);
+if (bm == 0) continue;   // this whole tile pass is the padding sentinel
+```
+
+Safe because `live_tile_rows` is documented uniform across the block --
+`bm == 0` is the same answer on every thread, so the `continue` is not a
+divergent branch. Confirmed at the kernel level with a second
+`nsys --cuda-graph-trace=node` profile, isolated to the batch-3 decode phase
+alone (`LLMXABE_SKIP_SINGLE_STREAM=1`, a one-line addition to
+`bench_decode_batch` for exactly this): `moe_expert_ffn` dropped to
+106,846-188,925 ns/call (160,374.9 avg, 1,120 calls) and `moe_expert_down` to
+90,878-146,141 ns/call (122,294.8 avg, 1,120 calls) -- both roughly halved,
+matching the "one wasted pass in two" arithmetic exactly.
+
+**What was tried and correctly *not* kept:** the same profile suggested
+`dequant_tile_q6k`'s `q6k_value(d, sc, si, raw)` -- called once per element,
+recomputing `d * (float)sc[si]` fresh each of four times -- looked like a
+second lever. It is not a new idea: "The MoE decode GEMV, re-measured"
+(2026-08-17, above) tried exactly this hoist for `moe_expert_ffn_gemv` and
+confirmed with `cuobjdump -sass` that the hoisted and unhoisted forms compile
+to **byte-identical code** -- `ptxas` already proves `sc[si]` does not depend
+on the unpack loop's variable and hoists it itself. Applying it here anyway
+measured 77.9 vs 77.8 tok/s at N=3, run-to-run noise, exactly as that section
+predicts. Reverted; a comment on `q6k_value` now points future readers at
+that section instead of leaving the redundant hoist as if it were load-bearing.
+
+Effect of the MoE fix alone, N=3 at a 32,768-token context: **64.1 -> 77.8
+tok/s, +21.4%.** Real, and still short: below single-stream's 83.9 and short
+of the 109.6 tok/s (1.3x) the next section's target called credible progress.
+
+### Second: GDN's own round-1 fix paid weight traffic N times below its tile floor -- and the first attempt at a wider tile regressed N=3 before a second attempt fixed it
+
+The previous section's `GdnBlock::project_per_sequence` fallback (added to
+fix a *worse* defect -- the tiled kernel running unconditionally at any
+`tokens > 1`) itself has a cost the previous section's own doc comment
+already named without drawing the conclusion: "`tokens` separate untiled
+reads cost `tokens` times the weight." Below `PROJ_TILES[0]` (8), a batch of
+`N` sequences reads GDN's qkv/gate/out projection weights `N` times instead
+of once. Converting the aggregate table to step time makes the shape of this
+visible: step time was close to linear in `tokens` from N=1 to N=4 and only
+dropped once N=8 crossed into `proj_tile_for`'s fully-live tile-8 regime --
+the signature of a code path boundary sitting exactly at `PROJ_TILES[0]`.
+
+**First attempt, and a real regression.** Added `gdn_proj_q8_0_t2`/`_t4`
+kernel instantiations (the `GDN_PROJ_TILED` macro is already parametric) and
+extended `PROJ_TILES` to `[2, 4, 8, 16]`, keeping the existing "widest tile no
+wider than `tokens`" selection rule. This is wrong below the widest declared
+tile: `proj_tile_for` launches `ceil(tokens / tile)` *independent* grid.y
+slices, and each slice re-walks the whole weight matrix on its own -- the
+reuse `GDN_PROJ_TILED` buys is within a slice, not across them. At 3 tokens,
+"widest tile no wider than 3" is tile 2, and `ceil(3 / 2)` is two slices: one
+full, one half-live, which is two full weight reads for three tokens, not
+one. Measured on `bench_decode_batch` at the 32,768-token context: N=3 went
+from 77.8 to **73.0 tok/s (41.1 ms/step)** -- slower than the per-sequence
+fallback it was meant to replace, and N=2 and N=4 (both exact fits for a
+declared tile, one slice either way) improved as expected, which is what
+made the N=3 regression legible as a selection-policy bug rather than a
+tiling one.
+
+**Second attempt: change which tile gets picked, not just which tiles
+exist.** `proj_tile_for` now runs two different rules, split at the widest
+declared tile. Below it, the smallest tile that covers `tokens` in a
+*single* slice -- which can be wider than `tokens`, deliberately, since a
+guarded slice pays close to a full slice's weight-read cost regardless of
+how empty it is (this project's own prior measurement: a 32-wide tile at 19
+live tokens cost 21%, not proportionally more at lower fill). Three tokens
+now takes tile 4 in one guarded slice at 75% live, not tile 2 in two. At and
+above the widest declared tile, the original rule stands unchanged -- proven
+correct at 128 and 512 tokens by the sweep this constant's own doc comment
+already recorded, and no single tile covers those widths in one slice anyway.
+
+Measured, 32,768-token context, mean ms/step:
+
+| N | project_per_sequence (round 1) | tile [2,4,8,16], old rule | tile [2,4,8,16], new rule |
+|---:|---:|---:|---:|
+| 2 | 27.55 | 26.30 | 26.35 |
+| 3 | 38.56 | 41.12 (**regression**) | 38.57 |
+| 4 | 48.94 | 40.79 | 40.76 |
+
+The new rule recovers N=2's and N=4's wins and removes N=3's regression --
+but does not improve N=3 past where it already was. A second
+`nsys --cuda-graph-trace=node` profile, isolated to the batch-3 decode phase,
+shows why: `gdn_proj_q8_0_t4` (the single guarded slice N=3 now takes) costs
+125,662.3 ns/call on average, ~90 calls per step, ~11.3 ms/step -- close
+enough to what three separate untiled reads cost in aggregate that the two
+approaches wash out at this specific width. The fix is a genuine
+architecture improvement (one weight read per projection instead of three,
+which is the right shape and will matter more as more of the guard is
+recovered elsewhere) without being a net decode-time win at N=3 specifically,
+because the per-sequence fallback it replaced was already close to
+cost-competitive here, not because the fix does not do what it says.
+
+**Also checked and already fine:** the follow-up brief asked whether the LM
+head (540 MB, the single largest tensor) was being evaluated per sequence
+rather than once for the whole batch. It is not -- `LmHeadKernels` already
+compiles one exact GEMV per token width from 1 to 8
+(`lm_head_gemv_b1`..`lm_head_gemv_b8`), `Forward::body_batch_decode` calls it
+once with `n` tokens, and the per-sequence loop after it is only the cheap
+argmax reduction over each sequence's own already-computed logits row, not a
+second pass over the weight. No fix needed; recorded so the next reader does
+not re-derive it.
+
+### Final measured tables, both fixes together, GPU 2
+
+Accuracy gates, unchanged tolerances, run fresh against the combined diff:
+all three `tests/batch_decode.rs` differentials (the exact cross-sequence
+check still measures **0.000e0**; the tolerance check's max-abs figures are
+unchanged from the previous section, 8.631e-5 to 2.284e-4 against a 5e-3
+budget), all 6 `tests/moe_differential.rs` tests, all 11
+`tests/moe_block.rs` tests, all 26 `tests/gdn_differential.rs` /
+`gdn_chunked_differential.rs` / `gdn_block.rs` tests, and
+`the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax` -- llama.cpp's
+argmax token, still exactly reproduced. No tolerance loosened.
+
+**2,048-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 9.96 | 100.4 | 100.4 |
+| batch 1 | 11.29 | 88.6 | 88.6 |
+| batch 2 | 21.94 | 91.1 | 45.6 |
+| batch 3 | 32.04 | 93.6 | 31.2 |
+| batch 4 | 31.76 | **125.9** | 31.5 |
+| batch 8 | 47.92 | **166.9** | 20.9 |
+
+**32,768-token context:**
+
+| shape | mean ms/step | aggregate tok/s | per-sequence tok/s |
+| --- | ---: | ---: | ---: |
+| single_stream (N=1, baseline) | 11.92 | 83.9 | 83.9 |
+| batch 1 | 13.36 | 74.9 | 74.9 |
+| batch 2 | 26.35 | 75.9 | 37.9 |
+| batch 3 | 38.57 | 77.8 | 25.9 |
+| batch 4 | 40.76 | **98.1** | 24.5 |
+| batch 8 | 64.46 | **124.1** | 15.5 |
+
+N=8 is unchanged by either fix in this section, at either context -- it
+crosses `MMA_SPLIT_TOKENS`/`MMA_MIN_TOKENS` (8) into the int8-tensor-core
+path in both GDN and MoE, a different set of kernels from the ones either
+fix touched.
+
+### Against the target, honestly, again
+
+Still short. N=3 at the 32,768-token context is 77.8 tok/s: up 21.4% from
+where the previous section left it (64.1), no longer a regression against
+single-stream's own batch-path overhead, but still below single_stream
+itself (83.9) and short of the 109.6 tok/s (1.3x) this round's target called
+credible progress, let alone llama.cpp's 154.58. N=4 is the width that moved
+the most this round (81.7 -> 98.1, +20.1%) and N=2 moved modestly (72.6 ->
+75.9, +4.5%); N=3 sits between two tile boundaries in both fixed kernel
+families and inherits the worse case from each.
+
+Both defects fixed this round were real, correctly diagnosed before being
+fixed, confirmed at the kernel level with fresh `nsys` profiles rather than
+assumed from the first measurement, and verified against every accuracy gate
+with no tolerance changes. Neither one was the single lever that closes the
+N=3 gap, and the round's own arithmetic says why: MoE's fix bought ~21% at
+N=3 and GDN's fix bought ~0% net at that same width despite fixing a real
+architectural defect, which means the step's remaining cost at N=3 is spread
+across more of the ~1,000-1,300 per-step kernel launches the previous
+section already measured than either single hypothesis accounted for.
+
+### What a follow-up needs, updated
+
+The previous section's list stands, with one item resolved (MoE's tile
+width, item 1) and this round's own finding added:
+
+1. ~~Audit `moe_expert_ffn`/`moe_expert_down`'s tile width at N = 2-8~~ --
+   done this round; fixed, confirmed at the kernel level, +21.4% at N=3.
+2. **GDN's guarded-tile-4 cost at N=2-4 is now large enough to audit on its
+   own terms.** `gdn_proj_q8_0_t4` measured 125,662.3 ns/call, ~90 calls/step
+   at N=3 -- comparable in total to MoE's entire fixed tiled-GEMM
+   contribution, and no longer obviously cheaper than the untiled
+   per-sequence reads it replaced at this specific width. A genuinely fused
+   multi-sequence kernel (one launch, N pointers, rather than one guarded
+   tile pass with N/tile-width live lanes) is a different design than either
+   version tried here and was not attempted this round.
+3. **Fused, device-side-indexed multi-sequence kernels for the loops that
+   remain** -- GDN's causal convolution and delta-rule update, attention's
+   rotary/append/read -- as the previous section already named. Still `N`
+   separate launches each, unaudited and unchanged this round.
+4. Continuous batching, mixed prefill and decode in one step, and KV cache
+   pooling -- unchanged from the previous section, still out of scope for
+   this workstream.
