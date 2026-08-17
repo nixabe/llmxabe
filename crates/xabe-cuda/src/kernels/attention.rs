@@ -815,6 +815,20 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 #define MMA_KREG ((MMA_KT * 32 + 255) / 256)
 #define MMA_VREG ((MMA_KT / 2) / MMA_VB)
 
+// The two per-head fences around the softmax guard `my_s`/`my_m`/`my_l`/
+// `my_c`, all sliced to one warp group's `MMA_WPH` warps. At `MMA_HPB` 8,
+// `MMA_WPH` is 1: the "group" is a single warp reading its own writes to
+// shared memory, and `bar.sync` is a block-wide hardware resource paying for
+// cross-warp arrival tracking that has nothing to track. `__syncwarp()` gives
+// the same lane-to-lane visibility guarantee within that one warp for a
+// fraction of the cost. At any `MMA_WPH > 1` the group is still genuinely
+// cross-warp, so this falls back to the named barrier.
+#if MMA_WPH == 1
+#define MMA_HEAD_BAR() __syncwarp()
+#else
+#define MMA_HEAD_BAR() bar_group(hslot + 1, MMA_WPH * 32)
+#endif
+
 __device__ __forceinline__ unsigned pack_h2(float lo, float hi) {
     unsigned r;
     asm("{ .reg .f16 a, b;\n"
@@ -1096,7 +1110,8 @@ __global__ void attn_flash_causal_mma(
             my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg + 1] = s3 * scale2;
         }
         // Per head: `my_s` is this head's slice and no other group reads it.
-        bar_group(hslot + 1, MMA_WPH * 32);
+        // See `MMA_HEAD_BAR`.
+        MMA_HEAD_BAR();
 
         // The online softmax: one lane per key, and as many query rows at a
         // time as a warp has lanes to spare.
@@ -1149,7 +1164,8 @@ __global__ void attn_flash_causal_mma(
         }
         // Per head, for the same reason: `P V` reads this head's weights and
         // correction factors, both written just above by this group alone.
-        bar_group(hslot + 1, MMA_WPH * 32);
+        // See `MMA_HEAD_BAR`.
+        MMA_HEAD_BAR();
 
         // P V. Each warp accumulates over every key octet of its own head, for
         // the share of the output head dimension it owns.
