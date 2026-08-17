@@ -3406,3 +3406,52 @@ next to the 2^-11 already accepted by rounding K and V to binary16 -- is
 plausible and was wrong in effect. The end-to-end gain was never confirmed
 above the harness's 13% run-to-run spread either, so this traded a measured
 accuracy regression for an unmeasured speedup. Not shipped.
+
+## `exp2f` in the prefill softmax: an identity, not an approximation, and it lands (2026-08-17)
+
+`__expf` above is a genuine approximation; this is not. `expf(x)` is
+`exp2f(x)` plus range reduction, so scaling the score by `scale * log2(e)`
+before the softmax and using `exp2f` throughout computes the same function:
+`exp2(s_i - max_j s_j) == exp(x_i - max_j x_j)` when `s = x * log2(e)`, for
+every `i`. Weights, the running normalizer and the rescale factors are all
+unchanged; only the units of the running max differ, and the multiply the
+scale rides on was already being paid.
+
+Three `bench_attention` pairs, interleaved, expf/exp2f mean of three, ms:
+
+| key_offset | expf | exp2f | speedup |
+|---:|---:|---:|---:|
+| 0 | 0.255 | 0.240 | 1.06x |
+| 2,048 | 1.123 | 1.043 | 1.08x |
+| 8,192 | 3.735 | 3.478 | 1.07x |
+| 32,768 | 13.93 | 13.26 | 1.05x |
+| 65,536 | 23.23 | 20.56 | 1.13x |
+| 98,304 | 31.03 | 28.97 | 1.07x |
+| 131,072 | 41.59 | 38.90 | 1.07x |
+
+`exp2f` won every one of the three rounds at every depth. 5-13%, largest
+around 65,536 where the softmax loop's share of the tile is largest relative
+to the traffic already amortised by the prefetch.
+
+Correctness was held to the same bar as the `__expf` attempt precisely
+because "identity in exact arithmetic" is not "identity in floating point" --
+`exp2f` and `expf` round differently on the same hardware `MUFU.EX2`. All nine
+`attention_differential` tests pass, and the golden-logits test was run both
+ways by stashing the change: `the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`
+gives the **identical** winning logit (20.017208 against llama.cpp's
+19.902241) and the **identical** top-8 order and rank-4 noise-floor swap
+(239784/78229, separation 0.153701 against 0.205439 of implementation noise)
+with or without the change. Bit-identical output on the one prompt this repo
+checks against llama.cpp, which is the strongest correctness signal available
+here short of `ncu` (unavailable on this host).
+
+Applied only where it was measured to help. On `attn_flash_decode_warp` it
+measured **3.4% slower** (1.227 vs 1.188 ms interleaved) despite emitting 80
+fewer instructions for the same 16 `MUFU.EX2` and unchanged occupancy -- a
+standalone instruction-count model had predicted a 15% gain there and omitted
+the `part_acc` writeback, so it was not a faithful model of the kernel.
+Decode keeps `expf`; only `attn_flash_causal_mma` changed.
+
+Landed as a separate commit from the rest of this session's decode work,
+scoped to the three hunks inside `attn_flash_causal_mma` and its `ATTN_LOG2E`
+`#define`.
