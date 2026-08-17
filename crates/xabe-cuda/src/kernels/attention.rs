@@ -503,6 +503,25 @@ __global__ void attn_rope_partial_neox(
 // which is the whole win thrown away. 8 covers head_dim 256.
 #define ATTN_MAXD 8
 
+// `exp2f` is one `MUFU.EX2`; `expf` is that plus the range reduction around
+// it. Folding `log2(e)` into the score scale makes the swap an identity and
+// not an approximation: with `s = x * log2(e)`, `exp2(s_i - max_j s_j)` equals
+// `exp(x_i - max_j x_j)` for every i, so weights, normalizers and rescale
+// factors are unchanged and only the units of the running maximum differ. The
+// multiply it rides on was already being paid.
+//
+// Applied only where it was measured to help, which is not everywhere: on
+// `attn_flash_decode_warp` it measured 3.4% *slower* (1.227 vs 1.188 ms over
+// interleaved pairs) despite emitting 80 fewer instructions for the same 16
+// `MUFU.EX2` and the same occupancy -- so decode keeps `expf`. A standalone
+// cost ladder had predicted a 15% gain there; it omitted the `part_acc`
+// writeback and was not a faithful model of the kernel.
+//
+// It is also not the `__expf` substitution, which *is* an approximation: that
+// one measured 1.075x on prefill and was rejected for flipping a rank-4
+// ordering against llama.cpp's logits. See docs/BENCHMARKS.md.
+#define ATTN_LOG2E 1.4426950408889634f
+
 #define ATTN_FLASH(NAME, QT)                                                  \
 __global__ void NAME(                                                           \
     const float* __restrict__ q,                                                \
@@ -1069,10 +1088,12 @@ __global__ void attn_flash_causal_mma(
                     mma_m16n8k8(s0, s1, s2, s3, qa0[s], qa1[s], b0);
                 }
             }
-            my_s[g * MMA_KT + 8 * sub + 2 * tg]           = s0 * scale;
-            my_s[g * MMA_KT + 8 * sub + 2 * tg + 1]       = s1 * scale;
-            my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg]     = s2 * scale;
-            my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg + 1] = s3 * scale;
+            // Scores and maxima in log2 units for this kernel; see ATTN_LOG2E.
+            float scale2 = scale * ATTN_LOG2E;
+            my_s[g * MMA_KT + 8 * sub + 2 * tg]           = s0 * scale2;
+            my_s[g * MMA_KT + 8 * sub + 2 * tg + 1]       = s1 * scale2;
+            my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg]     = s2 * scale2;
+            my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg + 1] = s3 * scale2;
         }
         // Per head: `my_s` is this head's slice and no other group reads it.
         bar_group(hslot + 1, MMA_WPH * 32);
@@ -1111,9 +1132,9 @@ __global__ void attn_flash_causal_mma(
                 }
                 float m0 = my_m[row];
                 float nm = fmaxf(m0, tmax);
-                float corr = (m0 == neg_inf()) ? 0.0f : expf(m0 - nm);
+                float corr = (m0 == neg_inf()) ? 0.0f : exp2f(m0 - nm);
 
-                float e = live ? expf(sv - nm) : 0.0f;
+                float e = live ? exp2f(sv - nm) : 0.0f;
                 float lsum = e;
                 for (int off = MMA_KT >> 1; off > 0; off >>= 1) {
                     lsum += __shfl_xor_sync(0xffffffff, lsum, off);
