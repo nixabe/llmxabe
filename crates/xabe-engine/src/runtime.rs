@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaStream, DriverError};
 use smallvec::SmallVec;
+use tracing::debug;
 use xabe_gguf::{GgufError, GgufFile};
 use xabe_model::ModelConfig;
 use xabe_model::weights::WeightSchema;
@@ -354,6 +356,7 @@ impl DeviceRuntime {
         ngram: Option<NgramConfig>,
         retention_interval: usize,
     ) -> Result<Self, RuntimeError> {
+        let load_started = Instant::now();
         if prefill_chunk == 0 {
             return Err(RuntimeError::ZeroPrefillChunk);
         }
@@ -377,6 +380,11 @@ impl DeviceRuntime {
             .map_err(|errors| RuntimeError::Schema(format!("{errors:?}")))?;
         let (weights, _) =
             DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)?;
+        debug!(
+            device = device_ordinal,
+            elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+            "worker weights resident"
+        );
         let prefill = Forward::new(
             &ctx,
             &stream,
@@ -386,6 +394,12 @@ impl DeviceRuntime {
             config.clone(),
             prefill_chunk,
         )?;
+        debug!(
+            device = device_ordinal,
+            elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+            tokens = prefill_chunk,
+            "worker prefill shape ready"
+        );
         let retention_prefill = if retention_interval > 0 && retention_interval != prefill_chunk {
             Some(prefill.reshape(
                 &ctx,
@@ -410,6 +424,12 @@ impl DeviceRuntime {
             }
             tail *= 2;
         }
+        debug!(
+            device = device_ordinal,
+            elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+            tail_shapes = prefill_tails.len(),
+            "worker prefill tail shapes ready"
+        );
 
         // Index by batch width. Every serving width is built at startup, so
         // switching N=1/N=2/N=3 never allocates on the decode hot path.
@@ -420,6 +440,12 @@ impl DeviceRuntime {
             pass.enable_batch_decode(&ctx, &stream)?;
             decode.push(Some(pass));
         }
+        debug!(
+            device = device_ordinal,
+            elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+            decode_shapes = max_batch,
+            "worker decode shapes ready"
+        );
         let graphs = (0..=max_batch).map(|_| None).collect();
 
         Ok(Self {
