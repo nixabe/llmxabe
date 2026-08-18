@@ -6992,3 +6992,161 @@ landed only once `cuobjdump -sass` confirmed everything outside its own
 stated blast radius stayed byte-identical. `N` 1 and 8 sit where they did
 before any of this work started, which is the other half of the same
 claim: the sessions never touched what they did not mean to.
+
+## GDN at batch decode: a real bandwidth gap, a plausible fix, and a measured reject once ptxas and the hardware both disagreed with the register math (2026-08-18)
+
+GDN was the one major decode-step stage never bandwidth-audited at batch
+shapes, named as the last lever of this session at 23.0% of the N=3 step
+per an earlier profile. A fresh `nsys profile --cuda-graph-trace=node`
+capture (N=3, 32,768-token context, `LLMXABE_SKIP_SINGLE_STREAM=1`, GPU 2,
+last 300ms of the run -- roughly 10 decode steps), kernel time summed per
+name and divided by the window total:
+
+| kernel | calls | total ns | share of GDN | share of step |
+|---|---:|---:|---:|---:|
+| `gdn_proj_q8_0_t4` | 877 | 55,034,615 | 73.3% | 18.7% |
+| `gdn_recurrent_step` | 878 | 12,609,178 | 16.8% | 4.3% |
+| `conv1d_step` | 876 | 2,451,343 | 3.3% | 0.8% |
+| `gdn_normalize_qk` | 878 | 2,080,200 | 2.8% | 0.7% |
+| `gdn_alpha_beta_gates_t1` | 292 | 1,666,021 | 2.2% | 0.6% |
+| `gdn_silu_split_qkv` | 292 | 716,036 | 1.0% | 0.2% |
+| `gdn_add` | 293 | 544,609 | 0.7% | 0.2% |
+| **GDN total** | | **75,102,002** | | **25.5%** |
+| all kernels in window | | 293,962,608 | | 100% |
+
+25.5% against the cited 23.0% is the same finding from a different capture,
+not a contradiction. The ranking is decisive: `gdn_proj_q8_0_t4` -- the
+projection kernel this file's own earlier workstream already tuned via
+`proj_tile_for`'s tile-selection rule -- is 73% of GDN's own time and
+18.7% of the *whole* decode step by itself, an order of magnitude ahead of
+`gdn_recurrent_step`, the state-update kernel the brief expected to be
+competitive (its 2 MiB/layer/seq state read+write is real traffic, but at
+30 layers x 3 seqs x 2 directions it is ~360 MB/step against the
+projection's ~1.07 GB/step below). Every other GDN kernel is under 1% of
+the step. This audit is about `gdn_proj_q8_0_t4` or it is about nothing.
+
+### Achieved bandwidth: 28% of roofline, well under this file's own GEMV kernels
+
+Three Q8_0 matrices route through the tiled projection per GDN layer per
+step at N=3 (`hidden` 2048, `conv_dim()` 8192, `value_dim()` 4096, all from
+`GdnGeometry`): `qkv` (8192 x 2048), `gate`/`z` (4096 x 2048), `out` (2048 x
+4096). Q8_0 is 34 bytes per 32 elements, so one full read of all three is
+`(8192 + 4096) x 64 x 34 + 2048 x 128 x 34` = 35.65 MB; `proj_tile_for`
+sends N=3 to tile 4 (the smallest tile that covers 3 tokens in one grid.y
+slice), so this is read *once* per layer per step, not three times. Over
+30 GDN layers that is 1.07 GB/step, matching `gdn_proj_q8_0`'s own doc
+comment ("1.07 GiB of Gated DeltaNet projections") independently.
+
+Dividing the window's `gdn_proj_q8_0_t4` time by its call count (877 calls
+/ 90 calls-per-step = 9.74 steps in the window) gives 5.65 ms/step for
+1.07 GB: **189 GB/s, 28.2% of the card's 672 GB/s streaming roofline** --
+below the MoE narrow kernels' own 38.2%/31.0% (a prior section's finding),
+well below the LM head's GEMV at 82-89%.
+
+### Ruling out occupancy: already full
+
+`ptxas -v` on `GDN_BLOCK_SRC` extracted standalone: `gdn_proj_q8_0_t4` is
+58 registers, 128-thread blocks (`PROJ_WARPS` 4), zero spill. `65536 / (58
+x 128) = 8.8` -> 8 blocks/SM, `8 x 128 = 1024` threads/SM -- the Turing
+maximum, already 100% theoretical occupancy at this kernel's baseline
+register count. Occupancy is not the lever here; the defect checklist's
+other named items (stray kernel choice, load width) do not fit either --
+`proj_tile_for`'s tile-4 choice is the correct, already-measured one for
+N=3, and the per-lane load (`blk[2 + lane]`, one coalesced byte per lane)
+is the same shape as this file's own GEMV kernels use successfully
+elsewhere.
+
+### The hypothesis: a runtime-bounded loop with no in-flight depth
+
+What is left is the dequant loop itself: `for (int b = 0; b < blocks; ++b)`
+inside `GDN_PROJ_TILED`, where `blocks = k_dim / 32` is a *kernel
+parameter* -- a genuine runtime value, not a compile-time constant -- so
+nothing about the loop lets `ptxas` unroll it on its own, and nothing in
+the body issues a second weight load before the first one's arithmetic has
+retired. This is the same defect this project has already fixed twice:
+`moe_expert_ffn_gemv`'s `#pragma unroll 2` and `moe_expert_down`'s
+`MOE_DOWN_UNROLL` both exist because a fully-occupied GEMV-shaped kernel
+with no loop depth is a memory-parallelism bound, not a bandwidth one, and
+28% against those kernels' 46-89% is exactly that signature.
+
+Built: `GDN_PROJ_TILED` gained a fourth macro parameter (`KU`, the unroll
+factor), threaded through `_Pragma` via the standard two-level stringize
+trick (`_Pragma` cannot appear as a bare `#pragma` inside a `#define ...
+\` body, and a macro parameter must be expanded before it is stringized).
+`ptxas -v` on the four declared widths, unroll factor swept per width
+because the fix is not free everywhere:
+
+| kernel | baseline | unroll 2 |
+|---|---:|---:|
+| `gdn_proj_q8_0_t2` | 52 | 46 |
+| `gdn_proj_q8_0_t4` | 58 | 58 (SASS byte-identical) |
+| `gdn_proj_q8_0_t8` | 120 | 96 |
+| `gdn_proj_q8_0_t16` | 128 | 227 |
+
+`t16`'s accumulator array (`RR` 4 x `TT` 16, 64 floats already) had no
+register room left; unrolling doubled its in-flight dequant temporaries
+and more than doubled the register count, a full occupancy tier lost. It
+kept `KU = 1` (no unroll, its original shape) -- it is never reached below
+9 tokens and this session's own sweep never exceeds 8. `t2`/`t8` improved
+on paper. `t4` -- the width N=3 and N=4 actually use -- compiled to
+**byte-identical SASS**, register-for-register: `ptxas` was already making
+the same scheduling decision for this specific loop shape with or without
+the source-level hint. That result alone meant this fix could not move
+N=3, this session's own headline metric, before a single kernel was ever
+launched.
+
+### Gates
+
+`cargo test --release -p xabe-engine --lib block::gdn`: 12/12, including
+`the_projection_tiles_match_the_kernel` (updated to check the new fourth
+parameter) and `the_tiled_projection_reads_each_operand_once_per_tile`
+(unchanged, still passing -- the two reuse invariants this kernel exists
+for are untouched).
+`gdn_differential` 3/3, `gdn_chunked_differential` 10/10, `gdn_block` 13/13
+(including two direct llama.cpp parity tests, `each_step_matches_llama_
+cpp_when_fed_its_own_input` and `the_whole_block_matches_llama_cpp_token_
+by_token`).
+`moe_differential` 7/7 and `batch_decode` 3/3 bit-exact, both unaffected as
+expected -- this section never touched `moe.rs`. Golden unchanged.
+`cuobjdump -sass` against the merged-main tree (`666224d`) this section
+built on: exactly `gdn_proj_q8_0_t2` and `gdn_proj_q8_0_t8` differ (the two
+widths whose register count moved); every other kernel in the module,
+`gdn_proj_q8_0_t4` and `gdn_proj_q8_0_t16` included, is byte-identical.
+
+### Throughput: a real regression at N=2, flat at N=3/N=4 exactly as the SASS predicted, a sub-3% win at N=8
+
+Interleaved A/B against merged main, `bench_decode_batch`, 3 rounds, 2,048
+context:
+
+| N | before (tok/s) | after (tok/s) | delta |
+|---:|---:|---:|---:|
+| 2 | 115.0-117.3 | 106.2-107.0 | **-8.7% to -9.5%** |
+| 3 | 125.1-126.8 | 125.2-126.0 | flat (SASS-identical) |
+| 4 | 141.9-143.4 | 141.9-142.2 | flat (SASS-identical) |
+| 8 | 169.2-170.8 | 171.5-172.3 | +1.0% to +1.9% |
+
+`t2` regressed by nearly 9% despite `ptxas -v` showing *fewer* registers
+(52 -> 46) -- a register-count improvement that did not translate to a
+throughput one, the same lesson the split-kernel reject two sections back
+already recorded once: occupancy and register math are a proxy, not the
+measurement. `t8`'s register win (120 -> 96) did translate to a real gain
+at N=8, but at 1.0-1.9% it sits under this round's own 3%-of-step bar, and
+N=3 -- the width this whole session was scoped around -- moved not at all,
+because its kernel's machine code did not change.
+
+### Disposition
+
+Rejected, reverted (`git checkout -- crates/xabe-engine/src/block/gdn.rs`,
+confirmed empty `git diff` against `666224d`). Net effect across the
+measured widths is negative-to-flat-to-marginal, and the one width this
+session was scoped around shows zero measured change for a structural
+reason (`ptxas` already reached the same code), not a small one. Per this
+round's own bound: no width cleared 3% of step time in the direction that
+would justify shipping a mixed win/loss/flat result, so this closes the
+GDN lever as audited-and-declined rather than landed. `gdn_proj_q8_0_t4`'s
+28%-of-roofline ceiling stands as the honest number for a follow-up
+session: whatever closes it will need to change what `ptxas` schedules,
+not hint at a schedule it already reaches on its own -- a restructured
+dequant (wider vector loads across `blk`, or trading the byte-at-a-time
+`blk[2 + lane]` read for a differently laid-out quant stream) rather than
+a loop-unroll hint, and is out of this session's scope.
