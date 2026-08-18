@@ -135,23 +135,26 @@ Q6_K/Q8_0 *dequantization* is transcribed from `ggml-quants.c`; the
 explicitly **not** llama.cpp's least-squares quantizer. RoPE's NEOX pairing was
 confirmed from `ggml_compute_forward_rope_flt`.
 
-## What is not yet tested
+## Serving acceptance status
 
 Stated plainly, because a gap you know about is manageable and one you assume
 away is not.
 
-- The scheduler-driven three-worker serving path has not been run since it was
-  added; the CUDA driver is currently unreachable. Isolated kernel and forward
-  gates predate that path and do not prove it.
-- Parent-linked incremental attention snapshots have not been restored onto a
-  second GPU and compared against a cold prefill. `cross_worker_restore` is the
-  acceptance check for that claim.
-- Nine simultaneous sequences and the mixed two-decode/one-prefill step have
-  not been measured through `Engine::step_devices`.
-- The OpenAI HTTP surface has not been exercised against three live workers.
-- No same-day scheduler-path N=3 comparison against llama.cpp's best flags has
-  been recorded. Isolated `bench_decode_batch` results do not substitute for
-  that serving measurement.
+On 2026-08-18, `worker_smoke`, `engine_smoke`, and
+`cross_worker_restore` passed on the three local RTX 8000s. The engine run
+served nine sequences, balanced three onto each worker, and exercised a mixed
+two-decode/one-prefill step on every card. The cross-worker restore emitted
+exactly the same token ids as the cold path.
+
+On 2026-08-19, nine simultaneous HTTP `/v1/completions` requests were served
+successfully by one server bound to all three cards; every response produced
+four tokens and the same `" Paris, a city"` continuation. This checks the
+non-streaming HTTP-to-engine path, not streaming (which remains unsupported),
+disconnect cancellation under a live socket, or overload behavior.
+
+The same-day scheduler-path N=3 comparison is recorded at the end of
+`BENCHMARKS.md`. The live path is within 0.7% of the isolated kernel path, so
+it does not explain the remaining throughput gap.
 
 ## Running
 
