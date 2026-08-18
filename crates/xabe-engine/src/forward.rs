@@ -80,6 +80,8 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use cudarc::driver::sys;
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{
@@ -101,6 +103,9 @@ use crate::block::attention::{
 };
 use crate::block::gdn::{
     GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
+};
+use crate::block::gdn_verify::{
+    GdnSnapshotRing, GdnVerifyError, GdnVerifyScratch, run_layer_with_snapshots,
 };
 use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
 use crate::state::{SequenceState, StateError};
@@ -206,6 +211,8 @@ pub enum ForwardError {
     Driver(DriverError),
     /// A Gated DeltaNet block failed.
     Gdn(GdnBlockError),
+    /// A snapshotted Gated DeltaNet layer failed.
+    GdnVerify(GdnVerifyError),
     /// A Gated Attention block failed.
     Attention(AttentionBlockError),
     /// The MoE block failed.
@@ -298,6 +305,7 @@ impl std::fmt::Display for ForwardError {
             Self::Compile(m) => write!(f, "embedding kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Gdn(e) => write!(f, "{e}"),
+            Self::GdnVerify(e) => write!(f, "{e}"),
             Self::Attention(e) => write!(f, "{e}"),
             Self::Moe(e) => write!(f, "{e}"),
             Self::LayerOps(e) => write!(f, "{e}"),
@@ -395,6 +403,7 @@ macro_rules! from_error {
 }
 from_error!(DriverError, Driver);
 from_error!(GdnBlockError, Gdn);
+from_error!(GdnVerifyError, GdnVerify);
 from_error!(AttentionBlockError, Attention);
 from_error!(MoeBlockError, Moe);
 from_error!(LayerOpsError, LayerOps);
@@ -689,6 +698,11 @@ pub struct Forward {
     /// Host staging for the copy above, pre-sized once so publishing a step
     /// never allocates (`AGENTS.md` rule 6).
     batch_positions_host: Vec<i32>,
+    /// Stable pageable source used only while capturing the batch graph.
+    batch_zero_tokens: Vec<i32>,
+
+    /// Allocated by `enable_verify`, once per Gated DeltaNet layer.
+    verify_scratch: Option<Vec<GdnVerifyScratch>>,
 
     report: ForwardReport,
 }
@@ -996,6 +1010,8 @@ impl Forward {
             batch_argmax_out: None,
             batch_positions: None,
             batch_positions_host: Vec::new(),
+            batch_zero_tokens: Vec::new(),
+            verify_scratch: None,
             report: ForwardReport {
                 arena_bytes: weights.arena().capacity() as u64,
                 moe_bytes,
@@ -1300,6 +1316,7 @@ impl Forward {
         self.batch_argmax_out = Some(stream.alloc_zeros::<i32>(tokens)?);
         self.batch_positions = Some(stream.alloc_zeros::<i32>(tokens)?);
         self.batch_positions_host = vec![0i32; tokens];
+        self.batch_zero_tokens = vec![0i32; tokens];
         Ok(())
     }
 
@@ -1559,12 +1576,22 @@ impl Forward {
             return Err(ForwardError::CaptureWhileProfiling);
         }
         let n = self.tokens;
-        self.check_batch_shape(states, &vec![0i32; n])?;
+        self.check_batch_shape(states, &self.batch_zero_tokens)?;
         // As `capture_step`: the capture must already know about the token
         // ids and every sequence's position before it starts, or the copies
         // that publish them would be recorded into the graph, and a copy
         // from pageable host memory cannot be.
-        self.publish_batch_inputs(stream, states, &vec![0i32; n])?;
+        stream.memcpy_htod(&self.batch_zero_tokens, &mut self.d_tokens)?;
+        self.moe.publish_tokens(stream, n)?;
+        for (dst, state) in self.batch_positions_host.iter_mut().zip(states.iter()) {
+            *dst = state.position() as i32;
+        }
+        stream.memcpy_htod(
+            &self.batch_positions_host,
+            self.batch_positions
+                .as_mut()
+                .expect("enabled batch decode has positions"),
+        )?;
         stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
         let recorded = self.body_batch_decode(stream, states);
         let graph = stream.end_capture(
@@ -1588,6 +1615,23 @@ impl Forward {
         graph: &BatchStepGraph,
         token_ids: &[i32],
     ) -> Result<Vec<i32>, ForwardError> {
+        let mut output = Vec::with_capacity(self.tokens);
+        self.replay_batch_step_into(stream, states, graph, token_ids, &mut output)?;
+        Ok(output)
+    }
+
+    /// Allocation-free sibling of [`Self::replay_batch_step`].
+    ///
+    /// `output` must already have room for the fixed batch width. Serving
+    /// runtimes reserve it at startup and reuse it across decode rounds.
+    pub fn replay_batch_step_into(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        graph: &BatchStepGraph,
+        token_ids: &[i32],
+        output: &mut Vec<i32>,
+    ) -> Result<(), ForwardError> {
         let n = self.tokens;
         if token_ids.len() != n {
             return Err(ForwardError::BatchWidth {
@@ -1607,11 +1651,19 @@ impl Forward {
         }
         self.publish_batch_inputs(stream, states, token_ids)?;
         graph.graph.launch()?;
-        let host = self.read_batch_sampled(stream)?;
+        if output.capacity() < n {
+            return Err(ForwardError::BatchWidth {
+                expected: n,
+                got: output.capacity(),
+                what: "sample output capacity",
+            });
+        }
+        output.resize(n, 0);
+        self.read_batch_sampled_into(stream, output)?;
         for state in states.iter_mut() {
             state.advance(1);
         }
-        Ok(host)
+        Ok(())
     }
 
     /// The shape checks [`Self::run_batch_decode`] and
@@ -1716,7 +1768,7 @@ impl Forward {
         for layer in 0..self.config.num_layers {
             match self.config.layer_kind(layer) {
                 LayerKind::GatedDeltaNet => {
-                    let mut gdn_states: Vec<&mut GdnState> =
+                    let mut gdn_states: SmallVec<[&mut GdnState; 3]> =
                         states.iter_mut().map(|st| st.gdn_mut(gdn_slot)).collect();
                     self.gdn
                         .forward_batch_decode(
@@ -1748,9 +1800,9 @@ impl Forward {
                         .batch_positions
                         .as_ref()
                         .expect("published by publish_batch_inputs");
-                    let mut caches: Vec<&mut KvCache> = Vec::with_capacity(n);
-                    let mut pos_offsets: Vec<usize> = Vec::with_capacity(n);
-                    let mut position_views = Vec::with_capacity(n);
+                    let mut caches: SmallVec<[&mut KvCache; 3]> = SmallVec::new();
+                    let mut pos_offsets: SmallVec<[usize; 3]> = SmallVec::new();
+                    let mut position_views: SmallVec<[_; 3]> = SmallVec::new();
                     for (i, state) in states.iter_mut().enumerate() {
                         pos_offsets.push(state.position());
                         let (cache, _) = state.kv_and_position_mut(attn_slot);
@@ -1762,7 +1814,7 @@ impl Forward {
                             crate::viewslice::subslice(stream, batch_positions, i, 1)
                         });
                     }
-                    let positions: Vec<&CudaSlice<i32>> =
+                    let positions: SmallVec<[&CudaSlice<i32>; 3]> =
                         position_views.iter().map(|v| &**v).collect();
                     self.attention[attn_slot]
                         .forward_batch_decode(
@@ -1884,6 +1936,246 @@ impl Forward {
         )?;
         stream.synchronize()?;
         Ok(host)
+    }
+
+    fn read_batch_sampled_into(
+        &self,
+        stream: &Arc<CudaStream>,
+        host: &mut [i32],
+    ) -> Result<(), ForwardError> {
+        stream.memcpy_dtoh(
+            self.batch_argmax_out
+                .as_ref()
+                .expect("checked by the caller"),
+            host,
+        )?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Allocate the scratch [`Self::run_verify`] needs: one
+    /// [`GdnVerifyScratch`] per Gated DeltaNet layer, sized for this pass's
+    /// `tokens` (the verify window, `1 + d`). Idempotent, like
+    /// [`Self::enable_batch_decode`], and for the same reason —
+    /// `AGENTS.md` rule 6 makes allocating on `run_verify`'s call a bug
+    /// rather than a convenience.
+    pub fn enable_verify(&mut self, stream: &Arc<CudaStream>) -> Result<(), ForwardError> {
+        if self.verify_scratch.is_some() {
+            return Ok(());
+        }
+        let geometry = self.gdn.geometry();
+        let mut scratch = Vec::with_capacity(self.gdn_weights.len());
+        for _ in &self.gdn_weights {
+            scratch.push(GdnVerifyScratch::new(stream, &geometry, self.tokens)?);
+        }
+        self.verify_scratch = Some(scratch);
+        Ok(())
+    }
+
+    /// A speculative-decode verify step: `token_ids` (`[id_last, draft_1,
+    /// ..., draft_d]`, length `self.tokens = 1 + d`) run through this pass's
+    /// full `1 + d`-position causal window in a single weight-read pass, with
+    /// every Gated DeltaNet layer's recurrent state snapshotted at every
+    /// position boundary along the way.
+    ///
+    /// Returns one greedy-argmax id per window position — row `i`'s id is
+    /// the target model's own next-token prediction *after* having seen
+    /// `token_ids[0..=i]`, which is what the caller compares against
+    /// `token_ids[1..]` to find the accepted prefix (see
+    /// `docs/OPTIMIZATION.md` §R6 and `AGENTS.md`'s bonus-token discussion).
+    ///
+    /// **Leaves `state` exactly where a plain [`Self::run`] over the whole
+    /// window would** — every Gated DeltaNet layer is fully advanced, not
+    /// rolled back — and does **not** call `state.advance()` at all. Rolling
+    /// back to an accepted count `k` is the caller's job, once it has
+    /// compared this call's return value against the drafts and decided `k`:
+    /// call [`GdnSnapshotRing::commit`] with `i = k` on every ring in
+    /// `rings`, then `state.advance(k)`. The attention key/value caches need
+    /// no separate rollback — a rejected tail's cache entries sit at
+    /// positions `state.position() + k ..` and are simply never read again
+    /// until a later pass overwrites them at exactly those positions; see
+    /// `crate::state`'s module docs on why a reset does not clear the cache.
+    ///
+    /// [`Self::enable_verify`] and [`Self::enable_batch_decode`] must both
+    /// already have been called — the first allocates the per-layer
+    /// snapshot scratch, the second the wide LM head and per-row argmax this
+    /// method reuses unchanged (a verify window's positions are no
+    /// different, to that tail, from batched decode's per-sequence rows: in
+    /// both cases it is `tokens` independent hidden-state rows in, `tokens`
+    /// logit rows and argmax ids out).
+    ///
+    /// `rings` must hold one [`GdnSnapshotRing`] of depth `self.tokens + 1`
+    /// per Gated DeltaNet layer, in layer order — the caller's, because they
+    /// are per-*sequence* state (like [`SequenceState`] itself) and this
+    /// pass is shared across sequences.
+    ///
+    /// Gated DeltaNet projections take the split-layout tiled path when
+    /// `gdn_int8` is resident — the same pairing one-token decode uses —
+    /// so a verify window's first FMA agrees with the chain of
+    /// [`Self::run`] calls the identity test compares against.
+    pub fn run_verify(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        rings: &mut [GdnSnapshotRing],
+        token_ids: &[i32],
+    ) -> Result<Vec<i32>, ForwardError> {
+        if token_ids.len() != self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: token_ids.len(),
+            });
+        }
+        if self.batch_lm_head.is_none() {
+            return Err(ForwardError::BatchDecodeNotEnabled);
+        }
+        let Some(mut scratch) = self.verify_scratch.take() else {
+            return Err(ForwardError::BatchWidth {
+                expected: self.gdn_weights.len(),
+                got: 0,
+                what: "verify scratch (call enable_verify first)",
+            });
+        };
+        if rings.len() != self.gdn_weights.len() || scratch.len() != self.gdn_weights.len() {
+            let got = rings.len().min(scratch.len());
+            self.verify_scratch = Some(scratch);
+            return Err(ForwardError::BatchWidth {
+                expected: self.gdn_weights.len(),
+                got,
+                what: "gdn snapshot rings/scratch",
+            });
+        }
+
+        self.publish_inputs(stream, state, token_ids)?;
+        self.embed(stream)?;
+
+        let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
+        for layer in 0..self.config.num_layers {
+            let result = match self.config.layer_kind(layer) {
+                LayerKind::GatedDeltaNet => {
+                    let r = run_layer_with_snapshots(
+                        stream,
+                        &mut self.gdn,
+                        &self.gdn_weights[gdn_slot],
+                        self.gdn_int8.get(gdn_slot),
+                        state.gdn_mut(gdn_slot),
+                        &self.hidden_state,
+                        &mut self.mixer_out,
+                        &mut scratch[gdn_slot],
+                        &mut rings[gdn_slot],
+                        self.tokens,
+                    )
+                    .map_err(ForwardError::from);
+                    gdn_slot += 1;
+                    r
+                }
+                LayerKind::GatedAttention => {
+                    let pos_offset = state.position();
+                    let (cache, positions) = state.kv_and_position_mut(attn_slot);
+                    let r = self.attention[attn_slot]
+                        .forward(
+                            stream,
+                            &mut self.attn_scratch,
+                            &self.hidden_state,
+                            cache,
+                            pos_offset,
+                            positions,
+                            &mut self.mixer_out,
+                        )
+                        .map_err(ForwardError::from);
+                    attn_slot += 1;
+                    r
+                }
+            };
+            if let Err(e) = result {
+                self.verify_scratch = Some(scratch);
+                return Err(e);
+            }
+
+            if let Err(e) = self.moe.forward(
+                stream,
+                &self.moe_weights[layer as usize],
+                &self.mixer_out,
+                self.tokens,
+                &mut self.ffn_out,
+                &mut self.hidden_state,
+            ) {
+                self.verify_scratch = Some(scratch);
+                return Err(ForwardError::from(e));
+            }
+        }
+        self.verify_scratch = Some(scratch);
+
+        self.layer_ops.rms_norm(
+            stream,
+            &self.hidden_state,
+            &self.w_output_norm,
+            &mut self.final_norm,
+            self.tokens,
+            self.hidden,
+            self.rms_eps,
+        )?;
+
+        let vocab = self.vocab;
+        let n = self.tokens;
+        {
+            let lm_head = self.batch_lm_head.as_ref().expect("checked above");
+            let logits = self.batch_logits.as_mut().expect("checked above");
+            lm_head
+                .forward(
+                    stream,
+                    QuantTensor {
+                        bytes: &self.w_lm_head,
+                        quant: ExpertQuant::Q8_0,
+                    },
+                    &self.final_norm,
+                    n,
+                    logits,
+                )
+                .map_err(ForwardError::LmHead)?;
+        }
+        for i in 0..n {
+            // SAFETY: as `body_batch_decode`'s identical tail — `i < n`,
+            // and `batch_logits`/`batch_argmax_values`/`batch_argmax_indices`/
+            // `batch_argmax_out` are all sized from `enable_batch_decode` to
+            // exactly `n` (times `vocab` or `ARGMAX_BLOCKS` where relevant).
+            let row = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_logits.as_ref().expect("checked above"),
+                    i * vocab,
+                    vocab,
+                )
+            };
+            let mut values = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_values.as_ref().expect("checked above"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut indices = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_indices.as_ref().expect("checked above"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut out_one = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_out.as_ref().expect("checked above"),
+                    i,
+                    1,
+                )
+            };
+            self.lm_head
+                .argmax(stream, &row, vocab, &mut values, &mut indices, &mut out_one)
+                .map_err(ForwardError::LmHead)?;
+        }
+        self.read_batch_sampled(stream)
     }
 
     /// Allocate carried state for one sequence of up to `max_seq` positions.

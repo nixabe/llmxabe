@@ -37,6 +37,13 @@ pub type BlockHash = u64;
 /// from the attention group's blocks.
 pub type GdnSlot = BlockId;
 
+/// Identity and backing block of one evicted radix leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvictedPrefix {
+    pub hash: BlockHash,
+    pub block: BlockId,
+}
+
 /// Sentinel parent hash for the first block of any sequence.
 pub const ROOT_HASH: BlockHash = 0;
 
@@ -97,6 +104,8 @@ pub struct PrefixMatch {
     /// Reusable GDN snapshot, if any retained snapshot falls within the
     /// matched range.
     pub gdn_snapshot: Option<GdnSlot>,
+    /// Hash of the node that owns `gdn_snapshot`.
+    pub gdn_snapshot_hash: Option<BlockHash>,
     /// Tokens the reused GDN snapshot actually covers.
     ///
     /// This is AGENTS.md rule 2 made concrete: it is the largest retained
@@ -186,6 +195,7 @@ impl RadixTree {
             result.matched_hash = Some(h);
             if let Some(slot) = node.gdn_snapshot {
                 result.gdn_snapshot = Some(slot);
+                result.gdn_snapshot_hash = Some(h);
                 result.gdn_matched_tokens = node.token_end;
             }
         }
@@ -286,6 +296,14 @@ impl RadixTree {
     /// [`crate::pool::BlockPool`]). Not benchmarked at scale — see the
     /// crate's top-level report for what was and wasn't measured.
     pub fn evict_unreferenced(&self, max_nodes: usize) -> Vec<BlockId> {
+        self.evict_unreferenced_entries(max_nodes)
+            .into_iter()
+            .map(|entry| entry.block)
+            .collect()
+    }
+
+    /// Eviction detail for owners that must release hash-keyed side data.
+    pub fn evict_unreferenced_entries(&self, max_nodes: usize) -> Vec<EvictedPrefix> {
         let mut inner = self.inner.write();
         let mut evicted = Vec::new();
 
@@ -302,7 +320,10 @@ impl RadixTree {
             };
 
             let node = inner.nodes.remove(&hash).expect("just found it");
-            evicted.push(node.block);
+            evicted.push(EvictedPrefix {
+                hash,
+                block: node.block,
+            });
 
             if node.parent == ROOT_HASH {
                 inner.root_children.remove(&hash);
@@ -470,6 +491,18 @@ mod tests {
         assert!(tree.contains(hashes[0]));
         assert!(tree.contains(hashes[1]));
         assert!(!tree.contains(hashes[2]));
+    }
+
+    #[test]
+    fn detailed_eviction_returns_the_hash_for_side_store_cleanup() {
+        let tree = RadixTree::new(256);
+        let (prefix, hashes) = build_chain(256, 2048, 2);
+        tree.insert(&prefix);
+        let evicted = tree.evict_unreferenced_entries(1);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].hash, hashes[1]);
+        assert_eq!(evicted[0].block, BlockId(1));
+        assert!(!tree.contains(hashes[1]));
     }
 
     #[test]

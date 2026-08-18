@@ -106,7 +106,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PinnedHostSlice,
+    PushKernelArg,
 };
 
 use xabe_cuda::arena::ArenaError;
@@ -517,6 +518,15 @@ pub struct KvCache {
     max_seq: usize,
 }
 
+/// One attention layer's reusable prefix in page-locked host memory.
+pub(crate) struct HostKvPrefix {
+    pub k: PinnedHostSlice<u16>,
+    pub v: PinnedHostSlice<u16>,
+    pub positions: usize,
+    pub start: usize,
+    pub kv_dim: usize,
+}
+
 impl KvCache {
     /// Allocate a zeroed cache for `max_seq` positions of one attention layer.
     ///
@@ -563,6 +573,47 @@ impl KvCache {
     /// The cached values, same layout, not normed and not rotated.
     pub fn values(&self) -> &CudaSlice<u16> {
         &self.v
+    }
+
+    pub(crate) fn snapshot_range(
+        &self,
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        start: usize,
+        positions: usize,
+    ) -> Result<HostKvPrefix, DriverError> {
+        assert!(start <= positions);
+        assert!(positions <= self.max_seq);
+        let first = start * self.kv_dim;
+        let elements = (positions - start) * self.kv_dim;
+        // SAFETY: both allocations are immediately initialized by the two
+        // device-to-host copies before any host read is possible.
+        let mut k = unsafe { ctx.alloc_pinned::<u16>(elements)? };
+        let mut v = unsafe { ctx.alloc_pinned::<u16>(elements)? };
+        stream.memcpy_dtoh(&self.k.slice(first..first + elements), &mut k)?;
+        stream.memcpy_dtoh(&self.v.slice(first..first + elements), &mut v)?;
+        Ok(HostKvPrefix {
+            k,
+            v,
+            positions,
+            start,
+            kv_dim: self.kv_dim,
+        })
+    }
+
+    pub(crate) fn restore_prefix(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        prefix: &HostKvPrefix,
+    ) -> Result<(), DriverError> {
+        assert_eq!(prefix.kv_dim, self.kv_dim);
+        assert!(prefix.start <= prefix.positions);
+        assert!(prefix.positions <= self.max_seq);
+        let first = prefix.start * prefix.kv_dim;
+        let elements = (prefix.positions - prefix.start) * prefix.kv_dim;
+        stream.memcpy_htod(&prefix.k, &mut self.k.slice_mut(first..first + elements))?;
+        stream.memcpy_htod(&prefix.v, &mut self.v.slice_mut(first..first + elements))?;
+        Ok(())
     }
 }
 

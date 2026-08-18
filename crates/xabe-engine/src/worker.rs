@@ -9,21 +9,51 @@
 //! crosses PCIe on the decode path. What makes them one engine is the shared
 //! prefix tree above them, not any device-level coupling.
 //!
-//! # Not yet bound to a device
-//!
-//! This type currently owns the host-side half of a worker: the two-group
-//! cache pools and the scheduler. It records which GPU it is *for*
-//! ([`Worker::device_ordinal`]) but does not create a CUDA context, load
-//! weights, or launch anything. The device half arrives with the kernels.
+//! A worker is initially host-only so routing and admission tests need no GPU.
+//! [`Worker::bind_device`] installs the CUDA half: context, stream, resident
+//! weights, fixed serving shapes and per-request sequence states.
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use xabe_cache::config::{CacheConfig, CapacityReport};
 use xabe_cache::pool::BlockPool;
 use xabe_sched::config::SchedulerConfig;
 use xabe_sched::error::AdmissionError;
+use xabe_sched::ngram::NgramConfig;
+
+use xabe_model::ModelConfig;
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 use xabe_sched::scheduler::Scheduler;
 
 use crate::router::WorkerLoad;
+use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeError};
+use crate::state::SequenceSnapshot;
+
+#[derive(Debug)]
+pub enum WorkerExecutionError {
+    Runtime(RuntimeError),
+    Admission(AdmissionError),
+    NotBound,
+}
+
+impl core::fmt::Display for WorkerExecutionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Runtime(e) => write!(f, "{e}"),
+            Self::Admission(e) => write!(f, "{e}"),
+            Self::NotBound => write!(f, "worker has not been bound to its CUDA device"),
+        }
+    }
+}
+
+impl core::error::Error for WorkerExecutionError {}
+
+impl From<RuntimeError> for WorkerExecutionError {
+    fn from(value: RuntimeError) -> Self {
+        Self::Runtime(value)
+    }
+}
 
 /// Identifies a worker within the engine.
 ///
@@ -50,6 +80,16 @@ pub struct Worker {
     /// the attention page size. See `docs/CACHE.md`.
     gdn_pool: BlockPool,
     scheduler: Scheduler,
+    runtime: Option<DeviceRuntimeHandle>,
+    batch_scratch: BatchDescription,
+    pending: HashMap<RequestId, PendingSequence>,
+    vocab: Option<u32>,
+}
+
+struct PendingSequence {
+    request: NewRequest,
+    prompt: Vec<i32>,
+    snapshot: Option<Arc<SequenceSnapshot>>,
 }
 
 impl Worker {
@@ -70,6 +110,7 @@ impl Worker {
         let gdn_pool = BlockPool::new("gdn", cache.gdn_page_bytes(), gdn_slots);
         let scheduler = Scheduler::new(sched, attention_blocks);
 
+        let width = scheduler.config().max_concurrent_decodes() as usize;
         Self {
             id,
             device_ordinal,
@@ -77,6 +118,10 @@ impl Worker {
             attention_pool,
             gdn_pool,
             scheduler,
+            runtime: None,
+            batch_scratch: BatchDescription::with_capacity(width, width),
+            pending: HashMap::new(),
+            vocab: None,
         }
     }
 
@@ -158,13 +203,190 @@ impl Worker {
         self.scheduler.admit(req)
     }
 
+    /// Create the CUDA half of this worker and prebuild every decode width.
+    pub fn bind_device(
+        &mut self,
+        model_path: &Path,
+        model: ModelConfig,
+        prefill_chunk: usize,
+    ) -> Result<(), RuntimeError> {
+        let max_batch = self.scheduler.config().max_concurrent_decodes() as usize;
+        let drafts = self.scheduler.config().draft_tokens_per_step() as usize;
+        let history_capacity =
+            (self.attention_pool.total() * self.cache.attention_block_size()) as usize;
+        let ngram = (drafts > 0).then(|| {
+            NgramConfig::new(2, 4, drafts, history_capacity)
+                .expect("worker cache capacity exceeds the n-gram window")
+        });
+        let vocab = model.vocab_size;
+        self.runtime = Some(DeviceRuntimeHandle::spawn(
+            self.device_ordinal,
+            model_path.to_path_buf(),
+            model,
+            prefill_chunk,
+            max_batch,
+            ngram,
+            self.cache.gdn_retention_interval() as usize,
+        )?);
+        self.vocab = Some(vocab);
+        Ok(())
+    }
+
+    pub fn is_device_bound(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    /// Admit both scheduler metadata and the actual prompt token ids.
+    pub fn admit_tokens(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+    ) -> Result<RequestId, WorkerExecutionError> {
+        self.validate_pending(req, &prompt, None)?;
+        let id = self
+            .scheduler
+            .admit(req)
+            .map_err(WorkerExecutionError::Admission)?;
+        self.pending.insert(
+            id,
+            PendingSequence {
+                request: req,
+                prompt,
+                snapshot: None,
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn admit_tokens_restored(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        snapshot: Arc<SequenceSnapshot>,
+    ) -> Result<RequestId, WorkerExecutionError> {
+        self.validate_pending(req, &prompt, Some(&snapshot))?;
+        let prefix = snapshot.position() as u32;
+        let id = self
+            .scheduler
+            .admit_with_prefix(req, prefix)
+            .map_err(WorkerExecutionError::Admission)?;
+        self.pending.insert(
+            id,
+            PendingSequence {
+                request: req,
+                prompt,
+                snapshot: Some(snapshot),
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn snapshot(&self, id: RequestId) -> Result<Arc<SequenceSnapshot>, WorkerExecutionError> {
+        self.runtime
+            .as_ref()
+            .ok_or(WorkerExecutionError::NotBound)?
+            .snapshot(id)
+            .map_err(WorkerExecutionError::Runtime)
+    }
+
     /// Advance one scheduling step.
     pub fn step(&mut self) -> BatchDescription {
         self.scheduler.step()
     }
 
+    /// Schedule and execute one live device step.
+    pub fn step_device(&mut self) -> Result<DeviceStep, WorkerExecutionError> {
+        self.scheduler.step_into(&mut self.batch_scratch);
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(WorkerExecutionError::NotBound)?;
+        for prefill in &self.batch_scratch.prefills {
+            if let Some(pending) = self.pending.remove(&prefill.id) {
+                match pending.snapshot {
+                    Some(snapshot) => {
+                        runtime.admit_restored(pending.request, pending.prompt, snapshot)?
+                    }
+                    None => runtime.admit(pending.request, pending.prompt)?,
+                }
+            }
+        }
+        let batch = std::mem::take(&mut self.batch_scratch);
+        let mut step = self
+            .runtime
+            .as_ref()
+            .expect("runtime was checked above")
+            .execute(batch)
+            .map_err(WorkerExecutionError::Runtime)?;
+        for decode in &step.scheduled.decodes {
+            let emitted = step
+                .generated
+                .iter()
+                .filter(|(id, _)| *id == decode.id)
+                .count() as u32;
+            if emitted > 1 {
+                self.scheduler.advance_speculative(decode.id, emitted - 1);
+            }
+        }
+        for &id in &step.completed {
+            self.scheduler.finish_request(id);
+        }
+        let decode_items = step.scheduled.decodes.len();
+        let prefill_items = step.scheduled.prefills.len();
+        self.batch_scratch = std::mem::take(&mut step.scheduled);
+        Ok(DeviceStep {
+            decode_items,
+            prefill_items,
+            generated: step.generated,
+            completed: step.completed,
+            stopped: step.stopped,
+            retained: step.retained,
+        })
+    }
+
+    fn validate_pending(
+        &self,
+        req: NewRequest,
+        prompt: &[i32],
+        snapshot: Option<&SequenceSnapshot>,
+    ) -> Result<(), WorkerExecutionError> {
+        let vocab = self.vocab.ok_or(WorkerExecutionError::NotBound)?;
+        if self.pending.contains_key(&req.id)
+            || self.scheduler.is_waiting(req.id)
+            || self.scheduler.is_running(req.id)
+        {
+            return Err(RuntimeError::DuplicateRequest(req.id).into());
+        }
+        if prompt.len() != req.prompt_tokens as usize {
+            return Err(RuntimeError::PromptLength {
+                declared: req.prompt_tokens,
+                actual: prompt.len(),
+            }
+            .into());
+        }
+        if let Some(&token) = prompt
+            .iter()
+            .find(|&&token| token < 0 || token as u32 >= vocab)
+        {
+            return Err(RuntimeError::TokenOutOfRange { token, vocab }.into());
+        }
+        if let Some(snapshot) = snapshot
+            && snapshot.position() > prompt.len()
+        {
+            return Err(RuntimeError::SnapshotPrefix {
+                snapshot: snapshot.position(),
+                prompt: prompt.len(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Release a completed request's reservations.
     pub fn finish(&mut self, id: RequestId) -> bool {
+        if let Some(runtime) = &self.runtime {
+            let _ = runtime.remove(id);
+        }
         self.scheduler.finish_request(id)
     }
 
@@ -182,6 +404,7 @@ impl core::fmt::Debug for Worker {
             .field("kv_utilization", &self.kv_utilization())
             .field("waiting", &self.scheduler.waiting_len())
             .field("running", &self.scheduler.running_len())
+            .field("device_bound", &self.is_device_bound())
             .finish()
     }
 }

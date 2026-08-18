@@ -11,24 +11,24 @@
 //! ([`Engine::prefix_tree`]). That last one is the project's only unqualified
 //! architectural claim — see `docs/ARCHITECTURE.md`.
 //!
-//! # Status
-//!
-//! Host-side only. Workers record which GPU they are for but do not yet create
-//! a CUDA context, load weights, or launch kernels. Everything here is
-//! deterministic and testable without a device, which is deliberate:
-//! scheduling and routing policy should be debuggable on a laptop.
+//! Workers retain a host-only construction path so scheduling and routing stay
+//! testable without CUDA. [`Worker::bind_device`] adds the serving runtime and
+//! [`Worker::step_device`] executes scheduler batches on that worker's card.
 
 pub mod block;
 pub mod engine;
 pub mod forward;
 pub mod router;
+pub mod runtime;
+pub mod speculative;
 pub mod state;
 pub(crate) mod viewslice;
 pub mod weights;
 pub mod worker;
 
-pub use engine::{Engine, Placement, PlacementError};
+pub use engine::{Engine, EngineExecutionError, Placement, PlacementError};
 pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
-pub use state::{SequenceState, StateError};
+pub use runtime::{DeviceRuntime, DeviceStep, RuntimeError};
+pub use state::{SequenceSnapshot, SequenceState, StateError};
 pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
-pub use worker::{Worker, WorkerId};
+pub use worker::{Worker, WorkerExecutionError, WorkerId};

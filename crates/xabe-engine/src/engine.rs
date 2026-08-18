@@ -5,16 +5,57 @@
 //! [`crate::router`] — below this layer, workers are entirely independent and
 //! never touch each other's device memory.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+use smallvec::SmallVec;
+
 use xabe_cache::config::CacheConfig;
-use xabe_cache::radix::{BlockHash, RadixTree};
+use xabe_cache::pool::BlockId;
+use xabe_cache::radix::{BlockHash, PrefixBlock, RadixTree};
+use xabe_model::ModelConfig;
 use xabe_sched::config::SchedulerConfig;
 use xabe_sched::error::AdmissionError;
 use xabe_sched::request::{NewRequest, RequestId};
 
 use crate::router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
-use crate::worker::{Worker, WorkerId};
+use crate::runtime::{DeviceStep, RuntimeError};
+use crate::state::SequenceSnapshot;
+use crate::worker::{Worker, WorkerExecutionError, WorkerId};
+
+#[derive(Debug)]
+pub enum EngineExecutionError {
+    Placement(PlacementError),
+    Worker {
+        worker: WorkerId,
+        source: WorkerExecutionError,
+    },
+    WorkerPanicked(WorkerId),
+    SnapshotNotRetained {
+        position: usize,
+        interval: u32,
+    },
+    MissingWorker(WorkerId),
+}
+
+impl core::fmt::Display for EngineExecutionError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Placement(e) => write!(f, "{e}"),
+            Self::Worker { worker, source } => write!(f, "{worker}: {source}"),
+            Self::WorkerPanicked(worker) => write!(f, "{worker} execution thread panicked"),
+            Self::SnapshotNotRetained { position, interval } => write!(
+                f,
+                "snapshot position {position} is not a {interval}-token retention boundary"
+            ),
+            Self::MissingWorker(worker) => write!(f, "{worker} does not exist"),
+        }
+    }
+}
+
+impl core::error::Error for EngineExecutionError {}
 
 /// Why a request could not be placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +108,10 @@ pub struct Engine {
     /// See `docs/ARCHITECTURE.md`.
     prefix_tree: Arc<RadixTree>,
     router: RouterConfig,
+    snapshots: Arc<RwLock<HashMap<BlockHash, Arc<SequenceSnapshot>>>>,
+    request_hashes: HashMap<(WorkerId, RequestId), Vec<BlockHash>>,
+    request_refs: HashMap<(WorkerId, RequestId), Vec<BlockHash>>,
+    max_prefix_nodes: usize,
 }
 
 impl Engine {
@@ -102,6 +147,10 @@ impl Engine {
             workers,
             prefix_tree,
             router,
+            snapshots: Arc::new(RwLock::new(HashMap::new())),
+            request_hashes: HashMap::new(),
+            request_refs: HashMap::new(),
+            max_prefix_nodes: attention_blocks_per_worker as usize,
         }
     }
 
@@ -138,7 +187,10 @@ impl Engine {
         // state — so prefill genuinely restarts at the snapshot. Scoring the
         // longer attention match would overstate the saving and route toward
         // a worker that cannot actually deliver it. See `docs/CACHE.md`.
-        let usable = matched.gdn_matched_tokens;
+        let usable = matched
+            .gdn_snapshot_hash
+            .filter(|hash| self.snapshots.read().contains_key(hash))
+            .map_or(0, |_| matched.gdn_matched_tokens);
         self.workers
             .iter()
             .map(|w| w.load_for(usable, req))
@@ -180,6 +232,172 @@ impl Engine {
             reusable_prefix_tokens: matched_tokens,
             score,
         })
+    }
+
+    /// Load one model replica on every worker's configured device.
+    pub fn bind_devices(
+        &mut self,
+        model_path: &Path,
+        model: ModelConfig,
+        prefill_chunk: usize,
+    ) -> Result<(), (WorkerId, RuntimeError)> {
+        for worker in &mut self.workers {
+            if let Err(error) = worker.bind_device(model_path, model.clone(), prefill_chunk) {
+                return Err((worker.id(), error));
+            }
+        }
+        Ok(())
+    }
+
+    /// Route and admit a request together with its tokenized prompt.
+    pub fn place_tokens(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        block_hashes: &[BlockHash],
+    ) -> Result<Placement, EngineExecutionError> {
+        let budget = self
+            .workers
+            .first()
+            .map(|worker| worker.scheduler().config().token_budget())
+            .unwrap_or(0);
+        let matched = self.prefix_tree.match_prefix(block_hashes);
+        let snapshot = matched
+            .gdn_snapshot_hash
+            .and_then(|hash| self.snapshots.read().get(&hash).cloned());
+        let loads = self.score_workers(&req, block_hashes);
+        let Routed {
+            worker,
+            score,
+            matched_tokens,
+        } = route(&self.router, &loads, req.prompt_tokens, budget)
+            .map_err(|error| EngineExecutionError::Placement(PlacementError::Routing(error)))?;
+        let request = if let Some(snapshot) = snapshot {
+            self.worker_mut(worker)
+                .expect("router returned an existing worker")
+                .admit_tokens_restored(req, prompt, snapshot)
+        } else {
+            self.worker_mut(worker)
+                .expect("router returned an existing worker")
+                .admit_tokens(req, prompt)
+        }
+        .map_err(|source| EngineExecutionError::Worker { worker, source })?;
+        self.request_hashes
+            .insert((worker, request), block_hashes.to_vec());
+        let referenced = matched_tokens as usize
+            / self
+                .worker(worker)
+                .expect("router returned an existing worker")
+                .cache_config()
+                .attention_block_size() as usize;
+        if referenced > 0 {
+            let hashes = block_hashes[..referenced].to_vec();
+            self.prefix_tree.incr_ref_chain(&hashes);
+            self.request_refs.insert((worker, request), hashes);
+        }
+        Ok(Placement {
+            worker,
+            request,
+            reusable_prefix_tokens: matched_tokens,
+            score,
+        })
+    }
+
+    /// Publish a worker's current retained state into the shared host cache.
+    pub fn publish_snapshot(
+        &mut self,
+        worker: WorkerId,
+        request: RequestId,
+        block_hashes: &[BlockHash],
+    ) -> Result<Arc<SequenceSnapshot>, EngineExecutionError> {
+        let source = self
+            .worker(worker)
+            .ok_or(EngineExecutionError::MissingWorker(worker))?;
+        let snapshot = source
+            .snapshot(request)
+            .map_err(|source| EngineExecutionError::Worker { worker, source })?;
+        self.install_snapshot(worker, Arc::clone(&snapshot), block_hashes)?;
+        Ok(snapshot)
+    }
+
+    fn install_snapshot(
+        &self,
+        worker: WorkerId,
+        snapshot: Arc<SequenceSnapshot>,
+        block_hashes: &[BlockHash],
+    ) -> Result<(), EngineExecutionError> {
+        let source = self
+            .worker(worker)
+            .ok_or(EngineExecutionError::MissingWorker(worker))?;
+        let position = snapshot.position();
+        let interval = source.cache_config().gdn_retention_interval();
+        if position == 0 || !(position as u32).is_multiple_of(interval) {
+            return Err(EngineExecutionError::SnapshotNotRetained { position, interval });
+        }
+        let blocks = position as u32 / source.cache_config().attention_block_size();
+        if block_hashes.len() < blocks as usize {
+            return Err(EngineExecutionError::SnapshotNotRetained { position, interval });
+        }
+        let prefix: Vec<PrefixBlock> = block_hashes[..blocks as usize]
+            .iter()
+            .enumerate()
+            .map(|(index, &hash)| PrefixBlock {
+                hash,
+                block: BlockId(index as u32),
+                gdn_snapshot: (index + 1 == blocks as usize).then_some(BlockId(0)),
+            })
+            .collect();
+        let leaf = prefix.last().expect("non-zero snapshot has a leaf").hash;
+        self.prefix_tree.insert(&prefix);
+        self.snapshots.write().insert(leaf, snapshot);
+        let excess = self.prefix_tree.len().saturating_sub(self.max_prefix_nodes);
+        if excess > 0 {
+            let evicted = self.prefix_tree.evict_unreferenced_entries(excess);
+            let mut snapshots = self.snapshots.write();
+            for entry in evicted {
+                snapshots.remove(&entry.hash);
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute one scheduler step on every device-bound worker concurrently.
+    pub fn step_devices(
+        &mut self,
+    ) -> Result<SmallVec<[(WorkerId, DeviceStep); 3]>, EngineExecutionError> {
+        let mut steps: SmallVec<[(WorkerId, DeviceStep); 3]> = std::thread::scope(|scope| {
+            let handles: SmallVec<[_; 3]> = self
+                .workers
+                .iter_mut()
+                .filter(|worker| worker.is_device_bound())
+                .map(|worker| {
+                    let id = worker.id();
+                    (id, scope.spawn(move || worker.step_device()))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|(worker, handle)| match handle.join() {
+                    Ok(Ok(step)) => Ok((worker, step)),
+                    Ok(Err(source)) => Err(EngineExecutionError::Worker { worker, source }),
+                    Err(_) => Err(EngineExecutionError::WorkerPanicked(worker)),
+                })
+                .collect::<Result<SmallVec<[_; 3]>, _>>()
+        })?;
+        for (worker, step) in &mut steps {
+            for (request, snapshot) in std::mem::take(&mut step.retained) {
+                if let Some(hashes) = self.request_hashes.get(&(*worker, request)) {
+                    self.install_snapshot(*worker, snapshot, hashes)?;
+                }
+            }
+            for request in &step.completed {
+                self.request_hashes.remove(&(*worker, *request));
+                if let Some(hashes) = self.request_refs.remove(&(*worker, *request)) {
+                    self.prefix_tree.decr_ref_chain(&hashes);
+                }
+            }
+        }
+        Ok(steps)
     }
 }
 

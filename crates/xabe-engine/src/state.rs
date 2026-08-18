@@ -49,11 +49,11 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaSlice, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, PinnedHostSlice};
 
 use xabe_model::config::ModelConfig;
 
-use crate::block::attention::{AttentionBlockError, KvCache};
+use crate::block::attention::{AttentionBlockError, HostKvPrefix, KvCache};
 use crate::block::gdn::{GdnBlock, GdnBlockError, GdnState};
 
 /// Something went wrong allocating or resetting sequence state.
@@ -65,6 +65,8 @@ pub enum StateError {
     Attention(AttentionBlockError),
     /// The driver rejected a clear.
     Driver(cudarc::driver::DriverError),
+    /// A host snapshot belongs to a different model geometry or is too long.
+    SnapshotShape,
 }
 
 impl std::fmt::Display for StateError {
@@ -73,6 +75,7 @@ impl std::fmt::Display for StateError {
             Self::Gdn(e) => write!(f, "Gated DeltaNet state: {e}"),
             Self::Attention(e) => write!(f, "key/value cache: {e}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
+            Self::SnapshotShape => write!(f, "prefix snapshot does not match sequence geometry"),
         }
     }
 }
@@ -121,6 +124,58 @@ pub struct SequenceState {
     /// claiming a position no cache was written for.
     d_position: CudaSlice<i32>,
     max_seq: usize,
+}
+
+struct HostGdnState {
+    conv: PinnedHostSlice<f32>,
+    recurrent: PinnedHostSlice<f32>,
+}
+
+/// A complete resumable prefix, stored in page-locked host memory.
+///
+/// Attention and GDN retain their natural geometries: attention contains only
+/// `position` prefix positions, while each GDN layer contains its fixed-size
+/// convolution and recurrent state. No group is padded to the other's size.
+pub struct SequenceSnapshot {
+    position: usize,
+    attention: Vec<HostKvPrefix>,
+    gdn: Vec<HostGdnState>,
+    next_token: Option<i32>,
+    parent: Option<Arc<SequenceSnapshot>>,
+}
+
+impl SequenceSnapshot {
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Target-model prediction produced after computing this exact prefix.
+    pub fn next_token(&self) -> Option<i32> {
+        self.next_token
+    }
+
+    pub(crate) fn set_next_token(&mut self, token: i32) {
+        self.next_token = Some(token);
+    }
+
+    pub fn attention_bytes(&self) -> usize {
+        let own: usize = self
+            .attention
+            .iter()
+            .map(|prefix| prefix.k.num_bytes() + prefix.v.num_bytes())
+            .sum();
+        own + self
+            .parent
+            .as_ref()
+            .map_or(0, |parent| parent.attention_bytes())
+    }
+
+    pub fn gdn_bytes(&self) -> usize {
+        self.gdn
+            .iter()
+            .map(|state| state.conv.num_bytes() + state.recurrent.num_bytes())
+            .sum()
+    }
 }
 
 impl SequenceState {
@@ -192,6 +247,78 @@ impl SequenceState {
         }
         self.position = 0;
         stream.memset_zeros(&mut self.d_position)?;
+        Ok(())
+    }
+
+    /// Copy the filled prefix and recurrent state into page-locked host RAM.
+    pub fn snapshot(
+        &self,
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        parent: Option<Arc<SequenceSnapshot>>,
+    ) -> Result<SequenceSnapshot, StateError> {
+        let start = parent.as_ref().map_or(0, |snapshot| snapshot.position);
+        if start > self.position {
+            return Err(StateError::SnapshotShape);
+        }
+        let mut attention = Vec::with_capacity(self.kv.len());
+        for cache in &self.kv {
+            attention.push(cache.snapshot_range(ctx, stream, start, self.position)?);
+        }
+        let mut gdn = Vec::with_capacity(self.gdn.len());
+        for state in &self.gdn {
+            // SAFETY: each pinned allocation is initialized by memcpy_dtoh
+            // before the snapshot is returned.
+            let mut conv = unsafe { ctx.alloc_pinned::<f32>(state.conv.len())? };
+            let mut recurrent = unsafe { ctx.alloc_pinned::<f32>(state.recurrent.len())? };
+            stream.memcpy_dtoh(&state.conv, &mut conv)?;
+            stream.memcpy_dtoh(&state.recurrent, &mut recurrent)?;
+            gdn.push(HostGdnState { conv, recurrent });
+        }
+        stream.synchronize()?;
+        Ok(SequenceSnapshot {
+            position: self.position,
+            attention,
+            gdn,
+            next_token: None,
+            parent,
+        })
+    }
+
+    /// Restore a snapshot created on this or another CUDA context.
+    pub fn restore(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        snapshot: &SequenceSnapshot,
+    ) -> Result<(), StateError> {
+        if snapshot.position > self.max_seq
+            || snapshot.attention.len() != self.kv.len()
+            || snapshot.gdn.len() != self.gdn.len()
+        {
+            return Err(StateError::SnapshotShape);
+        }
+        let mut chain = Vec::new();
+        let mut cursor = Some(snapshot);
+        while let Some(current) = cursor {
+            chain.push(current);
+            cursor = current.parent.as_deref();
+        }
+        for current in chain.into_iter().rev() {
+            for (cache, prefix) in self.kv.iter_mut().zip(&current.attention) {
+                cache.restore_prefix(stream, prefix)?;
+            }
+        }
+        for (state, host) in self.gdn.iter_mut().zip(&snapshot.gdn) {
+            if state.conv.len() != host.conv.len() || state.recurrent.len() != host.recurrent.len()
+            {
+                return Err(StateError::SnapshotShape);
+            }
+            stream.memcpy_htod(&host.conv, &mut state.conv)?;
+            stream.memcpy_htod(&host.recurrent, &mut state.recurrent)?;
+        }
+        self.position = snapshot.position;
+        stream.memcpy_htod(&[self.position as i32], &mut self.d_position)?;
+        stream.synchronize()?;
         Ok(())
     }
 

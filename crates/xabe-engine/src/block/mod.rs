@@ -32,4 +32,6 @@
 
 pub mod attention;
 pub mod gdn;
+pub mod gdn_verify;
 pub mod moe;
+pub mod mtp;
