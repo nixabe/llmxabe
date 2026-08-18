@@ -110,8 +110,10 @@ fn run_width(
             // become decode-ready before the steady-state window begins.
             max_output_tokens: WARMUP
                 + steps
-                + u32::try_from(context.div_ceil(PREFILL_CHUNK)).unwrap_or(u32::MAX)
-                + 2,
+                + u32::try_from(context.div_ceil(PREFILL_CHUNK))
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(width as u32)
+                + 16,
         };
         worker
             .admit_tokens(
