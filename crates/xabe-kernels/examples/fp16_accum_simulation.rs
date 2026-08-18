@@ -30,24 +30,66 @@
 //!
 //! Run: `cargo run --release -p xabe-kernels --example fp16_accum_simulation`
 //!
-//! ## Result (2026-08-18)
+//! ## Result, part 1 (2026-08-18): IID-random V holds, but that is not the
+//! ## regime that matters
 //!
-//! Holds with real margin at every depth from 512 to 131,072, at both
-//! rescale cadences, at the deepest row (three seeds at 131,072):
-//! fp16-accumulate max_abs error is ~1.2e-4-1.5e-4 against `MMA_GATE`'s
-//! 3.906e-3 -- about 26-30x headroom, not trending toward the gate as depth
-//! grows, and not materially different between an 8x-more-frequent rescale
-//! (our own kernel's tiling) and llama.cpp's own, wider one. The
-//! self-normalizing division at the end bounds it: the accumulator's
-//! absolute magnitude grows with the running softmax denominator, and both
-//! are divided out together, so a fp16 rounding's *relative* contribution
-//! to the final normalized output does not compound with depth or rescale
-//! frequency. This does not mean adopting fp16 accumulation is free of risk
-//! the model itself would not also need re-validating against
-//! (`forward_pass`'s golden logits, not just this differential gate) -- it
-//! means the differential gate alone is not the blocker. See "Two
-//! accumulators, one instruction set" in docs/BENCHMARKS.md for the
-//! decision this was reported for.
+//! With Q, K, **and V** independently random, this simulation holds with
+//! real margin at every depth from 512 to 131,072, at both rescale
+//! cadences: fp16-accumulate max_abs error is ~1.2e-4-1.5e-4 against
+//! `MMA_GATE`'s 3.906e-3, ~26-30x headroom. On the strength of that result
+//! the change was built on device (`attn_flash_causal_mma`'s `P V`
+//! accumulator switched to `half2`, confirmed against a standalone
+//! hardware probe that the `m16n8k8` f16-accumulate fragment layout this
+//! simulation assumed is exactly right) -- and it broke the codebase's own
+//! adversarial differential test,
+//! `device_attention_holds_the_softmax_normalizer_over_128k_dense_keys`,
+//! by 209x (max_abs 0.816 against `MMA_GATE`'s 3.906e-3), plus two nearer
+//! cosine-threshold failures at shallower depths. **This simulation's
+//! IID-random-V sweep did not test the regime that actually broke.**
+//!
+//! ## Result, part 2: the constant-V regime, added after the on-device failure
+//!
+//! `run_constant_v_at_depth` mirrors the failing test exactly: K stays
+//! random (so `Q K^T` scores, and the online-softmax rescales they drive,
+//! are real), but every key shares one value vector `c`, so the exact
+//! answer is `c` itself (softmax weights are a partition of unity). This
+//! reproduces the on-device failure directly: fp16-accumulate max_abs
+//! grows from 3.2e-2 at 8,192 keys to 2.6e-1 at 32,768 to **7.3e-1 at
+//! 131,072** -- the same order of magnitude as the kernel's own 0.816, and
+//! monotonically worse with depth rather than bounded, unlike the
+//! IID-random-V sweep above. Rescale cadence (8 vs 64) still does not
+//! matter (both give the same number to 3 significant figures at every
+//! depth); only depth and the coherence of what is being accumulated do.
+//!
+//! The mechanism: with V constant, the `P V` accumulator at every point in
+//! the loop is a scalar multiple of one fixed vector -- every dimension
+//! grows together rather than the independent, partially-self-canceling
+//! walk that IID random V produces. Growth between rescales is additive
+//! and unbounded in the number of terms folded in since the last rescale
+//! (bounded by depth, not by a constant); once the accumulator's magnitude
+//! is large enough relative to fp16's ~11-bit mantissa, further
+//! same-sized increments round away entirely rather than merely losing a
+//! few ULP. IID-random V's independent, largely-canceling per-dimension
+//! walk never grows an individual dimension's magnitude far enough above
+//! a typical increment for this to bite -- which is exactly why that
+//! sweep missed it. A random attention weight distribution over genuinely
+//! diverse values is the ordinary case; a long run of keys whose values
+//! are highly correlated (repetition, a dominant token, a near-uniform
+//! semantic region) is not a synthetic edge case a real model never
+//! produces.
+//!
+//! ## Disposition
+//!
+//! Rejected. The device kernel change was reverted in full
+//! (`attn_flash_causal_mma` is byte-identical to its pre-this-investigation
+//! state; `git diff` on `attention.rs` after the revert is empty). The
+//! register win was real and independently confirmed (252 -> 198
+//! registers, zero spill both before and after, via `nvcc -Xptxas -v` on
+//! the extracted `ATTENTION_SRC`) but is moot: a lever that funds a second
+//! lever by breaking the accuracy gate the second lever was supposed to
+//! stay inside of is not a lever. See "fp16 P V accumulation as a
+//! register lever: the register win was real, the accuracy gate was not"
+//! in docs/BENCHMARKS.md.
 
 use xabe_kernels::compare::compare;
 use xabe_kernels::f16::round_through_f16;
@@ -226,6 +268,60 @@ const LLAMA_CPP_CHUNK: usize = 64;
 /// pessimistic of the two real cadences to check.
 const OUR_KERNEL_CHUNK: usize = 8;
 
+/// Mirrors `device_attention_holds_the_softmax_normalizer_over_128k_dense_keys`
+/// (attention_differential.rs): Q and K random as before, but every key
+/// shares the SAME value vector `c`, so the analytic answer is `c` exactly
+/// (softmax weights sum to one). The on-device version of this exact test
+/// failed at fp16 accumulation (max_abs 0.816, ~209x over MMA_GATE) when
+/// the IID-random-V sweep above predicted a safe ~1.3e-4 -- run to find out
+/// whether this simulation reproduces that gap or the on-device failure has
+/// a different cause.
+fn run_constant_v_at_depth(seq_len: usize, seed: u64, chunk: usize) {
+    let mut rng = Xorshift64Star::new(seed);
+    let q: Vec<Vec<f32>> = (0..seq_len)
+        .map(|_| rng.vec_f32(HEAD_DIM, -1.0, 1.0))
+        .collect();
+    let k: Vec<Vec<f32>> = (0..seq_len)
+        .map(|_| rng.vec_f32(HEAD_DIM, -1.0, 1.0))
+        .collect();
+    let c = rng.vec_f32(HEAD_DIM, -1.0, 1.0);
+    let v: Vec<Vec<f32>> = (0..seq_len).map(|_| c.clone()).collect();
+
+    let t = seq_len - 1;
+    let qh: Vec<Vec<f32>> = q
+        .iter()
+        .map(|r| r.iter().map(|&x| f16(x)).collect())
+        .collect();
+    let kh: Vec<Vec<f32>> = k
+        .iter()
+        .map(|r| r.iter().map(|&x| f16(x)).collect())
+        .collect();
+    let vh: Vec<Vec<f32>> = v
+        .iter()
+        .map(|r| r.iter().map(|&x| f16(x)).collect())
+        .collect();
+
+    let baseline = tiled_row(&qh[t], &kh, &vh, t, false, chunk);
+    let fp16_accum = tiled_row(&qh[t], &kh, &vh, t, true, chunk);
+
+    let base_cmp = compare(&baseline, &c);
+    let fp16_cmp = compare(&fp16_accum, &c);
+    println!(
+        "seq_len={seq_len:>7} chunk={chunk:>3} constant-V: baseline max_abs={:.3e} cosine={:.9}  |  \
+         fp16-accum max_abs={:.3e} cosine={:.9}  |  MMA_GATE max_abs={:.3e}  {}",
+        base_cmp.max_abs_error,
+        base_cmp.cosine_similarity,
+        fp16_cmp.max_abs_error,
+        fp16_cmp.cosine_similarity,
+        MMA_GATE_MAX_ABS,
+        if fp16_cmp.max_abs_error <= MMA_GATE_MAX_ABS {
+            "HOLDS"
+        } else {
+            "BREACHES"
+        },
+    );
+}
+
 fn main() {
     println!(
         "Simulating attn_flash_causal_mma's P*V accumulator at fp16 (llama.cpp's Turing arithmetic)"
@@ -250,6 +346,16 @@ fn main() {
     ] {
         run_at_depth(seq_len, seed, LLAMA_CPP_CHUNK, "llama.cpp nbatch_fa=64");
         run_at_depth(seq_len, seed, OUR_KERNEL_CHUNK, "our MMA_KEY_TILE=8");
+    }
+
+    println!("\n--- constant-V scenario (matches the on-device test that failed) ---\n");
+    for &(seq_len, seed) in &[
+        (8_192usize, 0x0DE5_5E00u64),
+        (32_768, 0x0DE5_5E01),
+        (131_072, 0x0DE5_5E02),
+    ] {
+        run_constant_v_at_depth(seq_len, seed, LLAMA_CPP_CHUNK);
+        run_constant_v_at_depth(seq_len, seed, OUR_KERNEL_CHUNK);
     }
 }
 

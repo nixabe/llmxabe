@@ -7998,3 +7998,134 @@ work, and out of this workstream's own remit -- not a redo of anything
 already attempted here. Recorded with this reasoning attached so whoever
 picks it up next starts from the conclusion two sessions and two
 hypotheses already reached, instead of re-discovering it.
+
+## fp16 P V accumulation as a register lever: the register win was real, the accuracy gate was not (2026-08-18)
+
+The lead's chain, closing the previous section's loop: `MMA_KEY_TRIPS`
+widening is the direct barrier-density fix and it was already rejected on
+register spill; the fp16-`P V`-accumulate simulation just filed held
+`MMA_GATE` with 26-30x margin; an `m16n8k8` fp16 C-fragment is half the
+registers of the fp32 one. If switching `P V`'s accumulator funds the
+registers `MMA_KEY_TRIPS` needed and didn't have, that closes the gap
+this workstream spent two sections calling shut. Built in the prescribed
+order -- fp16 `P V` alone first, gated, before touching `MMA_KEY_TRIPS` at
+all.
+
+### The register win: real, and bigger than estimated
+
+`attn_flash_causal_mma`'s `P V` accumulator (`float o[MMA_MAXT][4]`)
+became `unsigned o[MMA_MAXT][2]`, two `half2`-packed registers per output
+tile instead of four floats, driven by a new
+`mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16` device function
+alongside the existing fp32-accumulate one (`Q K^T` untouched, still
+`f32.f16.f16.f32`, exactly as the lead specified). The fragment-layout
+assumption -- that the two-per-register packing halves the existing
+`(d0,d1,d2,d3)` -> `(d0=row g, d1=row g+8)` mapping cleanly -- was not
+taken on faith: a standalone probe kernel ran one `m16n8k8.f16` call with
+a known identity-like operand pair and printed every lane's `(d0.x, d0.y,
+d1.x, d1.y)` against the expected `D[g][2tig]`, `D[g][2tig+1]`,
+`D[g+8][2tig]`, `D[g+8][2tig+1]` -- exact agreement on all 32 lanes.
+`nvcc -Xptxas -v` on the resulting kernel:
+
+| | registers | spill |
+|---|---:|---:|
+| before (fp32 `P V`) | 252 | 0 |
+| after (fp16 `P V`) | **198** | 0 |
+
+54 registers freed, zero spill either side -- more than the lead's
+25-30 estimate, and comfortably enough to fund `MMA_KEY_TRIPS=2` (which
+the earlier reject measured needing headroom this kernel did not have at
+252).
+
+### The accuracy gate: broken, by 209x, on the codebase's own most adversarial test
+
+`cargo test --release -p xabe-engine --test attention_differential`
+against the unchanged `MMA_GATE` (3.906e-3): 3 of 9 failed.
+
+`device_attention_holds_the_softmax_normalizer_over_128k_dense_keys` --
+every key shares one value vector `c`, so the exact answer is `c` at any
+depth (softmax weights partition unity) -- measured `max_abs=0.816`,
+**209x over `MMA_GATE`**, cosine 0.9875 against a minimum of
+`1 - 1e-6`. `device_attention_matches_the_reference_at_a_128k_window`
+and `device_attention_matches_the_reference_for_a_mid_sequence_query_block`
+both failed on the `1 - 1e-6` cosine floor as well, at `max_abs` still
+under `MMA_GATE` (1.17e-3 and 3.07e-4) but the direction error large
+enough that both this file's tolerances -- not just one -- catch it.
+
+This directly contradicts the simulation this same session filed just
+above, which swept IID-random Q, K, *and* V from 512 to 131,072 keys and
+held with 26-30x margin throughout. The simulation was not wrong about
+its own inputs; it tested the wrong regime.
+
+### Root-caused, and reproduced on the host for zero more GPU time
+
+`crates/xabe-kernels/examples/fp16_accum_simulation.rs` gained a second
+sweep, `run_constant_v_at_depth`, mirroring the failing test exactly: K
+stays random (so `Q K^T` scores, and the real online-softmax rescales
+they drive, are unchanged), V is one fixed vector `c` for every key. This
+reproduces the failure directly, at the same order of magnitude as the
+device kernel, and growing with depth rather than bounded:
+
+| keys | fp16-accumulate max_abs | vs `MMA_GATE` (3.906e-3) |
+|---:|---:|---:|
+| 8,192 | 3.2e-2 | 8.1x over |
+| 32,768 | 2.6e-1 | 67x over |
+| 131,072 | **7.3e-1** | **187x over** |
+
+Within an order of magnitude of the real kernel's 0.816 at the same
+depth, and monotonically worse with depth -- the IID-random-V sweep's
+error, by contrast, did not trend with depth at all. Rescale cadence (8
+vs 64, the two widths swept in the first sweep) makes no difference here
+either: both give the same number to 3 significant figures at every
+depth, ruling out tile width as the variable that matters.
+
+The mechanism: with V constant, `P V`'s running accumulator is a scalar
+multiple of one fixed vector at every point in the loop -- every
+dimension grows together, rather than the independent, largely
+self-canceling walk that IID-random V produces (a positive contribution
+in one dimension and a negative one in another, most of the time). Growth
+between two rescales is purely additive, and unbounded in the number of
+terms folded in since the last one -- bounded by how long the running max
+goes unchanged, not by a fixed constant. Once the accumulator's magnitude
+is large enough relative to fp16's 11-bit mantissa, further
+similarly-sized increments round away entirely rather than losing a few
+ULP each. IID-random V never drives an individual dimension's magnitude
+far enough past a typical increment for this to bite within 131,072 keys,
+which is exactly why the first sweep missed it -- and a long run of keys
+whose values are highly correlated (repetition, a dominant token, a
+near-uniform semantic region of a real sequence) is not a synthetic edge
+case a real model never produces; it is closer to the ordinary case than
+the IID-random baseline is.
+
+### Disposition
+
+Rejected. `attn_flash_causal_mma` was reverted to fp32 `P V`
+accumulation in full -- `git diff` on `attention.rs` after the revert is
+empty, byte-identical to the tree before this section's investigation
+started. The register win (252 -> 198, zero spill both sides) is real and
+independently confirmed via an isolated fragment-layout probe plus
+`ptxas`, but it does not ship: a lever that funds `MMA_KEY_TRIPS` by
+breaking the accuracy gate `MMA_KEY_TRIPS` was supposed to land inside of
+is not a lever. `MMA_KEY_TRIPS` was not attempted on top of it, per the
+lead's own stated order (fp16 `P V` gated first) and per AGENTS.md's
+accuracy gate being non-negotiable regardless of what performance case
+exists on the other side of it.
+
+### What this leaves
+
+Both mechanisms this workstream and worker-3's decode-side investigation
+have named for 131,072 are now closed on evidence, not assumption:
+`MMA_KEY_TRIPS` widening on register spill (two sections up), and now
+fp16 `P V` accumulation -- real registers, but on the accuracy side of
+the gate rather than funding a path around it -- joins it. The
+barrier-density gap against `fattn-mma-f16.cuh` (previous section) stands
+as understood and unclosed by anything this workstream has tried. No
+further named lever remains for 131,072 without either a structural,
+register-neutral rewrite of the kernel's synchronization pattern, or a
+fp16-accumulate design that specifically defends against the coherent-V
+regime (e.g. an unconditional periodic renormalization independent of
+whether a new max was found, paid for in extra rescale instructions
+rather than gated correctness) -- named here, not attempted, since
+inventing and verifying a new numerical safeguard against a failure mode
+just discovered is a materially different, larger task than the one this
+section was asked to complete.
