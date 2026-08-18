@@ -8129,3 +8129,156 @@ rather than gated correctness) -- named here, not attempted, since
 inventing and verifying a new numerical safeguard against a failure mode
 just discovered is a materially different, larger task than the one this
 section was asked to complete.
+
+## Batch-vs-single-stream bit-identity, Phase A: a per-layer divergence audit, and no family measures zero (2026-08-18)
+
+The workstream the previous section's own §4 named as the one legal route
+back to the N=3 ceiling: make `run_batch_decode` bit-identical to three
+independent `run`/`replay_step` calls, per sequence, so a symmetric
+`mmvq`/dp4a activation-quantization scheme (the two dp4a sections above)
+would quantize genuinely identical inputs on both sides and could no
+longer fail `batch_decode`'s cross-path gate by construction. Phase A:
+find out *where* the ~1e-4-scale residual `batched_decode_agrees_with_
+independent_single_stream_decodes` already tolerates (8.6e-5 to 2.3e-4,
+measured against a 5e-3 bound) actually originates, before changing
+anything.
+
+### Instrumentation
+
+`Forward::run` and `Forward::run_batch_decode` had no way to read an
+intermediate hidden state at a finer grain than "after this layer's
+MoE" (`run`'s own `on_waypoint`) or "not at all" (`run_batch_decode` has
+no callback). Two new, diagnostic-only methods were added rather than a
+parameter on the existing ones: `run_with_stage_waypoints` and
+`run_batch_decode_with_stage_waypoints`, each a duplicate of `run`/
+`run_batch_decode`'s own loop, but calling `on_waypoint` after the
+layer's mixer (`WaypointStage::Mixer`, the buffer neither existing method
+ever exposes) as well as after MoE. Kept separate on purpose: `run`'s
+callback type is part of `forward_pass.rs`'s golden-test contract, and
+`body`/`body_batch_decode` are what `capture_step`/`capture_batch_step`
+record into a CUDA graph -- neither should have to carry a parameter that
+exists only for this audit. A new bin, `audit_batch_divergence`, drives
+both: batch(3) against three independent single-stream decodes, same
+synthetic-prompt generator `tests/batch_decode.rs` and `bench_decode_
+batch` already use, at context 2,048, three decode steps, comparing
+every layer's post-mixer and post-MoE hidden state, per sequence, via
+max-abs diff.
+
+### The table
+
+`layer -> family -> max_abs (worst of 3 steps x 3 sequences)`, `audit_
+batch_divergence` at context 2,048, `LLMXABE_STEPS=3` (default):
+
+```
+layer     family      stage      max_abs  at step   seq
+   -1      embed Embed      0.000e0        2     2
+    0        gdn Mixer     1.788e-7        1     0
+    0        moe Moe       1.788e-7        2     2
+    3  attention Mixer     7.153e-7        0     0
+    3        moe Moe       3.725e-7        0     0
+    7  attention Mixer     2.444e-6        1     0
+   11  attention Mixer     6.914e-6        2     2
+   15  attention Mixer     2.813e-5        1     0
+   18        gdn Mixer     4.756e-5        2     2
+   19  attention Mixer     6.416e-5        0     1
+   27  attention Mixer     1.922e-4        2     2
+   34        gdn Mixer     3.419e-5        2     2
+   34        moe Moe       1.111e-4        2     2
+   38        gdn Mixer     4.157e-5        2     1
+   38        moe Moe       2.213e-4        2     1
+   39  attention Mixer     2.098e-4        2     1
+   39        moe Moe       2.385e-4        2     1
+```
+
+(Full 82-row table -- every layer, both stages -- in the audit's own
+stdout; this is the subset that carries the argument. `embed` is a pure
+`get_rows` lookup with no arithmetic and measures exactly `0.000e0`, as
+expected -- the only family that does.)
+
+### Headline: growth from layer 1 to layer 40
+
+```
+      gdn: layer  0 = 1.788e-7   ->   layer 38 = 4.157e-5   (30 layers of this kind)
+attention: layer  3 = 7.153e-7   ->   layer 39 = 2.098e-4   (10 layers of this kind)
+      moe: layer  0 = 1.788e-7   ->   layer 39 = 2.385e-4   (40 layers of this kind)
+    embed: 0.000e0 (should be exactly 0.0 -- a pure lookup)
+```
+
+### What this rules out, and what it does not
+
+**Ruled out: a single culprit family.** None of the three measures
+`0.000e0`. Gated DeltaNet's *first* layer already disagrees at
+`1.788e-7` -- exactly `1.5x` `f32::EPSILON` (`1.1920929e-7`), the
+signature of one differently-contracted FMA, not an indexing bug --
+before MoE or Gated Attention have run at all. That number is not
+inferred, it is the direct confirmation of `batch_decode.rs`'s own
+module-doc reasoning: batch `N > 1` takes the tiled `gdn_proj_q8_0_t8`
+projection kernel, single-stream decode's `N == 1` step takes the
+untiled one, and "NVCC is free to make a different FMA-contraction
+choice for the same source expression when the surrounding loop shape
+differs." This audit is the first place that was measured layer by
+layer rather than only at the final logits.
+
+**Not ruled out, and evidenced against: a single dominant contributor
+further downstream.** Attention's per-layer jumps are visibly the
+largest of the three (`7.153e-7 -> 2.098e-4` over 10 layers, versus
+GDN's `1.788e-7 -> 4.157e-5` over 30, and MoE tracks close to whichever
+mixer fed it, not always above it -- e.g. layer 11 attention `6.914e-6`
+against that same layer's MoE `2.570e-6`, MoE *smaller*). But "largest
+of three nonzero contributors" is a different claim than "the only
+nonzero contributor," and layer 0's GDN number alone already rules out
+the latter. Attention warranting extra attention when it is unified is
+a reasonable prior *for effort allocation within Phase B*, not a license
+to unify only that one family and expect `batch_decode` to reach
+`0.000e0`.
+
+**Cross-check, not just a new number:** the final layer's MoE output
+(`2.385e-4`) lands almost exactly at the top of `batched_decode_agrees_
+with_independent_single_stream_decodes`'s own already-measured range for
+the final logits (`8.6e-5` to `2.3e-4`, recorded in that test's module
+docs and reproduced verbatim by the dp4a sections' `dp4a_enabled: false`
+A/B above). The audit's own methodology reproducing the number the gate
+test already reports, at the layer whose output feeds the final norm
+and LM head, is what makes the per-layer table trustworthy rather than
+an artifact of a different comparison.
+
+### What this means for Phase B's shape
+
+The plan this section executes named GDN and Attention as the two
+candidates and MoE as `bm1`/`narrow`-vs-`gemv`, "likely the same loop
+structure already" and expected to be the cheaper fix. This audit shows
+MoE is not free of the residual either -- it measures nonzero at layer 0
+and grows to the *largest* single number of the three by layer 39
+(`2.385e-4`, edging out attention's own `2.098e-4`) -- though the
+table's layer-11 counterexample above (MoE `2.570e-6` against attention
+`6.914e-6` at the same layer) means MoE is not simply "attention's
+number, slightly larger" either; it has its own, independent
+reduction-order dependence on `bm`, not purely inherited from its
+input's own residual. Reaching `batch_decode`'s `0.000e0` needs all
+three families -- Gated DeltaNet, Gated Attention, and MoE -- made
+reduction-order-identical between their batch and single-stream kernels,
+not the cheapest one alone with the other two left as "small enough to
+ignore": none of the three is small enough to ignore, they are just
+different sizes of the same kind of gap, and Phase B's per-family
+unification should track the residual after *each* family closes, not
+assume closing one clears the gate.
+
+### Gates, and what was and was not touched
+
+`batch_decode` 3/3, `forward_pass` golden 8/8 (including `the_forward_
+pass_reproduces_llama_cpps_logits_and_its_argmax`), `decode` 9/9,
+`graph_decode` 1/1 -- all unchanged and green, run both in the shared
+checkout before this work moved to its own worktree and again inside the
+worktree after the commit. No existing method's body was modified; both
+new methods are additive duplicates of `run`/`run_batch_decode`, so
+nothing gated by those two changed what it exercises. `cargo fmt --all
+-- --check` and `cargo clippy --workspace --all-targets` clean.
+`cuobjdump -sass` was not run this round -- nothing in this pass touches
+a kernel, only host-side loop duplication and a new diagnostic binary,
+so there is no kernel whose SASS could have changed.
+
+VRAM: 34.758 GiB peak of 47.27 GiB at context 2,048, batch 3 plus a
+single-stream decode-step pass and a prefill pass sharing the resident
+28.3 GiB MoE arena -- comfortably under the card's 48 GiB, same
+three-shapes-over-one-arena budget `tests/batch_decode.rs` already
+spends.
