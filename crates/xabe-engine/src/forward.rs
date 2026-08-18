@@ -26,7 +26,7 @@
 //! at 725 MiB per MoE layer that is 28.3 GiB of duplicate over 40 layers —
 //! the model, twice, on a 48 GiB card.
 //!
-//! Two things fix it here, and one is not fixed:
+//! Three things keep fixed-token shapes from duplicating model weights:
 //!
 //! - **Gated DeltaNet, the embedding, the final norm and the LM head take
 //!   [`crate::weights::ResidentTensor`] aliases.** Zero copy: the alias is the
@@ -42,12 +42,11 @@
 //!   copy of every tensor on the device — it is simply in 40 sets of
 //!   allocations rather than in the slab. All 40 layers stay resident and
 //!   nothing is re-uploaded per pass.
-//! - **Gated Attention still duplicates.** `GatedAttentionBlock::new` copies
-//!   through the host at construction and its scratch is private, so its ten
-//!   layers cost 289 MiB twice. That one is left standing rather than papered
-//!   over: it is bounded, it is measured by
-//!   [`ForwardReport::attention_duplicate_bytes`], and the fix is the same
-//!   `ResidentTensor` this file already uses for the other two shapes.
+//! - **Gated Attention weights and their split-layout int8 repacks are shared
+//!   across shapes.** The first shape still holds one copied set outside the
+//!   arena, measured by [`ForwardReport::attention_duplicate_bytes`]. A
+//!   reshape reuses that set and reports zero additional duplicate bytes;
+//!   kernels and scratch remain shape-local.
 //!
 //! # Prefill and decode are the same code
 //!
@@ -99,7 +98,8 @@ use xabe_model::config::{LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role};
 
 use crate::block::attention::{
-    AttentionBlockError, AttentionKernelSet, AttnScratch, GatedAttentionBlock, KvCache,
+    AttentionBlockError, AttentionKernelSet, AttentionLayerWeights, AttnScratch,
+    GatedAttentionBlock, KvCache,
 };
 use crate::block::gdn::{
     GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
@@ -420,8 +420,9 @@ pub struct ForwardReport {
     /// Not a duplicate: these roles are filtered out of the arena, so this is
     /// the model's only copy of them.
     pub moe_bytes: u64,
-    /// Bytes the ten Gated Attention blocks hold **in addition** to the
-    /// arena's copy of the same tensors.
+    /// Bytes this shape newly owns for Gated Attention **in addition** to the
+    /// arena's copy of the same tensors. A reshape reports zero because it
+    /// shares its donor's weights.
     ///
     /// This one is genuine duplication. See the module docs.
     pub attention_duplicate_bytes: u64,
@@ -621,6 +622,8 @@ pub struct Forward {
     layer_ops: LayerOpsKernels,
     gdn: GdnBlock,
     attention: Vec<GatedAttentionBlock>,
+    /// Shape-independent attention weights and lazy split-layout repacks.
+    attention_weights: Arc<Vec<Arc<AttentionLayerWeights>>>,
     /// One set of per-pass buffers for all ten attention layers. They run in
     /// sequence and nothing crosses a layer boundary, so ten private copies
     /// were ten times the per-token VRAM for no benefit. See [`AttnScratch`].
@@ -750,7 +753,7 @@ impl Forward {
         tokens: usize,
     ) -> Result<Self, ForwardError> {
         Self::build(
-            ctx, stream, file, directory, weights, config, tokens, None, None,
+            ctx, stream, file, directory, weights, config, tokens, None, None, None,
         )
     }
 
@@ -794,6 +797,7 @@ impl Forward {
             tokens,
             Some(Arc::clone(&self.moe_weights)),
             Some(Arc::clone(&self.gdn_int8)),
+            Some(Arc::clone(&self.attention_weights)),
         )
     }
 
@@ -808,8 +812,10 @@ impl Forward {
         tokens: usize,
         shared_moe: Option<Arc<Vec<MoeLayerWeights>>>,
         gdn_int8: Option<Arc<Vec<GdnLayerInt8>>>,
+        shared_attention: Option<Arc<Vec<Arc<AttentionLayerWeights>>>>,
     ) -> Result<Self, ForwardError> {
         let hidden = config.hidden_size as usize;
+        let owns_attention_weights = shared_attention.is_none();
         let vocab = config.vocab_size as usize;
         let (free_before, _) = xabe_cuda::arena::memory_info(ctx)?;
 
@@ -913,24 +919,57 @@ impl Forward {
             }
         };
 
-        // --- the 10 Gated Attention layers, which copy --------------------
+        // --- the 10 Gated Attention layers, shared across shapes ----------
         let attn_kernels = Arc::new(AttentionKernelSet::new(ctx, &config, tokens)?);
         let mut attention = Vec::new();
+        let mut shared_index = 0;
         for layer in 0..config.num_layers {
             if config.layer_kind(layer) != LayerKind::GatedAttention {
                 continue;
             }
-            attention.push(GatedAttentionBlock::new(
-                Arc::clone(&attn_kernels),
-                stream,
-                weights,
-                &config,
-                layer,
-                tokens,
-                rms_eps,
-                rope_theta,
-            )?);
+            let block = match &shared_attention {
+                Some(shared) => {
+                    let layer_weights = shared
+                        .get(shared_index)
+                        .expect("reshape attention weights match the model config");
+                    GatedAttentionBlock::from_shared(
+                        Arc::clone(&attn_kernels),
+                        stream,
+                        Arc::clone(layer_weights),
+                        &config,
+                        layer,
+                        tokens,
+                        rms_eps,
+                        rope_theta,
+                    )?
+                }
+                None => GatedAttentionBlock::new(
+                    Arc::clone(&attn_kernels),
+                    stream,
+                    weights,
+                    &config,
+                    layer,
+                    tokens,
+                    rms_eps,
+                    rope_theta,
+                )?,
+            };
+            attention.push(block);
+            shared_index += 1;
         }
+        debug_assert!(
+            shared_attention
+                .as_ref()
+                .is_none_or(|shared| shared_index == shared.len())
+        );
+        let attention_weights = shared_attention.unwrap_or_else(|| {
+            Arc::new(
+                attention
+                    .iter()
+                    .map(GatedAttentionBlock::shared_weights)
+                    .collect(),
+            )
+        });
 
         // One scratch for all ten of them: they run in sequence and nothing
         // crosses a layer boundary. Ten private copies cost 1.68 MB of VRAM
@@ -969,7 +1008,11 @@ impl Forward {
             },
         )?;
 
-        let attention_duplicate_bytes = attention_bytes(weights, &config);
+        let attention_duplicate_bytes = if owns_attention_weights {
+            attention_bytes(weights, &config)
+        } else {
+            0
+        };
         stream.synchronize()?;
         let (free_after, _) = xabe_cuda::arena::memory_info(ctx)?;
 
@@ -983,6 +1026,7 @@ impl Forward {
             layer_ops,
             gdn,
             attention,
+            attention_weights,
             attn_scratch,
             moe,
             lm_head,
@@ -1245,7 +1289,9 @@ impl Forward {
     /// threshold where that path engages — so the oracle gate alone would
     /// never exercise it. See `tests/int8_forward.rs`.
     ///
-    /// Frees about 1.43 GiB. Not reversible without rebuilding the pass.
+    /// Drops this shape's int8 handles. Shared attention repacks remain owned
+    /// by the model so sibling shapes keep their independent choice; this
+    /// shape cannot re-enable them without being rebuilt.
     ///
     /// Clears **both** mixers. Clearing only the Gated DeltaNet side would
     /// leave the ten Gated Attention layers on tensor cores in the supposed

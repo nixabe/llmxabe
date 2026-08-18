@@ -100,10 +100,11 @@
 //! `tokens = 19` and a decode block at `tokens = 1` write to and read from the
 //! same cache — which is what makes the second of those a continuation of the
 //! first rather than a separate sequence. The weights are aliases into the
-//! arena and are not duplicated either, so a second block shape costs only its
-//! own scratch, which at `tokens = 1` is negligible.
+//! A standalone block owns its copied weights. [`crate::forward::Forward`]
+//! shares those copies and their lazy split-layout repacks when it reshapes,
+//! so a second full-model shape adds only shape-local kernels and scratch.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PinnedHostSlice,
@@ -630,13 +631,7 @@ pub struct GatedAttentionBlock {
     rms_eps: f32,
     rope_theta: f32,
 
-    w_input_norm: CudaSlice<f32>,
-    w_q_norm: CudaSlice<f32>,
-    w_k_norm: CudaSlice<f32>,
-    w_qgate: CudaSlice<u8>,
-    w_k: CudaSlice<u8>,
-    w_v: CudaSlice<u8>,
-    w_out: CudaSlice<u8>,
+    weights: Arc<AttentionLayerWeights>,
 
     /// The four Q8_0 projections repacked into the split layout the integer
     /// tensor cores can load, plus the handle that drives them.
@@ -645,7 +640,23 @@ pub struct GatedAttentionBlock {
     /// quantization sweep over the activations and a grid quantized to 8-token
     /// tiles — that a short batch cannot amortize, and a decode step of one
     /// token would pay all of it to fill an eighth of a fragment.
-    int8: Option<AttnInt8>,
+    int8: Option<Arc<AttnInt8>>,
+}
+
+/// Shape-independent device weights for one Gated Attention layer.
+///
+/// The ordinary and split-layout copies are shared by every fixed-token
+/// shape. `int8` is populated while a shape is built, never in a forward
+/// pass, so lazy construction does not put an allocation on the hot path.
+pub(crate) struct AttentionLayerWeights {
+    w_input_norm: CudaSlice<f32>,
+    w_q_norm: CudaSlice<f32>,
+    w_k_norm: CudaSlice<f32>,
+    w_qgate: CudaSlice<u8>,
+    w_k: CudaSlice<u8>,
+    w_v: CudaSlice<u8>,
+    w_out: CudaSlice<u8>,
+    int8: Mutex<Option<Arc<AttnInt8>>>,
 }
 
 /// The per-pass buffers every Gated Attention layer needs, owned once.
@@ -811,6 +822,19 @@ struct AttnInt8 {
     out_s: CudaSlice<f32>,
 }
 
+fn shared_or_try_init<T, E>(
+    slot: &Mutex<Option<Arc<T>>>,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Result<Arc<T>, E> {
+    let mut cached = slot.lock().expect("attention repack mutex poisoned");
+    if let Some(value) = cached.as_ref() {
+        return Ok(Arc::clone(value));
+    }
+    let value = Arc::new(build()?);
+    *cached = Some(Arc::clone(&value));
+    Ok(value)
+}
+
 /// Which scratch buffer [`GatedAttentionBlock::quantize_activations`] reads.
 ///
 /// The quantizer needs `&mut self` for the destination and `&self` for the
@@ -880,6 +904,8 @@ impl GatedAttentionBlock {
     /// Drop this block's repacked int8 weights, forcing its four projections
     /// back to the fp32 kernels. See [`crate::forward::Forward::disable_tensor_cores`].
     pub fn disable_tensor_cores(&mut self) {
+        // Deliberately leave `weights.int8` intact: another shape may still
+        // use it, and disabling this block is a shape-local A/B decision.
         self.int8 = None;
     }
 
@@ -952,6 +978,18 @@ impl GatedAttentionBlock {
         rms_eps: f32,
         rope_theta: f32,
     ) -> Result<Self, AttentionBlockError> {
+        let shared = Arc::new(Self::load_weights(stream, weights, config, layer)?);
+        Self::from_shared(
+            kernels, stream, shared, config, layer, tokens, rms_eps, rope_theta,
+        )
+    }
+
+    fn load_weights(
+        stream: &Arc<CudaStream>,
+        weights: &DeviceWeights,
+        config: &ModelConfig,
+        layer: u32,
+    ) -> Result<AttentionLayerWeights, AttentionBlockError> {
         let a = config.attention;
         let hidden = config.hidden_size as usize;
         let head_dim = a.head_dim as usize;
@@ -975,22 +1013,58 @@ impl GatedAttentionBlock {
         let w_v = q8_0_weight(weights, stream, Role::AttnV, layer, &[h, kv_dim as u64])?;
         let w_out = q8_0_weight(weights, stream, Role::AttnOut, layer, &[q_dim as u64, h])?;
 
-        // Repack up front rather than lazily: the alternative is a first pass
-        // that allocates and launches five extra kernels mid-forward, which
-        // `AGENTS.md` rule 6 forbids and which would poison the first timed
-        // repetition of every benchmark.
+        Ok(AttentionLayerWeights {
+            w_input_norm,
+            w_q_norm,
+            w_k_norm,
+            w_qgate,
+            w_k,
+            w_v,
+            w_out,
+            int8: Mutex::new(None),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_shared(
+        kernels: Arc<AttentionKernelSet>,
+        stream: &Arc<CudaStream>,
+        weights: Arc<AttentionLayerWeights>,
+        config: &ModelConfig,
+        layer: u32,
+        tokens: usize,
+        rms_eps: f32,
+        rope_theta: f32,
+    ) -> Result<Self, AttentionBlockError> {
+        let a = config.attention;
+        let hidden = config.hidden_size as usize;
+        let head_dim = a.head_dim as usize;
+        let q_heads = a.q_heads as usize;
+        let kv_heads = a.kv_heads as usize;
+        let q_dim = q_heads * head_dim;
+        let kv_dim = kv_heads * head_dim;
+
+        // Build on demand at shape construction, not on the hot path. The
+        // mutex makes concurrent reshape construction share the same repack.
         let int8 = if Self::uses_tensor_cores(tokens) {
-            Some(AttnInt8::repack(
-                stream.context(),
-                stream,
-                &w_qgate,
-                &w_k,
-                &w_v,
-                &w_out,
-                hidden * 2 * q_dim,
-                hidden * kv_dim,
-                q_dim * hidden,
-            )?)
+            Some(shared_or_try_init(&weights.int8, || {
+                let repacked = AttnInt8::repack(
+                    stream.context(),
+                    stream,
+                    &weights.w_qgate,
+                    &weights.w_k,
+                    &weights.w_v,
+                    &weights.w_out,
+                    hidden * 2 * q_dim,
+                    hidden * kv_dim,
+                    q_dim * hidden,
+                )?;
+                // Publish the cache entry only after its producing stream has
+                // finished. Concurrent shape construction may use another
+                // stream, which otherwise has no dependency on these writes.
+                stream.synchronize()?;
+                Ok::<_, AttentionBlockError>(repacked)
+            })?)
         } else {
             None
         };
@@ -1006,15 +1080,13 @@ impl GatedAttentionBlock {
             rope_dim: a.rope_dim as usize,
             rms_eps,
             rope_theta,
-            w_input_norm,
-            w_q_norm,
-            w_k_norm,
-            w_qgate,
-            w_k,
-            w_v,
-            w_out,
+            weights,
             int8,
         })
+    }
+
+    pub(crate) fn shared_weights(&self) -> Arc<AttentionLayerWeights> {
+        Arc::clone(&self.weights)
     }
 
     /// Which block this is.
@@ -1086,7 +1158,7 @@ impl GatedAttentionBlock {
         k.ops.rms_norm(
             stream,
             hidden_state,
-            &self.w_input_norm,
+            &self.weights.w_input_norm,
             &mut sc.normed,
             t,
             self.hidden,
@@ -1117,7 +1189,7 @@ impl GatedAttentionBlock {
             k.qgate.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_qgate,
+                    bytes: &self.weights.w_qgate,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.normed,
@@ -1135,7 +1207,7 @@ impl GatedAttentionBlock {
         k.ops.rms_norm(
             stream,
             &sc.query,
-            &self.w_q_norm,
+            &self.weights.w_q_norm,
             &mut sc.query_normed,
             t * self.q_heads,
             self.head_dim,
@@ -1172,7 +1244,7 @@ impl GatedAttentionBlock {
             k.kv.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_k,
+                    bytes: &self.weights.w_k,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.normed,
@@ -1182,7 +1254,7 @@ impl GatedAttentionBlock {
             k.kv.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_v,
+                    bytes: &self.weights.w_v,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.normed,
@@ -1195,7 +1267,7 @@ impl GatedAttentionBlock {
         k.ops.rms_norm(
             stream,
             &sc.key,
-            &self.w_k_norm,
+            &self.weights.w_k_norm,
             &mut sc.key_normed,
             t * self.kv_heads,
             self.head_dim,
@@ -1291,7 +1363,7 @@ impl GatedAttentionBlock {
             k.out.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_out,
+                    bytes: &self.weights.w_out,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.gated,
@@ -1394,7 +1466,7 @@ impl GatedAttentionBlock {
         k.ops.rms_norm(
             stream,
             hidden_state,
-            &self.w_input_norm,
+            &self.weights.w_input_norm,
             &mut sc.normed,
             t,
             self.hidden,
@@ -1423,7 +1495,7 @@ impl GatedAttentionBlock {
             k.qgate.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_qgate,
+                    bytes: &self.weights.w_qgate,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.normed,
@@ -1440,7 +1512,7 @@ impl GatedAttentionBlock {
         k.ops.rms_norm(
             stream,
             &sc.query,
-            &self.w_q_norm,
+            &self.weights.w_q_norm,
             &mut sc.query_normed,
             t * self.q_heads,
             self.head_dim,
@@ -1477,7 +1549,7 @@ impl GatedAttentionBlock {
             k.kv.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_k,
+                    bytes: &self.weights.w_k,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.normed,
@@ -1487,7 +1559,7 @@ impl GatedAttentionBlock {
             k.kv.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_v,
+                    bytes: &self.weights.w_v,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.normed,
@@ -1500,7 +1572,7 @@ impl GatedAttentionBlock {
         k.ops.rms_norm(
             stream,
             &sc.key,
-            &self.w_k_norm,
+            &self.weights.w_k_norm,
             &mut sc.key_normed,
             t * self.kv_heads,
             self.head_dim,
@@ -1606,7 +1678,7 @@ impl GatedAttentionBlock {
             k.out.forward(
                 stream,
                 QuantTensor {
-                    bytes: &self.w_out,
+                    bytes: &self.weights.w_out,
                     quant: ExpertQuant::Q8_0,
                 },
                 &sc.gated,
@@ -1816,5 +1888,22 @@ mod tests {
         assert_eq!(huge.grid_dim.0 as usize, ELEMENTWISE_MAX_GRID);
         assert!(small.grid_dim.0 <= huge.grid_dim.0);
         assert_eq!(small.block_dim.0 as usize, ELEMENTWISE_BLOCK);
+    }
+
+    #[test]
+    fn a_lazy_repack_is_built_once_and_shared() {
+        let slot = Mutex::new(None);
+        let first = shared_or_try_init(&slot, || Ok::<_, ()>(17)).unwrap();
+        let second = shared_or_try_init(&slot, || Ok::<_, ()>(99)).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*second, 17);
+    }
+
+    #[test]
+    fn a_failed_lazy_repack_can_be_retried() {
+        let slot = Mutex::new(None);
+        assert!(shared_or_try_init::<u32, _>(&slot, || Err("failed")).is_err());
+        let recovered = shared_or_try_init(&slot, || Ok::<_, &str>(23)).unwrap();
+        assert_eq!(*recovered, 23);
     }
 }
