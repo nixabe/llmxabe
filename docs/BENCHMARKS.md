@@ -7754,3 +7754,125 @@ distributions (outlier channels, exact-zero SwiGLU blocks) that the
 isolated test's `Xorshift64Star::vec_f32(-1.0, 1.0)` draw does not
 reproduce, and repeated-launch state in `iq`/`iq_scales` under real
 per-layer expert-selection churn rather than one clean call.
+
+### Follow-up: two named hypotheses, both tested directly, both closed
+
+The lead's read of the failure signature: `5.078e-1` on a `5e-3`-bounded
+comparison is not a precision gap, it is two paths taking different expert
+routes -- quantization noise (~1e-4/layer) compounding over forty layers
+until a marginal top-8 selection flips. Two mechanisms proposed, in order.
+
+**Hypothesis 1: asymmetric arithmetic.** The above section's diff wired
+`dp4a` into the `max_tokens == 1` GEMV branch only. `batch_decode`'s
+`batched_decode_agrees_with_independent_single_stream_decodes` compares a
+3-sequence batch step (`narrow`/`bm1`, still fp32) against independent
+`max_tokens == 1` single-stream steps (`dp4a`) -- fp32 arithmetic on one
+side, int8 on the other, which is not a fair differential regardless of
+whether either kernel has a bug. The predicted fix: wire the same `mmvq`
+scheme into the batch-side `narrow`/`bm1` kernels so both sides run
+identical arithmetic.
+
+Built it. `moe_expert_down_narrow_dp4a` replaces both `moe_expert_down_
+narrow` and `moe_expert_down_bm1` in one launch: no register-tiling (that
+question is this session's already-closed throughput one, not this pass's),
+just a `dp4a` dot product looped once per live row in a bucket, reading
+`iq`/`iq_scales` from `mma_quantize_rows_q8` -- reused unmodified from
+`down_mma`, which already produces exactly this int8-plus-fp32-scale row
+for every one of `sorted_capacity`'s slots -- rather than a new quantize
+kernel. Gated behind the same `dp4a_enabled` flag, `self.mma.is_some()`
+required in addition since the quantize call is a method on `MmaKernels`.
+
+Two new differentials before touching `batch_decode`, per the standing
+"gate before perf, gate before declaring the fix worked" rule:
+`device_grouped_forward_matches_the_reference_at_one_token_with_dp4a`
+(reused from the section above) and a new
+`device_grouped_forward_matches_the_reference_at_narrow_batch_width_with_
+dp4a` at `max_tokens = 4`, every token given the *same* router logits so
+every routed bucket lands at `bm == 4` -- read `bucket_live` back and
+assert some entry exceeds 1, so the test cannot silently degenerate to the
+`bm == 1` case the GEMV differential already covers. Both pass: `cosine=
+0.999981 max_abs=6.454e-5` at `N=4`, comfortably inside `ROUTED_MMA_GATE`.
+`moe_differential` 9/9.
+
+Bound derivation, not reuse by default, since the lead asked for one:
+`moe_quantize_slot0_q8` and `mma_quantize_rows_q8` are the same absmax/
+round-to-nearest math on the same one-scale-per-32-block layout, and
+`dp4a.s32.s32` and `mma.sync.s8.s8.s32` are both *exact* 32-bit integer
+accumulations of the same int8 operands -- dp4a is a four-lane-at-a-time
+version of the identical reduction, not a different rounding regime. The
+error source `ROUTED_MMA_GATE` was derived against (activation
+quantization noise, not accumulation) is the same magnitude by
+construction, so the bound carries over on that argument, not because it
+worked once already.
+
+`batch_decode` did not improve: `max_abs_diff` at step 0 seq 0 moved from
+`5.078e-1` (asymmetric) to `7.081e-1` (symmetric) -- slightly *worse*, not
+resolved, and failing at step 0 rather than drifting in across steps.
+`identical_prompts_in_one_batch_produce_bit_identical_rows` still held at
+exactly `0.000e0`. Hypothesis 1 predicted symmetry would close the gap at
+its unchanged `5e-3` bound; it did not move the gap in the right direction
+at all.
+
+**Hypothesis 2: graph-capture staleness** (the quantize launch running
+outside a captured graph, so replay reads stale activations). Ruled out
+structurally before running anything: `batched_decode_agrees_with_
+independent_single_stream_decodes` calls `Forward::run_batch_decode`,
+which issues plain uncaptured launches every step (`forward.rs`,
+`run_batch_decode` → `body_batch_decode`, no `begin_capture`). Graph
+capture only happens in `capture_batch_step`/`replay_batch_step`, exercised
+by the sibling test `a_captured_batch_step_generates_the_same_sequence_
+as_the_launch_path`, which passes both before and after this pass's diff.
+The failing comparison never touches a captured graph at all.
+
+**Causation re-confirmed, symmetry ruled out as the fix.** A second direct
+`dp4a_enabled` A/B on the now-symmetric diff: forced `false`, `batch_
+decode` reproduces clean `main`'s baseline exactly again (`8.6e-5` to
+`2.3e-4` across all nine step/sequence pairs, identical to the first
+section's own A/B). Forced back to `true`, the `7e-1`-scale failure
+returns. dp4a is still the cause -- both hypotheses named a *wiring* fix
+and neither wiring fix changed that.
+
+**What the evidence is now consistent with, not yet built or tested**:
+`main`'s own baseline comparison is not exactly `0.000e0` between a batch
+step and an independent single-stream step (`8.6e-5` to `2.3e-4`) — a
+real, harmless, pre-existing fp32 reduction-order difference between
+`GatedAttentionBlock`/`GdnBlock`'s batched-vs-single-stream kernels, well
+inside `5e-3`. Round-to-nearest int8 quantization is a discontinuous
+function of its input: an activation element sitting near a quantization
+bin's edge can flip to a different quantized code from an input
+perturbation far smaller than the bin width, and that flip is not a small
+error relative to the perturbation that caused it — it is a full step of
+`d`, injected into one element of one 32-block, that this session's own
+`ROUTED_MMA_GATE` derivation already treats as `d`-scale per occurrence
+rather than continuous. Forty layers deep, one such flip on a
+router-adjacent feature is what plausibly turns a `1e-4`-scale, harmless,
+already-present cross-path difference into the `5e-1`-scale routing-level
+divergence observed — and this reads as an argument for why making the
+*scheme* symmetric would not be expected to help: both compared paths
+still quantize two inputs that were never bit-identical to begin with, so
+symmetry of scheme does not buy symmetry of result when the scheme itself
+is a discontinuous function of a divergence that already existed. This is
+offered as the most evidence-consistent account of all three
+observations — isolated single-call passes, sustained serving fails,
+symmetry does not close it, no captured graph involved — not as a
+confirmed mechanism; it was not built or measured this pass, and doing so
+(instrumenting a specific element's quantized code across the
+batch/single-stream comparison to catch a bin flip directly) is future
+work, not a re-attempt of this lever without first deciding whether a
+quantization-based `mmvq` scheme is compatible with `batch_decode`'s
+existing bound at all.
+
+### Disposition (updated)
+
+Rejected again, reverted the same way (`git checkout -- crates/xabe-cuda/
+src/kernels/moe.rs crates/xabe-engine/tests/moe_differential.rs`, confirmed
+empty `git diff`, `moe_differential` 7/7 and `batch_decode` 3/3 both green
+on the clean tree). Both of the lead's named hypotheses were tested
+directly rather than argued from -- symmetric wiring built, gated through
+two new differentials before touching `batch_decode` at all, and measured
+worse, not better; graph capture ruled out from the call graph before a
+single kernel ran. The `mmvq`/`dp4a` lever for xabe's MoE decode closes
+for this session on that basis: the isolated-differential-passes,
+sustained-serving-fails signature survived a real fix attempt at the
+lead's own most-likely mechanism, which is stronger evidence against
+shipping it than the first section's reject alone was.
