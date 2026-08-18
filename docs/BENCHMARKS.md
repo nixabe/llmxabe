@@ -6824,3 +6824,144 @@ are live -- the unroll-pragma reject two sections back already ruled out
 the cheap version of that (register cliff from carrying the tiled
 fallback's frame), so a real fix likely needs the fallback path itself
 restructured, not just the dispatch around it. Not attempted this session.
+
+## The split-kernel design, re-tried on a precomputed `bm`: a real win this time, plus a `ptxas` allocator surprise the register math didn't see coming (2026-08-18)
+
+The previous section's own close named the cheap next experiment: re-test
+the lean `bm == 1` split against the `bucket_live` baseline, now that
+`bm` is a table read shared by both halves instead of something either one
+derives. Built as specified: `moe_expert_ffn_bm1`/`moe_expert_down_bm1`
+generalize `moe_expert_ffn_gemv`/`moe_expert_down_gemv`'s "assume slot 0"
+to "loop the block's sub-tiles, handle only the one where `bucket_live`
+says `bm == 1`"; `moe_expert_ffn_narrow`/`moe_expert_down_narrow` drop their
+`bm == 1` branch (`bm <= 1` now skips, same as `bm == 0` always did). The
+two partition every bucket's every sub-tile exactly once between them.
+
+### The bm1 kernels: no shared memory, no tiled fallback, one load and a clamp per sub-tile
+
+```c
+int bucket_bm = bucket_live[blk];
+for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+    int bm = bucket_bm - m0;
+    if (bm < 0) bm = 0;
+    if (bm > MOE_TM) bm = MOE_TM;
+    if (bm != 1) continue;
+    int flat = sorted_token_ids[(long long)blk * block_size + m0];
+    ...
+}
+```
+
+`bm == 1` means `bucket_bm == m0 + 1`: the bucket's whole live prefix ends
+one row into this sub-tile, so the live slot is always local index 0 --
+`tile_gemm_pair_direct1`/`tile_gemm_single_direct1` (which only ever touch
+index 0 of the pointer they are handed) take a one-element *register* array,
+not `moe_expert_ffn_narrow`'s `MOE_TM`-wide shared one. No `xabe_shared`
+tile, no `__syncthreads()`, no `tile_gemm_pair<TM>` fallback compiled in at
+all.
+
+### Blast radius: two new kernels, two modified, sixteen untouched
+
+`cuobjdump -sass` against the `bucket_live` tree (`2704b6a`) this section
+built on:
+
+| function | SASS |
+|---|---|
+| `moe_expert_ffn_bm1`, `moe_expert_down_bm1` | new |
+| `moe_expert_ffn_narrow`, `moe_expert_down_narrow` | differs (expected: `bm == 1` branch removed) |
+| every other of the 16 remaining kernels, including `moe_align_block_size` and all four `moe_expert_*_mma*` | byte-identical |
+
+### Registers: the target shape, and a surprise in the kernel that lost a branch
+
+`ptxas -v`, same standalone-extraction method as every register table in
+this file:
+
+| kernel | before (bucket_live) | after (split) |
+|---|---:|---:|
+| `moe_expert_ffn_bm1` | -- | 49 |
+| `moe_expert_down_bm1` | -- | 57 |
+| `moe_expert_ffn_narrow` | 79 | 100 |
+| `moe_expert_down_narrow` | 80 | 76 |
+
+The two new kernels land almost exactly on the shape this workstream has
+been chasing since the first split reject: 49 and 57 registers, `65536 /
+(256 * 57) = 4.5` -> 4 blocks/SM for the down half, the "56-58 reg / 4
+blocks/SM" target named three sections back. `moe_expert_down_narrow`
+improved on its own, 80 -> 76 -- removing a branch gave the allocator one
+fewer thing to reconcile and it used the room. `moe_expert_ffn_narrow` did
+the opposite: 79 -> 100, a full occupancy tier lost (`65536 / (256 * 100) =
+2.56` -> 2 blocks/SM, down from 3). Removing the same *kind* of branch from
+a near-identical sibling kernel moved the allocator's decision in opposite
+directions -- not something the register math from either split reject
+predicted, and not explainable from the source diff alone; `ptxas`'s
+allocator has already been shown once this project (the branch-inside-
+`tile_gemm_pair` regression, `moe_expert_ffn_mma`'s 80 -> 126 registers)
+to make decisions across a wider scope than the local control flow being
+edited suggests.
+
+`__global__ void __launch_bounds__(256, 3) moe_expert_ffn_narrow(...)`
+recovers it: 100 -> 80 registers, zero spill, matching this file's own
+established pattern (`moe_expert_ffn_mma`/`_narrow`'s dual-width split
+already uses `__launch_bounds__` the same way). `moe_expert_down_narrow`
+was left alone -- it was already at the same occupancy tier as before the
+split, and the hint would only clamp a value already under the cap.
+
+### Accuracy gates
+
+`cargo test --release -p xabe-engine --test moe_differential`: 7/7 both
+before and after the `__launch_bounds__` fix -- the differential test does
+not touch registers, so this is confirming the *partition* is correct
+(every dispatch table the test drives produces the same `inter`/`partial`
+whether a bucket's live row landed in `expert_ffn_bm1` or
+`expert_ffn_narrow`'s hands), not the occupancy claim, which the SASS
+extraction above is.
+`cargo test --release -p xabe-engine --test batch_decode`: 3/3 bit-exact,
+including the CUDA-graph-captured path -- two more launches per projection
+inside the capture, `identical_prompts_in_one_batch_produce_bit_identical_
+rows` still passes at zero max diff.
+Golden test unchanged.
+
+### Throughput: a real win at every narrow width, once the register regression was caught
+
+Interleaved A/B against the `bucket_live` baseline (`2704b6a`), same method
+as every throughput table in this file. First measured *before* the
+`__launch_bounds__` fix, then after, to see the fix's own effect:
+
+| N | context | before split (tok/s) | split, no fix | split + `__launch_bounds__` |
+|---:|---:|---:|---:|---:|
+| 2 | 2,048 | 109.9-111.5 | 114.6-115.2 | 114.7-115.5 |
+| 3 | 2,048 | 121.4-122.4 | 124.4-124.7 | 125.0-125.6 |
+| 4 | 2,048 | 138.9-139.8 | 139.9-140.1 (flat) | 141.5-142.2 |
+| 8 | 2,048 | 169.2-170.2 | 169.4-169.5 | 169.2-169.5 |
+| 2 | 32,768 | 89.2-89.8 | 91.9 | 91.9 |
+| 3 | 32,768 | 95.9-97.8 | 98.2-98.4 | 99.0-99.1 |
+| 4 | 32,768 | 107.7-108.0 | 108.0 (flat) | 109.1-109.2 |
+| 8 | 32,768 | 128.1 | 128.1 | 128.0 |
+
+Without the fix, N=4 -- the width where `moe_expert_ffn_narrow` (now
+running at 2 blocks/SM instead of 3) does the *most* work, since more of
+its buckets have `counts[e]` at 2, 3 or 4 rather than exactly 1 -- comes out
+flat: the bm1 kernel's win and the narrow kernel's regression roughly
+cancel. With the fix, every narrow width improves, by margins that grow
+with the register recovery's relative weight: +1.1% to +2.4% at N=4 (32,768
+and 2,048 respectively), up through +2.5% to +5.1% at N=2, where almost no
+bucket ever reaches the narrow kernel at all. N=8 stays flat at both
+contexts, exactly what byte-identical SASS on its own path predicts.
+
+This is a real, if uneven, win -- not the "down 31% -> 63%" the original
+split reject's occupancy math implied three sections ago. The bm1 kernels
+hit that occupancy target almost exactly (49/57 registers), but the
+combined kernel this section actually measures against is `moe_expert_ffn_
+narrow`/`moe_expert_down_narrow` doing the *rest* of the work, and that
+kernel's own occupancy barely moved (it was already at 3 blocks/SM, and the
+split plus the fix leaves it there, not higher). The deeper bandwidth gap
+the original section named -- 38.2%/31.0% against the GEMV kernels' own
+47%/63% -- is still not closed, because nothing here reduced bytes streamed
+per live row; this section only ever removed wasted `bm`-discovery work,
+first at the bucket level (the `bucket_live` table) and now again at the
+kernel-selection level (routing `bm == 1` to a kernel with no reason to
+carry the tiled fallback's registers).
+
+### Disposition
+
+Landed. Every measured width is flat or better, none regressed, and every
+accuracy gate is green with the fix applied.

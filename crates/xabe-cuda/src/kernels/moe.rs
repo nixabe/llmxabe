@@ -2110,7 +2110,18 @@ __global__ void moe_expert_ffn(
 // MOE_NARROW_DECODE_MAX`), a launch-time decision from a host-known value,
 // not a device readback -- unchanged from how `max_tokens == 1` already
 // picks `moe_expert_ffn_gemv` over both.
-__global__ void moe_expert_ffn_narrow(
+//
+// `__launch_bounds__(256, 3)` is a correction, not a tuning choice: removing
+// the `bm == 1` branch (now `moe_expert_ffn_bm1`'s) left only the tiled
+// path, and `ptxas`'s allocator responded by climbing from 79 to 100
+// registers with the branch gone -- fewer live ranges to reconcile at the
+// branch join, not fewer registers needed. 100 drops this kernel's own
+// occupancy a full tier (3 blocks/SM to 2), which was eating most of the
+// split's gain back on exactly the buckets (`bm` 2-4) this kernel still
+// owns. The hint caps it back at the pre-split 80 registers, zero spill,
+// confirmed by `ptxas -v` on the standalone extraction this session's
+// BENCHMARKS.md entry cites.
+__global__ void __launch_bounds__(256, 3) moe_expert_ffn_narrow(
     const unsigned char* __restrict__ gate_q, int gate_quant,
     const unsigned char* __restrict__ up_q,   int up_quant,
     const float* __restrict__ hidden_states,
@@ -2145,10 +2156,19 @@ __global__ void moe_expert_ffn_narrow(
         // what lets a wholly-empty sub-tile (every bucket's second one,
         // below `MOE_NARROW_DECODE_MAX`) skip both `__syncthreads()` below
         // rather than pay them to discover there is nothing to do.
+        //
+        // `bm == 1` is `moe_expert_ffn_bm1`'s alone now, not this kernel's:
+        // with `bm` a table read instead of a derivation, splitting the two
+        // cases into two kernels no longer means deriving `bm` twice -- see
+        // that kernel's own comment for why this is the same lever the
+        // split-kernel reject wanted, minus the cost that sank it. The two
+        // kernels partition every bucket's every sub-tile exactly once
+        // between them; skipping `bm <= 1` here is the other half of that
+        // partition.
         int bm = bucket_bm - m0;
         if (bm < 0) bm = 0;
         if (bm > MOE_TM) bm = MOE_TM;
-        if (bm == 0) continue;
+        if (bm <= 1) continue;
 
         __syncthreads();
         if (threadIdx.x < MOE_TM) {
@@ -2163,19 +2183,13 @@ __global__ void moe_expert_ffn_narrow(
 
         float ag[MOE_TM];
         float au[MOE_TM];
-        if (bm == 1) {
-            tile_gemm_pair_direct1(
-                gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
-                wrow, hidden, lane, live, ag, au);
-        } else {
 #define MOE_FFN_TILE_NARROW(TM) tile_gemm_pair<TM>(                          \
                 gate_q, gate_quant, up_q, up_quant, hidden_states, rows, xs, \
                 wrow, hidden, lane, live, ag, au)
-            if      (bm > 8) { MOE_FFN_TILE_NARROW(16); }
-            else if (bm > 2) { MOE_FFN_TILE_NARROW(8);  }
-            else             { MOE_FFN_TILE_NARROW(2);  }
+        if      (bm > 8) { MOE_FFN_TILE_NARROW(16); }
+        else if (bm > 2) { MOE_FFN_TILE_NARROW(8);  }
+        else             { MOE_FFN_TILE_NARROW(2);  }
 #undef MOE_FFN_TILE_NARROW
-        }
 
         if (live && lane == 0) {
             #pragma unroll
@@ -2186,6 +2200,85 @@ __global__ void moe_expert_ffn_narrow(
                         act * au[m];
                 }
             }
+        }
+    }
+}
+
+// `moe_expert_ffn_narrow`'s `bm == 1` half, pulled into its own entry point
+// now that `bucket_live` makes finding it a load and a clamp rather than a
+// populate-then-scan.
+//
+// This is the same lever the split-kernel reject two sections back tried
+// and lost: a `bm == 1`-only kernel needs none of the tiled fallback's
+// registers, so it can reach the standalone GEMV kernels' occupancy class
+// instead of `moe_expert_ffn_narrow`'s. What sank that attempt was not the
+// register math -- it landed within a register of this section's own
+// measurement -- it was that deriving `bm` a second time, by walking
+// `sorted_token_ids` and scanning for the sentinel a second time, cost more
+// than the leaner kernel saved, and that cost scaled with `grid.x`. With
+// `bm` a table read shared by both kernels, that second derivation does not
+// happen at all: this kernel and `moe_expert_ffn_narrow` each pay exactly
+// one load and one clamp per sub-tile, the same one `bucket_live`'s
+// predecessor already priced in.
+//
+// No shared memory, no `rows[]`/`xs` tile, no `tile_gemm_pair<TM>` fallback
+// compiled in at all: `tile_gemm_pair_direct1` only ever touches index 0 of
+// the pointer it is handed, so a one-element register array serves it
+// exactly as well as `moe_expert_ffn_narrow`'s `MOE_TM`-wide shared one did,
+// without `moe_expert_ffn_narrow`'s tiled dispatch dragging in registers
+// this kernel's own arithmetic never needs.
+//
+// grid/block/shared: identical to `moe_expert_ffn_narrow`'s own launch --
+// same `intermediate x expert_block_capacity` tiling, so the two share one
+// `LaunchConfig` on the host side.
+__global__ void moe_expert_ffn_bm1(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    int live = 1;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+    int bucket_bm = bucket_live[blk];
+
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        int bm = bucket_bm - m0;
+        if (bm < 0) bm = 0;
+        if (bm > MOE_TM) bm = MOE_TM;
+        if (bm != 1) continue;
+
+        // The only live slot in this sub-tile is local index 0: `bm == 1`
+        // means `bucket_bm == m0 + 1`, so the bucket's whole live prefix
+        // ends one row into this sub-tile, at global slot `m0`.
+        int flat = sorted_token_ids[(long long)blk * block_size + m0];
+        long long rows[1];
+        rows[0] = (long long)(flat / top_k) * hidden;
+
+        float ag[1];
+        float au[1];
+        tile_gemm_pair_direct1(
+            gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
+            wrow, hidden, lane, live, ag, au);
+
+        if (lane == 0) {
+            float act = ag[0] / (1.0f + expf(-ag[0]));
+            inter[((long long)blk * block_size + m0) * intermediate + r] = act * au[0];
         }
     }
 }
@@ -2534,11 +2627,12 @@ __global__ void moe_expert_down_narrow(
     for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
         // See `moe_expert_ffn_narrow`: `bm` is a precomputed load and a
         // clamp, so a fully-empty sub-tile skips both `__syncthreads()`
-        // rather than paying them to find that out.
+        // rather than paying them to find that out. `bm == 1` is
+        // `moe_expert_down_bm1`'s alone now, for the same reason.
         int bm = bucket_bm - m0;
         if (bm < 0) bm = 0;
         if (bm > MOE_TM) bm = MOE_TM;
-        if (bm == 0) continue;
+        if (bm <= 1) continue;
 
         __syncthreads();
         if (threadIdx.x < MOE_TM) {
@@ -2554,18 +2648,13 @@ __global__ void moe_expert_down_narrow(
         __syncthreads();
 
         float ad[MOE_TM];
-        if (bm == 1) {
-            tile_gemm_single_direct1(
-                down_q, down_quant, inter, rows, wrow, intermediate, lane, live, ad);
-        } else {
 #define MOE_DOWN_TILE_NARROW(TM) tile_gemm_single<TM>(                       \
                 down_q, down_quant, inter, rows, xs,                         \
                 wrow, intermediate, lane, live, ad)
-            if      (bm > 8) { MOE_DOWN_TILE_NARROW(16); }
-            else if (bm > 2) { MOE_DOWN_TILE_NARROW(8);  }
-            else             { MOE_DOWN_TILE_NARROW(2);  }
+        if      (bm > 8) { MOE_DOWN_TILE_NARROW(16); }
+        else if (bm > 2) { MOE_DOWN_TILE_NARROW(8);  }
+        else             { MOE_DOWN_TILE_NARROW(2);  }
 #undef MOE_DOWN_TILE_NARROW
-        }
 
         if (live && lane == 0) {
             #pragma unroll
@@ -2575,6 +2664,59 @@ __global__ void moe_expert_down_narrow(
                         partial, topk_weights, slot_flat[m], numel, hidden, h, ad[m]);
                 }
             }
+        }
+    }
+}
+
+// `moe_expert_down_narrow`'s `bm == 1` half, pulled out for the same reason
+// and the same way as `moe_expert_ffn_bm1` -- see that kernel's own comment
+// for the full account of why this is the split-kernel reject's own shape,
+// minus the doubled `bm`-derivation that sank it.
+//
+// grid/block/shared: identical to `moe_expert_down_narrow`'s own launch.
+__global__ void moe_expert_down_bm1(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    int live = 1;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+    int bucket_bm = bucket_live[blk];
+
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        int bm = bucket_bm - m0;
+        if (bm < 0) bm = 0;
+        if (bm > MOE_TM) bm = MOE_TM;
+        if (bm != 1) continue;
+
+        int flat = sorted_token_ids[(long long)blk * block_size + m0];
+        long long rows[1];
+        rows[0] = ((long long)blk * block_size + m0) * intermediate;
+
+        float ad[1];
+        tile_gemm_single_direct1(
+            down_q, down_quant, inter, rows, wrow, intermediate, lane, live, ad);
+
+        if (lane == 0) {
+            store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, ad[0]);
         }
     }
 }
@@ -3472,12 +3614,20 @@ pub struct MoeKernels {
     expert_ffn_gemv: CudaFunction,
     expert_down_gemv: CudaFunction,
     /// `1 < N <= MOE_NARROW_DECODE_MAX` batch-decode path: `moe_expert_ffn`'s
-    /// own body, `bm == 1` read directly instead of staged. A separate
-    /// compiled entry point from `expert_ffn`, not a runtime branch inside
-    /// it — see the CUDA source's own comment above `moe_expert_ffn_narrow`
-    /// for why a same-function branch was tried first and rejected.
+    /// own body, `bm > 1` only. A separate compiled entry point from
+    /// `expert_ffn`, not a runtime branch inside it — see the CUDA source's
+    /// own comment above `moe_expert_ffn_narrow` for why a same-function
+    /// branch was tried first and rejected. `bm == 1` is `expert_ffn_bm1`'s,
+    /// below: the two partition every dispatch bucket's every sub-tile
+    /// between them.
     expert_ffn_narrow: CudaFunction,
     expert_down_narrow: CudaFunction,
+    /// The `bm == 1` half `expert_ffn_narrow`/`expert_down_narrow` no longer
+    /// handle. See `moe_expert_ffn_bm1`'s own comment for why this is the
+    /// split-kernel reject's shape, re-tried once `bucket_live` removed the
+    /// cost that sank the first attempt.
+    expert_ffn_bm1: CudaFunction,
+    expert_down_bm1: CudaFunction,
     expert_ffn_mma: CudaFunction,
     expert_ffn_mma_q8: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
@@ -3603,6 +3753,8 @@ impl MoeKernels {
             expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
             expert_ffn_narrow: module.load_function("moe_expert_ffn_narrow")?,
             expert_down_narrow: module.load_function("moe_expert_down_narrow")?,
+            expert_ffn_bm1: module.load_function("moe_expert_ffn_bm1")?,
+            expert_down_bm1: module.load_function("moe_expert_down_bm1")?,
             expert_ffn_mma: module.load_function(if narrow {
                 "moe_expert_ffn_mma_narrow"
             } else {
@@ -4088,6 +4240,44 @@ impl MoeKernels {
             // no longer share one argument list -- see `bucket_live`'s own
             // comment on `moe_align_block_size`.
             if narrow {
+                // `expert_ffn_bm1` first: it and `expert_ffn_narrow` partition
+                // every bucket's every sub-tile by `bm` (1 vs >1), writing
+                // disjoint `inter` slots, so launch order between them does
+                // not affect the result -- this order just runs the cheap,
+                // no-shared-memory kernel before the one that needs
+                // `shared`. See `moe_expert_ffn_bm1`'s own comment.
+                let bm1_cfg = LaunchConfig {
+                    grid_dim: (
+                        (g.intermediate as u32).div_ceil(TILE_ROWS),
+                        g.expert_block_capacity() as u32,
+                        1,
+                    ),
+                    block_dim: (GEMM_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bm1_builder = stream.launch_builder(&self.expert_ffn_bm1);
+                bm1_builder
+                    .arg(gate.bytes)
+                    .arg(&gate_code)
+                    .arg(up.bytes)
+                    .arg(&up_code)
+                    .arg(hidden_states)
+                    .arg(&buffers.sorted_token_ids)
+                    .arg(&buffers.expert_ids)
+                    .arg(&buffers.bucket_live)
+                    .arg(&buffers.valid_tokens)
+                    .arg(&top_k)
+                    .arg(&block_size)
+                    .arg(&hidden)
+                    .arg(&intermediate)
+                    .arg(&mut buffers.inter);
+                // SAFETY: same bounds as `expert_ffn_narrow` below, minus the
+                // shared memory it does not use -- it never stages a tile,
+                // only ever reads `sorted_token_ids`/`hidden_states` at the
+                // one slot `bucket_live` already proved is this sub-tile's
+                // sole live row.
+                unsafe { bm1_builder.launch(bm1_cfg) }?;
+
                 let mut builder = stream.launch_builder(&self.expert_ffn_narrow);
                 builder
                     .arg(gate.bytes)
@@ -4247,6 +4437,39 @@ impl MoeKernels {
             // which `expert_down` does not, so (as for the ffn half above)
             // the two launches no longer share one argument list.
             if narrow {
+                // `expert_down_bm1` first, same partition-by-`bm` reasoning
+                // as the ffn half above. Both read `buffers.inter`, which the
+                // ffn launches above already fully populated for every live
+                // slot (their own partition covers it), and both write
+                // disjoint `partial` slots.
+                let bm1_cfg = LaunchConfig {
+                    grid_dim: (
+                        (g.hidden as u32).div_ceil(TILE_ROWS),
+                        g.expert_block_capacity() as u32,
+                        1,
+                    ),
+                    block_dim: (GEMM_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let mut bm1_builder = stream.launch_builder(&self.expert_down_bm1);
+                bm1_builder
+                    .arg(down.bytes)
+                    .arg(&down_code)
+                    .arg(&buffers.inter)
+                    .arg(&buffers.topk_weights)
+                    .arg(&buffers.sorted_token_ids)
+                    .arg(&buffers.expert_ids)
+                    .arg(&buffers.bucket_live)
+                    .arg(&buffers.valid_tokens)
+                    .arg(&top_k)
+                    .arg(&block_size)
+                    .arg(&hidden)
+                    .arg(&intermediate)
+                    .arg(&mut buffers.partial);
+                // SAFETY: same bounds as `expert_down_narrow` below, minus
+                // the shared memory it does not use.
+                unsafe { bm1_builder.launch(bm1_cfg) }?;
+
                 let mut builder = stream.launch_builder(&self.expert_down_narrow);
                 builder
                     .arg(down.bytes)
