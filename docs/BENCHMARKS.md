@@ -6965,3 +6965,30 @@ carry the tiled fallback's registers).
 
 Landed. Every measured width is flat or better, none regressed, and every
 accuracy gate is green with the fix applied.
+
+### Closing sweep: `N` 1-8, both contexts, on merged main (`145c675`)
+
+The full width sweep this workstream's brief asked for at the end,
+`single_stream` and `batch 1` included this time (both untouched by
+anything in this workstream -- `MOE_NARROW_DECODE_MAX` gates the narrow/
+bm1 kernels on `max_tokens > 1`):
+
+| N | 2,048 (tok/s) | 32,768 (tok/s) |
+|---:|---:|---:|
+| single_stream | 102.0 | 84.5 |
+| 1 | 101.7 | 83.9 |
+| 2 | 116.0 | 91.8 |
+| 3 | 126.4 | 99.2 |
+| 4 | 142.4 | 109.2 |
+| 8 | 169.7 | 128.2 |
+
+This closes the `bucket_live`/split-kernel workstream: `moe_align_block_
+size`'s new table and the two kernels reading it (`_narrow`, now `bm > 1`
+only, and the new `_bm1` pair) together took every `N` 2-4 width from the
+narrow-GEMV win's own baseline (the "MoE's small-bucket GEMV, take two"
+section) to the numbers above, in four dated sections each gated on the
+same suite (`moe_differential`, `batch_decode` bit-exact, golden) and each
+landed only once `cuobjdump -sass` confirmed everything outside its own
+stated blast radius stayed byte-identical. `N` 1 and 8 sit where they did
+before any of this work started, which is the other half of the same
+claim: the sessions never touched what they did not mean to.
