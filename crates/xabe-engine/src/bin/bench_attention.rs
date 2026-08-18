@@ -47,7 +47,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::CudaContext;
 use tracing::{error, info};
 
 use xabe_cuda::device::{DeviceInfo, driver_available};
@@ -71,6 +71,14 @@ fn chunk() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|c| *c > 0)
         .unwrap_or(DEFAULT_CHUNK)
+}
+
+fn concurrent_queries() -> usize {
+    std::env::var("LLMXABE_ATTN_CONCURRENT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0 && *n <= 3)
+        .unwrap_or(1)
 }
 
 /// `key_offset` values: the depth already cached when the chunk arrives.
@@ -105,7 +113,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         info.peak_bandwidth_gb_s(),
     );
 
-    let stream = ctx.default_stream();
+    let concurrent = concurrent_queries();
+    if concurrent > 1 {
+        // SAFETY: this benchmark owns the context and explicitly synchronizes
+        // every stream before reusing or dropping any allocation.
+        unsafe { ctx.disable_event_tracking() };
+    }
+    let mut streams = vec![ctx.default_stream()];
+    for _ in 1..concurrent {
+        streams.push(ctx.new_stream()?);
+    }
+    let stream = Arc::clone(&streams[0]);
     let kernels = AttentionKernels::new(&ctx, Q_HEADS, KV_HEADS, HEAD_DIM)?;
     // A/B levers for the tensor-core decode kernel against
     // `attn_flash_decode_warp`'s per-key online softmax, which `decode()`
@@ -119,13 +137,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         kernels.set_decode_mma_wpo(wpo);
     }
-    let mut dec = AttnDecodeScratch::new(&stream, Q_HEADS, HEAD_DIM)?;
+    let mut decs = streams
+        .iter()
+        .map(|stream| AttnDecodeScratch::new(stream, Q_HEADS, HEAD_DIM))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let chunk = chunk();
     let max_keys = DEPTHS[DEPTHS.len() - 1] + chunk;
     let kv_elems = max_keys * KV_HEADS * HEAD_DIM;
     info!(
-        "cache {:.2} GiB, chunk {chunk}, tensor cores: {}",
+        "cache {:.2} GiB, chunk {chunk}, concurrent queries {concurrent}, tensor cores: {}",
         (2 * kv_elems * size_of::<u16>()) as f64 / (1 << 30) as f64,
         kernels.uses_tensor_cores(chunk),
     );
@@ -141,10 +162,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|i| (0x3800 | (i % 1024)) as u16)
         .collect();
 
-    let q = stream.clone_htod(q_host.as_slice())?;
-    let k = stream.clone_htod(kv_host.as_slice())?;
-    let v = stream.clone_htod(kv_host.as_slice())?;
-    let mut out = stream.alloc_zeros::<f32>(chunk * Q_HEADS * HEAD_DIM)?;
+    let shared_cache = std::env::var_os("LLMXABE_ATTN_SEPARATE_CACHE").is_none();
+    let mut qs = vec![stream.clone_htod(q_host.as_slice())?];
+    let mut ks = vec![stream.clone_htod(kv_host.as_slice())?];
+    let mut vs = vec![stream.clone_htod(kv_host.as_slice())?];
+    for stream in streams.iter().skip(1) {
+        qs.push(stream.clone_htod(q_host.as_slice())?);
+        if !shared_cache {
+            ks.push(stream.clone_htod(kv_host.as_slice())?);
+            vs.push(stream.clone_htod(kv_host.as_slice())?);
+        }
+    }
+    let mut outs = streams
+        .iter()
+        .map(|stream| stream.alloc_zeros::<f32>(chunk * Q_HEADS * HEAD_DIM))
+        .collect::<Result<Vec<_>, _>>()?;
     drop(q_host);
     drop(kv_host);
 
@@ -155,40 +187,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for &depth in &DEPTHS {
-        let positions = stream.clone_htod([depth as i32].as_slice())?;
-        let launch = |stream: &Arc<CudaStream>,
-                      dec: &mut AttnDecodeScratch,
-                      out: &mut _|
-         -> Result<(), Box<dyn std::error::Error>> {
-            kernels.forward(
-                stream,
-                dec,
-                &q,
-                &k,
-                &v,
-                out,
-                chunk,
-                max_keys,
-                depth + chunk,
-                &positions,
-            )?;
-            Ok(())
-        };
+        let positions = streams
+            .iter()
+            .map(|stream| stream.clone_htod([depth as i32].as_slice()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         for _ in 0..WARMUP {
-            launch(&stream, &mut dec, &mut out)?;
+            for (index, (((stream, dec), out), position)) in streams
+                .iter()
+                .zip(&mut decs)
+                .zip(&mut outs)
+                .zip(&positions)
+                .enumerate()
+            {
+                let cache = if shared_cache { 0 } else { index };
+                kernels.forward(
+                    stream,
+                    dec,
+                    &qs[index],
+                    &ks[cache],
+                    &vs[cache],
+                    out,
+                    chunk,
+                    max_keys,
+                    depth + chunk,
+                    position,
+                )?;
+            }
         }
-        stream.synchronize()?;
+        for stream in &streams {
+            stream.synchronize()?;
+        }
 
         let start = Instant::now();
         for _ in 0..REPS {
-            launch(&stream, &mut dec, &mut out)?;
+            for (index, (((stream, dec), out), position)) in streams
+                .iter()
+                .zip(&mut decs)
+                .zip(&mut outs)
+                .zip(&positions)
+                .enumerate()
+            {
+                let cache = if shared_cache { 0 } else { index };
+                kernels.forward(
+                    stream,
+                    dec,
+                    &qs[index],
+                    &ks[cache],
+                    &vs[cache],
+                    out,
+                    chunk,
+                    max_keys,
+                    depth + chunk,
+                    position,
+                )?;
+            }
         }
-        stream.synchronize()?;
+        for stream in &streams {
+            stream.synchronize()?;
+        }
         let ms = start.elapsed().as_secs_f64() * 1e3 / REPS as f64;
 
         let (issued, minimum) = traffic(&kernels, depth, chunk);
-        let flops = causal_flops(depth, chunk);
+        let issued = issued * concurrent;
+        let minimum = minimum * concurrent;
+        let flops = causal_flops(depth, chunk) * concurrent as f64;
         info!(
             "{depth:>10}  {chunk:>8}  {ms:>9.3}  {:>9.1}  {:>9.3}  {:>8.3}  {:>8.2}",
             issued as f64 / (ms * 1e6),

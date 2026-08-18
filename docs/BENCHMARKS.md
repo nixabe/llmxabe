@@ -8892,3 +8892,28 @@ committed and then reverted; the tree remains on the fp32 routed-down path.
 The larger Q6_K gate/up dp4a candidate has the same activation-quantization
 risk plus more complicated weight arithmetic, so this result removes it from
 the immediate queue rather than licensing a larger experiment.
+
+## 2026-08-19 — Independent streams recover part of decode attention's N=3 serialization
+
+`bench_attention` gained a diagnostic `LLMXABE_ATTN_CONCURRENT=1..3` mode that
+launches one decode query on each of up to three CUDA streams. Three
+interleaved one-query/three-query pairs on GPU 0 produced:
+
+| context | one query ms | three concurrent ms | three sequential ms | concurrent saving |
+| ---: | ---: | ---: | ---: | ---: |
+| 32,768 | 0.304--0.305 | 0.746--0.753 | 0.912--0.915 | 17.4--18.5% |
+| 65,536 | 0.510--0.512 | 1.292--1.308 | 1.530--1.536 | 14.5--15.9% |
+| 131,072 | 0.920--0.926 | 2.403--2.442 | 2.760--2.778 | 12.1--13.5% |
+
+The default diagnostic shares one read-only K/V allocation across streams. A
+second three-run set with `LLMXABE_ATTN_SEPARATE_CACHE=1` used independent K/V
+allocations and measured 0.747--0.750 ms at 32K, 1.303--1.311 ms at 65K, and
+2.415--2.420 ms at 128K. The result is therefore generic concurrent issue and
+bandwidth utilization, not an L2 reuse result from sharing a cache pointer.
+
+Production batch decode still serializes the three per-sequence RoPE, append,
+and attention operations. Across ten attention layers, the isolated result
+puts the plausible 32K recovery near 1.5--1.7 ms per N=3 step. That is material
+but cannot by itself close the full 24--30% aggregate decode gap. Production
+multi-stream execution still needs exact N=1/N=3 and graph-capture gates before
+this diagnostic can be called an engine improvement.
