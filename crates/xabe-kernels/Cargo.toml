@@ -11,3 +11,7 @@ authors.workspace = true
 xabe-model.workspace = true
 half.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tracing.workspace = true
+xabe-log.workspace = true

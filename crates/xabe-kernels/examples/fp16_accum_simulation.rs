@@ -91,6 +91,7 @@
 //! register lever: the register win was real, the accuracy gate was not"
 //! in docs/BENCHMARKS.md.
 
+use tracing::info;
 use xabe_kernels::compare::compare;
 use xabe_kernels::f16::round_through_f16;
 use xabe_kernels::rng::Xorshift64Star;
@@ -241,7 +242,7 @@ fn run_at_depth(seq_len: usize, seed: u64, chunk: usize, label: &str) {
     let base_cmp = compare(&baseline, &reference);
     let fp16_cmp = compare(&fp16_accum, &reference);
 
-    println!(
+    info!(
         "seq_len={seq_len:>7} chunk={chunk:>3} ({label:<24}) baseline: max_abs={:.3e} cosine={:.9}  |  \
          fp16-accum candidate: max_abs={:.3e} cosine={:.9}  |  MMA_GATE max_abs={:.3e}  {}",
         base_cmp.max_abs_error,
@@ -306,7 +307,7 @@ fn run_constant_v_at_depth(seq_len: usize, seed: u64, chunk: usize) {
 
     let base_cmp = compare(&baseline, &c);
     let fp16_cmp = compare(&fp16_accum, &c);
-    println!(
+    info!(
         "seq_len={seq_len:>7} chunk={chunk:>3} constant-V: baseline max_abs={:.3e} cosine={:.9}  |  \
          fp16-accum max_abs={:.3e} cosine={:.9}  |  MMA_GATE max_abs={:.3e}  {}",
         base_cmp.max_abs_error,
@@ -323,14 +324,15 @@ fn run_constant_v_at_depth(seq_len: usize, seed: u64, chunk: usize) {
 }
 
 fn main() {
-    println!(
+    xabe_log::init_from_args();
+    info!(
         "Simulating attn_flash_causal_mma's P*V accumulator at fp16 (llama.cpp's Turing arithmetic)"
     );
-    println!("against the current fp32-accumulate baseline MMA_GATE (3.90625e-3) already gates.");
-    println!(
+    info!("against the current fp32-accumulate baseline MMA_GATE (3.90625e-3) already gates.");
+    info!(
         "Only the deepest query row is evaluated at each depth (O(seq_len), matches the worst case)."
     );
-    println!(
+    info!(
         "Two rescale cadences: llama.cpp's own nbatch_fa=64, and our kernel's narrower MMA_KEY_TILE=8.\n"
     );
 
@@ -348,7 +350,7 @@ fn main() {
         run_at_depth(seq_len, seed, OUR_KERNEL_CHUNK, "our MMA_KEY_TILE=8");
     }
 
-    println!("\n--- constant-V scenario (matches the on-device test that failed) ---\n");
+    info!("\n--- constant-V scenario (matches the on-device test that failed) ---\n");
     for &(seq_len, seed) in &[
         (8_192usize, 0x0DE5_5E00u64),
         (32_768, 0x0DE5_5E01),
