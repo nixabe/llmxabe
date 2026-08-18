@@ -17,6 +17,10 @@
 //! interval; the device gate rejects a heterogeneous fleet), so a preflight
 //! that successfully builds these types has checked them.
 
+mod http;
+mod tokenizer;
+
+use std::path::PathBuf;
 use tracing::{error, info, warn};
 use xabe_cache::config::CacheConfig;
 use xabe_cuda::{check_gate, device};
@@ -35,6 +39,9 @@ const TOTAL_CONTEXT: u32 = 393_216;
 const KV_ELEM_BYTES_F16: u64 = 2;
 /// Measured tensor-data size of `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`.
 const WEIGHTS_BYTES: u64 = (296 * (1024 * 1024 * 1024)) / 10;
+const DEFAULT_MODEL_PATH: &str =
+    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+const PREFILL_CHUNK: usize = 4096;
 
 /// Bytes as GiB, for display.
 fn gib(bytes: u64) -> f64 {
@@ -167,8 +174,9 @@ fn main() -> std::process::ExitCode {
 
     // 6. Engine. One worker per device, sharing one prefix tree.
     let attention_blocks = TOTAL_CONTEXT / cache.attention_block_size();
+    let attention_block_size = cache.attention_block_size() as usize;
     let ordinals: Vec<usize> = devices.iter().map(|d| d.ordinal).collect();
-    let engine = Engine::new(
+    let mut engine = Engine::new(
         &ordinals,
         cache,
         sched,
@@ -182,7 +190,39 @@ fn main() -> std::process::ExitCode {
         attention_blocks
     );
 
-    info!("\nPreflight passed. No HTTP surface yet — this engine cannot serve");
-    info!("requests. See README.md for what is and is not implemented.");
-    std::process::ExitCode::SUCCESS
+    let model_path = std::env::var_os("LLMXABE_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH));
+    info!("\nloading           {}", model_path.display());
+    if let Err((worker, failure)) = engine.bind_devices(&model_path, model, PREFILL_CHUNK) {
+        error!("worker {worker} failed to load: {failure}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let tokenizer = match tokenizer::from_gguf(&model_path) {
+        Ok(tokenizer) => tokenizer,
+        Err(failure) => {
+            error!("tokenizer        FAIL — {failure}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let address = std::env::var("LLMXABE_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".to_owned());
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(failure) => {
+            error!("runtime          FAIL — {failure}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(http::serve(
+        engine,
+        tokenizer,
+        attention_block_size,
+        &address,
+    )) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(failure) => {
+            error!("server           FAIL — {failure}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }

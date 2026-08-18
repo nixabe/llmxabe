@@ -19,3 +19,9 @@ xabe-cache.workspace = true
 xabe-sched.workspace = true
 xabe-engine.workspace = true
 xabe-cuda.workspace = true
+xabe-gguf.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.22"
