@@ -8755,3 +8755,51 @@ move `run` too -- that pairing is not what `batch_decode` gates.
 
 N=1 and N=3 decode throughput against llama.cpp were not
 re-measured. This commit does not move the head-to-head.
+
+## 2026-08-18 — The serving path runs on three cards without moving the N=3 bar
+
+The scheduler/runtime integration was exercised on three idle Quadro RTX
+8000s. `worker_smoke` completed at N=1, N=2, and N=3. The first
+`engine_smoke` rejected a real bug: three workers concurrently entering
+global CUDA graph capture invalidated worker 0's width-2 capture with
+`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`. Changing capture mode to
+thread-local is the correct ownership boundary because every context and
+stream permanently lives on its own runtime thread. After that change,
+`engine_smoke` completed nine sequences, placed exactly three on each card,
+and every worker executed the required two-decode plus one-prefill mixed
+step. `cross_worker_restore` also passed across two independent contexts;
+the restored and cold paths emitted exactly `[82, 198, 248045, 271]`.
+
+Decode was then re-measured on GPU 0 with a freshly rebuilt
+`bench_decode_batch`, 32 timed graph replays after four warmups. Three
+repetitions per context:
+
+| context | shape | aggregate tok/s, three runs | recorded 2026-08-18 baseline | result |
+| ---: | --- | --- | ---: | --- |
+| 2,048 | single stream | 101.1, 100.2, 100.4 | 101.3 | within 1.1% |
+| 2,048 | batch 3 | 143.6, 143.1, 143.0 | 145.3 | within 1.6% |
+| 32,768 | single stream | 82.5, 81.3, 80.8 | 82.5 | spread reaches -2.1% |
+| 32,768 | batch 3 | 106.9, 107.0, 106.7 | 107.0 | within 0.3% |
+
+An initial 2,048-token sweep printed 122.9--123.8 tok/s for batch 3. It was
+not a code result: `target/release/bench_decode_batch` had not been relinked
+after the always-repack change. Rebuilding the named binary restored
+143.0--143.6 tok/s. Record this reject because invoking an existing target
+binary directly does not ask Cargo whether it is stale.
+
+llama.cpp was measured three times on GPU 1 with its best decode flags:
+`-ngl 99 -sm none -fa on -b 4096 -ub 4096 -ctk f16 -ctv f16 -c 131072
+-npp 2048,32768 -ntg 32 -npl 1,3`.
+
+| context | N | llama.cpp tok/s, three runs | llmxabe median tok/s | median ratio |
+| ---: | ---: | --- | ---: | ---: |
+| 2,048 | 1 | 98.86, 98.59, 98.16 | 100.4 | 1.02x |
+| 2,048 | 3 | 188.40, 188.23, 187.14 | 143.1 | 0.76x |
+| 32,768 | 1 | 88.44, 88.23, 87.74 | 81.3 | 0.92x |
+| 32,768 | 3 | 153.67, 152.86, 153.10 | 106.9 | 0.70x |
+
+The serving work did not materially regress the isolated N=3 path. It also
+did not improve it: the same 24--30% aggregate-throughput loss to llama.cpp
+remains. The goal's N=3 performance criterion is therefore still open; the
+successful three-card serving acceptance is not evidence that the throughput
+gap closed.
