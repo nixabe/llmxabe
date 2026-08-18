@@ -8863,3 +8863,32 @@ warmups plus eight timed): `moe_expert_down_bm1` plus
 This is the evidence for retrying the previously gated Q8-activation/dp4a
 routed-down experiment symmetrically across N=1--3. It is not evidence that
 the retry will win; correctness gates run before timing.
+
+## 2026-08-18 — Symmetric Q8 activation still makes routed down width-dependent
+
+The profiled routed-down share above justified rebuilding the old dp4a idea
+after the upstream N=1/N=3 activations became bit-identical. The reattempt used
+one opt-in activation quantizer and one contraction kernel for decode widths
+one through three, with one fp32 scale per 32 activation values, signed codes
+clamped to `[-127, 127]`, byte-packed reads from Q8_0's 34-byte weight blocks,
+and the existing fp32 path retained as the default and fallback.
+
+The narrow GPU gate caught two implementation defects before the result: the
+first quantizer address omitted its lane, and fused N=1 dispatch does not
+publish `bucket_live`. After both were fixed, the exact cross-width gate still
+rejected the idea on GPU 2. With real layer-0 Q6_K gate/up and Q8_0 down
+weights, identical hidden activations and routing, the N=1 and N=3 down outputs
+were:
+
+| comparison | max abs | cosine | max output magnitude | result |
+| --- | ---: | ---: | ---: | --- |
+| dp4a N=1 vs N=3 | `4.397443e-5` | `0.999980` | `6.7609e-3` | **reject: not exact** |
+
+This is numerically inside `ROUTED_MMA_GATE`, but it fails the stricter gate
+required for a discontinuous quantizer: identical inputs must produce exactly
+the same codes, scales, and result at every serving width. No full decode or
+performance benchmark was run after that failure. The implementation was
+committed and then reverted; the tree remains on the fp32 routed-down path.
+The larger Q6_K gate/up dp4a candidate has the same activation-quantization
+risk plus more complicated weight arithmetic, so this result removes it from
+the immediate queue rather than licensing a larger experiment.
