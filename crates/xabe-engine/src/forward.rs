@@ -1177,7 +1177,11 @@ impl Forward {
         // and a copy from pageable host memory is not something a graph may
         // contain.
         self.publish_inputs(stream, state, &vec![0i32; self.tokens])?;
-        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+        // Workers capture concurrently on three dedicated runtime threads.
+        // Global mode lets unrelated CUDA work in either sibling thread
+        // invalidate this stream's capture; thread-local mode scopes that
+        // restriction to the worker that owns this context and stream.
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         // Whatever happens, the capture has to be closed before the error is
         // returned, or the stream stays in capture mode and every later launch
         // on it fails.
@@ -1592,7 +1596,10 @@ impl Forward {
                 .as_mut()
                 .expect("enabled batch decode has positions"),
         )?;
-        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)?;
+        // Each worker owns its stream on a dedicated OS thread, and all three
+        // workers may lazily capture a new batch width at the same time.
+        // Global capture mode makes those independent contexts interfere.
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
         let recorded = self.body_batch_decode(stream, states);
         let graph = stream.end_capture(
             sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
