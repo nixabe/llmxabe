@@ -7429,6 +7429,57 @@ llama.cpp identified in the previous section stays a named, understood,
 and now doubly-confirmed-expensive-to-close difference rather than a
 fixed one.
 
+### The complete ceiling, in one place
+
+Three sections' worth of measurement compose into a single argument for
+why llama.cpp's deep-decode advantage over this kernel does not close
+further without loosening `GATE`:
+
+1. **`Q K^T` at a single fp16 rounding of `Q`, not `q_hi`/`q_lo`, issues
+   keys at 2x this kernel's rate** (the instruction-diff section) --
+   forbidden outright: the naive single rounding is the exact change that
+   broke the 1e-5 gate at `n_keys = 61` the session this kernel was built,
+   which is why the split-precision trick exists at all.
+2. **`fp16` `VKQ` accumulation is what makes llama.cpp's barrier-free
+   per-warp design fit in Turing's register file.** Not a throughput
+   difference -- the ablation above measured `f16`- and `f32`-accumulate
+   `mma` within 0.4% of each other -- a *capacity* one: a `half2`
+   accumulator packs two logical values per 32-bit register where `float`
+   needs one each, so llama.cpp's full-`head_dim`, per-warp `VKQ_C` costs
+   half the registers this section's `o` did for the identical coverage.
+   That is very likely the specific difference between this section's
+   255-register, spilling attempt and llama.cpp's own shipped shape at
+   the same geometry, though this session did not build an `fp16`-
+   accumulate variant of `attn_flash_decode_mma` to confirm the exact
+   number -- the packing argument is register arithmetic, not a
+   measurement, and is included as reasoning rather than a fourth
+   ablation result. Building it was not attempted: `o` is decode's final
+   partial, written once to `part_acc` and read back by
+   `attn_flash_decode_combine`'s `expf`-weighted merge over however many
+   keys a whole split covers (up to thousands at 131,072 depth), and
+   `fp16`'s ~3 decimal digits of precision held across that many
+   `*= cg` rescalings is a real, untested risk against the same 1e-5 gate
+   `Q K^T`'s residual trick exists to satisfy -- unlike `Q K^T`, `P V` is
+   only accepted under the *looser* `MMA_GATE` when measured on its own,
+   but decode's gate is applied to the whole output, not per phase, and
+   `Q K^T`'s own error already consumes nearly all of the 1e-5 budget by
+   itself (1.11e-5 was the naive kernel's actual measured overshoot).
+3. **With `fp32` accumulators -- the only precision this session verified
+   decode can afford -- every route to llama.cpp's barrier structure this
+   file tried costs registers or shared-memory occupancy this card's
+   register file and 64 KiB carveout cannot both fund at once,** measured
+   shut from two directions in this section alone (255 registers with
+   spill one way, 1 block/SM the other) on top of the register wall the
+   two sections before it already hit from different starting points.
+
+Put together: deep decode's ceiling past `WPO=2`'s current 0.93x/0.88x/
+0.83x at 32K/65K/131K is a precision trade this project chose on purpose,
+not an engineering gap this session failed to close. Closing it further
+means deciding the 1e-5 gate is negotiable for decode the way it already
+is not for anything else in this file -- a project-level accuracy
+decision, not a kernel one, and out of scope for this workstream to make
+unilaterally.
+
 ## `fattn-mma-f16.cuh` at prefill's own geometry: precision ruled out twice over, barrier density confirmed and already blocked (2026-08-18)
 
 The lead's frame: does llama.cpp's `fattn-mma-f16.cuh` accumulate `Q K^T`
