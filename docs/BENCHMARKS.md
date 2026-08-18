@@ -7290,3 +7290,141 @@ of a precision tax. What does transfer: the fp16-vs-fp32-accumulate
 ablation above is architecture-level, not kernel-specific -- any Turing
 `m16n8k8` accumulator-width question this workstream or worker-1's has is
 answered by the same measurement, and does not need re-running per kernel.
+
+## Removing the per-trip cross-warp softmax round trip: built, measured on `ptxas` alone, and the register math the previous section flagged as the open question closes it (2026-08-18)
+
+The previous section named llama.cpp's independent-per-warp online softmax
+(register/shuffle state, merged once at the end) as a real, gate-safe
+structural lever, distinct from the `Q K^T` precision ceiling, left
+unbuilt for lack of session budget. Budget was extended specifically to
+build it. This section is the honest result of the most direct, literal
+realization of that design: it does not clear the register bar the
+previous section's own trap #3 named as the condition for it to be worth
+anything, and a second attempt at recovering the difference does not
+either -- both checked before spending a differential run on either.
+
+### The design, as specified
+
+Each of `WPO` warps keeps a disjoint 8-key octet for the *whole* split
+(the same octet index every trip, not re-split per trip) with private,
+register-resident `(m, l)` running softmax state instead of the block-
+shared `m_sh`/`l_sh`/`corr_sh` this file's earlier sections built.
+`s_sh` stays as the `Q K^T` -> softmax handoff (per the brief: "keeping
+the existing shared-memory score path within each warp's stripe"), just
+resized `8 * WPO` per row instead of `8` and scoped so only the owning
+warp ever touches its own slice -- the two `__syncthreads()` bracketing
+that handoff (after `Q K^T`, after the softmax write-back) become
+`__syncwarp()`, since no other warp depends on either write anymore. The
+two `__syncthreads()` around K/V staging are untouched -- that traffic is
+still genuinely cooperative across every warp and was never part of what
+this section targets.
+
+The consequence the brief's own trap #3 named directly: `P V` can no
+longer split by output dimension across warps (`dbase = warp * dpw`, the
+shipped kernel's own scheme) because that split needs every warp's octet
+visible in `s_sh` at once -- exactly the round trip being removed. Each
+warp instead reconstructs the *entire* `head_dim` output from its own
+octet alone, deferring the cross-warp merge to the very end. Reused rather
+than re-derived: instead of an in-kernel shared exchange merging `WPO`
+warps' partials, each warp writes its own raw `(o, m, l)` to its own
+virtual split index `split * WPO + warp`, and `attn_flash_decode_combine`
+-- given a new `n_splits` parameter in place of the hardcoded `DEC_SPLITS`
+-- merges `DEC_SPLITS * WPO` of them with the exact same log-sum-exp
+identity it already used to merge `DEC_SPLITS` block-level partials. No
+second copy of that algebra was written.
+
+### The register cost, checked with `nvcc -Xptxas -v` before anything else
+
+`o` is the cost the brief's trap named: covering the whole `head_dim`
+instead of `head_dim / WPO` grows it from `o[DMMA_MAXT_(WPO)][4]` (64
+registers at `WPO=2`, 32 at `WPO=4`) to `o[head_dim/8][4]` -- 128
+registers at *either* width, since it no longer depends on `WPO` once
+each warp's coverage is the full output:
+
+| variant | before this section | after (this design) |
+|---|---:|---:|
+| `WPO=2` | 252 registers, 0 spill | **255 registers, 120 B spill** (stores + loads) |
+| `WPO=4` | 235 registers, 0 spill | **255 registers, 104 B spill** |
+
+Both widths hit the 255-register hardware ceiling and spill -- not the
+16-56 B the earlier register-spill section fixed, but 104-120 B, 2-7x
+worse. Freeing `m_sh`/`l_sh`/`corr_sh`'s shared-address bookkeeping and
+the `oc` loop's removal did shave some registers back, per the trap's own
+prediction, but nowhere near the ~64-96 registers `o`'s growth cost at
+either width. This alone answers "verify the net": it is negative, and a
+kernel that hits 255 registers *with* spill is a worse starting point than
+the 252/235-register, 0-spill kernel currently shipped -- this file's own
+"Widening the softmax-rescale tile" and "Staging `Q` to shared" sections
+both already measured spilled variants of this kernel losing 30-40%,
+not a close call.
+
+### A second attempt, ruled out by arithmetic before touching `nvcc` again
+
+The obvious mitigation -- move `o` out of registers into a per-warp shared
+array, loading and storing around each `mma` call instead of holding all
+32 output-dim slots live at once -- was evaluated against the shared-
+memory budget before implementing it, the same "verify the arithmetic
+first" discipline the "Staging `Q` to shared" section used. `o` is
+per-*lane*, not per-warp (`mma`'s C fragment is distributed across a
+warp's 32 lanes), so a shared `o` needs `nthr * (head_dim/8) * 4` floats:
+at `WPO=2`, `64 * 32 * 4 * 4 B = 32,768 B`, on top of the existing
+~21,344 B for K/V staging, `s_sh`, and the resized `m_sh`/`l_sh`/
+`corr_sh` -- **~54,112 B total**, `65,536 / 54,112 = 1` block/SM. That is
+the exact occupancy-collapse mechanism this file has already measured
+twice as a loss: `WPO=4`'s 1-block/SM shape in the original split-
+precision-`Q` section, and the register-lever attempts in "Widening the
+softmax-rescale tile" and "Staging `Q` to shared" both explicitly traded
+away the 3-block/SM margin that makes `WPO=2` win at all. Trading a
+register spill for the same occupancy collapse those sections independently
+measured as a loss is not a second candidate worth building and
+re-measuring -- it is the first candidate's failure mode by a different
+route.
+
+### Correctness not checked, on purpose
+
+Neither variant was wired into the real kernel or run against
+`attention_differential`. Both already fail the performance bar the
+brief itself set ("the win only lands if you stay at 3 blocks/SM and 0
+spill") before reaching a differential test, and every prior section in
+this file that measured a spilled or occupancy-collapsed variant of this
+kernel measured a loss, not a coin flip -- spending a ~7-minute
+differential run to confirm the arithmetic of a design that cannot ship
+regardless of its answer is exactly the kind of unnecessary verification
+this project's own effort discipline argues against. `crates/xabe-cuda/src/kernels/attention.rs`
+is untouched (`git status` clean); every design in this section lived only
+in a scratchpad `.cu` extraction.
+
+### Disposition
+
+Not built. The literal design the brief specified is register-infeasible
+at this model's `head_dim=256`, `WPO in {2, 4}` geometry, and the direct
+mitigation is occupancy-infeasible by the same arithmetic this file has
+already used twice to reject other levers on this kernel. This is the
+"stop there" branch the brief's own closing bar names: one honest attempt
+at the literal design (255 registers, real spill, checked with `ptxas`),
+one honest evaluation of the direct mitigation (54 KB shared, 1 block/SM,
+checked by arithmetic against the same ceiling this file already
+calibrated), both negative before a differential run was worth spending.
+The last green state is unchanged: `attn_flash_decode_mma` at 7c7c180,
+`DECODE_MMA_DEPTH_THRESHOLD` at 16,384, `decode_mma`'s `Auto` dispatch
+unchanged. `attn_flash_decode_combine`'s hardcoded `DEC_SPLITS` loop bound
+was not touched either -- the `n_splits` parameter above was designed on
+paper as part of evaluating the register cost, not implemented in the
+shipped kernel, since the design it would have served does not clear the
+bar to ship.
+
+### What is actually left
+
+Both routes to removing the per-trip cross-warp round trip -- keep `P V`'s
+output-dim split and pay a real barrier (today's shipped shape), or drop
+it and pay either a register spill or a shared-memory occupancy collapse
+(this section) -- are now measured. A structural fix that keeps the
+output-dim split *and* avoids the barrier would need a way to move
+`WPO`'s worth of normalized `P` values between warps other than shared
+memory, which this architecture does not offer (`__shfl_sync` is strictly
+intra-warp; cross-warp exchange on Turing has no cheaper path than shared
+memory plus a block-wide sync). Absent a block-shape change bigger than
+this session's own bound allows, the barrier-density gap against
+llama.cpp identified in the previous section stays a named, understood,
+and now doubly-confirmed-expensive-to-close difference rather than a
+fixed one.
