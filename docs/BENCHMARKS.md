@@ -8419,6 +8419,50 @@ account, arrived at independently and on `main`, with no quantization
 involved at all -- the *routing* discontinuity is a live gap even
 without dp4a in the picture.
 
+### Why this retroactively explains the dp4a rejections, not just this session
+
+Restated plainly, because the lead flagged it as the strongest evidence
+yet for a decision this workstream already made on weaker grounds: **an
+ordinary top-8 routing flip, sourced from nothing but GDN's own
+~1e-5-scale batched-vs-single-stream reduction-order residual, already
+happens on `main` today, with no quantization, no dp4a, no int8
+anywhere in the picture.** The four-layer spike table above is not a
+hypothetical about what *would* happen if activations were quantized —
+it is measured, on the clean tree, right now.
+
+This is the same mechanism the dp4a sections diagnosed and named but
+could not fully confirm at the time: "the most evidence-consistent
+account of all three observations... not as a confirmed mechanism; it
+was not built or measured this pass." That gap is closed. dp4a's
+`5.078e-1`-to-`7.081e-1` blowups were never really about `dp4a`'s own
+int8 rounding being *inaccurate* — `moe_differential`'s isolated tests
+gated it at the same bound llama.cpp's own golden reference implies, and
+it passed. What actually broke `batch_decode` was that dp4a's rounding
+is a *second*, sharper discontinuity stacked on top of a *first*
+discontinuity (routing) that was already firing on its own, unquantized,
+for the reason this session's audit now shows directly. Making
+activation quantization symmetric between the batch and single-stream
+paths, which is what both dp4a follow-up attempts tried, could not have
+closed the gate: symmetric quantization of two already-non-identical
+inputs still quantizes two different things, and — this section's own
+finding — even *without* quantization at all, two non-identical inputs
+already select different experts often enough to spike the comparison
+by 2-5x at individual layers, forty layers deep enough to compound into
+the `5e-1`-scale failures dp4a produced.
+
+This is why `0.000e0`, not "small enough," is the only target that can
+ever make a discrete top-k decision — routing today, `mmvq`'s
+quantization codes if it is re-attempted after this workstream closes —
+safe to sit downstream of. Any nonzero residual, however small, is a
+standing invitation for *some* discontinuous decision somewhere in forty
+layers to flip on it; this section demonstrates that invitation is
+already being accepted, today, by routing alone. A future worker
+re-attempting `mmvq` after GDN and Attention reach `0.000e0` is not
+betting that quantization noise is "small enough" anymore — they are
+removing the raw material both discontinuities need, which this section
+is the first place in the record to show is necessary and not merely
+sufficient-in-theory.
+
 ### Disposition: no fix, a load-bearing negative result
 
 Nothing in `crates/xabe-cuda/src/kernels/moe.rs` or `crates/xabe-engine/
@@ -8456,8 +8500,7 @@ GDN itself (the lead's step 3, named "the hardest" and deliberately
 last) is now also, in effect, step 1: nothing downstream of it --
 including MoE's own milestone and, per worker-5's coordination note,
 a landing GDN-kernel change from a different workstream -- can reach
-its own milestone without it going first. This session stops here to
-report that back rather than unilaterally reordering a workstream
-another worker (worker-5) is also coordinating around, per the standing
-"report to the lead before proceeding" rule for exactly this kind of
-structural surprise.
+its own milestone without it going first. Reported to the lead rather
+than unilaterally reordering a workstream another worker (worker-5) is
+also coordinating around; reorder approved (2026-08-18), GDN next,
+attention projections after. The following section is that work.
