@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use xabe_cache::config::{CacheConfig, CapacityReport};
-use xabe_cache::pool::BlockPool;
+use xabe_cache::error::PoolExhausted;
+use xabe_cache::pool::{BlockId, BlockPool};
 use xabe_sched::config::SchedulerConfig;
 use xabe_sched::error::AdmissionError;
 use xabe_sched::ngram::NgramConfig;
@@ -34,6 +35,7 @@ use crate::state::SequenceSnapshot;
 pub enum WorkerExecutionError {
     Runtime(RuntimeError),
     Admission(AdmissionError),
+    Cache(PoolExhausted),
     NotBound,
 }
 
@@ -42,6 +44,7 @@ impl core::fmt::Display for WorkerExecutionError {
         match self {
             Self::Runtime(e) => write!(f, "{e}"),
             Self::Admission(e) => write!(f, "{e}"),
+            Self::Cache(e) => write!(f, "{e}"),
             Self::NotBound => write!(f, "worker has not been bound to its CUDA device"),
         }
     }
@@ -83,7 +86,14 @@ pub struct Worker {
     runtime: Option<DeviceRuntimeHandle>,
     batch_scratch: BatchDescription,
     pending: HashMap<RequestId, PendingSequence>,
+    reservations: Vec<CacheReservation>,
     vocab: Option<u32>,
+}
+
+struct CacheReservation {
+    request: Option<RequestId>,
+    attention: Vec<BlockId>,
+    gdn: Option<BlockId>,
 }
 
 struct PendingSequence {
@@ -111,6 +121,13 @@ impl Worker {
         let scheduler = Scheduler::new(sched, attention_blocks);
 
         let width = scheduler.config().max_concurrent_decodes() as usize;
+        let reservations = (0..width)
+            .map(|_| CacheReservation {
+                request: None,
+                attention: Vec::with_capacity(attention_blocks as usize),
+                gdn: None,
+            })
+            .collect();
         Self {
             id,
             device_ordinal,
@@ -121,6 +138,7 @@ impl Worker {
             runtime: None,
             batch_scratch: BatchDescription::with_capacity(width, width),
             pending: HashMap::new(),
+            reservations,
             vocab: None,
         }
     }
@@ -319,12 +337,18 @@ impl Worker {
     /// Schedule and execute one live device step.
     pub fn step_device(&mut self) -> Result<DeviceStep, WorkerExecutionError> {
         self.scheduler.step_into(&mut self.batch_scratch);
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(WorkerExecutionError::NotBound)?;
-        for prefill in &self.batch_scratch.prefills {
-            if let Some(pending) = self.pending.remove(&prefill.id) {
+        if self.runtime.is_none() {
+            return Err(WorkerExecutionError::NotBound);
+        }
+        for index in 0..self.batch_scratch.prefills.len() {
+            let id = self.batch_scratch.prefills[index].id;
+            if self.pending.contains_key(&id) {
+                self.reserve_cache(id)?;
+                let pending = self
+                    .pending
+                    .remove(&id)
+                    .expect("pending request was checked above");
+                let runtime = self.runtime.as_ref().expect("runtime was checked above");
                 match pending.snapshot {
                     Some(snapshot) => {
                         runtime.admit_restored(pending.request, pending.prompt, snapshot)?
@@ -352,6 +376,7 @@ impl Worker {
         }
         for &id in &step.completed {
             self.scheduler.finish_request(id);
+            self.release_cache(id);
         }
         let decode_items = step.scheduled.decodes.len();
         let prefill_items = step.scheduled.prefills.len();
@@ -411,7 +436,52 @@ impl Worker {
         if running && let Some(runtime) = &self.runtime {
             let _ = runtime.remove(id);
         }
-        self.scheduler.cancel_request(id) || pending
+        let cancelled = self.scheduler.cancel_request(id) || pending;
+        if cancelled {
+            self.release_cache(id);
+        }
+        cancelled
+    }
+
+    fn reserve_cache(&mut self, id: RequestId) -> Result<(), WorkerExecutionError> {
+        let blocks = self
+            .scheduler
+            .reserved_attention_blocks(id)
+            .expect("a first prefill is running and has a scheduler reservation");
+        let slot = self
+            .reservations
+            .iter_mut()
+            .find(|slot| slot.request.is_none())
+            .expect("scheduler width and reservation-slot count agree");
+        self.attention_pool
+            .alloc_into(blocks, &mut slot.attention)
+            .map_err(WorkerExecutionError::Cache)?;
+        match self.gdn_pool.alloc() {
+            Ok(gdn) => {
+                slot.request = Some(id);
+                slot.gdn = Some(gdn);
+                Ok(())
+            }
+            Err(error) => {
+                self.attention_pool.free_blocks(slot.attention.drain(..));
+                Err(WorkerExecutionError::Cache(error))
+            }
+        }
+    }
+
+    fn release_cache(&mut self, id: RequestId) {
+        let Some(slot) = self
+            .reservations
+            .iter_mut()
+            .find(|slot| slot.request == Some(id))
+        else {
+            return;
+        };
+        self.attention_pool.free_blocks(slot.attention.drain(..));
+        if let Some(gdn) = slot.gdn.take() {
+            self.gdn_pool.free_block(gdn);
+        }
+        slot.request = None;
     }
 
     /// Read-only access to the scheduler.
@@ -430,5 +500,39 @@ impl core::fmt::Debug for Worker {
             .field("running", &self.scheduler.running_len())
             .field("device_bound", &self.is_device_bound())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_reservations_move_both_natural_cache_groups_together() {
+        let model = ModelConfig::qwen3_6_35b_a3b();
+        let cache = CacheConfig::with_defaults(model).unwrap();
+        let sched = SchedulerConfig::with_defaults(4096, cache.attention_block_size(), 3).unwrap();
+        let mut worker = Worker::new(WorkerId(0), 0, cache, sched, 32, 3);
+        let id = RequestId(7);
+        worker
+            .admit(NewRequest {
+                id,
+                prompt_tokens: 512,
+                max_output_tokens: 256,
+            })
+            .unwrap();
+        let batch = worker.step();
+        assert_eq!(batch.prefills[0].id, id);
+        worker.reserve_cache(id).unwrap();
+
+        let live = worker.capacity();
+        assert_eq!(live.attention_free_blocks, 29);
+        assert_eq!(live.gdn_free_slots, 2);
+        assert_eq!(worker.kv_utilization(), 3.0 / 32.0);
+
+        assert!(worker.cancel(id));
+        let released = worker.capacity();
+        assert_eq!(released.attention_free_blocks, 32);
+        assert_eq!(released.gdn_free_slots, 3);
     }
 }

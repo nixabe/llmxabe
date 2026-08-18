@@ -103,6 +103,17 @@ impl Scheduler {
         self.waiting.iter().any(|r| r.id == id)
     }
 
+    /// Attention blocks held for a running request's full lifetime.
+    ///
+    /// This is the single source of truth the worker uses to mirror the
+    /// scheduler reservation into its physical attention-block pool.
+    pub fn reserved_attention_blocks(&self, id: RequestId) -> Option<u32> {
+        self.running
+            .iter()
+            .find(|request| request.id == id)
+            .map(|request| request.blocks_reserved)
+    }
+
     /// Account for additional target tokens accepted by one speculative
     /// decode step beyond the one token charged by [`Self::step`].
     pub fn advance_speculative(&mut self, id: RequestId, additional: u32) -> bool {
