@@ -485,6 +485,29 @@ pub enum Stage {
     LmHead,
 }
 
+/// Which point inside one layer a diagnostic waypoint was read at.
+///
+/// Exists only for [`Forward::run_with_stage_waypoints`] and
+/// [`Forward::run_batch_decode_with_stage_waypoints`] — the batch-vs-single-
+/// stream divergence audit's instrumentation, not part of the pass any
+/// golden or gate test exercises. `Stage` above exists for GPU-time
+/// profiling of the same pass and is a different axis: this one names *what
+/// buffer* a callback is looking at, not how long it took to produce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaypointStage {
+    /// Right after the embedding gather, before any layer runs.
+    Embed,
+    /// Right after the layer's mixer (Gated DeltaNet or Gated Attention),
+    /// before the MoE block folds it into the residual stream. This is the
+    /// buffer a divergence audit needs to tell "the mixer introduced this"
+    /// from "the MoE block introduced this" — `body`/`body_batch_decode`
+    /// only publish the post-MoE state to their own callers.
+    Mixer,
+    /// Right after the layer's MoE block, once its residual add has landed
+    /// in the hidden state that feeds the next layer.
+    Moe,
+}
+
 impl std::fmt::Display for Stage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1325,6 +1348,181 @@ impl Forward {
         Ok(host)
     }
 
+    /// Diagnostic-only sibling of [`Self::run_batch_decode`]: the same
+    /// batched step, but `on_waypoint` is called after each layer's mixer
+    /// (tagged [`WaypointStage::Mixer`]) and after each layer's MoE (tagged
+    /// [`WaypointStage::Moe`]), plus once after the embedding gather. Not
+    /// reachable from [`Self::body_batch_decode`], which
+    /// [`Self::capture_batch_step`] records into a graph and which no gate
+    /// test's contract should have to account for a diagnostic callback —
+    /// this duplicates its loop instead of adding a parameter to it, the
+    /// same trade [`Self::run_with_stage_waypoints`] makes against `body`.
+    /// See that method's docs and `docs/BENCHMARKS.md`'s "The N=3 ceiling"
+    /// §4 for why this exists: telling which family (Gated DeltaNet, Gated
+    /// Attention, or MoE) introduces the batch-vs-single-stream residual, and
+    /// at which layer, needs the per-stage buffer neither `run_batch_decode`
+    /// nor `body_batch_decode` exposes.
+    pub fn run_batch_decode_with_stage_waypoints(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        token_ids: &[i32],
+        mut on_waypoint: impl FnMut(Option<u32>, WaypointStage, &CudaSlice<f32>),
+    ) -> Result<Vec<i32>, ForwardError> {
+        self.check_batch_shape(states, token_ids)?;
+        self.publish_batch_inputs(stream, states, token_ids)?;
+
+        let n = self.tokens;
+        self.embed(stream)?;
+        on_waypoint(None, WaypointStage::Embed, &self.hidden_state);
+
+        let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
+        for layer in 0..self.config.num_layers {
+            match self.config.layer_kind(layer) {
+                LayerKind::GatedDeltaNet => {
+                    let mut gdn_states: Vec<&mut GdnState> =
+                        states.iter_mut().map(|st| st.gdn_mut(gdn_slot)).collect();
+                    self.gdn
+                        .forward_batch_decode(
+                            stream,
+                            &self.gdn_weights[gdn_slot],
+                            self.gdn_int8.get(gdn_slot),
+                            &mut gdn_states,
+                            &self.hidden_state,
+                            &mut self.mixer_out,
+                        )
+                        .map_err(ForwardError::Gdn)?;
+                    gdn_slot += 1;
+                }
+                LayerKind::GatedAttention => {
+                    let batch_positions = self
+                        .batch_positions
+                        .as_ref()
+                        .expect("published by publish_batch_inputs");
+                    let mut caches: Vec<&mut KvCache> = Vec::with_capacity(n);
+                    let mut pos_offsets: Vec<usize> = Vec::with_capacity(n);
+                    let mut position_views = Vec::with_capacity(n);
+                    for (i, state) in states.iter_mut().enumerate() {
+                        pos_offsets.push(state.position());
+                        let (cache, _) = state.kv_and_position_mut(attn_slot);
+                        caches.push(cache);
+                        // SAFETY: as `body_batch_decode`: `i < n` and
+                        // `batch_positions` holds exactly `n` elements,
+                        // allocated by `enable_batch_decode`.
+                        position_views.push(unsafe {
+                            crate::viewslice::subslice(stream, batch_positions, i, 1)
+                        });
+                    }
+                    let positions: Vec<&CudaSlice<i32>> =
+                        position_views.iter().map(|v| &**v).collect();
+                    self.attention[attn_slot]
+                        .forward_batch_decode(
+                            stream,
+                            &mut self.attn_scratch,
+                            &self.hidden_state,
+                            &mut caches,
+                            &pos_offsets,
+                            &positions,
+                            &mut self.mixer_out,
+                        )
+                        .map_err(ForwardError::Attention)?;
+                    attn_slot += 1;
+                }
+            }
+            on_waypoint(Some(layer), WaypointStage::Mixer, &self.mixer_out);
+
+            self.moe
+                .forward(
+                    stream,
+                    &self.moe_weights[layer as usize],
+                    &self.mixer_out,
+                    n,
+                    &mut self.ffn_out,
+                    &mut self.hidden_state,
+                )
+                .map_err(ForwardError::Moe)?;
+            on_waypoint(Some(layer), WaypointStage::Moe, &self.hidden_state);
+        }
+
+        self.layer_ops.rms_norm(
+            stream,
+            &self.hidden_state,
+            &self.w_output_norm,
+            &mut self.final_norm,
+            n,
+            self.hidden,
+            self.rms_eps,
+        )?;
+
+        let vocab = self.vocab;
+        {
+            let lm_head = self.batch_lm_head.as_ref().expect("checked by the caller");
+            let logits = self.batch_logits.as_mut().expect("checked by the caller");
+            lm_head
+                .forward(
+                    stream,
+                    QuantTensor {
+                        bytes: &self.w_lm_head,
+                        quant: ExpertQuant::Q8_0,
+                    },
+                    &self.final_norm,
+                    n,
+                    logits,
+                )
+                .map_err(ForwardError::LmHead)?;
+        }
+
+        for i in 0..n {
+            // SAFETY: as `body_batch_decode`.
+            let row = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_logits.as_ref().expect("checked by the caller"),
+                    i * vocab,
+                    vocab,
+                )
+            };
+            let mut values = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_values
+                        .as_ref()
+                        .expect("checked by the caller"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut indices = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_indices
+                        .as_ref()
+                        .expect("checked by the caller"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut out_one = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_out
+                        .as_ref()
+                        .expect("checked by the caller"),
+                    i,
+                    1,
+                )
+            };
+            self.lm_head
+                .argmax(stream, &row, vocab, &mut values, &mut indices, &mut out_one)?;
+        }
+
+        let host = self.read_batch_sampled(stream)?;
+        for state in states.iter_mut() {
+            state.advance(1);
+        }
+        Ok(host)
+    }
+
     /// Record one batched decode step — embedding, forty blocks (Gated
     /// DeltaNet batched, Gated Attention looped per sequence), the LM head
     /// and every sequence's argmax — as a CUDA graph, for
@@ -1763,6 +1961,118 @@ impl Forward {
         // state's claim about how many positions its caches hold is true.
         // Advancing earlier would leave a failed pass claiming positions that
         // no cache was written for, and the next call would read them.
+        state.advance(self.tokens);
+        Ok(())
+    }
+
+    /// Diagnostic-only sibling of [`Self::run`]: identical pass, but
+    /// `on_waypoint` is also called right after each layer's mixer (Gated
+    /// DeltaNet or Gated Attention), tagged [`WaypointStage::Mixer`], in
+    /// addition to the post-embed and post-MoE calls `run`/`body` already
+    /// make. Built for the batch-vs-single-stream divergence audit
+    /// (`docs/BENCHMARKS.md`, "The N=3 ceiling" §4's named follow-up): telling
+    /// "the mixer already disagreed" from "the mixer agreed and MoE
+    /// introduced the disagreement" needs the buffer `body` never exposes.
+    ///
+    /// A separate method rather than a new parameter on `body`/`run` on
+    /// purpose: `run`'s callback is exercised by the golden test
+    /// (`forward_pass.rs`) and `capture_step` captures `body` into a graph,
+    /// and this method is not meant to be reachable from either — it duplicates
+    /// `body`'s mixer/MoE loop rather than risk changing what either of those
+    /// call.
+    pub fn run_with_stage_waypoints(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        token_ids: &[i32],
+        mut on_waypoint: impl FnMut(Option<u32>, WaypointStage, &CudaSlice<f32>),
+    ) -> Result<(), ForwardError> {
+        if token_ids.len() != self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: token_ids.len(),
+            });
+        }
+        let (gdn_layers, attn_layers) = (self.gdn_weights.len(), self.attention.len());
+        if state.gdn_layers() != gdn_layers || state.attention_layers() != attn_layers {
+            return Err(ForwardError::StateShape {
+                expected_gdn: gdn_layers,
+                expected_attention: attn_layers,
+                got_gdn: state.gdn_layers(),
+                got_attention: state.attention_layers(),
+            });
+        }
+
+        self.publish_inputs(stream, state, token_ids)?;
+        self.embed(stream)?;
+        on_waypoint(None, WaypointStage::Embed, &self.hidden_state);
+
+        let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
+        for layer in 0..self.config.num_layers {
+            match self.config.layer_kind(layer) {
+                LayerKind::GatedDeltaNet => {
+                    self.gdn.forward(
+                        stream,
+                        &self.gdn_weights[gdn_slot],
+                        self.gdn_int8.get(gdn_slot),
+                        state.gdn_mut(gdn_slot),
+                        &self.hidden_state,
+                        &mut self.mixer_out,
+                    )?;
+                    gdn_slot += 1;
+                }
+                LayerKind::GatedAttention => {
+                    let pos_offset = state.position();
+                    let (cache, positions) = state.kv_and_position_mut(attn_slot);
+                    self.attention[attn_slot].forward(
+                        stream,
+                        &mut self.attn_scratch,
+                        &self.hidden_state,
+                        cache,
+                        pos_offset,
+                        positions,
+                        &mut self.mixer_out,
+                    )?;
+                    attn_slot += 1;
+                }
+            }
+            on_waypoint(Some(layer), WaypointStage::Mixer, &self.mixer_out);
+
+            self.moe.forward(
+                stream,
+                &self.moe_weights[layer as usize],
+                &self.mixer_out,
+                self.tokens,
+                &mut self.ffn_out,
+                &mut self.hidden_state,
+            )?;
+            on_waypoint(Some(layer), WaypointStage::Moe, &self.hidden_state);
+        }
+
+        self.layer_ops.rms_norm(
+            stream,
+            &self.hidden_state,
+            &self.w_output_norm,
+            &mut self.final_norm,
+            self.tokens,
+            self.hidden,
+            self.rms_eps,
+        )?;
+
+        let last = (self.tokens - 1) * self.hidden;
+        let row = self.final_norm.slice(last..last + self.hidden);
+        stream.memcpy_dtod(&row, &mut self.last_hidden)?;
+        self.lm_head.forward(
+            stream,
+            QuantTensor {
+                bytes: &self.w_lm_head,
+                quant: ExpertQuant::Q8_0,
+            },
+            &self.last_hidden,
+            1,
+            &mut self.logits,
+        )?;
+
         state.advance(self.tokens);
         Ok(())
     }
