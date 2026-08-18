@@ -83,6 +83,22 @@ Without it, the scheduler admits right up to the last free block, then
 immediately needs to evict, which preempts a request that is likely to be
 readmitted and preempted again. The watermark buys hysteresis.
 
+## Bounded waiting queue
+
+Admission is also bounded independently of device capacity. By default each
+worker holds at most four times `max_concurrent_decodes` requests in its
+waiting queue; with the shipped three-wide worker that is 12 queued requests,
+or 36 across the three-card engine. Running requests do not count against this
+limit because their full-lifetime KV reservation is already accounted for.
+
+Once the limit is reached, `can_admit()` reports the worker as saturated and
+`admit()` returns `WaitingQueueFull`. The HTTP layer exposes the engine's
+result as 503, allowing an upstream load balancer to retry instead of letting
+prompts and response channels grow without bound in host memory. Internal
+preemption may still put a running request back at the front: dropping already
+admitted work to enforce an external-admission limit would be a different and
+more destructive policy.
+
 ## Preemption by recompute
 
 When capacity runs short, requests are preempted and requeued at the **front**
@@ -133,4 +149,4 @@ Stated explicitly rather than discovered later:
   attention block counts as integers that a caller keeps in sync with the real
   pool. This keeps `step()` device-free and deterministic; wiring the two
   together belongs to `xabe-engine`.
-- No device memory is touched. All 18 tests are host-side logic.
+- No device memory is touched. The scheduler tests are host-side logic.

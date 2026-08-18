@@ -17,6 +17,8 @@ pub const DEFAULT_DRAFT_TOKENS_PER_STEP: u32 = 3;
 /// from the waiting queue, so admission doesn't repeatedly evict and
 /// preempt the same requests under load.
 pub const DEFAULT_WATERMARK_FRACTION: f64 = 0.01;
+/// Bound waiting requests so host-side admission cannot grow without limit.
+pub const DEFAULT_WAITING_REQUESTS_MULTIPLIER: u32 = 4;
 
 /// Scheduler configuration.
 ///
@@ -41,6 +43,9 @@ pub struct SchedulerConfig {
     /// block-worth of capacity that may be discarded on rejection, so it
     /// must be budgeted for up front, not after the fact.
     draft_tokens_per_step: u32,
+    /// Maximum requests held in the waiting queue; running requests are not
+    /// counted because their memory is already reserved.
+    max_waiting_requests: u32,
 }
 
 impl SchedulerConfig {
@@ -83,6 +88,8 @@ impl SchedulerConfig {
             max_concurrent_decodes,
             watermark_fraction,
             draft_tokens_per_step,
+            max_waiting_requests: max_concurrent_decodes
+                .saturating_mul(DEFAULT_WAITING_REQUESTS_MULTIPLIER),
         })
     }
 
@@ -122,6 +129,10 @@ impl SchedulerConfig {
         self.draft_tokens_per_step
     }
 
+    pub fn max_waiting_requests(&self) -> u32 {
+        self.max_waiting_requests
+    }
+
     /// Tokens one decoding request consumes from the step budget: one real
     /// token plus every drafted token, since a rejected draft still had to
     /// be scheduled and materialized in KV before rejection could happen.
@@ -152,6 +163,7 @@ mod tests {
             cfg.tokens_per_decode_step(),
             1 + DEFAULT_DRAFT_TOKENS_PER_STEP
         );
+        assert_eq!(cfg.max_waiting_requests(), 128);
     }
 
     /// AGENTS.md rule 3, the named regression: a config at the exact

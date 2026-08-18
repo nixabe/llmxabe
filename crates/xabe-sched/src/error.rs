@@ -65,4 +65,8 @@ pub enum AdmissionError {
         needed_blocks: u32,
         watermark_blocks: u32,
     },
+    /// The bounded waiting queue is full. The caller can retry after a later
+    /// scheduler step rather than allowing host memory to grow indefinitely.
+    #[error("waiting queue is full ({capacity} requests)")]
+    WaitingQueueFull { capacity: u32 },
 }

@@ -141,7 +141,8 @@ impl Scheduler {
     /// [`Self::attention_blocks_needed`] against total capacity, so they
     /// cannot disagree.
     pub fn can_admit(&self, req: &NewRequest) -> bool {
-        self.attention_blocks_needed(req.full_seq_len()) <= self.total_attention_blocks
+        (self.waiting.len() as u32) < self.config.max_waiting_requests()
+            && self.attention_blocks_needed(req.full_seq_len()) <= self.total_attention_blocks
     }
 
     /// Admit a request into the waiting queue.
@@ -182,6 +183,11 @@ impl Scheduler {
                 full_seq_len,
                 needed_blocks,
                 total_blocks: self.total_attention_blocks,
+            });
+        }
+        if self.waiting.len() as u32 >= self.config.max_waiting_requests() {
+            return Err(AdmissionError::WaitingQueueFull {
+                capacity: self.config.max_waiting_requests(),
             });
         }
         self.waiting.push_back(TrackedRequest {
@@ -506,6 +512,31 @@ mod tests {
         assert_eq!(third.prefills[0].id, RequestId(4));
         assert_eq!(s.running_len(), 3);
         assert_eq!(s.waiting_len(), 0);
+    }
+
+    #[test]
+    fn bounded_waiting_queue_rejects_before_host_growth() {
+        let config = SchedulerConfig::new(4096, 256, 1, 0.01, 0).unwrap();
+        let mut scheduler = Scheduler::new(config, 128);
+        for id in 1..=config.max_waiting_requests() {
+            scheduler.admit(req(u64::from(id), 32, 8)).unwrap();
+        }
+        assert!(!scheduler.can_admit(&req(999, 32, 8)));
+        let error = scheduler.admit(req(999, 32, 8)).unwrap_err();
+        assert_eq!(
+            error,
+            AdmissionError::WaitingQueueFull {
+                capacity: config.max_waiting_requests()
+            }
+        );
+        assert_eq!(
+            scheduler.waiting_len() as u32,
+            config.max_waiting_requests()
+        );
+        assert!(matches!(
+            scheduler.admit_with_prefix(req(1000, 32, 8), 33),
+            Err(AdmissionError::InvalidReusablePrefix { .. })
+        ));
     }
 
     #[test]
