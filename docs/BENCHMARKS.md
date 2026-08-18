@@ -7150,3 +7150,143 @@ not hint at a schedule it already reaches on its own -- a restructured
 dequant (wider vector loads across `blk`, or trading the byte-at-a-time
 `blk[2 + lane]` read for a differently laid-out quant stream) rather than
 a loop-unroll hint, and is out of this session's scope.
+
+## The instruction-level diff against `fattn-mma-f16.cuh`: one ruled-out mechanism, one confirmed ceiling, one blocked lever (2026-08-18)
+
+The lead's frame: `decode_mma` `WPO=2` measures ~290 GB/s (43%) at 131,072
+keys against llama.cpp's own ~589 GB/s (88%) on the identical geometry (1
+token, GQA 8, `head_dim` 256, binary16 KV, Turing), and "registers alone
+don't explain a 2x bandwidth gap in a kernel with zero spill." This
+compares `fattn-mma-f16.cuh`'s Turing mainloop against `attn_flash_decode_mma`
+instruction-for-instruction rather than assuming another register lever
+would close it.
+
+### The two kernels' configs at this exact shape
+
+`ggml_cuda_fattn_mma_get_config_turing(256, 256, 8)` (`DKQ=DV=256`,
+`ncols1=1` token `x` `ncols2=8` GQA heads `= ncols 8`) resolves to
+`nthreads=128` (4 warps), `occupancy=2`, `nbatch_fa=64`, `nbatch_K2=128`
+(the whole `head_dim/2` in one trip), `Q_in_reg=true`. `nstages_target=2`
+in the table is irrelevant on Turing: `ggml_cuda_fattn_mma_get_nstages`
+returns 0 unconditionally when `CP_ASYNC_AVAILABLE` is undefined (Turing,
+confirmed by the register-spill section above), so every load takes the
+plain, non-`cp_async` branch of `flash_attn_ext_f16_load_tile` -- the same
+`ggml_cuda_memcpy_1<16>` 16-byte-per-thread path this file already cited.
+**`Q_in_reg=true` for this exact geometry is the same conclusion the
+"Staging `Q` to shared" section reached empirically** (37-40% slower):
+llama.cpp's own config table keeps `Q` in registers here too, not shared.
+
+### Per-64-key-tile counts, `flash_attn_ext_f16_iter`, Turing, `cols_per_warp==8` branch (matches `ncols==8`)
+
+| | llama.cpp (`nbatch_fa=64`) | `attn_flash_decode_mma_wpo2` (`8*WPO=16` keys/trip) |
+|---|---|---|
+| keys per softmax-rescale trip | 64 | 16 |
+| warps, key-range split | 4 warps, each a disjoint 16-key slice, held from trip to trip | 2 warps, each an 8-key octet, re-split every trip |
+| K staging | one `ggml_cuda_memcpy_1<16>` pass, `nbatch_K2=128` = whole `head_dim/2` in one trip | one `uint4` (16 B) pass per `kw4` stripe, same tile width as before this session's spill fix |
+| `__syncthreads()` per trip | 2 (after K load: "only needed if `tile_K==tile_V`"; after V load, same) | 4 (after K/V staging landed; after `Q K^T` before softmax; after softmax before `P V`) |
+| softmax reduction | in registers, `__shfl_xor_sync` within each warp's own 32 lanes over its own 16-key slice; **no shared-memory round trip** | `s_sh`/`m_sh`/`l_sh`/`corr_sh`, written by `Q K^T`, synced, read by the softmax phase, synced again -- needed because the two warps' key-octets must merge into one shared `(m, l)` *before* the same trip's `P V` can use it |
+| cross-warp merge | deferred to once per whole `kb0` range (each warp's running `(KQ_max, KQ_rowsum, VKQ_C)` persists in registers across every trip; llama.cpp's decode path has no cross-warp merge inside this kernel at all -- GQA-8 decode is one `(ncols1, ncols2)` tile, not tiled further) | once *per trip*, via shared memory |
+| `Q K^T` MMA shape | `A = K` (`tile<16,8,half2>`, **16 real keys** in the M dimension), `B = Q` (`tile<8,8,half2>`, 8 real heads, single fp16 rounding) -- `mma.sync.m16n8k8.row.col.f32.f16.f16.f32`, **16 keys per call** | `A = Q` (`qa0`/`qa1`, 16 rows: 8 real heads via `q_hi`, 8 via `q_lo`), `B = K` (8 keys) -- same instruction, **8 keys per call** |
+| `P V` accumulator | `T_C_VKQ = tile<16,4,half2>` -- **fp16** accumulate | `float o[...][4]` -- fp32 accumulate |
+
+Barrier density: llama.cpp's 2 syncs / 64 keys = 0.031 syncs/key; ours,
+4 syncs / 16 keys = 0.25 syncs/key -- **8x denser**, and a genuinely
+separate mechanism from `nbatch_fa`/`DMMA_KT` width alone (0.031x2 syncs/key
+from tile width, the rest from routing the softmax merge through shared
+memory every trip instead of deferring it).
+
+### Ruled out: fp16-accumulate `P V` is not a throughput lever here
+
+`T_C_VKQ`'s fp16 accumulator was the lead's own named candidate
+("fp16 KQ accumulation, 2x tensor throughput"). Measured directly rather
+than assumed, since `ncu` cannot confirm or deny it: a standalone ablation
+(`mma.sync.aligned.m16n8k8.row.col.f16.f16.f16.f16` against
+`...f32.f16.f16.f32`, both driven by `CHAINS=4` independent register
+chains over `REPS=4,000` iterations, `72 SMs x 32 blocks x 128 threads`,
+CUDA events, 5 rounds) on this card:
+
+| accumulator | ms (round 1-5) | TFLOP/s |
+|---|---|---|
+| fp32 | 3.0806 / 3.0700 / 3.0629 / 3.0606 / 3.0579 | 98.0-98.8 |
+| fp16 | 3.0700 / 3.0595 / 3.0509 / 3.0540 / 3.0495 | 98.4-99.0 |
+
+0.2-0.4% apart, every round -- noise, not a throughput difference. Turing's
+`m16n8k8` HMMA issues at the same rate regardless of accumulator width on
+this card. This candidate is closed: switching `P V`'s accumulator to
+`half2` would buy nothing here, so it was not built.
+
+### Confirmed: `Q K^T`'s 2x MMA issue rate is the precision gate's own cost, not a design accident
+
+The table's `Q K^T` row is the real 2x. `attn_flash_decode_mma`'s own
+comment already states the field's actual mechanism precisely (`m16n8k8`'s
+A operand is fixed at 16 rows regardless of how many are real, so a
+zero-padded single-precision version of *this same kernel* would issue
+exactly as many `mma` calls as the `q_hi`/`q_lo` version does -- the split
+trick is free *relative to this kernel's own prior attempt*). That is a
+true but narrower claim than "free relative to llama.cpp": llama.cpp's
+kernel puts **keys**, not heads, in the 16-row M operand, so every one of
+its rows is real and every `mma` call covers twice the keys ours does.
+Checked whether swapping *our* operand mapping to match (keys in M, heads
+in N=8, one plain-precision call) and recovering `q_hi`/`q_lo` precision
+via two accumulated calls instead of doubled M-rows changes anything: it
+does not -- 2 calls / 16 keys and 1 call / 8 keys are the same rate. No
+operand rearrangement escapes it. Computing `Q K^T` at `q_hi + q_lo`
+precision costs exactly twice the tensor-core issue count of a single
+fp16 rounding, on this instruction shape, full stop -- the same conclusion
+the original kernel's design comment reached for *when* it is free (never,
+against a plain-precision comparison; only relative to a kernel that was
+already going to waste those rows).
+
+This does not cost `P V` anything -- that phase is already single fp16
+precision in both codebases, accepted under `MMA_GATE` on our side and
+never gated by a residual on theirs -- so the kernel-level cost is nearer
+1.5x than the full 2x quoted for `Q K^T` alone, assuming the two phases
+are roughly comparable in weight. `Q K^T` doing 2x the tensor-core work
+for the same key range extends the per-trip critical path with **zero
+extra DRAM traffic**, which is exactly what this file's `GB/s = bytes /
+time` convention reports as *worse bandwidth* even though not one extra
+byte moved -- the precision tax and the "43% vs 88%" framing are the same
+number seen two ways.
+
+### Not ruled out, and not attempted: the barrier-density difference
+
+The 4-vs-2-syncs-per-trip gap is real and, unlike `Q K^T`'s precision tax,
+is not gate-mandated -- llama.cpp's independent-per-warp online softmax
+(register/shuffle-only, merged once at the end) is a legitimate structural
+target distinct from both the register-spill fix and the rejected
+shared-`Q` experiment above. Building it means restructuring
+`attn_flash_decode_mma`'s warp assignment from "every warp re-merges into
+one shared `(m, l)` every trip" to "each warp owns a disjoint key stripe
+for the whole split, in registers, merged once at the end" -- a rewrite of
+the kernel's synchronization structure, not a parameter change, with a
+correctness surface at least as large as the exponent-base bug the
+original build caught. Named here as the next concrete lever rather than
+attempted rushed: this session's remaining budget after the structural
+comparison and the accumulate-throughput ablation was not enough to build
+and verify it against the full nine-differential suite at the discipline
+this file's other sections hold to, and a half-verified rewrite of the
+decode kernel's softmax merge is a worse outcome than an honest stop.
+
+### Disposition
+
+No kernel change this section. The fp16-accumulate lever is closed by
+direct measurement (a wash, not a win). The `Q K^T` precision cost is
+confirmed as an unavoidable consequence of the `q_hi`/`q_lo` split this
+file's own gate requires -- not fixable without loosening `GATE`, which
+stays out of scope. The barrier-density difference is real, structural,
+and unbuilt: named as the concrete next step rather than guessed at.
+`DECODE_MMA_DEPTH_THRESHOLD` and every shipped kernel are unchanged;
+nothing here touches `attn_flash_decode_mma`, `attn_flash_decode_warp`, or
+the dispatch lever.
+
+### For worker-1's prefill question
+
+`attn_flash_causal_mma` (prefill) does not carry `Q K^T`'s split-precision
+cost at all -- it accepts a single fp16 rounding of `Q` under the wider
+`MMA_GATE`, per this file's earlier prefill sections, so the mechanism this
+section confirms (2x issue rate from `q_hi`/`q_lo`) does not apply there;
+prefill's own `MMA_KEY_TRIPS` rejection above hit a register spill instead
+of a precision tax. What does transfer: the fp16-vs-fp32-accumulate
+ablation above is architecture-level, not kernel-specific -- any Turing
+`m16n8k8` accumulator-width question this workstream or worker-1's has is
+answered by the same measurement, and does not need re-running per kernel.
