@@ -383,6 +383,52 @@ fn main() -> ExitCode {
         "embed", embed_diff
     );
 
+    // ---- Per-sample correlation: for the exact (layer, step, seq) that
+    // maximizes the mixer's own diff, what did the MoE stage on that SAME
+    // sample read? A `moe/mixer` ratio near 1x is pure inheritance -- MoE
+    // faithfully carrying forward whatever the mixer already handed it,
+    // with nothing of its own to fix. A ratio far above 1x is MoE (or the
+    // router's discrete top-8 decision it feeds) adding real divergence of
+    // its own on top. Independent per-stage maxes (the table above) cannot
+    // tell these apart, because they are free to land on different
+    // (step, seq) pairs; this reads both stages off the *same* sample. ----
+    info!("");
+    info!("=== per-sample correlation: mixer diff vs moe diff on the same (layer, step, seq) ===");
+    info!(
+        "{:>5} {:>10} {:>12} {:>12} {:>8}",
+        "layer", "family", "mixer", "moe (same)", "ratio"
+    );
+    for &(layer, stage) in &waypoint_order {
+        if stage != WaypointStage::Mixer {
+            continue;
+        }
+        let Some(layer) = layer else { continue };
+        let family = family_of(&config, Some(layer), WaypointStage::Mixer);
+        let worst_mixer = readings
+            .iter()
+            .filter(|r| r.layer == Some(layer) && r.stage == WaypointStage::Mixer)
+            .max_by(|a, b| a.max_abs.total_cmp(&b.max_abs))
+            .expect("every mixer waypoint has at least one reading");
+        let same_sample_moe = readings
+            .iter()
+            .find(|r| {
+                r.layer == Some(layer)
+                    && r.stage == WaypointStage::Moe
+                    && r.step == worst_mixer.step
+                    && r.seq == worst_mixer.seq
+            })
+            .expect("every (layer, step, seq) has both a mixer and a moe reading");
+        let ratio = if worst_mixer.max_abs > 0.0 {
+            same_sample_moe.max_abs / worst_mixer.max_abs
+        } else {
+            f32::INFINITY
+        };
+        info!(
+            "{:>5} {:>10} {:>12.3e} {:>12.3e} {:>7.2}x",
+            layer, family, worst_mixer.max_abs, same_sample_moe.max_abs, ratio,
+        );
+    }
+
     let (free_now, _) = memory_info(&ctx).expect("memory info");
     info!(
         "peak VRAM {:.3} GiB of {:.2} GiB",

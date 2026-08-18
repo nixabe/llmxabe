@@ -1077,3 +1077,337 @@ fn the_one_token_dispatch_matches_the_reference_slot_for_slot() {
         g.experts_per_token, post_pad, num_blocks,
     );
 }
+
+// ---------------------------------------------------------------------------
+// gemv vs. bm1: the isolated bit-identity probe the batch-vs-single-stream
+// workstream's Phase A audit named.
+// ---------------------------------------------------------------------------
+
+/// One live token, decoded twice through two different **compiled entry
+/// points** with bit-identical inputs and identical routing: once through
+/// `max_tokens = 1` (the true single-stream shape, `moe_expert_ffn_gemv`/
+/// `moe_expert_down_gemv`), once through `max_tokens = 2` with only one
+/// valid token (`gemv` is false at `max_tokens > 1`, so this takes
+/// `moe_expert_ffn_bm1`/`moe_expert_down_bm1` -- every routed bucket holds
+/// exactly one live slot when there is exactly one live token, so `narrow`'s
+/// `bm <= 1` skip means it never does any real work here; only `bm1` does).
+///
+/// This isolates the exact pairing `docs/BENCHMARKS.md`'s Phase A audit
+/// named as the ~1e-4 residual's origin from the tiled (`TM > 1`) case
+/// entirely: with one live token there is no tile to stage, no `TM`-wide
+/// loop, nothing but the same "one row, no shared memory" shape on both
+/// sides. If the two still disagree, the divergence is not in tiling at
+/// all -- it is between two independently-compiled kernels whose per-row
+/// source expression is textually near-identical but not the same compiled
+/// function, which NVCC is free to schedule and FMA-contract differently.
+///
+/// Not gated on a tolerance: this prints the measured max-abs diff and
+/// documents Phase B's finding rather than asserting a pass, because at the
+/// time this test was written the two paths do **not** yet agree — see
+/// `docs/BENCHMARKS.md`'s "Phase B, step 1" entry. Once the fix lands this
+/// should become `assert_eq!` on bit-identical output.
+#[test]
+fn gemv_and_bm1_isolate_the_one_live_token_case() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB01);
+    let hidden: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    assert_carries_signal("hidden state", &hidden);
+    let logits: Vec<f32> = rng.vec_f32(config.moe.num_experts as usize, -8.0, 8.0);
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    let run = |max_tokens: usize| -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: config.moe.num_experts as usize,
+            experts_per_token: config.moe.experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: config.moe.expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        // Both sides stay on the fp32 dequant path -- the integer tensor
+        // cores are a third, unrelated kernel family this probe is not
+        // about, and `MMA_MIN_TOKENS` (8) is above both shapes tested here
+        // anyway.
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+
+        let mut flat_hidden = hidden.clone();
+        flat_hidden.resize(max_tokens * g.hidden, 0.0);
+        let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+        let mut flat_logits = logits.clone();
+        flat_logits.resize(max_tokens * g.num_experts, -1.0e30);
+        let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 1)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+
+        let mut d_out = stream
+            .alloc_zeros::<f32>(max_tokens * g.hidden)
+            .expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full[..g.hidden].to_vec()
+    };
+
+    let via_gemv = run(1);
+    // `MOE_NARROW_DECODE_MAX` is 4 in `xabe-cuda`; 2 is comfortably inside
+    // it and above 1, so `gemv` is false and `narrow` is true -- with one
+    // live token, `bucket_live[blk] == 1` for every active bucket, so
+    // `moe_expert_ffn_narrow`/`moe_expert_down_narrow`'s `bm <= 1` skip
+    // means they run zero real tiles here; the whole answer comes from
+    // `moe_expert_ffn_bm1`/`moe_expert_down_bm1`.
+    let via_bm1 = run(2);
+
+    let result = compare(&via_gemv, &via_bm1);
+    println!("gemv (max_tokens=1) vs bm1 (max_tokens=2, 1 live token): {result}");
+    println!(
+        "output magnitude: max |gemv| = {:.4e}",
+        via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_gemv, via_bm1,
+        "gemv and bm1 disagree on the one-live-token case -- see \
+         docs/BENCHMARKS.md's Phase B, step 1 entry for the state of this \
+         investigation",
+    );
+}
+
+/// As [`gemv_and_bm1_isolate_the_one_live_token_case`], for the other half
+/// of the narrow split: two tokens routed to the *same* expert set, forcing
+/// every active bucket's `bucket_live == 2` and so `moe_expert_ffn_narrow`/
+/// `moe_expert_down_narrow`'s tiled (`TM = 2`) path -- the one real
+/// structural difference from a GEMV that a one-live-token probe cannot
+/// exercise at all: a weight tile dequantized once and applied to two
+/// staged, shared-memory-read activation columns instead of one directly
+/// read column.
+///
+/// Token 0's row is compared against the same token, alone, through
+/// `max_tokens = 1` (`gemv`) -- identical hidden state, identical routing.
+#[test]
+fn gemv_and_narrow_isolate_the_two_live_token_case() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB02);
+    let hidden0: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    let hidden1: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    assert_carries_signal("hidden state", &hidden0);
+    // Same logits for both tokens -- identical top-k, so every one of the
+    // 8 buckets they land in has `bucket_live == 2`, not a mix of 1 and 2.
+    let logits: Vec<f32> = rng.vec_f32(config.moe.num_experts as usize, -8.0, 8.0);
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    let run_gemv = || -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: config.moe.num_experts as usize,
+            experts_per_token: config.moe.experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: config.moe.expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: 1,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let d_hidden = stream.clone_htod(&hidden0).expect("upload hidden");
+        let d_logits = stream.clone_htod(&logits).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 1)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+        let mut d_out = stream.alloc_zeros::<f32>(g.hidden).expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full
+    };
+
+    let run_narrow_token0 = || -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: config.moe.num_experts as usize,
+            experts_per_token: config.moe.experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: config.moe.expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: 2,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let mut flat_hidden = hidden0.clone();
+        flat_hidden.extend_from_slice(&hidden1);
+        let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+        let mut flat_logits = logits.clone();
+        flat_logits.extend_from_slice(&logits);
+        let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 2)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+        // Confirm the routing this test's whole premise depends on: both
+        // tokens really did land in the same buckets, so `bucket_live == 2`
+        // is what the kernel actually saw, not an artifact of a router
+        // tie-break this test did not anticipate.
+        let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+        stream.synchronize().expect("sync");
+        assert_eq!(
+            device_ids_for(&ids, 0, g.experts_per_token),
+            device_ids_for(&ids, 1, g.experts_per_token),
+            "both tokens must route to the same experts for this probe to \
+             exercise bucket_live == 2",
+        );
+        let mut d_out = stream
+            .alloc_zeros::<f32>(2 * g.hidden)
+            .expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full[..g.hidden].to_vec()
+    };
+
+    let via_gemv = run_gemv();
+    let via_narrow = run_narrow_token0();
+
+    let result = compare(&via_gemv, &via_narrow);
+    println!("gemv (alone) vs narrow token 0 (bucket_live=2): {result}");
+    println!(
+        "output magnitude: max |gemv| = {:.4e}",
+        via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_gemv, via_narrow,
+        "gemv and the tiled (TM=2) narrow path disagree on token 0's row \
+         when bucket_live == 2 -- see docs/BENCHMARKS.md's Phase B, step 1 \
+         entry for the state of this investigation",
+    );
+}
