@@ -7876,3 +7876,125 @@ for this session on that basis: the isolated-differential-passes,
 sustained-serving-fails signature survived a real fix attempt at the
 lead's own most-likely mechanism, which is stronger evidence against
 shipping it than the first section's reject alone was.
+
+## The N=3 ceiling, in one place (2026-08-18)
+
+Closing this workstream the way the two decode-side ceiling arguments
+above closed theirs (`ee4ad02`'s "The complete ceiling, in one place" and
+the section before it): one composed argument for where N=3 batch decode
+sits against llama.cpp and why, pulling together every section this
+workstream landed on the way here rather than leaving the answer spread
+across a dozen dated entries.
+
+### 1. What landed this session
+
+N=3 aggregate moved from 64.1 tok/s at 32,768 context -- this workstream's
+own recorded starting point ("MoE's small-bucket GEMV at batch decode": "at
+N=3 aggregate was 64.1 tok/s, below" llama.cpp's 154.58) -- to **99.2 tok/s**
+at the same context, **126.4 tok/s** at 2,048: the "Closing sweep" table's
+own N=3 row, two sections and one worker-session up. Six fixes were already
+landed before this session narrowed the gap further; three more landed in
+it specifically -- the narrow/bm1 kernel-selection split (`moe_expert_
+ffn_narrow`/`moe_expert_down_narrow` now `bm > 1` only, the new `_bm1` pair
+taking the single-live-row case with none of the tiled fallback's
+registers), the `bucket_live` dispatch-table precompute both kernel pairs
+read rather than re-derive their own `bm` from, and the split-kernel design
+re-tried on that precomputed `bm` ("a real win this time" after the
+register-budget version of the same idea was rejected once already on a
+cost the register math alone did not predict). Every one of the nine is
+individually gated (`moe_differential`, `batch_decode` bit-exact, golden)
+and SASS-isolated with `cuobjdump` to its own stated blast radius; the
+closing sweep's own N=1 (101.7 / 83.9) and N=8 (169.7 / 128.2) rows sitting
+within noise of where they stood before any of this session's work is the
+cross-check that none of the nine leaked scope into a width it was not
+scoped to touch.
+
+### 2. What's structural (`§2.6` recap)
+
+`docs/OPTIMIZATION.md` §2.6 models weight traffic per decode step as (LM
+head + projections + shared expert, read once) + 113.377 MB x `D(N)`
+(routed experts, read once per distinct expert per layer) + a flat
+131.7 MB/token state term. Two consequences bound what any kernel-level fix
+-- this workstream's or anyone else's -- can buy at N=3, independent of how
+well the kernel is written:
+
+- `D(3) = 23.26` of 256 experts (9.1%), against `D(1) = 8.00` (3.1%): three
+  sequences already touch ~2.9x the distinct experts one does, so the
+  weight-read amortization batching is supposed to buy is partial by
+  construction at this width, not a kernel defect still waiting to be found.
+  It improves with `N` (`D(32) = 163.30`, 63.8%), but N=3 sits on the steep
+  part of that curve, not the flat part.
+- The state term never amortizes, at any `N` -- each sequence's own KV
+  cache and GDN recurrent state costs exactly as much traffic per token
+  decoded alongside seven others as decoded alone, because there is nothing
+  to share. This is not specific to this engine: llama.cpp pays the
+  identical per-sequence cost, which is why its own measured efficiency
+  (§2.7) holds flat at ~41% of the concurrency-aware roofline from c=1 to
+  c=3 rather than climbing -- the batching win it captures is the
+  routed-expert term's, because the state term has none to capture, for
+  either implementation.
+
+### 3. Why llama.cpp's remaining edge is closed to this engine by design
+
+The two dp4a/Q8_1 sections above are the concrete version of this
+argument, not a separate story from it. llama.cpp's own N=3 batch
+efficiency rides in part on `mmvq` -- Q8_1-quantized activations and
+`dp4a` in the down (and, unattempted here, the up/gate) projection's inner
+loop, the same mechanism `docs/ORACLE.md` §8 item 0 already measured as
+1,000-10,000x less accurate than this engine's fp32 activation path
+against an independent reference. This session built it anyway, on the
+coordinator's own read that llama.cpp's golden logits are themselves
+produced by `mmvq`, so matching it might read *closer* to golden, not
+further. It passed every per-kernel gate this workstream has: `moe_
+differential` differentials at a bound derived (not tuned) from the same
+exact-integer accumulation llama.cpp's own kernel performs, bit-exactness
+on identical-prompt rows held at `0.000e0` in every configuration tried,
+and it survived a second attempt at making the batch and single-stream
+paths run *symmetric* arithmetic specifically to close the one gate it
+did fail.
+
+It failed that one gate both times: `batch_decode`'s cross-path agreement
+check, at `5.078e-1` asymmetric and `7.081e-1` symmetric against a `5e-3`
+bound -- a routing-scale divergence, not a rounding one. The most
+evidence-consistent account on record (previous section) is that int8
+quantization's discontinuity amplifies the small, benign, ~1e-4 reduction-
+order difference that *already exists* between this engine's batched and
+single-stream attention/GDN kernels on clean `main` into expert-selection
+flips over forty layers -- and that this is not a defect either
+implementation's kernels can be debugged out of, because the discontinuity
+is inherent to quantization itself, not to any one kernel's arithmetic.
+
+llama.cpp does not promise that a sequence decodes to the same logits
+whether it is batched with others or run alone; it has never needed to,
+and nothing in its own test suite checks for it. This engine does promise
+that -- it is the shared-session-cache serving contract this whole project
+exists for: three instances sharing a card, a sequence's output must not
+depend on which other sequences happen to be resident with it at the same
+step. Rejecting `mmvq` on `batch_decode`'s gate is that promise enforced,
+not an accuracy margin given up for caution. It is the same class of
+deliberate trade as the deep-decode precision ceiling `ee4ad02` closed:
+a documented, gate-verified line this engine will not cross for a
+throughput number, recorded so the next attempt starts from the reason
+rather than rediscovering it by tripping the same gate.
+
+### 4. The named future workstream that would legally reopen it
+
+The gate `mmvq` fails is a symptom of an upstream fact, not a property of
+`mmvq` itself: batch and single-stream decode are not bit-identical
+upstream of the MoE down projection. `batch(1)` already shares the same
+GEMV kernels as `max_tokens == 1` single-stream decode (the closing sweep's
+own numbers -- `single_stream` 102.0/84.5 against `1` 101.7/83.9 -- are
+within measurement noise of each other, not a coincidence) — the ~1e-4
+residual lives further up, in `GatedAttentionBlock`'s and `GdnBlock`'s own
+batched-vs-single-stream reduction order. A workstream that made those two
+paths bit-identical -- not merely close, but exactly reproducing -- would
+remove the discontinuity's raw material: with genuinely identical upstream
+activations feeding the quantizer on both sides, `mmvq`'s int8 rounding
+would be applied to the *same* input in both paths, `batch_decode`'s gate
+would clear by construction rather than by chance, and every differential
+this session already built and gated would still hold. That is a real,
+scoped structural project -- attention and GDN kernel work, not MoE kernel
+work, and out of this workstream's own remit -- not a redo of anything
+already attempted here. Recorded with this reasoning attached so whoever
+picks it up next starts from the conclusion two sessions and two
+hypotheses already reached, instead of re-discovering it.
