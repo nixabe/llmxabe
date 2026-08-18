@@ -98,7 +98,7 @@ fn run_width(
         width as u32,
     );
     worker
-        .bind_device(path, model.clone(), PREFILL_CHUNK.min(context).max(1))
+        .bind_device_for_benchmark(path, model.clone(), PREFILL_CHUNK.min(context).max(1))
         .map_err(|error| error.to_string())?;
 
     for sequence in 0..width {

@@ -226,6 +226,7 @@ impl DeviceRuntimeHandle {
         max_batch: usize,
         ngram: Option<NgramConfig>,
         retention_interval: usize,
+        stop_on_eos: bool,
     ) -> Result<Self, RuntimeError> {
         let (commands, receiver) = sync_channel::<RuntimeCommand>(1);
         let (ready_tx, ready_rx) = sync_channel(0);
@@ -240,6 +241,7 @@ impl DeviceRuntimeHandle {
                     max_batch,
                     ngram,
                     retention_interval,
+                    stop_on_eos,
                 );
                 match runtime {
                     Ok(mut runtime) => {
@@ -347,6 +349,7 @@ impl Drop for DeviceRuntimeHandle {
 }
 
 impl DeviceRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         device_ordinal: usize,
         model_path: &Path,
@@ -355,6 +358,7 @@ impl DeviceRuntime {
         max_batch: usize,
         ngram: Option<NgramConfig>,
         retention_interval: usize,
+        stop_on_eos: bool,
     ) -> Result<Self, RuntimeError> {
         let load_started = Instant::now();
         if prefill_chunk == 0 {
@@ -371,8 +375,9 @@ impl DeviceRuntime {
         unsafe { ctx.disable_event_tracking() };
 
         let file = GgufFile::open(model_path)?;
-        let eos_token = file
-            .get_u32("tokenizer.ggml.eos_token_id")
+        let eos_token = stop_on_eos
+            .then(|| file.get_u32("tokenizer.ggml.eos_token_id"))
+            .flatten()
             .map(|token| token as i32);
         let schema = WeightSchema::new(&config);
         let directory = schema

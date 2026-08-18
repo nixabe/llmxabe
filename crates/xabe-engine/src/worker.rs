@@ -210,6 +210,27 @@ impl Worker {
         model: ModelConfig,
         prefill_chunk: usize,
     ) -> Result<(), RuntimeError> {
+        self.bind_device_inner(model_path, model, prefill_chunk, true)
+    }
+
+    /// Bind the real scheduler/runtime path while leaving EOS as an ordinary
+    /// token, so a fixed-width throughput benchmark cannot silently shrink.
+    pub fn bind_device_for_benchmark(
+        &mut self,
+        model_path: &Path,
+        model: ModelConfig,
+        prefill_chunk: usize,
+    ) -> Result<(), RuntimeError> {
+        self.bind_device_inner(model_path, model, prefill_chunk, false)
+    }
+
+    fn bind_device_inner(
+        &mut self,
+        model_path: &Path,
+        model: ModelConfig,
+        prefill_chunk: usize,
+        stop_on_eos: bool,
+    ) -> Result<(), RuntimeError> {
         let max_batch = self.scheduler.config().max_concurrent_decodes() as usize;
         let drafts = self.scheduler.config().draft_tokens_per_step() as usize;
         let history_capacity =
@@ -227,6 +248,7 @@ impl Worker {
             max_batch,
             ngram,
             self.cache.gdn_retention_interval() as usize,
+            stop_on_eos,
         )?);
         self.vocab = Some(vocab);
         Ok(())
