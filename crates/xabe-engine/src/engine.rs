@@ -303,6 +303,23 @@ impl Engine {
         })
     }
 
+    /// Cancel a live request and release its scheduler, runtime, and cache
+    /// bookkeeping regardless of whether it is waiting or running.
+    pub fn cancel(&mut self, request: RequestId) -> bool {
+        let Some(worker) = self.workers.iter().find_map(|worker| {
+            (worker.scheduler().is_waiting(request) || worker.scheduler().is_running(request))
+                .then_some(worker.id())
+        }) else {
+            return false;
+        };
+        self.request_hashes.remove(&(worker, request));
+        if let Some(hashes) = self.request_refs.remove(&(worker, request)) {
+            self.prefix_tree.decr_ref_chain(&hashes);
+        }
+        self.worker_mut(worker)
+            .is_some_and(|worker| worker.cancel(request))
+    }
+
     /// Publish a worker's current retained state into the shared host cache.
     pub fn publish_snapshot(
         &mut self,
@@ -522,5 +539,35 @@ mod tests {
             cap.gdn_bytes_per_slot > u64::from(cap.attention_block_size) * 20_480 / 4,
             "GDN slot must remain its own natural size"
         );
+    }
+    #[test]
+    fn cancellation_removes_a_waiting_request_from_its_worker() {
+        let mut e = engine(1024);
+        let hash = 11;
+        e.prefix_tree.insert(&[PrefixBlock {
+            hash,
+            block: BlockId(0),
+            gdn_snapshot: None,
+        }]);
+        let placement = e.place(req(77, 2048, 16), &[]).unwrap();
+        e.prefix_tree.incr_ref_chain(&[hash]);
+        e.request_refs
+            .insert((placement.worker, placement.request), vec![hash]);
+        assert_eq!(e.prefix_tree.ref_count(hash), 1);
+        assert!(
+            e.worker(placement.worker)
+                .unwrap()
+                .scheduler()
+                .is_waiting(placement.request)
+        );
+        assert!(e.cancel(placement.request));
+        assert_eq!(e.prefix_tree.ref_count(hash), 0);
+        assert!(
+            !e.worker(placement.worker)
+                .unwrap()
+                .scheduler()
+                .is_waiting(placement.request)
+        );
+        assert!(!e.cancel(placement.request));
     }
 }

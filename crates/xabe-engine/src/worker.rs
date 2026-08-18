@@ -404,12 +404,14 @@ impl Worker {
         Ok(())
     }
 
-    /// Release a completed request's reservations.
-    pub fn finish(&mut self, id: RequestId) -> bool {
-        if let Some(runtime) = &self.runtime {
+    /// Cancel a waiting or running request and release all of its state.
+    pub fn cancel(&mut self, id: RequestId) -> bool {
+        let pending = self.pending.remove(&id).is_some();
+        let running = self.scheduler.is_running(id);
+        if running && let Some(runtime) = &self.runtime {
             let _ = runtime.remove(id);
         }
-        self.scheduler.finish_request(id)
+        self.scheduler.cancel_request(id) || pending
     }
 
     /// Read-only access to the scheduler.

@@ -196,6 +196,23 @@ impl Scheduler {
         }
     }
 
+    /// Cancel a request regardless of whether it is waiting or running.
+    ///
+    /// Running requests release their full-lifetime reservation. Waiting
+    /// requests hold no blocks yet, but still need to be removed so a dropped
+    /// client cannot consume a future serving slot.
+    pub fn cancel_request(&mut self, id: RequestId) -> bool {
+        if self.finish_request(id) {
+            return true;
+        }
+        if let Some(pos) = self.waiting.iter().position(|request| request.id == id) {
+            self.waiting.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Preempt a running request by recompute.
     ///
     /// Frees its reserved blocks, discards its progress
@@ -353,6 +370,27 @@ mod tests {
             prompt_tokens: prompt,
             max_output_tokens: max_out,
         }
+    }
+
+    #[test]
+    fn cancellation_removes_waiting_and_running_requests_and_releases_capacity() {
+        let mut scheduler = sched(4096, 256, 3, 100);
+        scheduler.admit(req(1, 512, 256)).unwrap();
+        scheduler.admit(req(2, 512, 256)).unwrap();
+
+        assert!(scheduler.cancel_request(RequestId(2)));
+        assert!(!scheduler.is_waiting(RequestId(2)));
+        assert_eq!(scheduler.waiting_len(), 1);
+
+        scheduler.step();
+        assert!(scheduler.is_running(RequestId(1)));
+        assert!(scheduler.free_attention_blocks() < scheduler.total_attention_blocks());
+        assert!(scheduler.cancel_request(RequestId(1)));
+        assert_eq!(
+            scheduler.free_attention_blocks(),
+            scheduler.total_attention_blocks()
+        );
+        assert!(!scheduler.cancel_request(RequestId(1)));
     }
 
     /// AGENTS.md rule 4, the named regression: chunked prefill splits

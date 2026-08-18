@@ -51,6 +51,34 @@ struct AppState {
     block_size: usize,
 }
 
+struct RequestGuard {
+    id: RequestId,
+    engine: Arc<Mutex<Engine>>,
+    armed: bool,
+}
+
+impl RequestGuard {
+    fn new(id: RequestId, engine: Arc<Mutex<Engine>>) -> Self {
+        Self {
+            id,
+            engine,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.lock().expect("engine poisoned").cancel(self.id);
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CompletionRequest {
     prompt: String,
@@ -178,6 +206,7 @@ async fn completions(
             .remove(&id);
         return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, error.to_string()));
     }
+    let mut request_guard = RequestGuard::new(id, Arc::clone(&state.engine));
 
     let mut output = Vec::with_capacity(request.max_tokens as usize);
     let finish_reason = loop {
@@ -195,6 +224,7 @@ async fn completions(
             }
         }
     };
+    request_guard.disarm();
     let text = state
         .tokenizer
         .decode(&output, false)
@@ -235,11 +265,16 @@ fn scheduler_loop(state: AppState) {
         match result {
             Ok(steps) => {
                 let mut clients = state.clients.lock().expect("client map poisoned");
+                let mut disconnected_ids = Vec::new();
                 for (_, step) in steps {
                     let stopped = &step.stopped;
                     for (id, token) in step.generated {
-                        if let Some(client) = clients.get(&id) {
-                            let _ = client.send(ClientEvent::Token(token));
+                        let disconnected = clients
+                            .get(&id)
+                            .is_some_and(|client| client.send(ClientEvent::Token(token)).is_err());
+                        if disconnected {
+                            clients.remove(&id);
+                            disconnected_ids.push(id);
                         }
                     }
                     for id in step.completed {
@@ -253,12 +288,26 @@ fn scheduler_loop(state: AppState) {
                         }
                     }
                 }
+                drop(clients);
+                let mut engine = state.engine.lock().expect("engine poisoned");
+                for id in disconnected_ids {
+                    engine.cancel(id);
+                }
             }
             Err(failure) => {
                 error!("device scheduler failed: {failure}");
                 let mut clients = state.clients.lock().expect("client map poisoned");
-                for (_, client) in clients.drain() {
-                    let _ = client.send(ClientEvent::Error(failure.to_string()));
+                let failed = clients
+                    .drain()
+                    .map(|(id, client)| {
+                        let _ = client.send(ClientEvent::Error(failure.to_string()));
+                        id
+                    })
+                    .collect::<Vec<_>>();
+                drop(clients);
+                let mut engine = state.engine.lock().expect("engine poisoned");
+                for id in failed {
+                    engine.cancel(id);
                 }
             }
         }
