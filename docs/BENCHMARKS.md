@@ -7626,3 +7626,131 @@ named, not attempted, for the same reason worker-3 named its own
 barrier-density lever without attempting it: a half-verified
 rewrite of a shipped kernel's synchronization structure is a worse outcome
 than an honest stop.
+
+## dp4a/Q8_1 activation quantization for the MoE down GEMV: gates clean in isolation, breaks badly in the real decode loop, rejected without a root cause (2026-08-18)
+
+The session's main bet for closing the N=3 gap: llama.cpp's own `mmvq`
+scheme applied to xabe's N==1 down-projection GEMV
+(`moe_expert_down_gemv`), the only MoE decode kernel still running fp32
+activations after the GEMV-family work already put a ceiling on that
+design (28-47% of bandwidth, dequant-and-stream bound). `vecdotq.cuh` read
+first: neither `vec_dot_q8_0_q8_1_impl` nor `vec_dot_q6_K_q8_1_impl_mmvq`
+consumes Q8_1's `sum` term, so the design simplified to a plain
+int8-plus-fp32-scale activation block (matching `mma_quantize_rows_q8`'s
+existing fp32-scale convention, not a literal fp16-packed Q8_1 struct) and
+`__dp4a` in place of the accumulate. Built the down half first, Q8_0
+weight, the simpler of the two pairings: a new `moe_quantize_slot0_q8`
+activation-quantize kernel (needed because `inter`'s slot-0-per-bucket
+rows are not contiguous the way `mma_quantize_rows_q8` assumes) and
+`moe_expert_down_gemv_dp4a`, wired into `grouped_forward_partial` behind a
+`dp4a_enabled` flag mirroring `disable_tensor_cores`'s shape, reusing
+`MoeBuffers::iq`/`iq_scales` (`down_mma` only runs at `max_tokens >=
+MMA_MIN_TOKENS`, this path only at `max_tokens == 1`, so the two never
+share the buffer in the same call).
+
+### Two bugs, both caught by gating before any perf measurement was run
+
+`moe_differential` 7/7 compiled clean the first time via NVRTC, but
+compiling is not exercising: `NUM_TOKENS = 37` in that file means every
+existing test's `gemv` branch (`max_tokens == 1`) is dead code, so the new
+kernels had never actually launched. Added
+`device_grouped_forward_matches_the_reference_at_one_token_with_dp4a`, a
+dedicated `max_tokens = 1` differential against the same fp32 CPU
+reference the 37-token tests use, at the already-accepted
+`ROUTED_MMA_GATE` bound. Two bugs surfaced immediately, both in code this
+round had not yet run:
+
+1. **`CUDA_ERROR_MISALIGNED_ADDRESS`.** `dequant_tile_q8_0`'s addressing
+   was described (in this round's own design notes) as "reused unchanged"
+   for the weight side, but `dequant_tile_q8_0` reads its four bytes one
+   at a time through `signed char`, never through a 4-byte cast --
+   because a Q8_0 block is 34 bytes, not a multiple of 4, so
+   `wblock * 34 + 2 + elem` is 4-byte aligned only for even `wblock`. The
+   new kernel used `*(const int*)(wblk + 2 + elem)` to build `dp4a`'s
+   packed operand and faulted on every odd `wblock`. Fixed by
+   byte-packing the same four bytes by hand (`(int)(unsigned
+   char)wblk[...] | (... << 8) | ...`), which needs no alignment and
+   produces the identical bit pattern a 4-byte load would have.
+2. **A bug in the test itself, not the kernel.** `router_logits()` always
+   builds `NUM_TOKENS` (37) rows regardless of the geometry passed in, so
+   the first draft of the new test fed a 37-row routing decision into a
+   1-token device buffer and indexed `hidden_states[token_idx]` out of
+   bounds on the host side. Fixed by building the single row of logits
+   directly, the same way
+   `the_one_token_dispatch_matches_the_reference_slot_for_slot` already
+   does, instead of reusing the 37-token helper.
+
+With both fixed, the new test passes: dp4a down vs. the fp32 host
+reference, `cosine=0.999979 max_abs=4.388e-5` -- inside `ROUTED_MMA_GATE`
+(`1e-4` / `0.9999`) with room to spare, and consistent with the
+coordinator's asymmetry prediction (golden's own reference is llama.cpp
+running this exact scheme, so this should if anything read *closer* to
+golden than the fp32 path does). The unmodified fp32 `gemv` path, run
+immediately after via `disable_dp4a()` in the same test, still matches at
+`cosine=1.000000 max_abs=6.98e-9` -- the tight `ROUTED_GATE` bound,
+unchanged, confirming the new branch left the old one untouched. All
+8/8 `moe_differential` pass.
+
+### `batch_decode`: a real, large divergence the isolated test never saw
+
+`batched_decode_agrees_with_independent_single_stream_decodes` failed:
+
+```
+step 0 seq 0: batched id 248068 reference id 248068 max_abs_diff 5.078e-1 cosine 0.999167860
+```
+
+against a 5e-3 bound. `identical_prompts_in_one_batch_produce_bit_identical_rows`
+still passed at exactly `0.000e0` for all three steps -- bit-exactness
+within one batched call survives, as expected, since dp4a is deterministic
+per launch. The failure is between the batched-decode run (`N > 1`,
+`gemv` false, this section's kernels never launch) and the
+independent-single-stream reference (`N == 1`, `gemv` true, this section's
+kernels are exactly what runs) -- 5,000x the ~1e-4 divergence clean `main`
+produces on the same comparison.
+
+Isolated the cause with a direct A/B rather than trusting the coincidence:
+forced `dp4a_enabled: false` at construction (leaving every other line of
+the diff in place) and reran the same failing test. It passed, matching
+clean `main`'s numbers exactly (`8.6e-5` to `2.3e-4` across all nine
+step/sequence pairs). Restoring `dp4a_enabled: true` reproduces the
+`5e-1` failure again. This isolates the regression to the dp4a down path
+specifically, not to an unrelated change elsewhere in the diff -- the diff
+touches nothing outside `moe.rs`'s down-GEMV dispatch and the new test.
+
+What makes this a genuine finding rather than a restatement of the
+misalignment bug already fixed above: the isolated one-shot differential
+test (fresh, zeroed buffers, one `grouped_forward` call, one random
+activation draw) passes cleanly at the expected accuracy, and the same
+kernel breaks badly under real serving conditions -- many sequential
+calls across 40 layers of real decode steps, reusing the same persistent
+`MoeBuffers`, on real (not synthetic-uniform) activation statistics. That
+gap was not closed this round: `iq`/`iq_scales` sizing was checked and is
+provably large enough (`expert_block_capacity() * intermediate <=
+sorted_capacity() * intermediate` for any `block_size >= 1`); the
+activation-side `av` read was checked and is provably 4-byte aligned
+(`intermediate` is itself a multiple of 32); `partial` is unconditionally
+memset before every call. None of those rule out the actual cause, and
+the round's remaining budget did not stretch to a real-activation-data
+repro small enough to bisect further.
+
+### Disposition
+
+Rejected, reverted (`git checkout -- crates/xabe-cuda/src/kernels/moe.rs
+crates/xabe-engine/tests/moe_differential.rs`, confirmed empty `git diff`
+against `16bcec2`). Per the standing rule -- reject on any gate failure
+before perf work, no exceptions for a plausible design -- this closes
+without a throughput number and without attempting the FFN half (Q6_K),
+which was next in the build order contingent on down's gates passing.
+The isolated differential result stands as evidence the *design* is
+sound (matches llama.cpp's own scheme, matches the accepted MMA-path
+tolerance, leaves the fp32 fallback bit-for-bit where it was); what
+failed is something specific to sustained real-serving use that a
+single-call differential test structurally cannot see. A follow-up
+attempting this lever again should gate through `batch_decode` -- not
+just `moe_differential` -- before declaring victory even on paper, and
+should look first at whatever differs between a fresh zeroed `MoeBuffers`
+and forty layers deep into a real KV-cache decode: real activation value
+distributions (outlier channels, exact-zero SwiGLU blocks) that the
+isolated test's `Xorshift64Star::vec_f32(-1.0, 1.0)` draw does not
+reproduce, and repeated-launch state in `iq`/`iq_scales` under real
+per-layer expert-selection churn rather than one clean call.
