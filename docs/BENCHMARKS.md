@@ -7428,3 +7428,150 @@ this session's own bound allows, the barrier-density gap against
 llama.cpp identified in the previous section stays a named, understood,
 and now doubly-confirmed-expensive-to-close difference rather than a
 fixed one.
+
+## `fattn-mma-f16.cuh` at prefill's own geometry: precision ruled out twice over, barrier density confirmed and already blocked (2026-08-18)
+
+The lead's frame: does llama.cpp's `fattn-mma-f16.cuh` accumulate `Q K^T`
+and `P V` in fp16 on Turing at Qwen3.6's shape, and if so, does that
+explain `attn_flash_causal_mma`'s 0.94x at 131,072? Settled by reading the
+source, then confirmed against the actual compiled SASS rather than
+assumed from the template code alone -- and cross-checked against
+worker-3's independent, hardware-measured answer to the same question on
+the decode side, filed just above.
+
+### The accumulator types, and which one is real for this shape
+
+`mma_tile_sizes<DV, ncols>` in `fattn-mma-f16.cuh`, under
+`TURING_MMA_AVAILABLE`, has exactly two specializations -- the general
+case and `ncols == 8` (decode's GQA-batched single token) -- and **both**
+fix `T_C_KQ` to `float` and `T_C_VKQ` to `half2`, unconditionally. There is
+no third case and no runtime branch: `Q K^T` accumulates fp32, `P V`
+accumulates fp16, on every Turing shape this file instantiates.
+
+Which specialization actually runs for Qwen3.6's prefill was not assumed
+from the template alone. `ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2`
+picks `ncols2 = 8` for `gqa_ratio = 8` (`q_heads=16, kv_heads=2`), then
+`switch_ncols1`'s own Turing-specific override --
+`ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING` -- caps
+`ncols1` at `32/ncols2 = 4` regardless of batch size, because this
+project's own `llama.cpp/build` is configured `CMAKE_CUDA_ARCHITECTURES=75`
+(confirmed in `CMakeCache.txt`). So the kernel actually dispatched to for
+every prefill chunk on this card is `flash_attn_ext_f16<256, 256, 4, 8,
+false, false>` -- **not** the `ncols1=64` shape its own file name would
+suggest reading the template-instance directory naively, and not the
+`ncols==8` decode specialization either (`ncols = ncols1*ncols2 = 32`,
+landing in the general case).
+
+`cuobjdump -sass` on that exact symbol, pulled from both the standalone
+`.o` and the shipped `libggml-cuda.so.0.19.0` (identical), settles it at
+the instruction level:
+
+| instruction | count |
+|---|---:|
+| `HMMA.1688.F32` | 768 |
+| `HMMA.1688.F16` | 768 |
+
+An exact 1:1 split -- `Q K^T` (fp32-accumulate) and `P V` (fp16-accumulate)
+do the same number of tensor-core issues, confirming the source-level
+typing with no ambiguity left. (A different, unrelated
+`flash_attn_ext_f16<256,256,64,1,...>` instantiation -- the no-GQA path,
+never dispatched to here -- compiles to a bare `NO_DEVICE_CODE` trap on
+this build; worth recording so a future reader who greps the same
+`ncols1_64-ncols2_1.cu.o` does not mistake it for live code.)
+
+### Ruled out, twice, by two different methods
+
+**Worker-3's hardware ablation** (filed above, "Ruled out: fp16-accumulate
+`P V` is not a throughput lever here") measured `mma.sync.m16n8k8`'s issue
+rate directly on this card: fp16- and fp32-accumulate HMMA are 0.2-0.4%
+apart, every round -- noise, not a 2x. That single measurement is
+architecture-level, not kernel-specific, and settles the lead's own framing
+("if llama.cpp accumulates in fp16 it gets 2x the tensor peak") as false
+for Turing on this card, for prefill exactly as much as for decode: **there
+is no throughput to gain from matching llama.cpp's `P V` precision here,
+so there is nothing to report-before-building** -- the gate the lead asked
+for (simulate the accuracy cost before proposing the change) does not need
+clearing, because there is no performance case for making it regardless of
+what the accuracy cost turns out to be.
+
+**A second, independent check anyway** (`crates/xabe-kernels/examples/
+fp16_accum_simulation.rs`), run before this was known, because the
+decode-side ablation was not yet filed when this section's own
+investigation started: a host-side simulation of `attn_flash_causal_mma`'s
+online-softmax arithmetic with the `P V` accumulator rounded to fp16 at
+every point real `HMMA.1688.F16` hardware would round it (after each
+8-key sub-group and after each tile's rescale), at both llama.cpp's own
+64-key rescale cadence and our kernel's narrower 8-key one, at every depth
+from 512 to 131,072, three seeds at the deepest. Result: **holds with
+26-30x margin against `MMA_GATE` (3.906e-3) at every depth and both
+cadences**, not trending toward the gate as depth or rescale frequency
+grows -- the self-normalizing division at the end of online softmax bounds
+a fp16 rounding's relative contribution regardless of how many times it
+happens. Two independently-derived answers -- one from hardware
+throughput, one from numerical simulation -- agree: **fp16 `P V`
+accumulation would cost nothing on accuracy and buy nothing on speed, on
+this card.** Not built, for the same reason worker-3's section did not
+build it: there is no case for it.
+
+### What the SASS-level structure *does* show: a real, already-named, already-blocked barrier-density gap
+
+Counting `__syncthreads()` inside `flash_attn_ext_f16_iter` for the
+dispatched `<256,256,4,8>` shape, `nbatch_fa=64` (from
+`ggml_cuda_fattn_mma_get_config_turing`'s `(256,256,32,...)` row): the
+`k0_start` loop over `DKQ/2` in steps of `nbatch_K2=128` runs exactly once
+(`128 == DKQ/2`), and the `i0_start` loop over `DV` in steps of
+`2*nbatch_V2=256` also runs exactly once (`256 == DV`) -- so the whole
+64-key tile costs **3 `__syncthreads()`** (K-tile stage, the
+`tile_K==tile_V` one, V-tile stage), all its `Q K^T`, softmax, and `P V`
+tensor-core work done in between on registers and warp shuffles alone.
+`0.047 syncs/key`.
+
+`attn_flash_causal_mma`'s own per-trip macro (`MMA_KT = 8`, this file's
+current shipped width) pays **2 `__syncthreads()`** (after staging K, after
+staging V) plus 2 `MMA_HEAD_BAR()` (`__syncwarp()`, warp-local and far
+cheaper) **every 8 keys** -- `0.25 syncs/key` on the block-wide barriers
+alone. **About 5.3x denser** than llama.cpp's prefill tile, the same
+pattern worker-3 found for decode (8x, at that kernel's different tile
+widths) from the same root cause: llama.cpp stages a whole wide tile once
+and does all the arithmetic for it without another block-wide sync; this
+file's kernels re-sync the whole block once per much-narrower key octet.
+
+This is not a new, unbuilt lever. It is the mechanism "Widening the
+softmax-rescale tile" (two sections up, `MMA_KEY_TRIPS` 1 -> 2 or 4) was
+built to attack -- processing more keys per `__syncthreads()` pair is
+exactly what widening the softmax-rescale tile means -- and that section
+already measured and rejected it on register spill: the kernel sits at
+252/255 registers with zero spill at `MMA_KT=8`, and widening trades
+occupancy away rather than buying anything, a wash trending slightly
+negative at 131,072. Quantifying the barrier-density gap here explains
+*why* that lever would have mattered if it had fit; it does not reopen it.
+
+### Disposition
+
+No kernel change from this section, same as worker-3's decode
+counterpart. Precision is closed by two independent measurements pointing
+the same way. The structural gap is real, sized, and already blocked by
+this kernel's own register budget -- not a new candidate, a confirmation
+that the one candidate this workstream found was the right one to try,
+and the right one to reject.
+
+### The 131,072 ceiling, stated plainly
+
+Deep prefill is bounded by `attn_flash_causal_mma` alone: attention is
+71.8% of a deep chunk's kernel time (this workstream's opening profile),
+and MoE's remaining share has already been closed as far as this
+workstream's own levers reach (see "Two compiled widths instead of one").
+Every mechanism this session and worker-3's decode-side investigation
+checked for the attention kernel itself is now closed, one way:
+`MMA_KEY_TRIPS` widening -- built, rejected on register spill (252/255,
+zero spill, no headroom). `P V` accumulator precision -- not a throughput
+lever on this card (hardware-measured) and not an accuracy risk either way
+(simulated), so not worth building regardless. Barrier density against
+llama.cpp -- real (~5x), but it is the same register-bound lever already
+tried. No further named lever remains for 131,072 from either workstream
+without a structural rewrite of the kernel's staging/synchronization
+pattern (register-neutral by construction, not a parameter change) --
+named, not attempted, for the same reason worker-3 named its own
+barrier-density lever without attempting it: a half-verified
+rewrite of a shipped kernel's synchronization structure is a worse outcome
+than an honest stop.
