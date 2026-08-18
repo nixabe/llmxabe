@@ -8803,3 +8803,63 @@ did not improve it: the same 24--30% aggregate-throughput loss to llama.cpp
 remains. The goal's N=3 performance criterion is therefore still open; the
 successful three-card serving acceptance is not evidence that the throughput
 gap closed.
+
+## 2026-08-18 — The serving benchmark reaches the kernel bar, and `-ub 2048` raises the decode bar
+
+The replacement target now includes llama.cpp at both `-b 4096 -ub 2048` and
+`-b 4096 -ub 4096`; the faster setting for each metric and context is the bar.
+This is not redundant. Three alternating llama.cpp pairs on GPU 1, same model
+and the final section's other flags, produced:
+
+| context | N | `-ub 2048` decode tok/s | `-ub 4096` decode tok/s | best median |
+| ---: | ---: | --- | --- | ---: |
+| 2,048 | 1 | 98.40, 98.15, 96.28 | 97.71, 97.47, 97.13 | **98.15** (`2048`) |
+| 2,048 | 3 | 189.34, 187.90, 182.14 | 186.61, 184.73, 185.20 | **187.90** (`2048`) |
+| 32,768 | 1 | 88.74, 87.46, 86.44 | 87.40, 86.38, 86.73 | **87.46** (`2048`) |
+| 32,768 | 3 | 154.33, 153.79, 152.76 | 152.23, 147.03, 153.82 | **153.79** (`2048`) |
+
+Decode prefers 2048 in this session. Prefill does not have one global winner:
+at N=3/32K, for example, `-ub 4096` printed 2,534--2,547 tok/s while
+`-ub 2048` printed 2,340--2,389. Future head-to-head tables must therefore
+retain both baselines instead of replacing one with the other.
+
+`bench_worker_decode` was added to time the live `Worker::step_device` path:
+admission is complete before timing, n-gram drafting is disabled, the first
+request-specific graph capture and four warmups are discarded, and each timed
+call must remain a pure fixed-width decode. EOS is deliberately an ordinary
+token in this benchmark; its first version let one synthetic sequence stop,
+then waited forever for N=3 to return. The second version caught that shrink
+but gave the earliest sequence too little output runway and rejected the last
+timed step. Both are measurement-harness rejects, not engine results.
+
+One scheduler-path run per cell on GPU 0, 32 host-wall timed steps:
+
+| context | N | mean ms/step | aggregate tok/s | isolated median above | result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 2,048 | 1 | 10.00 | 100.0 | 100.4 | within 0.4% |
+| 2,048 | 3 | 20.82 | 144.1 | 143.1 | within 0.7% |
+| 32,768 | 1 | 12.26 | 81.6 | 81.3 | within 0.4% |
+| 32,768 | 3 | 27.99 | 107.2 | 106.9 | within 0.3% |
+
+These are single runs establishing equivalence, not the three-pair claim run.
+They close one ambiguity: scheduler/runtime plumbing is not the 24--30% N=3
+gap. The live serving path reaches the isolated kernel bar.
+
+Worker construction was made observable while building this benchmark. A
+2048-token prefill shape takes about 19 seconds including NVRTC; seven tail
+shapes and three decode shapes then take about 0.2 seconds from the in-process
+PTX cache. Sharing each attention layer's ordinary weights and split-int8
+repack across `Forward::reshape` reduced construction-time residency from
+about 38.9 GiB to 35.5 GiB. Two apparent 14-minute startups were a stale
+`target/release/bench_worker_decode` invoked directly after the change -- the
+same stale-binary trap the previous section records. Rebuilding through Cargo
+made the phase timings truthful.
+
+An `nvprof` run over N=3 at 2K included prefill and therefore is not a clean
+percentage profile, but call counts isolate the twelve decode steps (four
+warmups plus eight timed): `moe_expert_down_bm1` plus
+`moe_expert_down_narrow` consumed 40.51 ms, or about 3.38 ms per step. That is
+16% of the measured 21.21 ms profiled step and is a material recoverable share.
+This is the evidence for retrying the previously gated Q8-activation/dp4a
+routed-down experiment symmetrically across N=1--3. It is not evidence that
+the retry will win; correctness gates run before timing.
