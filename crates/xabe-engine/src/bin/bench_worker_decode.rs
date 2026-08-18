@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use xabe_cache::CacheConfig;
 use xabe_engine::{Worker, WorkerId};
 use xabe_model::ModelConfig;
@@ -125,14 +125,34 @@ fn run_width(
     // first decode step can share the scheduler batch with the final prefill,
     // so count emitted tokens rather than assuming a fixed number of calls.
     let mut warmed = 0u32;
+    let mut setup_steps = 0u32;
+    let setup_limit = u32::try_from(context.div_ceil(PREFILL_CHUNK))
+        .unwrap_or(u32::MAX)
+        .saturating_mul(width as u32)
+        .saturating_add(WARMUP + 16);
     // The first full-width step captures the request-id-specific graph. Drop
     // it in addition to the ordinary warmups.
     while warmed < WARMUP + 1 {
         let step = worker.step_device().map_err(|error| error.to_string())?;
+        setup_steps += 1;
+        debug!(
+            setup_steps,
+            decodes = step.decode_items,
+            prefills = step.prefill_items,
+            generated = step.generated.len(),
+            completed = step.completed.len(),
+            stopped = step.stopped.len(),
+            "worker benchmark setup step"
+        );
+        if !step.completed.is_empty() || !step.stopped.is_empty() {
+            return Err("a request completed before the steady-state window".to_owned());
+        }
+        if setup_steps > setup_limit {
+            return Err(format!(
+                "no full-width steady-state decode after {setup_steps} scheduler steps"
+            ));
+        }
         if step.decode_items == width && step.prefill_items == 0 && step.generated.len() == width {
-            if !step.completed.is_empty() || !step.stopped.is_empty() {
-                return Err("a request completed during decode warmup".to_owned());
-            }
             warmed += 1;
         }
     }
