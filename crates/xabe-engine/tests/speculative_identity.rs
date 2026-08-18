@@ -30,7 +30,7 @@
 //! or the model file.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaContext, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
@@ -53,6 +53,11 @@ const ROPE_FREQ_BASE_KEY: &str = "qwen35moe.rope.freq_base";
 const DRAFT_TOKENS: usize = 3;
 /// The brief's floor.
 const MIN_STEPS: usize = 64;
+
+/// Each case makes roughly 30 GiB of model weights resident. Rust's test
+/// harness otherwise runs both cases concurrently and asks a 48 GiB card to
+/// hold two copies, turning the correctness gate into an OOM race.
+static GPU_CASE: Mutex<()> = Mutex::new(());
 
 fn model_path() -> PathBuf {
     std::env::var_os("LLMXABE_MODEL")
@@ -215,6 +220,7 @@ fn assert_sequences_match(regime: &str, plain: &[i32], speculative: &[i32], n: u
 
 #[test]
 fn speculative_decode_matches_plain_greedy_on_a_natural_prompt() {
+    let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
     let Some(fx) = setup() else { return };
     // The golden file is gitignored and lives at the main checkout's
     // `.golden/`; a worktree does not inherit it. `golden::setup` already
@@ -251,6 +257,7 @@ fn speculative_decode_matches_plain_greedy_on_a_natural_prompt() {
 
 #[test]
 fn speculative_decode_matches_plain_greedy_on_a_random_prompt() {
+    let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
     let Some(fx) = setup() else { return };
 
     // Deterministic, structureless token ids — see the module docs on why
