@@ -245,6 +245,10 @@ const MMA_M_NARROW: usize = 32;
 /// decode step of one token, where the integer path loses.
 const MMA_MIN_TOKENS: usize = 8;
 
+fn decode_dp4a_applies(enabled: bool, max_tokens: usize, quant: ExpertQuant) -> bool {
+    enabled && (1..=3).contains(&max_tokens) && quant == ExpertQuant::Q8_0
+}
+
 /// Batch width at or below which `grouped_forward_partial` picks
 /// `expert_ffn_narrow`/`expert_down_narrow` over `expert_ffn`/`expert_down`
 /// for `N > 1`. Below `MMA_MIN_TOKENS`, so there is no overlap with the
@@ -2445,6 +2449,89 @@ __global__ void moe_expert_down_gemv(
     }
 }
 
+// Experimental narrow-decode Q8_0 down projection. Every dispatch slot is
+// quantized with the same one-fp32-scale-per-32 scheme, independent of batch
+// width, and every width uses this one contraction body. This is deliberately
+// separate from the fp32 kernels so the serving differential can A/B it.
+__device__ __forceinline__ int moe_dp4a_s8(int a, int b, int c) {
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(c) : "r"(a), "r"(b), "r"(c));
+    return c;
+}
+
+#define MOE_Q8_WARPS 4
+__global__ void moe_quantize_dispatch_q8(
+    const float* __restrict__ x, const int* __restrict__ expert_ids,
+    signed char* __restrict__ q, float* __restrict__ scales,
+    int block_size, int k_dim
+) {
+    int blk = blockIdx.x;
+    if (expert_ids[blk] < 0) return;
+    int blocks = k_dim / 32;
+    int linear = blockIdx.y * blockDim.y + threadIdx.y;
+    if (linear >= block_size * blocks) return;
+    int slot = linear / blocks;
+    int b = linear - slot * blocks;
+    int lane = threadIdx.x;
+    long long base = ((long long)blk * block_size + slot) * k_dim + (long long)b * 32;
+    float v = x[base + lane];
+    float a = fabsf(v);
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+    float d = a > 0.0f ? a / 127.0f : 1.0f;
+    float inv = a > 0.0f ? 127.0f / a : 0.0f;
+    int qi = (int)rintf(v * inv);
+    qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
+    q[base] = (signed char)qi;
+    if (lane == 0) scales[base / 32] = d;
+}
+
+__global__ void moe_expert_down_dp4a(
+    const unsigned char* __restrict__ down_q,
+    const signed char* __restrict__ xq, const float* __restrict__ xscale,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids, const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live, const int* __restrict__ valid_tokens,
+    int top_k, int block_size, int hidden, int intermediate,
+    float* __restrict__ partial
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    int numel = (*valid_tokens) * top_k;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+    int elem = (lane * 4) & 31;
+    int blkoff = lane >> 3;
+    int live = bucket_live[blk];
+    for (int slot = 0; slot < live; ++slot) {
+        int flat = sorted_token_ids[(long long)blk * block_size + slot];
+        if (flat >= numel) continue;
+        long long xbase = ((long long)blk * block_size + slot) * intermediate;
+        float acc = 0.0f;
+        for (long long j0 = 0; j0 < intermediate; j0 += 128) {
+            long long wb = ((wrow + j0) >> 5) + blkoff;
+            const unsigned char* wblk = down_q + wb * 34;
+            float dw = load_half_le(wblk);
+            int wv = (int)(unsigned char)wblk[2 + elem]
+                   | ((int)(unsigned char)wblk[3 + elem] << 8)
+                   | ((int)(unsigned char)wblk[4 + elem] << 16)
+                   | ((int)(unsigned char)wblk[5 + elem] << 24);
+            long long ab = (j0 >> 5) + blkoff;
+            int av = *(const int*)(xq + xbase + ab * 32 + elem);
+            float dx = xscale[(xbase >> 5) + ab];
+            acc += dw * dx * (float)moe_dp4a_s8(wv, av, 0);
+        }
+        float out[1] = {acc};
+        warp_reduce_tile<1>(out);
+        if (lane == 0)
+            store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, out[0]);
+    }
+}
+
 // -------------------------------------------------------------------------
 // 3b. The same gate/up projection on the integer tensor cores.
 // -------------------------------------------------------------------------
@@ -3798,6 +3885,9 @@ pub struct MoeKernels {
     /// cost that sank the first attempt.
     expert_ffn_bm1: CudaFunction,
     expert_down_bm1: CudaFunction,
+    quantize_dispatch_q8: CudaFunction,
+    expert_down_dp4a: CudaFunction,
+    dp4a_enabled: bool,
     expert_ffn_mma: CudaFunction,
     expert_ffn_mma_q8: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
@@ -3929,6 +4019,9 @@ impl MoeKernels {
             expert_down_narrow: module.load_function("moe_expert_down_narrow")?,
             expert_ffn_bm1: module.load_function("moe_expert_ffn_bm1")?,
             expert_down_bm1: module.load_function("moe_expert_down_bm1")?,
+            quantize_dispatch_q8: module.load_function("moe_quantize_dispatch_q8")?,
+            expert_down_dp4a: module.load_function("moe_expert_down_dp4a")?,
+            dp4a_enabled: false,
             expert_ffn_mma: module.load_function(if narrow {
                 "moe_expert_ffn_mma_narrow"
             } else {
@@ -4020,6 +4113,16 @@ impl MoeKernels {
     /// Q6_K gate/up pair.
     pub fn tensor_cores_enabled(&self) -> bool {
         self.mma.is_some()
+    }
+
+    /// Enable the experimental symmetric Q8_0/dp4a down projection for
+    /// decode widths one through three. The fp32 path remains the default.
+    pub fn enable_decode_dp4a(&mut self) {
+        self.dp4a_enabled = true;
+    }
+
+    pub fn decode_dp4a_enabled(&self) -> bool {
+        self.dp4a_enabled
     }
 
     /// Publish this step's token count into the device scalar the kernels
@@ -4323,6 +4426,8 @@ impl MoeKernels {
         // own comment.
         let narrow = !gemv && !use_mma && g.max_tokens <= MOE_NARROW_DECODE_MAX;
 
+        let use_decode_dp4a = decode_dp4a_applies(self.dp4a_enabled, g.max_tokens, down.quant);
+
         if gemv {
             let cfg = LaunchConfig {
                 grid_dim: (
@@ -4521,7 +4626,57 @@ impl MoeKernels {
         // produce a plausible wrong answer instead of an obviously wrong one.
         stream.memset_zeros(&mut buffers.partial)?;
 
-        if gemv {
+        if use_decode_dp4a {
+            let blocks = g.intermediate / 32;
+            let quant_cfg = LaunchConfig {
+                grid_dim: (
+                    g.expert_block_capacity() as u32,
+                    (g.block_size * blocks).div_ceil(4) as u32,
+                    1,
+                ),
+                block_dim: (32, 4, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut quant = stream.launch_builder(&self.quantize_dispatch_q8);
+            quant
+                .arg(&buffers.inter)
+                .arg(&buffers.expert_ids)
+                .arg(&mut buffers.iq)
+                .arg(&mut buffers.iq_scales)
+                .arg(&block_size)
+                .arg(&intermediate);
+            // SAFETY: `iq` and its scales mirror `inter`'s dispatch-slot
+            // layout; the fixed grid covers no more than their capacities.
+            unsafe { quant.launch(quant_cfg) }?;
+
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.hidden as u32).div_ceil(TILE_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.expert_down_dp4a);
+            builder
+                .arg(down.bytes)
+                .arg(&buffers.iq)
+                .arg(&buffers.iq_scales)
+                .arg(&buffers.topk_weights)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.bucket_live)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.partial);
+            // SAFETY: every live slot was quantized above; weight and output
+            // bounds are the same as the fp32 down projection.
+            unsafe { builder.launch(cfg) }?;
+        } else if gemv {
             let cfg = LaunchConfig {
                 grid_dim: (
                     (g.hidden as u32).div_ceil(TILE_ROWS),
@@ -5375,6 +5530,24 @@ mod tests {
         assert_eq!(BLOCK_Q8_0_BYTES, 2 + QK8_0);
         // The real file is mixed, so the codes must be distinct and stable.
         assert_ne!(ExpertQuant::Q6K.code(), ExpertQuant::Q8_0.code());
+    }
+
+    #[test]
+    fn decode_dp4a_is_one_symmetric_width_family_and_opt_in() {
+        for width in 1..=3 {
+            assert!(!decode_dp4a_applies(false, width, ExpertQuant::Q8_0));
+            assert!(decode_dp4a_applies(true, width, ExpertQuant::Q8_0));
+            assert!(!decode_dp4a_applies(true, width, ExpertQuant::Q6K));
+        }
+        assert!(!decode_dp4a_applies(true, 4, ExpertQuant::Q8_0));
+        assert_eq!(
+            MOE_SRC
+                .matches("__global__ void moe_expert_down_dp4a(")
+                .count(),
+            1
+        );
+        assert!(MOE_SRC.contains("q[base] = (signed char)qi;"));
+        assert!(MOE_SRC.contains("moe_dp4a_s8(wv, av, 0)"));
     }
 
     #[test]
