@@ -703,6 +703,9 @@ pub struct Forward {
     batch_positions_host: Vec<i32>,
     /// Stable pageable source used only while capturing the batch graph.
     batch_zero_tokens: Vec<i32>,
+    /// Fixed fork/join resources for the sequence-local part of batched
+    /// attention. Created before serving and retained with captured graphs.
+    batch_attention: Option<BatchAttentionStreams>,
 
     /// Allocated by `enable_verify`, once per Gated DeltaNet layer.
     verify_scratch: Option<Vec<GdnVerifyScratch>>,
@@ -733,6 +736,12 @@ pub struct StepGraph {
 /// different pass or state.
 pub struct BatchStepGraph {
     graph: CudaGraph,
+}
+
+struct BatchAttentionStreams {
+    secondary: Vec<Arc<CudaStream>>,
+    fork: CudaEvent,
+    joins: Vec<CudaEvent>,
 }
 
 impl Forward {
@@ -1055,6 +1064,7 @@ impl Forward {
             batch_positions: None,
             batch_positions_host: Vec::new(),
             batch_zero_tokens: Vec::new(),
+            batch_attention: None,
             verify_scratch: None,
             report: ForwardReport {
                 arena_bytes: weights.arena().capacity() as u64,
@@ -1367,6 +1377,23 @@ impl Forward {
         self.batch_positions = Some(stream.alloc_zeros::<i32>(tokens)?);
         self.batch_positions_host = vec![0i32; tokens];
         self.batch_zero_tokens = vec![0i32; tokens];
+        let concurrent_attention = std::env::var_os("LLMXABE_SERIAL_BATCH_ATTENTION").is_none();
+        let lanes = if concurrent_attention {
+            tokens.saturating_sub(1)
+        } else {
+            0
+        };
+        let mut secondary = Vec::with_capacity(lanes);
+        let mut joins = Vec::with_capacity(tokens.saturating_sub(1));
+        for _ in 0..lanes {
+            secondary.push(ctx.new_stream()?);
+            joins.push(ctx.new_event(None)?);
+        }
+        self.batch_attention = Some(BatchAttentionStreams {
+            secondary,
+            fork: ctx.new_event(None)?,
+            joins,
+        });
         Ok(())
     }
 
@@ -1490,6 +1517,21 @@ impl Forward {
                     self.attention[attn_slot]
                         .forward_batch_decode(
                             stream,
+                            &self
+                                .batch_attention
+                                .as_ref()
+                                .expect("enabled batch decode has attention streams")
+                                .secondary,
+                            &self
+                                .batch_attention
+                                .as_ref()
+                                .expect("enabled batch decode has attention streams")
+                                .fork,
+                            &self
+                                .batch_attention
+                                .as_ref()
+                                .expect("enabled batch decode has attention streams")
+                                .joins,
                             &mut self.attn_scratch,
                             &self.hidden_state,
                             &mut caches,
@@ -1872,6 +1914,21 @@ impl Forward {
                     self.attention[attn_slot]
                         .forward_batch_decode(
                             stream,
+                            &self
+                                .batch_attention
+                                .as_ref()
+                                .expect("enabled batch decode has attention streams")
+                                .secondary,
+                            &self
+                                .batch_attention
+                                .as_ref()
+                                .expect("enabled batch decode has attention streams")
+                                .fork,
+                            &self
+                                .batch_attention
+                                .as_ref()
+                                .expect("enabled batch decode has attention streams")
+                                .joins,
                             &mut self.attn_scratch,
                             &self.hidden_state,
                             &mut caches,

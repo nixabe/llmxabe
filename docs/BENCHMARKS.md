@@ -8917,3 +8917,32 @@ puts the plausible 32K recovery near 1.5--1.7 ms per N=3 step. That is material
 but cannot by itself close the full 24--30% aggregate decode gap. Production
 multi-stream execution still needs exact N=1/N=3 and graph-capture gates before
 this diagnostic can be called an engine improvement.
+
+## 2026-08-19 — Batched attention now overlaps its three sequence-local reads
+
+The production N=2/N=3 decode shapes now retain fixed auxiliary streams,
+fork/join events, and one decode-partial scratch per sequence. At each Gated
+Attention layer, the batched projections and norms remain on the main stream;
+the per-sequence RoPE, cache append, and decode attention fork across streams,
+then rejoin before the batched output gate and projection. All resources are
+created by `enable_batch_decode`, outside capture and outside the hot path.
+
+`LLMXABE_SERIAL_BATCH_ATTENTION=1` retains the prior serial loop as a
+setup-time A/B control. Three interleaved serial/concurrent pairs on GPU 0,
+using the captured `bench_decode_batch` path, produced:
+
+| context | N | serial ms/step | concurrent ms/step | concurrent tok/s | step-time saving |
+| ---: | ---: | --- | --- | --- | --- |
+| 2,048 | 3 | 21.11, 21.04, 21.01 | 20.71, 20.74, 20.76 | 144.9, 144.6, 144.5 | 1.3--1.9% |
+| 32,768 | 3 | 28.48, 28.25, 28.23 | 27.31, 27.21, 27.09 | 109.8, 110.3, 110.7 | 3.7--4.0% |
+
+The isolated attention probe's larger 13--18% saving correctly identified a
+real opportunity, but its 1.5--1.7 ms whole-step estimate was high: production
+recovered 0.30--0.40 ms at 2K and 0.94--1.17 ms at 32K. The N=3 llama.cpp gap
+therefore remains open; 110.3 tok/s at 32K is still well below this session's
+153.79 tok/s best llama.cpp result.
+
+The correctness gate ran before timing. Three launched N=3 steps and three
+captured/replayed steps selected identical tokens. Against three independent
+N=1 passes, every one of nine full 248,320-logit rows had max-abs difference
+`0.000e0` and cosine `1.000000000`; identical prompts also remained bit exact.

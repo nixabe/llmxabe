@@ -107,8 +107,8 @@
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PinnedHostSlice,
-    PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PinnedHostSlice, PushKernelArg,
 };
 
 use xabe_cuda::arena::ArenaError;
@@ -696,7 +696,7 @@ pub struct AttnScratch {
     /// geometry rather than by `tokens`, and used only at `n_query == 1`, but
     /// held here because this is the struct with a stream to allocate from and
     /// the one already shared by all ten attention layers.
-    decode: AttnDecodeScratch,
+    decode: Vec<AttnDecodeScratch>,
 }
 
 impl AttnScratch {
@@ -727,7 +727,9 @@ impl AttnScratch {
             gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
             xq: None,
-            decode: AttnDecodeScratch::new(stream, a.q_heads as usize, a.head_dim as usize)?,
+            decode: (0..tokens)
+                .map(|_| AttnDecodeScratch::new(stream, a.q_heads as usize, a.head_dim as usize))
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 
@@ -1319,7 +1321,7 @@ impl GatedAttentionBlock {
         //    longer and the kernel reads none of the tail.
         k.mixer.forward(
             stream,
-            &mut sc.decode,
+            &mut sc.decode[0],
             &sc.query_roped,
             &cache.k,
             &cache.v,
@@ -1420,6 +1422,9 @@ impl GatedAttentionBlock {
     pub fn forward_batch_decode(
         &mut self,
         stream: &Arc<CudaStream>,
+        secondary_streams: &[Arc<CudaStream>],
+        fork: &CudaEvent,
+        joins: &[CudaEvent],
         sc: &mut AttnScratch,
         hidden_state: &CudaSlice<f32>,
         caches: &mut [&mut KvCache],
@@ -1579,21 +1584,37 @@ impl GatedAttentionBlock {
             self.rms_eps,
         )?;
 
-        // 7/8/9. Rotary, the key/value append, and the causal attention
-        //        read — one sequence at a time. See the method docs for why
-        //        these three cannot join the batch above.
-        for i in 0..n {
+        debug_assert!(secondary_streams.is_empty() || secondary_streams.len() == n - 1);
+        debug_assert_eq!(joins.len(), secondary_streams.len());
+        if !secondary_streams.is_empty() {
+            fork.record(stream)?;
+            for secondary in secondary_streams {
+                secondary.wait(fork)?;
+            }
+        }
+
+        // Queue auxiliary rows first so they are ready to issue as soon as
+        // the main stream reaches the fork. Row zero is submitted last on
+        // the already-busy main stream.
+        for i in (0..n).rev() {
+            let sequence_stream = if i == 0 || secondary_streams.is_empty() {
+                stream
+            } else {
+                &secondary_streams[i - 1]
+            };
             // SAFETY: `i < n = t`; `self.q_heads * self.head_dim` and
             // `self.kv_heads * self.head_dim` are `sc.query_normed`'s/
             // `sc.query_roped`'s and `sc.key_normed`'s/`sc.key_roped`'s own
             // per-token widths, and `kv_dim` is `sc.value`'s, all checked by
             // `AttnScratch::new` against `tokens * width`.
-            let q_normed_i =
-                unsafe { crate::viewslice::subslice(stream, &sc.query_normed, i * q_dim, q_dim) };
-            let mut q_roped_i =
-                unsafe { crate::viewslice::subslice(stream, &sc.query_roped, i * q_dim, q_dim) };
+            let q_normed_i = unsafe {
+                crate::viewslice::subslice(sequence_stream, &sc.query_normed, i * q_dim, q_dim)
+            };
+            let mut q_roped_i = unsafe {
+                crate::viewslice::subslice(sequence_stream, &sc.query_roped, i * q_dim, q_dim)
+            };
             k.mixer.rope(
-                stream,
+                sequence_stream,
                 &q_normed_i,
                 &mut q_roped_i,
                 1,
@@ -1603,12 +1624,14 @@ impl GatedAttentionBlock {
                 self.rope_theta,
             )?;
 
-            let k_normed_i =
-                unsafe { crate::viewslice::subslice(stream, &sc.key_normed, i * kv_dim, kv_dim) };
-            let mut k_roped_i =
-                unsafe { crate::viewslice::subslice(stream, &sc.key_roped, i * kv_dim, kv_dim) };
+            let k_normed_i = unsafe {
+                crate::viewslice::subslice(sequence_stream, &sc.key_normed, i * kv_dim, kv_dim)
+            };
+            let mut k_roped_i = unsafe {
+                crate::viewslice::subslice(sequence_stream, &sc.key_roped, i * kv_dim, kv_dim)
+            };
             k.mixer.rope(
-                stream,
+                sequence_stream,
                 &k_normed_i,
                 &mut k_roped_i,
                 1,
@@ -1618,10 +1641,11 @@ impl GatedAttentionBlock {
                 self.rope_theta,
             )?;
 
-            let value_i =
-                unsafe { crate::viewslice::subslice(stream, &sc.value, i * kv_dim, kv_dim) };
+            let value_i = unsafe {
+                crate::viewslice::subslice(sequence_stream, &sc.value, i * kv_dim, kv_dim)
+            };
             k.mixer.append_kv(
-                stream,
+                sequence_stream,
                 &k_roped_i,
                 &value_i,
                 &mut caches[i].k,
@@ -1631,11 +1655,12 @@ impl GatedAttentionBlock {
                 positions[i],
             )?;
 
-            let mut pregate_i =
-                unsafe { crate::viewslice::subslice(stream, &sc.pregate, i * q_dim, q_dim) };
+            let mut pregate_i = unsafe {
+                crate::viewslice::subslice(sequence_stream, &sc.pregate, i * q_dim, q_dim)
+            };
             k.mixer.forward(
-                stream,
-                &mut sc.decode,
+                sequence_stream,
+                &mut sc.decode[i],
                 &q_roped_i,
                 &caches[i].k,
                 &caches[i].v,
@@ -1645,6 +1670,12 @@ impl GatedAttentionBlock {
                 pos_offsets[i] + 1,
                 positions[i],
             )?;
+            if !secondary_streams.is_empty() && i > 0 {
+                joins[i - 1].record(sequence_stream)?;
+            }
+        }
+        for join in joins {
+            stream.wait(join)?;
         }
 
         // 10. The output gate. No position, no state: batches.
