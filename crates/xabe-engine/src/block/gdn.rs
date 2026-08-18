@@ -585,6 +585,103 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t4,  4,  1)
 GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8,  4)
 GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
+// `gdn_proj_split_gemv`'s per-lane grouping, generalized to TT tokens.
+//
+// The batch-vs-single-stream bit-identity workstream's finding: at
+// `1 < tokens < MMA_SPLIT_TOKENS`, `run_batch_decode` fed the qkv/gate/out
+// projections through `gdn_proj_q8_0_t*` above -- the *standard* layout,
+// same per-lane grouping as the untiled `gdn_proj_q8_0` -- while true
+// single-stream decode (`tokens == 1`, the repack resident) took
+// `gdn_proj_split_gemv`'s *split* layout with a different per-lane
+// grouping (four consecutive quants per lane, eight lanes covering each
+// Q8_0 block's 32 elements, instead of one lane owning element `lane` of
+// *every* block). `docs/BENCHMARKS.md`'s Phase B, step 2 measured the gap
+// directly: 7.153e-7 max-abs on a real qkv row, real weights, identical
+// input, nothing else different.
+//
+// Matching the GEMV's grouping from the *standard* layout was checked and
+// rejected before writing this: a lane's four consecutive quants land
+// inside one Q8_0 block only when the block's own byte offset is 4-byte
+// aligned, which happens for even blocks and not odd ones (34-byte
+// stride) -- the exact misalignment `dequant_tile_q8_0`'s dp4a bug hit,
+// documented above. Reproducing the GEMV's vectorized read over the
+// standard layout would need the same manual byte-packing that fix used,
+// which throws away the coalescing the split layout exists to buy in the
+// first place -- at that point it is not "the tiled kernel matching the
+// GEMV," it is the old 47%-of-roofline kernel wearing the GEMV's math.
+// The split layout is what makes the vectorized read *legal*, so this
+// kernel consumes it, reusing `GdnLayerInt8`'s existing repack -- no new
+// device memory, only a new entry point.
+//
+// Per-lane accumulation is `gdn_proj_split_gemv`'s, operand for operand,
+// in the same order, for each of TT token columns: the dequantized
+// `char4` and its scale are read once per 128-byte step and applied to
+// every live column's own accumulator with the same four sequential
+// `+=` steps the GEMV performs, before the next step's load. Column `i`'s
+// accumulator therefore sees exactly the GEMV's own sequence of additions
+// -- the other columns' arithmetic between one step and the next touches
+// different registers, which does not reorder what happens to this one.
+// `warp_reduce_sum` closes each column out with the exact same butterfly.
+// Out-of-range columns read zero, which contributes exactly zero to a
+// live column and is simply never written back for a padding one -- the
+// same convention `GDN_PROJ_TILED` uses.
+//
+// grid: (ceil(N / warps), ceil(tokens / TT)). block: (32, warps). One warp
+// owns one output row across all TT tokens -- no row tiling, matching the
+// GEMV's own one-row-per-warp granularity exactly, which is what keeps
+// this a pure generalization rather than a new design.
+#define GDN_PROJ_SPLIT_TILED(NAME, TT)                                       \
+__global__ void NAME(                                                        \
+    const signed char* __restrict__ wq,                                     \
+    const float* __restrict__ ws,                                           \
+    const float* __restrict__ x,                                            \
+    float* __restrict__ out,                                                \
+    int k_dim,                                                              \
+    int n_rows,                                                             \
+    int n_tokens                                                            \
+) {                                                                          \
+    int lane = threadIdx.x;                                                  \
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;                        \
+    if (n >= n_rows) return;                                                 \
+    int t0 = blockIdx.y * (TT);                                              \
+    if (t0 >= n_tokens) return;                                              \
+    int live_t = n_tokens - t0; if (live_t > (TT)) live_t = (TT);            \
+                                                                               \
+    const signed char* row = wq + (long long)n * k_dim;                      \
+    const float* sc = ws + (long long)n * (k_dim / 32);                      \
+                                                                               \
+    float acc[TT];                                                           \
+    _Pragma("unroll")                                                        \
+    for (int i = 0; i < (TT); ++i) acc[i] = 0.0f;                            \
+                                                                               \
+    for (int c = 0; c < k_dim; c += 128) {                                   \
+        int e0 = c + 4 * lane;                                               \
+        char4 q = *(const char4*)(row + e0);                                 \
+        float d = sc[e0 >> 5];                                               \
+        _Pragma("unroll")                                                    \
+        for (int i = 0; i < (TT); ++i) {                                     \
+            int t = t0 + i;                                                  \
+            float4 xv = (t < n_tokens)                                       \
+                ? *(const float4*)(x + (long long)t * k_dim + e0)            \
+                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);                       \
+            acc[i] += (float)q.x * d * xv.x;                                 \
+            acc[i] += (float)q.y * d * xv.y;                                 \
+            acc[i] += (float)q.z * d * xv.z;                                 \
+            acc[i] += (float)q.w * d * xv.w;                                 \
+        }                                                                    \
+    }                                                                        \
+                                                                               \
+    for (int i = 0; i < live_t; ++i) {                                       \
+        float sum = warp_reduce_sum(acc[i]);                                 \
+        if (lane == 0) out[(long long)(t0 + i) * n_rows + n] = sum;          \
+    }                                                                        \
+}
+
+GDN_PROJ_SPLIT_TILED(gdn_proj_split_t2,  2)
+GDN_PROJ_SPLIT_TILED(gdn_proj_split_t4,  4)
+GDN_PROJ_SPLIT_TILED(gdn_proj_split_t8,  8)
+GDN_PROJ_SPLIT_TILED(gdn_proj_split_t16, 16)
+
 // out[t][n] = sum_k weight[n][k] * x[t][k], with `weight` an f32 GGUF tensor.
 //
 // `ssm_alpha.weight` and `ssm_beta.weight` are f32 in this file, and are only
@@ -1113,6 +1210,24 @@ impl GdnLayerInt8 {
         let s = self.qkv_s.len() + self.gate_s.len() + self.out_s.len();
         (q + s * size_of::<f32>()) as u64
     }
+
+    /// The repacked qkv projection: split-layout quants and one fp32 scale
+    /// per 32-element block. Exposed for differential tests that need to
+    /// drive [`GdnBlock::project_split_gemv`] directly, outside the
+    /// `run`/`run_batch_decode` dispatch that otherwise owns these buffers.
+    pub fn qkv(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+        (&self.qkv_q, &self.qkv_s)
+    }
+
+    /// As [`Self::qkv`], for the output gate projection.
+    pub fn gate(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+        (&self.gate_q, &self.gate_s)
+    }
+
+    /// As [`Self::qkv`], for the output projection.
+    pub fn out(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+        (&self.out_q, &self.out_s)
+    }
 }
 
 impl GdnLayerWeights {
@@ -1339,6 +1454,7 @@ pub struct GdnBlock {
     proj_split_gemv: CudaFunction,
     proj_split_gemv_add: CudaFunction,
     proj_tiled: [CudaFunction; 4],
+    proj_split_tiled: [CudaFunction; 4],
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
     alpha_beta_gates_t1: CudaFunction,
@@ -1398,6 +1514,12 @@ impl GdnBlock {
                 module.load_function("gdn_proj_q8_0_t4")?,
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
+            ],
+            proj_split_tiled: [
+                module.load_function("gdn_proj_split_t2")?,
+                module.load_function("gdn_proj_split_t4")?,
+                module.load_function("gdn_proj_split_t8")?,
+                module.load_function("gdn_proj_split_t16")?,
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
@@ -1669,7 +1791,16 @@ impl GdnBlock {
         // single-stream gap, 1.23 ms of 1.30 ms/step. See
         // `docs/BENCHMARKS.md`'s batched-decode section for the nsys-diff
         // that found it kernel by kernel rather than assuming it.
+        //
+        // Below the tensor-core tile, `1 < tokens < MMA_SPLIT_TOKENS` used
+        // to take `gdn_proj_q8_0_t*` — the *standard* Q8_0 layout, a
+        // different per-lane grouping than the GEMV. That is the pairing
+        // `docs/BENCHMARKS.md`'s Phase A audit measured as GDN's first
+        // FMA at layer 0. `split_tiled` is the GEMV's own grouping,
+        // amortized across those tokens, so batch(N) and single-stream
+        // now share a reduction order.
         let gemv = tc.filter(|_| tokens == 1);
+        let split_tiled = tc.filter(|_| tokens > 1 && !Self::uses_tensor_cores(tokens));
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
         // 1. attn_norm-N, over every sequence's row.
@@ -1734,6 +1865,27 @@ impl GdnBlock {
                 &mut s.z,
                 g.hidden,
                 g.value_dim(),
+            )?;
+        } else if let Some(i8w) = split_tiled {
+            self.project_split_tiled(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project_split_tiled(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
             )?;
         } else {
             self.project(
@@ -1900,6 +2052,20 @@ impl GdnBlock {
                 g.value_dim(),
                 g.hidden,
             )?;
+        } else if let Some(i8w) = split_tiled {
+            // No fused residual form: `gdn_proj_split_gemv_add` has no token
+            // axis. Project, then add, matching the standard-layout path.
+            self.project_split_tiled(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
+            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else {
             self.project(
                 stream,
@@ -2263,6 +2429,68 @@ impl GdnBlock {
         // SAFETY: one warp per output row over a grid covering `n_rows` and
         // returning above it; every buffer was length-checked immediately
         // above against exactly the extent the kernel indexes.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// The split-layout projection, tiled over tokens: `gdn_proj_split_gemv`'s
+    /// own per-lane grouping and reduction order, generalized to
+    /// `1 < tokens < MMA_SPLIT_TOKENS` by amortizing the dequantized weight
+    /// across `tokens` columns instead of reading it once per token. See
+    /// `GDN_PROJ_SPLIT_TILED` in the module source for why this exists and
+    /// why it reads the repacked layout rather than the standard one.
+    ///
+    /// `tokens` must be at least 2 — the one-token case is
+    /// [`Self::project_split_gemv`], which this does not replace, because a
+    /// tile of one column carries `TT - 1` unused accumulators for nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_split_tiled(
+        &self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        check_len("split tiled x", tokens * k_dim, x.len())?;
+        check_len("split tiled out", tokens * n_rows, out.len())?;
+        check_len("split tiled wq", n_rows * k_dim, wq.len())?;
+        check_len("split tiled ws", n_rows * k_dim / QK8_0, ws.len())?;
+        if tokens < 2 {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "project_split_tiled tokens (use project_split_gemv at 1)",
+                expected: 2,
+                got: tokens,
+            });
+        }
+
+        let (slot, tile) = proj_tile_for(tokens);
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n_rows as u32).div_ceil(PROJ_WARPS),
+                (tokens as u32).div_ceil(tile),
+                1,
+            ),
+            block_dim: (32, PROJ_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i32, n_i32, t_i32) = (k_dim as i32, n_rows as i32, tokens as i32);
+        let mut builder = stream.launch_builder(&self.proj_split_tiled[slot]);
+        builder
+            .arg(wq)
+            .arg(ws)
+            .arg(x)
+            .arg(&mut *out)
+            .arg(&k_i32)
+            .arg(&n_i32)
+            .arg(&t_i32);
+        // SAFETY: as `project_split_gemv`, plus the token axis covered by
+        // `ceil(tokens / tile)` blocks that return above `n_tokens`, and the
+        // ragged final tile takes the guarded (zero-padded) path, so no lane
+        // reads `x` or writes `out` past `tokens - 1`.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }

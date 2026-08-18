@@ -8219,6 +8219,19 @@ choice for the same source expression when the surrounding loop shape
 differs." This audit is the first place that was measured layer by
 layer rather than only at the final logits.
 
+> **Superseded as a standing residual, not as a diagnosis.** The
+> `1.788e-7` GDN layer-0 number, and the "none of the three measures
+> `0.000e0`" headline, were true of this tree on 2026-08-18 before the
+> next two sections landed. The pairing the module-doc named was the
+> right *class* of defect (batch tile vs single-stream GEMV) and the
+> wrong *kernel family*: single-stream decode does not take
+> `gdn_proj_q8_0` at all when the split-layout repack is resident, it
+> takes `gdn_proj_split_gemv`, and the 7.15e-7 isolated gap is that
+> layout's reduction order against the standard Q8_0 tile, not NVCC
+> choosing two FMAs inside one source. Closed to `0.000e0` at every
+> family, every layer, contexts 8 and 2,048, by the section after
+> Phase B step 1. The table above is the before-picture.
+
 **Not ruled out, and evidenced against: a single dominant contributor
 further downstream.** Attention's per-layer jumps are visibly the
 largest of the three (`7.153e-7 -> 2.098e-4` over 10 layers, versus
@@ -8479,14 +8492,34 @@ occasional multiplicative spike where that propagation crosses the
 router's own top-8 decision boundary -- a consequence of GDN's/
 Attention's unresolved divergence, not an independent MoE defect.
 
+> **Superseded in one clause, confirmed in the other.** The routed-
+> expert pairing (gemv / bm1 / narrow) and the router logits projection
+> remain what this section measured: already bit-identical, nothing to
+> edit. The "almost entirely propagated" reading of the *moe* waypoint,
+> and the "nothing in `moe.rs` changed" sentence, do not cover the
+> shared expert. That pairing -- `moe_shared_ffn_gemv` (4-warp
+> contraction, smem 4-add, fused SwiGLU) against `moe_shared_ffn` (one
+> warp per row, `tile_gemm_pair` over `MOE_TM=16`) -- was never
+> isolated here, generates `1.12e-8` on identical input, and is what
+> the next section closed. After the mixers *and* that pairing close,
+> the moe waypoint is `0.000e0` at every layer, which is the
+> inherited-only claim becoming true rather than assumed. Do not re-
+> isolate the routed pairing; do not treat this section as a license
+> to leave the shared expert alone.
+
 **This changes the milestone, not the plan.** "MoE layer-0 divergence
-0.000e0" as a standalone checkpoint is not reachable by editing MoE:
+0.000e0" as a standalone checkpoint is not reachable by editing MoE
+*routed experts*:
 layer 0 is a GDN layer, MoE's layer-0 output is proven to be a function
-of GDN's layer-0 output and nothing else divergent, and the two bit-
-exact differentials above mean a bit-identical input to MoE necessarily
-produces a bit-identical MoE output (same kernels, same router, same
-weights). MoE's own milestone completes automatically once GDN's does --
-it is not a separate unit of work, and the routing-flip risk closes with
+of GDN's layer-0 output and nothing else divergent *in the routed
+path*, and the two bit-
+exact differentials above mean a bit-identical input to those kernels
+necessarily
+produces a bit-identical routed output (same kernels, same router, same
+weights). MoE's own milestone completes automatically once GDN's does
+*and* the shared-expert pairing is unified --
+it is not a separate unit of work on the routed side, and the routing-flip
+risk closes with
 it too, by the same construction argument the coordinator's own §4 made
 for the dp4a lever ("with genuinely identical upstream activations
 feeding the quantizer on both sides, `mmvq`'s int8 rounding would be
@@ -8504,3 +8537,221 @@ its own milestone without it going first. Reported to the lead rather
 than unilaterally reordering a workstream another worker (worker-5) is
 also coordinating around; reorder approved (2026-08-18), GDN next,
 attention projections after. The following section is that work.
+
+## Phase B, steps 2-3: close GDN's split-layout pairing, the shared expert the GEMV already summed, and the 2..63 repack hole (2026-08-18)
+
+The previous section left three claims standing: GDN is the remaining
+source of the residual; MoE's routed pairing is already bit-identical
+so its milestone completes automatically once GDN's does; and the
+`1.788e-7` GDN layer-0 number is the tiled `gdn_proj_q8_0_t8` versus
+the untiled `gdn_proj_q8_0`. All three were right about *class* and
+wrong about *which kernel*. Closing the actual pairings, then
+re-running the same audit at the same two shapes, is this section.
+
+Nothing here is a throughput claim. CUDA graph capture was not
+re-measured. Fused MoE dispatch was not touched. Symmetric `mmvq` is
+now a legal next attempt -- batch and single-stream activations agree
+bit-for-bit, so a discrete quantizer sitting on them would see the
+same input -- and it is not done.
+
+### Isolated: GDN's real pairing is split-layout GEMV vs standard-layout tile
+
+`tests/gdn_proj_differential.rs` (new, three tests, all `assert_eq!`
+or an explicit `assert_ne!` documenting the remaining layout gap)
+isolates the projection kernels on layer-0's real Q8_0 weights, one
+row of IID hidden state, no mixer, no residual add:
+
+- `untiled_and_tiled_standard_layout_already_agree`: `gdn_proj_q8_0`
+  (`tokens == 1`) against `gdn_proj_q8_0_t*` (`tokens > 1`, token 0).
+  Both walk `blk[2 + lane]` in the same per-lane order over the
+  standard 34-byte Q8_0 block. `max_abs=0.000e0`. Phase A's
+  module-doc reasoning -- "NVCC is free to make a different
+  FMA-contraction choice when the surrounding loop shape differs" --
+  does not fire on this family. The two standard-layout kernels were
+  never the residual.
+- `split_layout_gemv_disagrees_with_the_standard_layout`:
+  `gdn_proj_split_gemv` (repacked, 4-per-lane) against `gdn_proj_q8_0`
+  (standard 34-byte). `max_abs=7.153e-7`. The kernel's own comment
+  already said this ("the warp reduction sums in a different
+  order... equivalent rather than bit-identical"); this is that
+  number, measured, not inferred. This *is* the residual Phase A
+  named, just not the pairing it named: single-stream decode takes
+  the split GEMV whenever `gdn_int8` is resident, and batch decode
+  was taking the standard tile.
+- `split_layout_tiled_agrees_with_the_gemv`: new
+  `gdn_proj_split_t{2,4,8,16}` (`project_split_tiled`, tokens=3 so
+  the covering tile is t4, token 0 compared) against
+  `gdn_proj_split_gemv`. Same operand order, same 4-wide lane walk,
+  same warp reduction, just a token axis. `max_abs=0.000e0`.
+
+`run_batch_decode` at `1 < tokens < MMA_SPLIT_TOKENS` now takes
+`project_split_tiled` for qkv, gate, and out. `run` is unchanged:
+GEMV at one token, standard-layout tile otherwise. The fused
+`gdn_proj_split_gemv_add` has no token axis, so the batch out-
+projection is project-then-`add`, matching the standard-layout path
+rather than inventing a fused form. Attention projections were not
+rewritten: `lm_head_rows<BT>` already `assert_eq!`s b1 against b5,
+and the decode mixer is per-sequence.
+
+### Isolated: the leftover after GDN closed was the shared expert, not the router
+
+With GDN layer-0 at `0.000e0` on the isolated probe, the next
+generated residual sat in MoE after all. Phase B step 1 never
+compared `moe_shared_ffn_gemv` to `moe_shared_ffn`. Two new tests in
+`moe_differential.rs`:
+
+- `router_t1_and_tiled_isolate_the_same_row`: `moe_block_router_
+  logits_t1` against `TT=8`, token 0 of a three-token block.
+  `max_abs=0.000e0`. Confirms the "already engineered" claim from
+  the previous section; `ROUTER_JC == THREADS` is doing what the
+  comment said.
+- `shared_gemv_and_tiled_isolate_the_one_live_token_case`:
+  `moe_shared_ffn_gemv` / `moe_shared_down_gemv` (`max_tokens == 1`,
+  one row per block, 4 warps split the 2,048-term contraction, 4-add
+  in shared memory, fused SwiGLU) against `moe_shared_ffn` /
+  `moe_shared_down` (`max_tokens == 3`, one warp per row,
+  `tile_gemm_pair` / `tile_gemm_single` over `MOE_TM=16`). First
+  run, before any kernel change: `max_abs=1.117587e-8` on the
+  identical row. That is generated, not inherited. It is also why
+  the previous section's "almost entirely propagated" reading of
+  the moe waypoint was one pairing short.
+
+The fix is the same shape as GDN's: keep the GEMV's reduction tree
+and put a token axis on it. `moe_shared_ffn_gemv_t{2,4,8,16}` and
+`moe_shared_down_gemv_t{2,4,8,16}` (`#pragma unroll 2` on ffn, 4 on
+down; per-lane `dequant_tile` + `float4` activation;
+`warp_reduce_tile<TT>`). `shared_expert` still dispatches on
+`max_tokens` -- a geometry constant, not the live count -- so the
+compiled kernel is fixed for CUDA-graph reasons that cost nothing
+to keep: 1 → old GEMV; 2..=16 → tiled GEMV (smallest covering tile,
+so a 3-token decode is one t4 launch); >16 → original
+`moe_shared_ffn` tile; >=128 still the int8 MMA. Prefill above 16
+is not a batch-vs-single-stream pairing and was left alone.
+
+After the wire: the same isolate is `max_abs=0.000e0`.
+`moe_differential` is 11/11.
+
+### The audit at context 2,048 then read zero, and the audit at context 8 did not
+
+`audit_batch_divergence` at the Phase A shape (context 2,048, 3
+decode steps, batch 3), GPU 1, after both kernel families landed:
+
+```
+      gdn: every layer, every step, every seq = 0.000e0
+attention: every layer, every step, every seq = 0.000e0
+      moe: every layer, every step, every seq = 0.000e0
+    embed: 0.000e0
+```
+
+Headline growth from the Phase A table -- gdn `1.788e-7 → 4.157e-5`,
+attention `7.153e-7 → 2.098e-4`, moe `1.788e-7 → 2.385e-4` -- is
+now `0 → 0` on every family. Peak VRAM 34.758 GiB, same three-
+shapes-over-one-arena budget as Phase A. The four-layer routing-
+flip spike table from the previous section is gone with its input:
+there is no ~1e-5 mixer residual left for the 8th/9th expert
+logits to sit on.
+
+`batch_decode` at this point was *not* zero. `PROMPT_LEN=8`, 3
+steps, 3 sequences: token ids agreed, cosine 1.0, logit
+`max_abs_diff=1.184e-3`. That is larger than Phase A's final-logit
+range, not smaller. The same audit re-run at `LLMXABE_CONTEXT=8
+LLMXABE_STEPS=3` -- the gate test's own shape -- showed why:
+
+```
+      gdn: layer  0 = 1.788e-7   ->   layer 38 = 1.459e-4
+attention: layer  3 = 3.128e-4   (grows from the inherited GDN residual)
+      moe: layer  0 = ...        ->   layer 39 = 5.150e-4
+           layer 34 moe / mixer = 26x   (routing flip, same signature)
+```
+
+GDN layer 0 at context 8 is the *same* `1.788e-7` Phase A measured
+at context 2,048, which is the number of falling back to the
+standard-layout tile. The new kernels were compiled and the isolate
+was green; the batch-decode shape was not taking them.
+
+### The 2..63 hole: `reshape` inherited an empty `gdn_int8`
+
+`Forward` is a fixed-width object. Prefill and decode are two
+`Forward`s sharing MoE weights and `gdn_int8` through `reshape`.
+Three consumers of that buffer: integer tensor cores at
+`tokens >= MMA_SPLIT_TOKENS` (64), `gdn_proj_split_gemv` at 1, and
+now `gdn_proj_split_t*` at `1 < tokens < 64`. The build predicate
+was still `wants_repack = uses_tensor_cores(tokens) || tokens == 1`.
+An 8-token prefill -- `batch_decode`'s `PROMPT_LEN` -- built an
+empty vector; the batch-3 reshape inherited nothing; `run_batch_
+decode` took `project()` over the standard Q8_0 layout. A 2,048-
+token prefill is already past 64, so it built the repack, the
+batch reshape inherited it, and the audit at that depth was
+already `0.000e0`. Same kernels, two prefill widths, two answers.
+
+The 4..63 hole was already on record as a *decode-speed* defect
+(a one-token decode spawned from those prefills fell back to the
+fp32 projection and paid 13%: 9.7 ms became 11.0). It is also a
+correctness defect the moment a 2..3-token batch decode is
+spawned from the same empty vector. Every width now has a
+consumer, so every width builds the repack. `disable_tensor_cores`
+still produces an empty vector and still rebuilds on the next
+reshape that wants it.
+
+After the predicate change, same GPU, same bins:
+
+```
+LLMXABE_CONTEXT=8 LLMXABE_STEPS=3 audit_batch_divergence
+      gdn / attention / moe / embed: 0.000e0 at every layer
+      peak VRAM 33.008 GiB
+```
+
+`cargo test --release -p xabe-engine --test batch_decode`: 3/3.
+Logit `max_abs_diff=0.000e0` on every (step, seq) cell of the
+independent-single-stream comparison -- was `1.184e-3` one
+predicate ago. `identical_prompts_in_one_batch_produce_bit_
+identical_rows` still `0.000e0`. Captured-graph ids match the
+launch path. Peak VRAM on that test 0.102 GiB reported (arena
+2.291 GiB).
+
+### Gates
+
+All on the worktree, 2026-08-18, one process, cards pinned:
+
+| Gate | Result |
+| --- | --- |
+| `gdn_proj_differential` (GPU 1, release) | 3/3, split tiled vs gemv `0.000e0`, standard vs split `7.153e-7` (documented `assert_ne!`) |
+| `moe_differential` (GPU 2, release) | 11/11, shared gemv vs tiled `0.000e0`, router t1 vs TT=8 `0.000e0` |
+| `audit_batch_divergence` ctx 2,048 / 3 steps / batch 3 | every mixer + moe waypoint `0.000e0` |
+| `audit_batch_divergence` ctx 8 / 3 steps / batch 3 | every mixer + moe waypoint `0.000e0` |
+| `batch_decode` (release) | 3/3, logits `0.000e0` every cell |
+| `cargo fmt --all` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+
+`forward_pass` golden and `decode` were not re-run this pass. The
+logit comparison in `batch_decode` is the stronger statement for
+this workstream (independent single-stream vs batched, bit-exact,
+the test whose tolerance this stream exists to delete). They
+should be run before anyone quotes this as a merge.
+
+### What this unlocks, and what it does not
+
+`0.000e0` at every family is the condition the previous section
+named as necessary before a discrete downstream decision --
+routing today, `mmvq`'s quantization codes if it is re-attempted --
+is safe to sit on. Routing no longer has a residual to flip on;
+the 26x layer-34 spike is gone with it. Symmetric `mmvq` is
+therefore a legal lever again, in the narrow sense that both
+paths would quantize the same bits. It is not built, not
+measured, and the last three attempts at it failed for reasons
+that were *partly* this residual and *partly* their own. Do not
+read this section as "go build `mmvq`."
+
+Attention's mixer and the LM head were already on a bit-identical
+pairing and stayed that way; they did not need a kernel. Prefill
+above `SHARED_GEMV_MAX_TOKENS=16` still uses `moe_shared_ffn`'s
+one-warp-per-row tile, which is not compared against the GEMV
+and does not have to be: there is no single-stream prefill of
+that width. `run` at `1 < tokens < 64` still takes the standard-
+layout GDN tile; only `run_batch_decode` was moved onto the split
+tile. A future worker who wants `run` of an 8-token prefill to
+agree with `run_batch_decode` of the same 8 tokens would need to
+move `run` too -- that pairing is not what `batch_decode` gates.
+
+N=1 and N=3 decode throughput against llama.cpp were not
+re-measured. This commit does not move the head-to-head.

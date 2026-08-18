@@ -1411,3 +1411,212 @@ fn gemv_and_narrow_isolate_the_two_live_token_case() {
          entry for the state of this investigation",
     );
 }
+
+/// The shared expert's one-token GEMV (`moe_shared_ffn_gemv` /
+/// `moe_shared_down_gemv`, `max_tokens == 1`) against its token-tiled
+/// generalization (`moe_shared_ffn_gemv_t*` / `moe_shared_down_gemv_t*`,
+/// `1 < max_tokens <= 16`). The previous pairing — GEMV vs
+/// `moe_shared_ffn` — disagreed at `max_abs = 1.12e-8` because the
+/// GEMV splits the 2,048-term product across four warps and the tile
+/// reduces it in one. This is the gate that the tiled GEMV matches
+/// the one-token kernel operand-for-operand.
+///
+/// Token 0 of a three-token tiled launch is compared against the same
+/// row run alone through the GEMV. Three is the audit's own batch width
+/// and is well below `SHARED_MMA_MIN_TOKENS`, so both sides stay on the
+/// fp32 kernels.
+#[test]
+fn shared_gemv_and_tiled_isolate_the_one_live_token_case() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let entries: Vec<_> = [Role::MoeSharedGate, Role::MoeSharedUp, Role::MoeSharedDown]
+        .iter()
+        .map(|&r| {
+            directory
+                .find(r, Some(LAYER))
+                .unwrap_or_else(|| panic!("{r} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = entries
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(entries[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB03);
+    let hidden0: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    let hidden1: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    let hidden2: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
+    assert_carries_signal("hidden state", &hidden0);
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(entries[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(entries[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(entries[2].info.ggml_type),
+    };
+
+    let run = |max_tokens: usize, rows: &[Vec<f32>]| -> Vec<f32> {
+        let g = MoeGeometry {
+            num_experts: config.moe.num_experts as usize,
+            experts_per_token: config.moe.experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: config.moe.expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens,
+        };
+        let kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let mut flat = Vec::with_capacity(max_tokens * g.hidden);
+        for row in rows {
+            flat.extend_from_slice(row);
+        }
+        flat.resize(max_tokens * g.hidden, 0.0);
+        let d_hidden = stream.clone_htod(&flat).expect("upload hidden");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, rows.len())
+            .expect("valid_tokens");
+        let mut d_out = stream
+            .alloc_zeros::<f32>(max_tokens * g.hidden)
+            .expect("out allocates");
+        kernels
+            .shared_expert(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("shared expert");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        stream.synchronize().expect("sync");
+        full[..g.hidden].to_vec()
+    };
+
+    let via_gemv = run(1, std::slice::from_ref(&hidden0));
+    let via_tiled = run(3, &[hidden0, hidden1, hidden2]);
+
+    let result = compare(&via_gemv, &via_tiled);
+    println!("shared gemv (max_tokens=1) vs tiled (max_tokens=3, token 0): {result}");
+    println!(
+        "output magnitude: max |gemv| = {:.4e}",
+        via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_gemv, via_tiled,
+        "shared-expert gemv and tiled disagree on the same row -- this is \
+         the pairing Phase B, step 1 never isolated",
+    );
+}
+
+/// The router GEMM's one-token instantiation (`moe_block_router_logits_t1`,
+/// `max_tokens == 1`) against the eight-token tile (`moe_block_router_
+/// logits`, `max_tokens > 1`). Phase B, step 1 named this pairing as
+/// already engineered for bit-identity (`ROUTER_JC` equals the block
+/// width in both instantiations) and deferred the isolated differential
+/// until GDN/Attention closed. GDN layer-0 now measures `0.000e0`; if
+/// MoE layer-0 still does not, this is the next place the residual can
+/// still be generated.
+///
+/// Token 0 of a three-token `MoeBlock` is compared against the same
+/// residual row run alone through a one-token block. The rest of the
+/// block (routed experts, shared expert, combine) is not compared here
+/// -- only the logits the two kernels write.
+#[test]
+fn router_t1_and_tiled_isolate_the_same_row() {
+    use xabe_engine::block::moe::{MoeBlock, MoeLayerWeights};
+
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+    let eps = MoeBlock::eps_from(&file);
+
+    let mut rng = Xorshift64Star::new(0x_5EED_BB04);
+    let hidden = config.hidden_size as usize;
+    let row0 = rng.vec_f32(hidden, -1.0, 1.0);
+    let row1 = rng.vec_f32(hidden, -1.0, 1.0);
+    let row2 = rng.vec_f32(hidden, -1.0, 1.0);
+    assert_carries_signal("residual", &row0);
+
+    let run = |max_tokens: usize, rows: &[Vec<f32>]| -> Vec<f32> {
+        let g = MoeBlock::geometry_for(&config, BLOCK_SIZE, max_tokens);
+        let mut block = MoeBlock::new(&ctx, &stream, g, eps).expect("block builds");
+        block.disable_tensor_cores();
+        let weights =
+            MoeLayerWeights::upload(&stream, &file, &directory, LAYER, &g).expect("weights upload");
+        let mut residual = Vec::with_capacity(max_tokens * hidden);
+        for row in rows {
+            residual.extend_from_slice(row);
+        }
+        residual.resize(max_tokens * hidden, 0.0);
+        let d_residual = stream.clone_htod(&residual).expect("upload residual");
+        let mut ffn_out = stream
+            .alloc_zeros::<f32>(max_tokens * hidden)
+            .expect("ffn_out");
+        let mut l_out = stream
+            .alloc_zeros::<f32>(max_tokens * hidden)
+            .expect("l_out");
+        block
+            .forward(
+                &stream,
+                &weights,
+                &d_residual,
+                rows.len(),
+                &mut ffn_out,
+                &mut l_out,
+            )
+            .expect("moe forward");
+        stream.synchronize().expect("sync");
+        let logits = stream
+            .clone_dtoh(block.router_logits())
+            .expect("logits back");
+        stream.synchronize().expect("sync");
+        logits[..g.num_experts].to_vec()
+    };
+
+    let via_t1 = run(1, std::slice::from_ref(&row0));
+    let via_tiled = run(3, &[row0, row1, row2]);
+
+    let result = compare(&via_t1, &via_tiled);
+    println!("router t1 (max_tokens=1) vs tiled (max_tokens=3, token 0): {result}");
+    println!(
+        "output magnitude: max |t1| = {:.4e}",
+        via_t1.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+    );
+
+    assert_eq!(
+        via_t1, via_tiled,
+        "router t1 and the TT=8 tile disagree on the same row -- the \
+         pairing Phase B, step 1 deferred is not bit-identical after all",
+    );
+}

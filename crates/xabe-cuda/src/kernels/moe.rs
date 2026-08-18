@@ -178,6 +178,28 @@ const ROUTE_LANE_EXPERTS: usize = 16;
 /// time being scheduled than reading.
 const SHARED_WARPS: u32 = 4;
 
+/// Token tiles for the multi-token generalization of the shared-expert GEMV.
+///
+/// Same set `gdn.rs` uses for `project_split_tiled`: below the widest, pick
+/// the smallest tile that covers `max_tokens` in one grid.y slice so a
+/// 3-token decode (the audit's own batch width) is one launch of the 4-wide
+/// kernel, not two launches of the 2-wide one.
+const SHARED_GEMV_TILES: [u32; 4] = [2, 4, 8, 16];
+
+/// `shared_expert` uses the GEMV's reduction tree (tiled over tokens) up to
+/// this width, then the original `moe_shared_ffn` tile. Decode is never
+/// this wide; a 64-token prefill still wants the one-warp-per-row form
+/// that amortizes a weight read across `MOE_TM` columns.
+const SHARED_GEMV_MAX_TOKENS: usize = 16;
+
+fn shared_gemv_tile_for(tokens: usize) -> (usize, u32) {
+    if let Some(i) = SHARED_GEMV_TILES.iter().position(|&t| tokens <= t as usize) {
+        return (i, SHARED_GEMV_TILES[i]);
+    }
+    let widest = SHARED_GEMV_TILES.len() - 1;
+    (widest, SHARED_GEMV_TILES[widest])
+}
+
 /// Warps per block on the integer tensor-core path. Mirrors `MOE_MMA_WARPS`.
 const MMA_WARPS: u32 = 8;
 /// Output rows one warp owns — one `m8n8k16` N fragment. Mirrors `MOE_MMA_N`.
@@ -3102,6 +3124,154 @@ __global__ void moe_shared_down_gemv(
     if (lane == 0) out[h] = ad[0];
 }
 
+// The one-token shared-expert GEMV, tiled over tokens. `moe_shared_ffn`
+// reduces the 2,048-term product in one warp; the GEMV splits it across
+// `MOE_SHARED_WARPS` warps and adds the four partials in shared memory
+// before the fused SwiGLU. Those two trees disagree in the last bits
+// (`shared_gemv_and_tiled_isolate_the_one_live_token_case`). Column `i`
+// sees the GEMV's own sequence of additions — other columns touch
+// different registers.
+//
+// grid: (intermediate, ceil(max_tokens / TT)). block: MOE_SHARED_WARPS warps.
+#define MOE_SHARED_FFN_GEMV_TILED(NAME, TT)                                  \
+__global__ void NAME(                                                        \
+    const unsigned char* __restrict__ gate_q, int gate_quant,                \
+    const unsigned char* __restrict__ up_q,   int up_quant,                  \
+    const float* __restrict__ hidden_states,                                 \
+    const int* __restrict__ valid_tokens,                                    \
+    int hidden,                                                              \
+    int intermediate,                                                        \
+    float* __restrict__ inter                                                \
+) {                                                                          \
+    int nvalid = *valid_tokens;                                              \
+    if (nvalid < 1) return;                                                  \
+    int t0 = blockIdx.y * (TT);                                              \
+    if (t0 >= nvalid) return;                                                \
+    int live_t = nvalid - t0; if (live_t > (TT)) live_t = (TT);               \
+    int lane = threadIdx.x & 31;                                             \
+    int warp = threadIdx.x >> 5;                                             \
+    int r = blockIdx.x;                                                      \
+    if (r >= intermediate) return;                                           \
+    long long wrow = (long long)r * hidden;                                  \
+    int chunk = hidden / MOE_SHARED_WARPS;                                   \
+    int stop = warp * chunk + chunk;                                         \
+                                                                               \
+    float ag[TT];                                                            \
+    float au[TT];                                                            \
+    _Pragma("unroll")                                                        \
+    for (int i = 0; i < (TT); ++i) { ag[i] = 0.0f; au[i] = 0.0f; }           \
+                                                                               \
+    _Pragma("unroll 2")                                                      \
+    for (int j0 = warp * chunk; j0 < stop; j0 += MOE_TK) {                   \
+        float wg[MOE_TN];                                                    \
+        float wu[MOE_TN];                                                    \
+        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);               \
+        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);               \
+        _Pragma("unroll")                                                    \
+        for (int i = 0; i < (TT); ++i) {                                     \
+            int t = t0 + i;                                                  \
+            float4 xv;                                                       \
+            if (t < nvalid) {                                                \
+                xv = *(const float4*)(hidden_states                          \
+                    + (long long)t * hidden + j0 + 4 * lane);                \
+            } else {                                                         \
+                xv.x = 0.0f; xv.y = 0.0f; xv.z = 0.0f; xv.w = 0.0f;          \
+            }                                                                \
+            ag[i] += wg[0] * xv.x;  au[i] += wu[0] * xv.x;                   \
+            ag[i] += wg[1] * xv.y;  au[i] += wu[1] * xv.y;                   \
+            ag[i] += wg[2] * xv.z;  au[i] += wu[2] * xv.z;                   \
+            ag[i] += wg[3] * xv.w;  au[i] += wu[3] * xv.w;                   \
+        }                                                                    \
+    }                                                                        \
+    warp_reduce_tile<TT>(ag);                                                \
+    warp_reduce_tile<TT>(au);                                                \
+                                                                               \
+    __shared__ float sg[MOE_SHARED_WARPS][TT];                               \
+    __shared__ float su[MOE_SHARED_WARPS][TT];                               \
+    if (lane == 0) {                                                         \
+        _Pragma("unroll")                                                    \
+        for (int i = 0; i < (TT); ++i) {                                     \
+            sg[warp][i] = ag[i]; su[warp][i] = au[i];                        \
+        }                                                                    \
+    }                                                                        \
+    __syncthreads();                                                         \
+    if (threadIdx.x == 0) {                                                  \
+        for (int i = 0; i < live_t; ++i) {                                   \
+            float g = 0.0f;                                                  \
+            float u = 0.0f;                                                  \
+            for (int w = 0; w < MOE_SHARED_WARPS; ++w) {                     \
+                g += sg[w][i]; u += su[w][i];                                \
+            }                                                                \
+            inter[(long long)(t0 + i) * intermediate + r] =                  \
+                (g / (1.0f + expf(-g))) * u;                                 \
+        }                                                                    \
+    }                                                                        \
+}
+
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t2,  2)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t4,  4)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t8,  8)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t16, 16)
+
+// grid: (ceil(hidden / MOE_ROWS), ceil(max_tokens / TT)).
+#define MOE_SHARED_DOWN_GEMV_TILED(NAME, TT)                                 \
+__global__ void NAME(                                                        \
+    const unsigned char* __restrict__ down_q, int down_quant,                \
+    const float* __restrict__ inter,                                         \
+    const int* __restrict__ valid_tokens,                                    \
+    int hidden,                                                              \
+    int intermediate,                                                        \
+    float* __restrict__ out                                                  \
+) {                                                                          \
+    int nvalid = *valid_tokens;                                              \
+    if (nvalid < 1) return;                                                  \
+    int t0 = blockIdx.y * (TT);                                              \
+    if (t0 >= nvalid) return;                                                \
+    int live_t = nvalid - t0; if (live_t > (TT)) live_t = (TT);               \
+    int lane = threadIdx.x & 31;                                             \
+    int warp = threadIdx.x >> 5;                                             \
+    int h = blockIdx.x * MOE_ROWS + warp;                                    \
+    if (h >= hidden) return;                                                 \
+    long long wrow = (long long)h * intermediate;                            \
+                                                                               \
+    float ad[TT];                                                            \
+    _Pragma("unroll")                                                        \
+    for (int i = 0; i < (TT); ++i) ad[i] = 0.0f;                             \
+                                                                               \
+    _Pragma("unroll 4")                                                      \
+    for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {                      \
+        float wd[MOE_TN];                                                    \
+        dequant_tile(down_q, down_quant, wrow + j0, lane, wd);               \
+        _Pragma("unroll")                                                    \
+        for (int i = 0; i < (TT); ++i) {                                     \
+            int t = t0 + i;                                                  \
+            float4 xv;                                                       \
+            if (t < nvalid) {                                                \
+                xv = *(const float4*)(inter                                  \
+                    + (long long)t * intermediate + j0 + 4 * lane);          \
+            } else {                                                         \
+                xv.x = 0.0f; xv.y = 0.0f; xv.z = 0.0f; xv.w = 0.0f;          \
+            }                                                                \
+            ad[i] += wd[0] * xv.x;                                           \
+            ad[i] += wd[1] * xv.y;                                           \
+            ad[i] += wd[2] * xv.z;                                           \
+            ad[i] += wd[3] * xv.w;                                           \
+        }                                                                    \
+    }                                                                        \
+    warp_reduce_tile<TT>(ad);                                                \
+                                                                               \
+    if (lane == 0) {                                                         \
+        for (int i = 0; i < live_t; ++i) {                                   \
+            out[(long long)(t0 + i) * hidden + h] = ad[i];                   \
+        }                                                                    \
+    }                                                                        \
+}
+
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t2,  2)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t4,  4)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t8,  8)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t16, 16)
+
 // -------------------------------------------------------------------------
 // 4. fp32 weighted sum of each token's top-k contributions.
 // -------------------------------------------------------------------------
@@ -3640,6 +3810,10 @@ pub struct MoeKernels {
     shared_down: CudaFunction,
     shared_ffn_gemv: CudaFunction,
     shared_down_gemv: CudaFunction,
+    /// `moe_shared_ffn_gemv` / `moe_shared_down_gemv` tiled over tokens at
+    /// `SHARED_GEMV_TILES` widths. Index matches `shared_gemv_tile_for`.
+    shared_ffn_gemv_tiled: [CudaFunction; 4],
+    shared_down_gemv_tiled: [CudaFunction; 4],
     swiglu: CudaFunction,
     geometry: MoeGeometry,
     /// The dispatch-slot ceiling `expert_ffn_mma`/`expert_down_mma` were
@@ -3777,6 +3951,18 @@ impl MoeKernels {
             shared_down: module.load_function("moe_shared_down")?,
             shared_ffn_gemv: module.load_function("moe_shared_ffn_gemv")?,
             shared_down_gemv: module.load_function("moe_shared_down_gemv")?,
+            shared_ffn_gemv_tiled: [
+                module.load_function("moe_shared_ffn_gemv_t2")?,
+                module.load_function("moe_shared_ffn_gemv_t4")?,
+                module.load_function("moe_shared_ffn_gemv_t8")?,
+                module.load_function("moe_shared_ffn_gemv_t16")?,
+            ],
+            shared_down_gemv_tiled: [
+                module.load_function("moe_shared_down_gemv_t2")?,
+                module.load_function("moe_shared_down_gemv_t4")?,
+                module.load_function("moe_shared_down_gemv_t8")?,
+                module.load_function("moe_shared_down_gemv_t16")?,
+            ],
             swiglu: module.load_function("moe_swiglu")?,
             geometry,
             mma_m,
@@ -4684,22 +4870,28 @@ impl MoeKernels {
         let gate_code = gate.quant.code();
         let up_code = up.quant.code();
         let down_code = down.quant.code();
-        let shared = tile_shared_bytes();
-        let token_tiles = (g.max_tokens as u32).div_ceil(TILE_M as u32);
 
-        // One token is a GEMV; see `moe_shared_ffn_gemv`.
+        // One token is a GEMV; see `moe_shared_ffn_gemv`. Decode-width
+        // batches (`1 < max_tokens <= SHARED_GEMV_MAX_TOKENS`) are the
+        // same GEMV tiled over the token axis (`moe_shared_ffn_gemv_t*`),
+        // not `moe_shared_ffn`: that kernel reduces the 2,048-term product
+        // in one warp, the GEMV splits it across four and adds the
+        // partials in shared memory, and the two trees disagree in the
+        // last bits. Prefill above that bound keeps the original tile.
+        let use_gemv = g.max_tokens <= SHARED_GEMV_MAX_TOKENS;
+        if use_gemv && !g.hidden.is_multiple_of(SHARED_WARPS as usize * TILE_K) {
+            return Err(MoeError::UnsupportedGeometry {
+                geometry: Box::new(g),
+                reason: "the shared-expert GEMV splits `hidden` over \
+                         4 warps in 128-element tiles, so it must be a \
+                         multiple of 512",
+            });
+        }
+
         if g.max_tokens == 1 {
             // One block per output row, its warps splitting the contraction.
             // See `moe_shared_ffn_gemv` for why the row-per-warp shape was
             // the wrong one at this geometry.
-            if !g.hidden.is_multiple_of(SHARED_WARPS as usize * TILE_K) {
-                return Err(MoeError::UnsupportedGeometry {
-                    geometry: Box::new(g),
-                    reason: "the one-token shared expert splits `hidden` over \
-                             8 warps in 128-element tiles, so it must be a \
-                             multiple of 1024",
-                });
-            }
             let ffn_cfg = LaunchConfig {
                 grid_dim: (g.intermediate as u32, 1, 1),
                 block_dim: (SHARED_WARPS * 32, 1, 1),
@@ -4740,6 +4932,53 @@ impl MoeKernels {
             return Ok(());
         }
 
+        if use_gemv {
+            let (slot, tile) = shared_gemv_tile_for(g.max_tokens);
+            let gemv_tiles = (g.max_tokens as u32).div_ceil(tile);
+            let ffn_cfg = LaunchConfig {
+                grid_dim: (g.intermediate as u32, gemv_tiles, 1),
+                block_dim: (SHARED_WARPS * 32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.shared_ffn_gemv_tiled[slot]);
+            builder
+                .arg(gate.bytes)
+                .arg(&gate_code)
+                .arg(up.bytes)
+                .arg(&up_code)
+                .arg(hidden_states)
+                .arg(&buffers.valid_tokens)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.shared_inter);
+            // SAFETY: grid.x is `intermediate` and `shared_inter` is
+            // `max_tokens * intermediate` floats; the token index is gated
+            // on the device `valid_tokens`, and the ragged final tile
+            // takes the zero-padded path so no lane reads `hidden_states`
+            // past `nvalid`.
+            unsafe { builder.launch(ffn_cfg) }?;
+
+            let down_cfg = LaunchConfig {
+                grid_dim: ((g.hidden as u32).div_ceil(TILE_ROWS), gemv_tiles, 1),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.shared_down_gemv_tiled[slot]);
+            builder
+                .arg(down.bytes)
+                .arg(&down_code)
+                .arg(&buffers.shared_inter)
+                .arg(&buffers.valid_tokens)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(out);
+            // SAFETY: as above; `out` is `max_tokens * hidden` floats.
+            unsafe { builder.launch(down_cfg) }?;
+            return Ok(());
+        }
+
+        let shared = tile_shared_bytes();
+        let token_tiles = (g.max_tokens as u32).div_ceil(TILE_M as u32);
         let ffn_cfg = LaunchConfig {
             grid_dim: ((g.intermediate as u32).div_ceil(TILE_ROWS), token_tiles, 1),
             block_dim: (GEMM_THREADS, 1, 1),
@@ -4888,6 +5127,17 @@ mod tests {
                 "{name} is {value} in Rust but not in the kernel source",
             );
         }
+        assert!(
+            MOE_SRC.contains("moe_shared_ffn_gemv_t2")
+                && MOE_SRC.contains("moe_shared_ffn_gemv_t4")
+                && MOE_SRC.contains("moe_shared_ffn_gemv_t8")
+                && MOE_SRC.contains("moe_shared_ffn_gemv_t16")
+                && MOE_SRC.contains("moe_shared_down_gemv_t2")
+                && MOE_SRC.contains("moe_shared_down_gemv_t4")
+                && MOE_SRC.contains("moe_shared_down_gemv_t8")
+                && MOE_SRC.contains("moe_shared_down_gemv_t16"),
+            "the shared-expert GEMV tile specializations are missing from MOE_SRC",
+        );
         assert_eq!(GEMM_THREADS, TILE_ROWS * 32, "one warp per output row");
         // A tile is one half of a 256-element Q6_K superblock, which is what
         // makes the header read once per tile instead of once per element.
@@ -5125,6 +5375,21 @@ mod tests {
         assert_eq!(BLOCK_Q8_0_BYTES, 2 + QK8_0);
         // The real file is mixed, so the codes must be distinct and stable.
         assert_ne!(ExpertQuant::Q6K.code(), ExpertQuant::Q8_0.code());
+    }
+
+    #[test]
+    fn shared_gemv_tile_covers_decode_widths() {
+        // Smallest covering tile, same rule as `gdn.rs`'s `proj_tile_for`.
+        // Three is the audit's batch width and must land on one t4 launch.
+        assert_eq!(shared_gemv_tile_for(2), (0, 2));
+        assert_eq!(shared_gemv_tile_for(3), (1, 4));
+        assert_eq!(shared_gemv_tile_for(4), (1, 4));
+        assert_eq!(shared_gemv_tile_for(5), (2, 8));
+        assert_eq!(shared_gemv_tile_for(8), (2, 8));
+        assert_eq!(shared_gemv_tile_for(9), (3, 16));
+        assert_eq!(shared_gemv_tile_for(16), (3, 16));
+        assert_eq!(shared_gemv_tile_for(17), (3, 16));
+        assert_eq!(SHARED_GEMV_MAX_TOKENS, 16);
     }
 
     #[test]

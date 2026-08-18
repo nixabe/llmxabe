@@ -625,11 +625,17 @@ pub struct Forward {
     w_output_norm: ManuallyDrop<CudaSlice<f32>>,
     w_lm_head: ManuallyDrop<CudaSlice<u8>>,
     gdn_weights: Vec<ManuallyDrop<GdnLayerWeights>>,
-    /// The Q8_0 projections repacked for integer tensor cores, one per Gated
-    /// DeltaNet layer — empty when this shape will not use them.
+    /// The Q8_0 projections in the split layout, one per Gated DeltaNet
+    /// layer — empty only after [`Self::disable_tensor_cores`].
     ///
-    /// Built only for shapes above `GdnBlock::uses_tensor_cores`, so a decode
-    /// pass does not pay 1.13 GiB for a path it never takes.
+    /// Three consumers share this buffer: the integer tensor cores at
+    /// `tokens >= MMA_SPLIT_TOKENS`, `gdn_proj_split_gemv` at one token,
+    /// and `gdn_proj_split_t*` at `1 < tokens < MMA_SPLIT_TOKENS` (batch
+    /// decode). Building it only at 1 and >=64 left a 2..63 prefill with
+    /// an empty vector; `reshape` then handed that empty vector to a
+    /// batch-decode shape and the projections fell back to the standard
+    /// Q8_0 tile, which is the 7.15e-7 GDN layer-0 residual Phase B
+    /// closed at context 2048 (where the prefill is already >=64).
     gdn_int8: Arc<Vec<GdnLayerInt8>>,
     /// Shared with every other shape built over the same model.
     ///
@@ -855,27 +861,28 @@ impl Forward {
             gdn_weights.push(ManuallyDrop::new(alias_gdn_layer(weights, stream, layer)?));
         }
 
-        // The repack serves two different paths: the tensor cores above the
-        // threshold, and a one-token GEMV that wants the split layout for its
+        // The repack serves three paths: the tensor cores above the
+        // threshold, a one-token GEMV that wants the split layout for its
         // *alignment* rather than its arithmetic — Q8_0's 34-byte block stride
         // makes an in-place read straddle a sector boundary fifteen times in
-        // sixteen. See `gdn_proj_split_gemv`.
+        // sixteen — and the same GEMV tiled over `1 < tokens < MMA_SPLIT_
+        // TOKENS` so batch decode and single-stream share a reduction order.
+        // See `gdn_proj_split_gemv` / `gdn_proj_split_t*`.
         //
         // Shared through `reshape` like the MoE weights, and for the same
         // reason: a prefill pass and the decode pass driven over the same
         // sequence would otherwise hold two copies of 1.13 GiB.
         // **Sharing is conditional on the donor having built it.** A pass that
-        // wants neither the tensor cores nor the one-token GEMV builds an
-        // empty vector, and `reshape` hands that empty vector to the shape it
-        // spawns. A decode pass reshaped from a prefill of 4..63 tokens
-        // therefore inherited *nothing* and fell back to the fp32 projection
-        // path, which cost 13% of every decode step — 9.7 ms became 11.0 —
-        // for no reason visible at the call site. Measured across a prompt
-        // sweep: 1, 64 and 128 gave 9.7 ms and 4, 8, 16 and 32 gave 11.0,
-        // because 1 and >=64 are exactly the two prompt lengths that build it.
-        let wants_repack = GdnBlock::uses_tensor_cores(tokens) || tokens == 1;
+        // wants none of the three paths builds an empty vector, and `reshape`
+        // hands that empty vector to the shape it spawns. That used to be
+        // the 4..63-token hole: those prefills built nothing, so a one-token
+        // decode they spawned fell back to the fp32 projection (13% of every
+        // decode step — 9.7 ms became 11.0) and a 2..3-token batch decode
+        // they spawned took the standard-layout tile (the 7.15e-7 GDN
+        // layer-0 residual). Every width now has a consumer, so every
+        // width builds it.
         let gdn_int8 = match gdn_int8 {
-            Some(shared) if shared.is_empty() && wants_repack => {
+            Some(shared) if shared.is_empty() => {
                 let mut built = Vec::new();
                 for w in &gdn_weights {
                     built.push(gdn.repack(stream, w)?);
@@ -885,10 +892,8 @@ impl Forward {
             Some(shared) => shared,
             None => {
                 let mut built = Vec::new();
-                if wants_repack {
-                    for w in &gdn_weights {
-                        built.push(gdn.repack(stream, w)?);
-                    }
+                for w in &gdn_weights {
+                    built.push(gdn.repack(stream, w)?);
                 }
                 Arc::new(built)
             }
