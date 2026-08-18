@@ -13,7 +13,7 @@
 //! request's full worst-case lifetime (`prompt + max_output_tokens`) the
 //! moment it is pulled from the waiting queue into the running batch,
 //! rather than growing incrementally block-by-block as generation
-//! proceeds; and MTP draft-token rejection is modeled only at the
+//! proceeds; and speculative draft-token rejection is modeled only at the
 //! token-budget level ([`crate::config::SchedulerConfig::tokens_per_decode_step`]),
 //! not at the level of discarding individual speculative KV blocks. Both
 //! are noted again on the relevant methods below.
@@ -103,6 +103,19 @@ impl Scheduler {
         self.waiting.iter().any(|r| r.id == id)
     }
 
+    /// Account for additional target tokens accepted by one speculative
+    /// decode step beyond the one token charged by [`Self::step`].
+    pub fn advance_speculative(&mut self, id: RequestId, additional: u32) -> bool {
+        let Some(req) = self.running.iter_mut().find(|req| req.id == id) else {
+            return false;
+        };
+        req.computed_tokens = req
+            .computed_tokens
+            .saturating_add(additional)
+            .min(req.full_seq_len());
+        true
+    }
+
     fn attention_blocks_needed(&self, full_seq_len: u32) -> u32 {
         full_seq_len.div_ceil(self.config.block_size())
     }
@@ -135,6 +148,22 @@ impl Scheduler {
     /// current free capacity plus watermark headroom) when the request is
     /// pulled from the waiting queue into the running batch in [`Self::step`].
     pub fn admit(&mut self, req: NewRequest) -> Result<RequestId, AdmissionError> {
+        self.admit_with_prefix(req, 0)
+    }
+
+    /// Admit a request whose first `computed_prefix` prompt tokens have been
+    /// restored from a shared cache snapshot.
+    pub fn admit_with_prefix(
+        &mut self,
+        req: NewRequest,
+        computed_prefix: u32,
+    ) -> Result<RequestId, AdmissionError> {
+        if computed_prefix > req.prompt_tokens {
+            return Err(AdmissionError::InvalidReusablePrefix {
+                prefix_tokens: computed_prefix,
+                prompt_tokens: req.prompt_tokens,
+            });
+        }
         let full_seq_len = req.full_seq_len();
         let needed_blocks = self.attention_blocks_needed(full_seq_len);
         if needed_blocks > self.total_attention_blocks {
@@ -148,7 +177,7 @@ impl Scheduler {
             id: req.id,
             prompt_tokens: req.prompt_tokens,
             max_output_tokens: req.max_output_tokens,
-            computed_tokens: 0,
+            computed_tokens: computed_prefix,
             blocks_reserved: 0,
         });
         Ok(req.id)
@@ -214,17 +243,28 @@ impl Scheduler {
     /// further is scheduled that step — this is the "chunking the last
     /// request that does not fit" behavior AGENTS.md describes.
     pub fn step(&mut self) -> BatchDescription {
+        let mut batch = BatchDescription::default();
+        self.step_into(&mut batch);
+        batch
+    }
+
+    /// Allocation-free scheduler step when `batch` was reserved at startup.
+    pub fn step_into(&mut self, batch: &mut BatchDescription) {
+        batch.decodes.clear();
+        batch.prefills.clear();
         let mut budget = self.config.token_budget();
-        let mut decodes = Vec::new();
-        let mut prefills = Vec::new();
 
         // Phase 1: every decode-ready running request, unconditionally.
-        for req in self.running.iter_mut().filter(|r| r.is_decode_ready()) {
+        for req in self
+            .running
+            .iter_mut()
+            .filter(|r| r.is_decode_ready() && r.computed_tokens < r.full_seq_len())
+        {
             let cost = self.config.tokens_per_decode_step();
             if budget < cost {
                 break;
             }
-            decodes.push(DecodeItem {
+            batch.decodes.push(DecodeItem {
                 id: req.id,
                 tokens: cost,
             });
@@ -241,7 +281,7 @@ impl Scheduler {
             }
             let remaining = req.prompt_tokens - req.computed_tokens;
             let chunk = remaining.min(budget);
-            prefills.push(PrefillItem {
+            batch.prefills.push(PrefillItem {
                 id: req.id,
                 tokens: chunk,
             });
@@ -253,7 +293,10 @@ impl Scheduler {
         }
 
         // Phase 3: admit from the waiting queue, watermark-gated.
-        while !chunked_this_step && budget > 0 {
+        while !chunked_this_step
+            && budget > 0
+            && self.running.len() < self.config.max_concurrent_decodes() as usize
+        {
             let Some(candidate) = self.waiting.front() else {
                 break;
             };
@@ -273,21 +316,19 @@ impl Scheduler {
             self.free_attention_blocks -= needed_blocks;
             req.blocks_reserved = needed_blocks;
 
-            let remaining = req.prompt_tokens;
+            let remaining = req.prompt_tokens - req.computed_tokens;
             let chunk = remaining.min(budget);
-            prefills.push(PrefillItem {
+            batch.prefills.push(PrefillItem {
                 id: req.id,
                 tokens: chunk,
             });
-            req.computed_tokens = chunk;
+            req.computed_tokens += chunk;
             budget -= chunk;
             if chunk < remaining {
                 chunked_this_step = true;
             }
             self.running.push(req);
         }
-
-        BatchDescription { decodes, prefills }
     }
 }
 
@@ -354,6 +395,17 @@ mod tests {
     }
 
     #[test]
+    fn sequence_length_overflow_saturates_and_is_rejected() {
+        let mut s = sched(512, 256, 4, 4);
+        let request = req(1, u32::MAX - 10, 100);
+        assert_eq!(request.full_seq_len(), u32::MAX);
+        assert!(matches!(
+            s.admit(request),
+            Err(AdmissionError::ExceedsTotalCapacity { .. })
+        ));
+    }
+
+    #[test]
     fn admission_accepts_a_request_that_fits() {
         let mut s = sched(512, 256, 4, 4);
         assert!(s.admit(req(1, 500, 100)).is_ok());
@@ -364,7 +416,7 @@ mod tests {
     fn decode_requests_are_always_scheduled_before_prefill() {
         // Enough budget for one decode step (1 token here, no drafts) plus
         // some prefill.
-        let mut s = sched(300, 256, 1, 8);
+        let mut s = sched(300, 256, 2, 8);
         s.admit(req(1, 200, 50)).unwrap();
         let batch1 = s.step();
         assert_eq!(batch1.decodes.len(), 0, "nothing running yet");
@@ -380,6 +432,50 @@ mod tests {
             batch2.has_prefill(),
             "leftover budget should prefill request 2"
         );
+    }
+
+    #[test]
+    fn waiting_requests_never_overfill_the_workers_decode_slots() {
+        let mut s = sched(4096, 256, 3, 64);
+        for id in 1..=4 {
+            s.admit(req(id, 32, 8)).unwrap();
+        }
+        let first = s.step();
+        assert_eq!(first.prefills.len(), 3);
+        assert_eq!(s.running_len(), 3);
+        assert_eq!(s.waiting_len(), 1);
+
+        let second = s.step();
+        assert_eq!(second.decodes.len(), 3);
+        assert!(second.prefills.is_empty());
+        assert_eq!(s.running_len(), 3);
+        assert_eq!(s.waiting_len(), 1);
+
+        assert!(s.finish_request(RequestId(1)));
+        let third = s.step();
+        assert_eq!(third.prefills.len(), 1);
+        assert_eq!(third.prefills[0].id, RequestId(4));
+        assert_eq!(s.running_len(), 3);
+        assert_eq!(s.waiting_len(), 0);
+    }
+
+    #[test]
+    fn step_into_reuses_reserved_batch_storage() {
+        let mut s = sched(4096, 256, 3, 64);
+        for id in 1..=3 {
+            s.admit(req(id, 32, 8)).unwrap();
+        }
+        let mut batch = BatchDescription::with_capacity(3, 3);
+        let decode_ptr = batch.decodes.as_ptr();
+        let prefill_ptr = batch.prefills.as_ptr();
+        s.step_into(&mut batch);
+        assert_eq!(batch.prefills.len(), 3);
+        assert_eq!(batch.decodes.as_ptr(), decode_ptr);
+        assert_eq!(batch.prefills.as_ptr(), prefill_ptr);
+        s.step_into(&mut batch);
+        assert_eq!(batch.decodes.len(), 3);
+        assert_eq!(batch.decodes.as_ptr(), decode_ptr);
+        assert_eq!(batch.prefills.as_ptr(), prefill_ptr);
     }
 
     #[test]
@@ -481,15 +577,15 @@ mod tests {
         );
     }
 
-    /// Speculative decode (MTP) draft tokens must enter the per-step budget
+    /// Speculative decode draft tokens (whether MTP or n-gram) must enter the per-step budget
     /// calculation, sized for the drafted case rather than the accepted
     /// case, or admission oscillates as the acceptance rate varies.
     #[test]
     fn draft_tokens_are_charged_against_the_step_budget_for_every_decode() {
-        let config = SchedulerConfig::new(20, 4, 2, 0.0, 3).unwrap(); // 1 + 3 draft = 4 tokens/decode
+        let config = SchedulerConfig::new(20, 4, 3, 0.0, 3).unwrap(); // 1 + 3 draft = 4 tokens/decode
         let mut s = Scheduler::new(config, 100);
-        s.admit(req(1, 4, 0)).unwrap();
-        s.admit(req(2, 4, 0)).unwrap();
+        s.admit(req(1, 4, 10)).unwrap();
+        s.admit(req(2, 4, 10)).unwrap();
         s.step(); // both prefill fully (4 tokens each, budget 20)
 
         // Now both are decode-ready: 2 requests * 4 tokens/decode = 8
@@ -503,5 +599,41 @@ mod tests {
             prefill_tokens, 12,
             "exactly the budget left after both decodes"
         );
+    }
+
+    #[test]
+    fn a_request_with_no_output_budget_is_not_scheduled_for_decode() {
+        let mut s = sched(300, 256, 1, 8);
+        s.admit(req(1, 10, 0)).unwrap();
+        s.step();
+        assert!(s.step().decodes.is_empty());
+    }
+
+    #[test]
+    fn accepted_speculative_tokens_advance_without_exceeding_the_output_limit() {
+        let mut s = sched(300, 256, 1, 8);
+        s.admit(req(1, 10, 3)).unwrap();
+        s.step();
+        assert_eq!(s.step().decodes.len(), 1);
+        assert!(s.advance_speculative(RequestId(1), 99));
+        assert!(s.step().decodes.is_empty());
+    }
+
+    #[test]
+    fn restored_prefix_skips_only_the_computed_prompt_tokens() {
+        let mut s = sched(300, 256, 1, 8);
+        s.admit_with_prefix(req(1, 600, 10), 512).unwrap();
+        let batch = s.step();
+        assert_eq!(batch.prefills[0].tokens, 88);
+        assert!(s.step().decodes.len() == 1);
+    }
+
+    #[test]
+    fn restored_prefix_cannot_extend_beyond_the_prompt() {
+        let mut s = sched(300, 256, 1, 8);
+        assert!(matches!(
+            s.admit_with_prefix(req(1, 10, 1), 11),
+            Err(AdmissionError::InvalidReusablePrefix { .. })
+        ));
     }
 }

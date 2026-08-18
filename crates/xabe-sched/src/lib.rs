@@ -22,6 +22,7 @@
 
 pub mod config;
 pub mod error;
+pub mod ngram;
 pub mod request;
 pub mod scheduler;
 

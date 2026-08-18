@@ -23,14 +23,14 @@ impl NewRequest {
     /// the worst-case generated output. The quantity AGENTS.md rule 4 says
     /// admission must check, in full, up front.
     pub const fn full_seq_len(&self) -> u32 {
-        self.prompt_tokens + self.max_output_tokens
+        self.prompt_tokens.saturating_add(self.max_output_tokens)
     }
 }
 
 /// One decoding request's contribution to a scheduled step.
 ///
 /// `tokens` is [`crate::config::SchedulerConfig::tokens_per_decode_step`]:
-/// one real token plus every MTP draft token, since draft tokens consume
+/// one real token plus every speculative draft token, since drafts consume
 /// step budget and KV capacity whether or not they're later accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeItem {
@@ -63,6 +63,14 @@ pub struct BatchDescription {
 }
 
 impl BatchDescription {
+    /// Preallocate the two scheduler-owned item lists for a serving worker.
+    pub fn with_capacity(decodes: usize, prefills: usize) -> Self {
+        Self {
+            decodes: Vec::with_capacity(decodes),
+            prefills: Vec::with_capacity(prefills),
+        }
+    }
+
     /// Whether the running batch contains any prefill work at all.
     pub fn has_prefill(&self) -> bool {
         !self.prefills.is_empty()

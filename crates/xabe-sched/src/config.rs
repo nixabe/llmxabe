@@ -8,10 +8,9 @@
 
 use crate::error::SchedulerConfigError;
 
-/// MTP typically drafts 2-3 tokens per step for this model family; default
-/// to the conservative (larger) end so the budget is sized for the drafted
-/// case rather than the accepted case, per AGENTS.md's guidance on
-/// speculative-decode interaction.
+/// Both MTP and n-gram speculation commonly draft 2-3 tokens per step;
+/// default to the conservative (larger) end so the budget is sized for the
+/// drafted case rather than the accepted case.
 pub const DEFAULT_DRAFT_TOKENS_PER_STEP: u32 = 3;
 
 /// Fraction of total attention blocks reserved as headroom when admitting
@@ -36,7 +35,8 @@ pub struct SchedulerConfig {
     max_concurrent_decodes: u32,
     /// Fraction of total attention blocks reserved as admission headroom.
     watermark_fraction: f64,
-    /// MTP draft tokens produced per decode step. Each drafted token
+    /// Maximum speculative tokens produced per decode step. The draft source
+    /// may be MTP, n-gram lookup, or none. Each drafted token
     /// consumes one slot of the per-step token budget and reserves one KV
     /// block-worth of capacity that may be discarded on rejection, so it
     /// must be budgeted for up front, not after the fact.

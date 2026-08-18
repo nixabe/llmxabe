@@ -33,6 +33,12 @@ pub enum SchedulerConfigError {
 /// A request rejected at admission time.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionError {
+    /// A cache restore cannot claim tokens beyond the submitted prompt.
+    #[error("reusable prefix {prefix_tokens} exceeds prompt length {prompt_tokens}")]
+    InvalidReusablePrefix {
+        prefix_tokens: u32,
+        prompt_tokens: u32,
+    },
     /// AGENTS.md rule 4: chunked prefill splits *compute*, not *memory*. A
     /// request that will never fit in KV capacity across its full lifetime
     /// (prompt + max output) must be rejected up front, even though its
