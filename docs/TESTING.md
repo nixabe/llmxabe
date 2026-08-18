@@ -140,14 +140,18 @@ confirmed from `ggml_compute_forward_rope_flt`.
 Stated plainly, because a gap you know about is manageable and one you assume
 away is not.
 
-- **No GPU kernel exists**, so no reference has been differentially tested
-  against a device implementation. The harness API is built for it
-  (`assert_matches(candidate, reference, &Tolerance::reduced_precision_gpu())`)
-  but has never been used that way.
-- **No per-layer golden activations** from `transformers` fp32 have been
-  captured. The references are validated against upstream implementations and
-  against each other, not against the actual model's behaviour.
-- **The GDN reference has not been run against real Qwen3.6 weights.**
+- The scheduler-driven three-worker serving path has not been run since it was
+  added; the CUDA driver is currently unreachable. Isolated kernel and forward
+  gates predate that path and do not prove it.
+- Parent-linked incremental attention snapshots have not been restored onto a
+  second GPU and compared against a cold prefill. `cross_worker_restore` is the
+  acceptance check for that claim.
+- Nine simultaneous sequences and the mixed two-decode/one-prefill step have
+  not been measured through `Engine::step_devices`.
+- The OpenAI HTTP surface has not been exercised against three live workers.
+- No same-day scheduler-path N=3 comparison against llama.cpp's best flags has
+  been recorded. Isolated `bench_decode_batch` results do not substitute for
+  that serving measurement.
 
 ## Running
 
@@ -157,6 +161,31 @@ cargo test -p xabe-kernels            # references and harness
 cargo test -p xabe-kernels gdn        # the critical path
 cargo run -p xabe-cuda --bin probe    # device gate and milestone-00 spike
 ```
+
+Serving acceptance uses the scheduler-driven runtime rather than the isolated
+forward benchmarks:
+
+```sh
+# One visible card, N=1 or N=3 through Worker::step_device.
+CUDA_VISIBLE_DEVICES=0 LLMXABE_BATCH_N=3 \
+  cargo run --release -p xabe-engine --bin worker_smoke
+
+# Three visible cards, nine requests, including a 2-decode + 1-prefill step
+# on every worker.
+CUDA_VISIBLE_DEVICES=0,1,2 \
+  cargo run --release -p xabe-engine --bin engine_smoke
+
+# Two separate CUDA contexts: cold 2K prefill versus pinned-host KV/GDN
+# restore, compared by exact emitted token ids.
+CUDA_VISIBLE_DEVICES=0,1 \
+  cargo run --release -p xabe-engine --bin cross_worker_restore
+```
+
+These commands are acceptance checks, not benchmarks. Run the dated,
+interleaved benchmark commands from the final section of `BENCHMARKS.md`
+before making a throughput claim. As of 2026-08-18 the serving checks above
+compile, but have not been run since their addition because the CUDA driver is
+unreachable on the development host.
 
 Tests needing the 32 GB model file or a GPU **skip and say so**. A skipped test
 is not a passing test — do not read a green run on a GPU-less machine as
