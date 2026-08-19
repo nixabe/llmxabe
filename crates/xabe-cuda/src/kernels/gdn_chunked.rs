@@ -196,8 +196,10 @@ const SOLVE_VB: u32 = 32;
 /// substitution is sequential in `t` and runs on the first row of them, and
 /// the per-token output is not, so it runs on all of them.
 const SOLVE_TT: u32 = 8;
-/// Warps in a scan block, each owning one value index. Mirrors `SCAN_WARPS`.
+/// Warps in a scan block. Mirrors `SCAN_WARPS`.
 const SCAN_WARPS: u32 = 4;
+/// Adjacent value indices one scan warp owns. Mirrors `SCAN_COLS`.
+const SCAN_COLS: u32 = 2;
 
 /// Head dimensions one scan lane carries, at most. Mirrors `SCAN_MAXR`.
 ///
@@ -307,22 +309,25 @@ __global__ void gdn_chunk_normalize_qk(
 // conclusion: its CUDA gated-delta op is a scan, and the chunked form survives
 // only as the slower ggml-graph fallback.
 //
-// grid: (value_heads, head_dim / SCAN_WARPS). block: (32, SCAN_WARPS).
+// grid: (value_heads, head_dim / (SCAN_WARPS * SCAN_COLS)).
+// block: (32, SCAN_WARPS).
 //
-// **One warp owns one (value head, value index) pair for the whole sequence.**
-// Lane `l` holds `S[vi][l], S[vi][l + 32], ...` -- `head_dim / 32` floats, four
-// at this geometry -- and never writes them out until the last token. The
+// **One warp owns adjacent (value head, value index) pairs for the whole
+// sequence.** Lane `l` holds `S[vi][l], S[vi][l + 32], ...` for each pair --
+// `head_dim / 32` floats per column, four at this geometry -- and never writes
+// them out until the last token. The
 // contraction of both `S k` and `S q` is over `j`, which is exactly the axis
 // the lanes span, so both reductions are warp shuffles: no shared memory, no
 // `__syncthreads`, and no global round trip for the state at any point in the
 // sequence. The chunked path wrote and re-read the whole state eight times per
 // layer to achieve the same thing.
 //
-// Every warp of a head re-reads the same `q` and `k` rows, which is a 128-fold
-// read amplification and is deliberate: the per-token working set is a few
-// tens of KiB across all heads and never leaves L1, and sharing it through
-// shared memory would reintroduce the barriers this shape exists to avoid.
+// Every warp of a head still re-reads `q` and `k`, but adjacent value columns
+// now share one register load and one decay/beta calculation. Sharing across
+// warps through shared memory would reintroduce the barriers this shape exists
+// to avoid.
 #define SCAN_WARPS 4
+#define SCAN_COLS 2
 // Head dimensions one lane carries. `head_dim / 32`, bounded so the state is a
 // register array indexed by constants after unrolling -- a runtime bound
 // spills it to local memory and the whole design with it.
@@ -342,19 +347,22 @@ __global__ void gdn_scan_prefill(
     int seq_len
 ) {
     int h  = blockIdx.x;
-    int vi = blockIdx.y * SCAN_WARPS + threadIdx.y;
-    if (vi >= head_dim) return;
+    int vi0 = (blockIdx.y * SCAN_WARPS + threadIdx.y) * SCAN_COLS;
+    if (vi0 >= head_dim) return;
     int lane = threadIdx.x;
     int nr = head_dim >> 5;
 
     // Modulo, not division. See `super::gdn`'s module docs.
     int hq = h % qk_heads;
 
-    float sreg[SCAN_MAXR];
-    long long sbase = ((long long)h * head_dim + vi) * head_dim;
+    float sreg[SCAN_COLS][SCAN_MAXR];
     #pragma unroll
-    for (int r = 0; r < SCAN_MAXR; ++r) {
-        sreg[r] = (r < nr) ? state[sbase + r * 32 + lane] : 0.0f;
+    for (int c = 0; c < SCAN_COLS; ++c) {
+        long long sbase = ((long long)h * head_dim + vi0 + c) * head_dim;
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            sreg[c][r] = (r < nr) ? state[sbase + r * 32 + lane] : 0.0f;
+        }
     }
 
     for (int t = 0; t < seq_len; ++t) {
@@ -380,35 +388,59 @@ __global__ void gdn_scan_prefill(
 
         // 1. Decay, held in registers rather than written and re-read.
         // 2. Delta correction against the *decayed* state.
-        float predicted = 0.0f;
+        float predicted[SCAN_COLS] = {};
         #pragma unroll
-        for (int r = 0; r < SCAN_MAXR; ++r) {
-            sreg[r] *= decay;
-            predicted += sreg[r] * kj[r];
+        for (int c = 0; c < SCAN_COLS; ++c) {
+            #pragma unroll
+            for (int r = 0; r < SCAN_MAXR; ++r) {
+                sreg[c][r] *= decay;
+                predicted[c] += sreg[c][r] * kj[r];
+            }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            predicted += __shfl_xor_sync(0xffffffff, predicted, off);
+            #pragma unroll
+            for (int c = 0; c < SCAN_COLS; ++c) {
+                predicted[c] += __shfl_xor_sync(0xffffffff, predicted[c], off);
+            }
         }
-        float vcorr = beta[ht] * (v[ht * head_dim + vi] - predicted);
+        float b = beta[ht];
+        float vcorr[SCAN_COLS];
+        #pragma unroll
+        for (int c = 0; c < SCAN_COLS; ++c) {
+            vcorr[c] = b * (v[ht * head_dim + vi0 + c] - predicted[c]);
+        }
 
         // 3. Outer-product update, and 4. the output from the *updated* state,
         //    in one pass: the freshly written state is consumed for the output
         //    while it is still in the register.
-        float o = 0.0f;
+        float o[SCAN_COLS] = {};
         #pragma unroll
-        for (int r = 0; r < SCAN_MAXR; ++r) {
-            sreg[r] += vcorr * kj[r];
-            o += sreg[r] * qj[r];
+        for (int c = 0; c < SCAN_COLS; ++c) {
+            #pragma unroll
+            for (int r = 0; r < SCAN_MAXR; ++r) {
+                sreg[c][r] += vcorr[c] * kj[r];
+                o[c] += sreg[c][r] * qj[r];
+            }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            o += __shfl_xor_sync(0xffffffff, o, off);
+            #pragma unroll
+            for (int c = 0; c < SCAN_COLS; ++c) {
+                o[c] += __shfl_xor_sync(0xffffffff, o[c], off);
+            }
         }
-        if (lane == 0) out[ht * head_dim + vi] = o;
+        if (lane == 0) {
+            #pragma unroll
+            for (int c = 0; c < SCAN_COLS; ++c) out[ht * head_dim + vi0 + c] = o[c];
+        }
     }
 
     #pragma unroll
-    for (int r = 0; r < SCAN_MAXR; ++r) {
-        if (r < nr) state[sbase + r * 32 + lane] = sreg[r];
+    for (int c = 0; c < SCAN_COLS; ++c) {
+        long long sbase = ((long long)h * head_dim + vi0 + c) * head_dim;
+        #pragma unroll
+        for (int r = 0; r < SCAN_MAXR; ++r) {
+            if (r < nr) state[sbase + r * 32 + lane] = sreg[c][r];
+        }
     }
 }
 
@@ -1238,7 +1270,7 @@ impl GdnChunkedKernels {
         let cfg = LaunchConfig {
             grid_dim: (
                 self.value_heads as u32,
-                (self.head_dim as u32).div_ceil(SCAN_WARPS),
+                (self.head_dim as u32).div_ceil(SCAN_WARPS * SCAN_COLS),
                 1,
             ),
             block_dim: (32, SCAN_WARPS, 1),
@@ -1569,6 +1601,17 @@ mod tests {
             "the kernel's INTER_TT is not {INTER_TT}; the shared staging \
              `gdn_chunked_forward` allocates would be the wrong size",
         );
+    }
+
+    #[test]
+    fn the_scan_geometry_constants_match_the_kernel_defines() {
+        for (name, value) in [("SCAN_WARPS", SCAN_WARPS), ("SCAN_COLS", SCAN_COLS)] {
+            let needle = format!("#define {name} {value}\n");
+            assert!(
+                GDN_CHUNKED_SRC.contains(&needle),
+                "the scan launch's {name}={value} disagrees with the kernel source",
+            );
+        }
     }
 
     #[test]

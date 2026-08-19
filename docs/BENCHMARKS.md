@@ -9130,3 +9130,36 @@ interleaved five-repetition whole-forward pairs:
 
 The larger shared tile and contraction loop lose once warm. The experimental
 constants were removed and the shipped K=128 staging remains.
+
+## 2026-08-19 — Two GDN state columns share one scan warp
+
+`gdn_scan_prefill` previously assigned one value column to each warp. Adjacent
+columns of one value head consume the same normalized q/k row, decay, beta,
+and token/head address arithmetic, but every warp recomputed all of them. The
+new shape retains the measured four-warp block and gives each warp two adjacent
+columns. It keeps two independent state and output accumulators, so each
+column's contraction and reduction order is unchanged, while the shared input
+work and grid width are halved. This is a different lever from the rejected
+eight-warp block: that changed residency without removing duplicated work.
+
+The release GDN differential passed all ten cases, including a 512-token scan,
+real model decay rates, non-zero carried state, scan versus chunked execution,
+and a ragged chunk tail. The release two-chunk N=3 forward differential also
+remained bit-exact for all six per-sequence logit comparisons (max-abs 0,
+cosine 1.0, argmax equal).
+
+At 2,046 total physical rows (682 per sequence), three interleaved
+five-repetition whole-forward pairs measured:
+
+| pair | two columns/warp | one column/warp | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,159.45 tok/s | 2,995.94 tok/s | 1.055x |
+| 2 | 3,093.74 tok/s | 2,968.09 tok/s | 1.042x |
+| 3 | 3,083.13 tok/s | 2,966.21 tok/s | 1.039x |
+
+Unlike the preceding scan-width, projection-tile, and contraction-depth
+experiments, the gain survives both warmed pairs. It recovers about 4--5% of
+the whole N=3 pass at this shape. This is not yet a win over llama.cpp's tuned
+3,342.41 tok/s at 2K with `-ub 4096`; the warm result is about 0.92x of that
+bar, and the physical ubatch differs. A tuned-width head-to-head remains
+required before making a replacement claim.
