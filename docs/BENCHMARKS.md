@@ -8946,3 +8946,64 @@ The correctness gate ran before timing. Three launched N=3 steps and three
 captured/replayed steps selected identical tokens. Against three independent
 N=1 passes, every one of nine full 248,320-logit rows had max-abs difference
 `0.000e0` and cosine `1.000000000`; identical prompts also remained bit exact.
+
+## 2026-08-19 — Matching llama.cpp's outer prefill tile without its fragment algorithm is eight times slower
+
+The next deep-prefill experiment implemented a separate, opt-in sm_75 kernel
+with the outer geometry used by llama.cpp's live
+`flash_attn_ext_f16<256,256,4,8>` specialization: four query positions across
+eight GQA sibling heads and a 64-key K/V tile. The shipped 16-query kernel
+remained the default and A/B fallback. The experiment deliberately used one
+aliased K/V shared-memory tile and no register-resident next-tile prefetch, so
+it tested whether the wider staging and lower barrier density could fit without
+repeating the previous spill failure.
+
+It fit, and that was not enough. `ptxas` for sm_75 reported 255 registers and
+zero spill stores or loads (the shipped kernel uses 252). The release 128K
+attention differential passed the unchanged `MMA_GATE`, with max-abs
+`8.881e-5` and cosine `0.999999583`. A first narrow CUDA-event A/B on GPU 0,
+8,192 query tokens, rejected it decisively:
+
+| key offset | shipped ms | four-query/64-key ms | result |
+| ---: | ---: | ---: | --- |
+| 32,768 | 165.717 | 1,275.549 | 7.70x slower |
+| 65,536 | 317.101 | 2,506.475 | 7.90x slower |
+| 98,304 | 472.412 | 3,781.404 | 8.00x slower |
+| 131,072 | 632.794 | 5,005.953 | 7.91x slower |
+
+The failure is execution structure rather than spilling. Four queries launch
+four times as many blocks as the shipped 16-query shape, while the conservative
+64-key softmax serialized max/exp/sum through four lanes. llama.cpp makes this
+outer geometry competitive with fragment-resident softmax and P-V combination;
+copying only its tile dimensions does not copy that algorithm. The experiment
+was removed. An honest retry must port the complete fragment layout and combine
+scheme rather than incrementally tune this rejected local shape.
+
+## 2026-08-19 — The required `-b 4096` prefill baseline, first complete single sweep
+
+`llama-batched-bench` was run on an idle Quadro RTX 8000 with `-ngl 99 -sm
+none -fa on -b 4096 -ctk f16 -ctv f16`, both required ubatches, and N=1/N=3.
+These are one run per cell, not the three interleaved repetitions needed for a
+final claim; they complete the missing shape matrix and identify which ubatch
+must be challenged first. Contexts through 32K used `-c 131072`; 65K and 128K
+used `-c 393216`, because llama.cpp divides `n_ctx` among the three parallel
+prompts.
+
+| context | N | `-ub 2048` tok/s | `-ub 4096` tok/s | faster setting |
+| ---: | ---: | ---: | ---: | --- |
+| 512 | 1 | 2,121.93 | 2,063.88 | 2048 |
+| 512 | 3 | 3,057.48 | 3,035.79 | 2048 |
+| 2,048 | 1 | 3,129.84 | 3,120.04 | 2048 |
+| 2,048 | 3 | 3,212.35 | 3,342.41 | 4096 |
+| 8,192 | 1 | 3,044.79 | 3,258.90 | 4096 |
+| 8,192 | 3 | 3,046.28 | 3,293.83 | 4096 |
+| 32,768 | 1 | 2,524.66 | 2,711.97 | 4096 |
+| 32,768 | 3 | 2,488.64 | 2,679.02 | 4096 |
+| 65,536 | 1 | 2,046.97 | 2,185.38 | 4096 |
+| 65,536 | 3 | 2,009.79 | 2,150.27 | 4096 |
+| 131,072 | 1 | 1,472.02 | 1,553.36 | 4096 |
+| 131,072 | 3 | 1,477.11 | 1,554.21 | 4096 |
+
+The first `-ub 2048` command incorrectly used `-c 131072` for 65K/128K
+N=3 and failed at admission after completing the 32K cells. Those deep cells
+were rerun with `-c 393216`; the failed harness configuration is not a result.
