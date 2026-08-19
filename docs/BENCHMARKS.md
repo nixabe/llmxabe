@@ -9057,3 +9057,24 @@ equal total ubatch on this model. The primitive remains useful for one-pass
 N=3 scheduling and is the shared representation needed to tune GDN/MoE across
 sequences, but it is not itself progress against llama.cpp's 3,342.41 tok/s at
 2K with `-ub 4096`.
+
+## 2026-08-19 — Independent GDN streams disappear into thermal drift
+
+The sequence-local portions of N=3 GDN prefill — causal convolution and the
+delta-rule mix — were placed on three preallocated streams with fixed fork/join
+events. The release two-chunk differential remained bit-exact for all three
+sequences. At 2,046 total physical rows (682 per sequence), three interleaved
+five-repetition pairs measured:
+
+| pair | concurrent GDN | serial GDN | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,004.86 tok/s | 2,986.01 tok/s | 1.006x |
+| 2 | 2,960.12 tok/s | 2,971.87 tok/s | 0.996x |
+| 3 | 2,954.04 tok/s | 2,966.13 tok/s | 0.996x |
+
+The first apparent 0.6% gain reversed in both later pairs as the card warmed.
+The stream experiment was removed: it adds synchronization resources without a
+repeatable throughput result. At this shape CUDA-event profiling assigns
+39.2% of the pass to GDN mixers, 52.2% to MoE, and 8.5% to attention, so the
+next N=3 work stays inside the tensor-core GDN/MoE kernels rather than trying
+to overlap already-saturating work.
