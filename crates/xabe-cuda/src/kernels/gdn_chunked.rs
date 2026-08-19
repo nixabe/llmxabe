@@ -199,7 +199,7 @@ const SOLVE_TT: u32 = 8;
 /// Warps in a scan block. Mirrors `SCAN_WARPS`.
 const SCAN_WARPS: u32 = 4;
 /// Adjacent value indices one scan warp owns. Mirrors `SCAN_COLS`.
-const SCAN_COLS: u32 = 2;
+const SCAN_COLS: u32 = 4;
 
 /// Head dimensions one scan lane carries, at most. Mirrors `SCAN_MAXR`.
 ///
@@ -327,7 +327,7 @@ __global__ void gdn_chunk_normalize_qk(
 // warps through shared memory would reintroduce the barriers this shape exists
 // to avoid.
 #define SCAN_WARPS 4
-#define SCAN_COLS 2
+#define SCAN_COLS 4
 // Head dimensions one lane carries. `head_dim / 32`, bounded so the state is a
 // register array indexed by constants after unrolling -- a runtime bound
 // spills it to local memory and the whole design with it.
