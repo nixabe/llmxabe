@@ -1764,6 +1764,334 @@ impl GdnBlock {
         result
     }
 
+    /// Batched prefill over equal-length, sequence-major chunks.
+    ///
+    /// `hidden` and `out` are
+    /// `[states.len()][chunk_tokens][hidden]`. Every projection, norm and
+    /// elementwise operation runs once over the flattened row axis, while the
+    /// causal convolution and delta-rule scan run once per contiguous
+    /// sequence chunk against that sequence's independent state. Thus no
+    /// weight-bound projection is repeated merely because the rows belong to
+    /// different sequences.
+    ///
+    /// `chunk_tokens` is explicit because a flat device allocation carries no
+    /// sequence-boundary metadata. It may be one (equivalent in meaning to
+    /// batched decode), although prefill callers normally provide a longer
+    /// chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_prefill(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        weights: &GdnLayerWeights,
+        int8: Option<&GdnLayerInt8>,
+        states: &mut [&mut GdnState],
+        chunk_tokens: usize,
+        hidden: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let tokens =
+            states
+                .len()
+                .checked_mul(chunk_tokens)
+                .ok_or(GdnBlockError::ShapeMismatch {
+                    what: "batch prefill hidden",
+                    expected: usize::MAX,
+                    got: hidden.len(),
+                })?;
+        check_len("batch prefill hidden", tokens * g.hidden, hidden.len())?;
+        check_len("batch prefill out", tokens * g.hidden, out.len())?;
+        if states.is_empty() {
+            return Ok(());
+        }
+        if chunk_tokens == 0 {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "batch prefill chunk tokens",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if chunk_tokens > g.max_tokens {
+            return Err(GdnBlockError::Chunked(GdnChunkedError::SequenceTooLong {
+                seq_len: chunk_tokens,
+                capacity: g.max_tokens,
+            }));
+        }
+
+        if self.scratch.as_ref().map(|s| s.tokens) != Some(tokens) {
+            self.scratch = Some(Scratch::new(stream, &g, tokens)?);
+        }
+        let mut scratch = self.scratch.take().expect("scratch was just installed");
+        let result = self.run_batch_prefill(
+            stream,
+            weights,
+            int8,
+            states,
+            chunk_tokens,
+            hidden,
+            out,
+            &mut scratch,
+        );
+        self.scratch = Some(scratch);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_batch_prefill(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        w: &GdnLayerWeights,
+        tc: Option<&GdnLayerInt8>,
+        states: &mut [&mut GdnState],
+        chunk_tokens: usize,
+        hidden: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        s: &mut Scratch,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let tokens = states.len() * chunk_tokens;
+        let gemv = tc.filter(|_| tokens == 1);
+        let split_tiled = tc.filter(|_| tokens > 1 && !Self::uses_tensor_cores(tokens));
+        let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
+
+        self.layer_ops.rms_norm(
+            stream,
+            hidden,
+            &w.input_norm,
+            &mut s.normed,
+            tokens,
+            g.hidden,
+            g.rms_eps,
+        )?;
+        if let Some(i8w) = tc {
+            self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.qkv_q,
+                    &i8w.qkv_s,
+                    xq,
+                    xs,
+                    &mut s.qkv,
+                    g.hidden,
+                    g.conv_dim(),
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.gate_q,
+                    &i8w.gate_s,
+                    xq,
+                    xs,
+                    &mut s.z,
+                    g.hidden,
+                    g.value_dim(),
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+        } else if let Some(i8w) = gemv {
+            self.project_split_gemv(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+            )?;
+            self.project_split_gemv(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+            )?;
+        } else if let Some(i8w) = split_tiled {
+            self.project_split_tiled(
+                stream,
+                &i8w.qkv_q,
+                &i8w.qkv_s,
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project_split_tiled(
+                stream,
+                &i8w.gate_q,
+                &i8w.gate_s,
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
+        } else {
+            self.project(
+                stream,
+                Projection::Q8_0(&w.qkv),
+                &s.normed,
+                &mut s.qkv,
+                g.hidden,
+                g.conv_dim(),
+                tokens,
+            )?;
+            self.project(
+                stream,
+                Projection::Q8_0(&w.gate),
+                &s.normed,
+                &mut s.z,
+                g.hidden,
+                g.value_dim(),
+                tokens,
+            )?;
+        }
+
+        let conv_dim = g.conv_dim();
+        let conv_chunk = chunk_tokens * conv_dim;
+        for (seq, state) in states.iter_mut().enumerate() {
+            let offset = seq * conv_chunk;
+            // SAFETY: sequence-major layout partitions both flattened buffers
+            // into `states.len()` disjoint chunks of `conv_chunk` elements.
+            let x = unsafe { crate::viewslice::subslice(stream, &s.qkv, offset, conv_chunk) };
+            let mut y =
+                unsafe { crate::viewslice::subslice(stream, &s.conv_raw, offset, conv_chunk) };
+            self.layer_ops.conv1d(
+                stream,
+                &x,
+                &w.conv1d,
+                &mut state.conv,
+                &mut y,
+                chunk_tokens,
+                conv_dim,
+                g.conv_kernel,
+            )?;
+        }
+        self.silu_split_qkv(
+            stream,
+            &s.conv_raw,
+            &mut s.conv_silu,
+            &mut s.q,
+            &mut s.k,
+            &mut s.v,
+            tokens,
+        )?;
+        self.alpha_beta_gates(
+            stream,
+            &w.alpha,
+            &w.beta,
+            &s.normed,
+            &w.dt_bias,
+            &w.a,
+            &mut s.alpha,
+            &mut s.beta_raw,
+            &mut s.a_softplus,
+            &mut s.log_decay,
+            &mut s.beta,
+            tokens,
+        )?;
+
+        let key_chunk = chunk_tokens * g.key_dim();
+        let value_chunk = chunk_tokens * g.value_dim();
+        let heads_chunk = chunk_tokens * g.value_heads;
+        for (seq, state) in states.iter_mut().enumerate() {
+            // SAFETY: each offset and length describes the corresponding
+            // sequence's disjoint contiguous chunk in the flattened scratch.
+            let q = unsafe { crate::viewslice::subslice(stream, &s.q, seq * key_chunk, key_chunk) };
+            let k = unsafe { crate::viewslice::subslice(stream, &s.k, seq * key_chunk, key_chunk) };
+            let v =
+                unsafe { crate::viewslice::subslice(stream, &s.v, seq * value_chunk, value_chunk) };
+            let decay = unsafe {
+                crate::viewslice::subslice(stream, &s.log_decay, seq * heads_chunk, heads_chunk)
+            };
+            let beta = unsafe {
+                crate::viewslice::subslice(stream, &s.beta, seq * heads_chunk, heads_chunk)
+            };
+            let mut core = unsafe {
+                crate::viewslice::subslice(stream, &s.core, seq * value_chunk, value_chunk)
+            };
+            self.mix(
+                stream,
+                state,
+                &q,
+                &k,
+                &v,
+                &decay,
+                &beta,
+                &mut core,
+                chunk_tokens,
+            )?;
+        }
+
+        self.layer_ops.rms_norm_swiglu(
+            stream,
+            &s.core,
+            &w.ssm_norm,
+            &s.z,
+            &mut s.core_norm,
+            &mut s.final_output,
+            tokens * g.value_heads,
+            g.head_dim,
+            g.rms_eps,
+        )?;
+        if let Some(i8w) = tc {
+            self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
+            let (xq, xs) = self.xq.as_ref().expect("quantized above");
+            self.mma
+                .q8_0_proj_split(
+                    stream,
+                    &i8w.out_q,
+                    &i8w.out_s,
+                    xq,
+                    xs,
+                    &mut s.projected,
+                    g.value_dim(),
+                    g.hidden,
+                    tokens,
+                )
+                .map_err(GdnBlockError::Mma)?;
+        } else if let Some(i8w) = gemv {
+            self.project_split_gemv(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+            )?;
+        } else if let Some(i8w) = split_tiled {
+            self.project_split_tiled(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
+        } else {
+            self.project(
+                stream,
+                Projection::Q8_0(&w.out),
+                &s.final_output,
+                &mut s.projected,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
+        }
+        self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_batch_decode(
         &mut self,

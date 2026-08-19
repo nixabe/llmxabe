@@ -297,6 +297,18 @@ fn chunked_prefill(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(1);
+    let serial_sequences = std::env::var_os("LLMXABE_SERIAL_BATCH_PREFILL").is_some();
+    if !serial_sequences && !chunk.is_multiple_of(sequences) {
+        error!(
+            "physical chunk {chunk} is not divisible by {sequences} sequences; choose a total row count such as 2046 or 4095 for N=3"
+        );
+        return;
+    }
+    let sequence_chunk = if serial_sequences {
+        chunk
+    } else {
+        chunk / sequences
+    };
     let max_seq = batches.iter().copied().max().unwrap_or(chunk);
     let built = Instant::now();
     let mut forward =
@@ -307,6 +319,13 @@ fn chunked_prefill(
                 return;
             }
         };
+    if sequences > 1
+        && !serial_sequences
+        && let Err(e) = forward.enable_batch_prefill(ctx, stream, sequences)
+    {
+        error!("FAILED to enable N={sequences} batched prefill: {e}");
+        return;
+    }
     let build_s = built.elapsed().as_secs_f64();
 
     let mut states = Vec::with_capacity(sequences);
@@ -321,7 +340,7 @@ fn chunked_prefill(
     }
 
     info!(
-        "chunked prefill: {chunk}-token pass built in {build_s:.1} s, {sequences} independent state(s) for {max_seq} positions"
+        "chunked prefill: {chunk} total rows ({sequence_chunk}/sequence) built in {build_s:.1} s, {sequences} independent state(s) for {max_seq} positions"
     );
     info!(
         "{:>8} | {:>7} | {:>16} | {:>14}",
@@ -331,11 +350,13 @@ fn chunked_prefill(
 
     let mut peak_used = 0u64;
     for &n in batches {
-        if !n.is_multiple_of(chunk) {
-            warn!("{n:>8} | skipped: not a multiple of the {chunk}-token chunk");
+        if !n.is_multiple_of(sequence_chunk) {
+            warn!(
+                "{n:>8} | skipped: not a multiple of the {sequence_chunk}-token per-sequence chunk"
+            );
             continue;
         }
-        let chunks = n / chunk;
+        let chunks = n / sequence_chunk;
         // Ids for the whole prompt, sliced per chunk. Same generator as the
         // single-pass path so the routing spread is identical.
         let ids: Vec<Vec<i32>> = (0..sequences)
@@ -348,16 +369,31 @@ fn chunked_prefill(
             })
             .collect();
 
+        let mut flattened = Vec::with_capacity(chunk);
         let mut run_once = |states: &mut [_]| -> Result<(), String> {
-            for (sequence, state) in states.iter_mut().enumerate() {
-                for c in 0..chunks {
-                    let slice = &ids[sequence][c * chunk..(c + 1) * chunk];
-                    forward.run(stream, state, slice, |_, _| {}).map_err(|e| {
-                        format!(
-                            "sequence {sequence}, chunk {c} at position {}: {e}",
-                            c * chunk
-                        )
-                    })?;
+            for c in 0..chunks {
+                if sequences == 1 || serial_sequences {
+                    for (sequence, state) in states.iter_mut().enumerate() {
+                        let slice = &ids[sequence][c * sequence_chunk..(c + 1) * sequence_chunk];
+                        forward.run(stream, state, slice, |_, _| {}).map_err(|e| {
+                            format!(
+                                "sequence {sequence}, chunk {c} at position {}: {e}",
+                                c * sequence_chunk
+                            )
+                        })?;
+                    }
+                } else {
+                    flattened.clear();
+                    for sequence_ids in &ids {
+                        flattened.extend_from_slice(
+                            &sequence_ids[c * sequence_chunk..(c + 1) * sequence_chunk],
+                        );
+                    }
+                    forward
+                        .run_batch_prefill(stream, states, &flattened)
+                        .map_err(|e| {
+                            format!("batch chunk {c} at position {}: {e}", c * sequence_chunk)
+                        })?;
                 }
             }
             Ok(())
@@ -408,9 +444,8 @@ fn chunked_prefill(
     );
     info!(
         "NOTE: one warmup discarded, {reps} timed repetitions. {sequences} independent \
-         prompt(s) are currently executed serially inside each timed batch as {chunk}-token \
-         passes over carried KV caches and recurrent states. At one sequence this is directly \
-         comparable to llama.cpp `-ub {chunk}`; at N>1 it is the production baseline that \
-         cross-sequence prefill batching must beat.",
+         prompt(s) share each {chunk}-row physical pass ({sequence_chunk} rows/sequence) over \
+         independent carried KV caches and recurrent states. This is directly comparable to \
+         llama.cpp `-ub {chunk}` at the same aggregate physical ubatch.",
     );
 }

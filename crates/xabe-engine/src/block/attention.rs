@@ -1722,6 +1722,282 @@ impl GatedAttentionBlock {
 
         Ok(())
     }
+
+    /// Batched prefill for independent equal-length chunks. Weight-bound
+    /// projections run over the flattened sequence-major rows; rotary, KV
+    /// append, and attention remain sequence-local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_prefill(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        sc: &mut AttnScratch,
+        hidden_state: &CudaSlice<f32>,
+        caches: &mut [&mut KvCache],
+        chunk_tokens: usize,
+        pos_offsets: &[usize],
+        positions: &[&CudaSlice<i32>],
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), AttentionBlockError> {
+        let n = caches.len();
+        if n == 0 || chunk_tokens == 0 || n * chunk_tokens != self.tokens {
+            return Err(AttentionBlockError::BufferShape {
+                what: "batch prefill tokens",
+                expected: self.tokens,
+                actual: n * chunk_tokens,
+            });
+        }
+        if pos_offsets.len() != n || positions.len() != n {
+            return Err(AttentionBlockError::BufferShape {
+                what: "batch prefill positions",
+                expected: n,
+                actual: pos_offsets.len().min(positions.len()),
+            });
+        }
+        let total = self.tokens;
+        let hidden_elems = total * self.hidden;
+        let q_dim = self.q_heads * self.head_dim;
+        let kv_dim = self.kv_heads * self.head_dim;
+        expect_len("block input", hidden_state.len(), hidden_elems)?;
+        expect_len("block output", out.len(), hidden_elems)?;
+        for (i, c) in caches.iter().enumerate() {
+            if pos_offsets[i] + chunk_tokens > c.max_seq {
+                return Err(AttentionBlockError::CacheExhausted {
+                    position: pos_offsets[i],
+                    tokens: chunk_tokens,
+                    max_seq: c.max_seq,
+                });
+            }
+            // The attention kernels take the sequence's starting position as
+            // one device scalar and add the row index internally.
+            expect_len("batch prefill position", positions[i].len(), 1)?;
+        }
+        let k = Arc::clone(&self.kernels);
+        k.ops.rms_norm(
+            stream,
+            hidden_state,
+            &self.weights.w_input_norm,
+            &mut sc.normed,
+            total,
+            self.hidden,
+            self.rms_eps,
+        )?;
+        if self.int8.is_some() {
+            self.quantize_activations(stream, sc, ScratchPick::Normed, total, self.hidden)?;
+        }
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.qgate_q,
+                &i8w.qgate_s,
+                xq,
+                xs,
+                &mut sc.packed,
+                self.hidden,
+                2 * q_dim,
+                total,
+            )?;
+        } else {
+            k.qgate.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.weights.w_qgate,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.normed,
+                total,
+                &mut sc.packed,
+            )?;
+        }
+        k.mixer
+            .split_query_and_gate(stream, &sc.packed, &mut sc.query, &mut sc.gate, total)?;
+        k.ops.rms_norm(
+            stream,
+            &sc.query,
+            &self.weights.w_q_norm,
+            &mut sc.query_normed,
+            total * self.q_heads,
+            self.head_dim,
+            self.rms_eps,
+        )?;
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.k_q,
+                &i8w.k_s,
+                xq,
+                xs,
+                &mut sc.key,
+                self.hidden,
+                kv_dim,
+                total,
+            )?;
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.v_q,
+                &i8w.v_s,
+                xq,
+                xs,
+                &mut sc.value,
+                self.hidden,
+                kv_dim,
+                total,
+            )?;
+        } else {
+            k.kv.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.weights.w_k,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.normed,
+                total,
+                &mut sc.key,
+            )?;
+            k.kv.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.weights.w_v,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.normed,
+                total,
+                &mut sc.value,
+            )?;
+        }
+        k.ops.rms_norm(
+            stream,
+            &sc.key,
+            &self.weights.w_k_norm,
+            &mut sc.key_normed,
+            total * self.kv_heads,
+            self.head_dim,
+            self.rms_eps,
+        )?;
+        for i in 0..n {
+            let base = i * chunk_tokens;
+            let qn = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    &sc.query_normed,
+                    base * q_dim,
+                    chunk_tokens * q_dim,
+                )
+            };
+            let mut qr = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    &sc.query_roped,
+                    base * q_dim,
+                    chunk_tokens * q_dim,
+                )
+            };
+            let kn = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    &sc.key_normed,
+                    base * kv_dim,
+                    chunk_tokens * kv_dim,
+                )
+            };
+            let mut kr = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    &sc.key_roped,
+                    base * kv_dim,
+                    chunk_tokens * kv_dim,
+                )
+            };
+            k.mixer.rope(
+                stream,
+                &qn,
+                &mut qr,
+                chunk_tokens,
+                self.q_heads,
+                self.rope_dim,
+                positions[i],
+                self.rope_theta,
+            )?;
+            k.mixer.rope(
+                stream,
+                &kn,
+                &mut kr,
+                chunk_tokens,
+                self.kv_heads,
+                self.rope_dim,
+                positions[i],
+                self.rope_theta,
+            )?;
+            let val = unsafe {
+                crate::viewslice::subslice(stream, &sc.value, base * kv_dim, chunk_tokens * kv_dim)
+            };
+            k.mixer.append_kv(
+                stream,
+                &kr,
+                &val,
+                &mut caches[i].k,
+                &mut caches[i].v,
+                chunk_tokens,
+                caches[i].max_seq,
+                positions[i],
+            )?;
+            let mut pg = unsafe {
+                crate::viewslice::subslice(stream, &sc.pregate, base * q_dim, chunk_tokens * q_dim)
+            };
+            k.mixer.forward(
+                stream,
+                &mut sc.decode[0],
+                &qr,
+                &caches[i].k,
+                &caches[i].v,
+                &mut pg,
+                chunk_tokens,
+                caches[i].max_seq,
+                pos_offsets[i] + chunk_tokens,
+                positions[i],
+            )?;
+        }
+        k.elementwise.sigmoid_gate(
+            stream,
+            &sc.pregate,
+            &sc.gate,
+            &mut sc.gate_sigmoid,
+            &mut sc.gated,
+            total * q_dim,
+        )?;
+        if self.int8.is_some() {
+            self.quantize_activations(stream, sc, ScratchPick::Gated, total, q_dim)?;
+        }
+        if let Some(i8w) = self.int8.as_ref() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
+            i8w.mma.q8_0_proj_split(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                xq,
+                xs,
+                &mut sc.projected,
+                q_dim,
+                self.hidden,
+                total,
+            )?;
+        } else {
+            k.out.forward(
+                stream,
+                QuantTensor {
+                    bytes: &self.weights.w_out,
+                    quant: ExpertQuant::Q8_0,
+                },
+                &sc.gated,
+                total,
+                &mut sc.projected,
+            )?;
+        }
+        k.elementwise
+            .residual_add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
+        Ok(())
+    }
 }
 
 /// Copy a resident Q8_0 tensor into a buffer of its own.

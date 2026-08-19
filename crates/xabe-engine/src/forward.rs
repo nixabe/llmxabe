@@ -290,6 +290,9 @@ pub enum ForwardError {
     /// states explicitly, once, rather than something this method does for
     /// them on its first call.
     BatchDecodeNotEnabled,
+    /// [`Forward::run_batch_prefill`] was called before its sequence-width
+    /// output and position scratch was allocated.
+    BatchPrefillNotEnabled,
     /// A batched-decode pass or its per-sequence states disagree with the
     /// batch width this pass was built for.
     BatchWidth {
@@ -377,6 +380,10 @@ impl std::fmt::Display for ForwardError {
             Self::BatchDecodeNotEnabled => write!(
                 f,
                 "run_batch_decode was called before enable_batch_decode allocated its scratch",
+            ),
+            Self::BatchPrefillNotEnabled => write!(
+                f,
+                "run_batch_prefill was called before enable_batch_prefill allocated its scratch",
             ),
             Self::BatchWidth {
                 expected,
@@ -1397,6 +1404,55 @@ impl Forward {
         Ok(())
     }
 
+    /// Allocate the fixed output and position scratch for equal-chunk batched
+    /// prefill. `self.tokens` is the total physical row count; `sequences`
+    /// names how those sequence-major rows are partitioned.
+    ///
+    /// This is separate from [`Self::enable_batch_decode`] because decode's
+    /// output width equals `self.tokens`, while prefill keeps only one last
+    /// row per sequence. Allocation remains an explicit cold-path operation.
+    pub fn enable_batch_prefill(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        sequences: usize,
+    ) -> Result<(), ForwardError> {
+        if sequences == 0 || !self.tokens.is_multiple_of(sequences) {
+            return Err(ForwardError::BatchWidth {
+                expected: self.tokens,
+                got: sequences,
+                what: "a divisor number of sequences",
+            });
+        }
+        if self.batch_lm_head.is_some() {
+            let output_rows = self.batch_argmax_out.as_ref().map_or(0, CudaSlice::len);
+            if output_rows != sequences {
+                return Err(ForwardError::BatchWidth {
+                    expected: output_rows,
+                    got: sequences,
+                    what: "sequences",
+                });
+            }
+            return Ok(());
+        }
+        self.batch_lm_head = Some(LmHeadKernels::new(
+            ctx,
+            LmHeadGeometry {
+                hidden: self.hidden,
+                vocab: self.vocab,
+                max_tokens: sequences,
+            },
+        )?);
+        self.batch_logits = Some(stream.alloc_zeros::<f32>(sequences * self.vocab)?);
+        self.batch_argmax_values = Some(stream.alloc_zeros::<f32>(sequences * ARGMAX_BLOCKS)?);
+        self.batch_argmax_indices = Some(stream.alloc_zeros::<i32>(sequences * ARGMAX_BLOCKS)?);
+        self.batch_argmax_out = Some(stream.alloc_zeros::<i32>(sequences)?);
+        self.batch_positions = Some(stream.alloc_zeros::<i32>(sequences)?);
+        self.batch_positions_host = vec![0i32; sequences];
+        self.batch_zero_tokens = vec![0i32; self.tokens];
+        Ok(())
+    }
+
     /// Batched decode: advance `states.len()` independent sequences by one
     /// token each, in a single pass, and return one sampled id per sequence
     /// in `states` order.
@@ -1445,6 +1501,158 @@ impl Forward {
             state.advance(1);
         }
         Ok(host)
+    }
+
+    /// Prefill equal-length chunks for independent sequences in one physical
+    /// pass. Token ids are sequence-major and must contain exactly
+    /// `self.tokens` rows. Weight-bound stages see the flattened row axis;
+    /// recurrent state, rotary positions and KV caches remain per sequence.
+    pub fn run_batch_prefill(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        token_ids: &[i32],
+    ) -> Result<Vec<i32>, ForwardError> {
+        let n = states.len();
+        if n == 0 || !self.tokens.is_multiple_of(n) {
+            return Err(ForwardError::BatchWidth {
+                expected: self.tokens,
+                got: n,
+                what: "a divisor number of states",
+            });
+        }
+        if token_ids.len() != self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: token_ids.len(),
+            });
+        }
+        let chunk_tokens = self.tokens / n;
+        let (gdn_layers, attn_layers) = (self.gdn_weights.len(), self.attention.len());
+        for state in states.iter() {
+            if state.gdn_layers() != gdn_layers || state.attention_layers() != attn_layers {
+                return Err(ForwardError::StateShape {
+                    expected_gdn: gdn_layers,
+                    expected_attention: attn_layers,
+                    got_gdn: state.gdn_layers(),
+                    got_attention: state.attention_layers(),
+                });
+            }
+            if state.position() + chunk_tokens > state.max_seq() {
+                return Err(ForwardError::CacheExhausted {
+                    position: state.position(),
+                    tokens: chunk_tokens,
+                    max_seq: state.max_seq(),
+                });
+            }
+        }
+        if self.batch_lm_head.is_none()
+            || self.batch_argmax_out.as_ref().map_or(0, |x| x.len()) != n
+        {
+            return Err(ForwardError::BatchPrefillNotEnabled);
+        }
+
+        stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
+        self.moe.publish_tokens(stream, self.tokens)?;
+        for state in states.iter_mut() {
+            state
+                .publish_position(stream)
+                .map_err(ForwardError::State)?;
+        }
+
+        self.embed(stream)?;
+        let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
+        for layer in 0..self.config.num_layers {
+            match self.config.layer_kind(layer) {
+                LayerKind::GatedDeltaNet => {
+                    let mut gdn_states: SmallVec<[&mut GdnState; 3]> =
+                        states.iter_mut().map(|s| s.gdn_mut(gdn_slot)).collect();
+                    self.gdn.forward_batch_prefill(
+                        stream,
+                        &self.gdn_weights[gdn_slot],
+                        self.gdn_int8.get(gdn_slot),
+                        &mut gdn_states,
+                        chunk_tokens,
+                        &self.hidden_state,
+                        &mut self.mixer_out,
+                    )?;
+                    gdn_slot += 1;
+                }
+                LayerKind::GatedAttention => {
+                    let mut caches: SmallVec<[&mut KvCache; 3]> = SmallVec::new();
+                    let mut offsets: SmallVec<[usize; 3]> = SmallVec::new();
+                    let mut positions: SmallVec<[&CudaSlice<i32>; 3]> = SmallVec::new();
+                    for state in states.iter_mut() {
+                        offsets.push(state.position());
+                        let (cache, position) = state.kv_and_position_mut(attn_slot);
+                        caches.push(cache);
+                        positions.push(position);
+                    }
+                    self.attention[attn_slot].forward_batch_prefill(
+                        stream,
+                        &mut self.attn_scratch,
+                        &self.hidden_state,
+                        &mut caches,
+                        chunk_tokens,
+                        &offsets,
+                        &positions,
+                        &mut self.mixer_out,
+                    )?;
+                    attn_slot += 1;
+                }
+            }
+            self.moe.forward(
+                stream,
+                &self.moe_weights[layer as usize],
+                &self.mixer_out,
+                self.tokens,
+                &mut self.ffn_out,
+                &mut self.hidden_state,
+            )?;
+        }
+
+        self.layer_ops.rms_norm(
+            stream,
+            &self.hidden_state,
+            &self.w_output_norm,
+            &mut self.final_norm,
+            self.tokens,
+            self.hidden,
+            self.rms_eps,
+        )?;
+        for seq in 0..n {
+            let source = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    &self.final_norm,
+                    (seq * chunk_tokens + chunk_tokens - 1) * self.hidden,
+                    self.hidden,
+                )
+            };
+            let mut destination = unsafe {
+                crate::viewslice::subslice(stream, &self.mixer_out, seq * self.hidden, self.hidden)
+            };
+            stream.memcpy_dtod(&*source, &mut *destination)?;
+        }
+        let lm_head = self.batch_lm_head.as_ref().expect("checked above");
+        let last_rows =
+            unsafe { crate::viewslice::subslice(stream, &self.mixer_out, 0, n * self.hidden) };
+        lm_head.forward(
+            stream,
+            QuantTensor {
+                bytes: &self.w_lm_head,
+                quant: ExpertQuant::Q8_0,
+            },
+            &last_rows,
+            n,
+            self.batch_logits.as_mut().expect("checked above"),
+        )?;
+        self.launch_batch_argmax(stream, n)?;
+        let sampled = self.read_batch_sampled(stream)?;
+        for state in states {
+            state.advance(chunk_tokens);
+        }
+        Ok(sampled)
     }
 
     /// Diagnostic-only sibling of [`Self::run_batch_decode`]: the same
@@ -2046,6 +2254,57 @@ impl Forward {
         )?;
         stream.synchronize()?;
         Ok(host)
+    }
+
+    fn launch_batch_argmax(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        rows: usize,
+    ) -> Result<(), ForwardError> {
+        let vocab = self.vocab;
+        for i in 0..rows {
+            let row = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_logits.as_ref().expect("batch output enabled"),
+                    i * vocab,
+                    vocab,
+                )
+            };
+            let mut values = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_values
+                        .as_ref()
+                        .expect("batch output enabled"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut indices = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_indices
+                        .as_ref()
+                        .expect("batch output enabled"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut output = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_out
+                        .as_ref()
+                        .expect("batch output enabled"),
+                    i,
+                    1,
+                )
+            };
+            self.lm_head
+                .argmax(stream, &row, vocab, &mut values, &mut indices, &mut output)?;
+        }
+        Ok(())
     }
 
     fn read_batch_sampled_into(

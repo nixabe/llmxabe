@@ -9028,3 +9028,32 @@ MTP remains a valid future serving feature; this measurement rejects it as the
 next standalone way to close the current N=3 gap. Integrating three unbatched
 speculative sessions would add a new serialization path before demonstrating a
 large enough per-session win.
+
+## 2026-08-19 — Cross-sequence prefill is correct, but equal total ubatch does not buy throughput
+
+The first true N=3 prefill path flattened equal sequence-major chunks through
+embedding, GDN and attention projections, MoE, final norm, and the LM head,
+while retaining independent recurrent and KV state. A release GPU differential
+compared three serial 64-token shapes with one 192-row shape over two carried
+chunks. All six per-sequence logit comparisons were bit-exact (max-abs 0,
+cosine 1.0), including the second chunk. An earlier 8-versus-24-row diagnostic
+crossed two different sub-64 projection tiles and was not exact; keeping both
+sides on the production tensor-core path removes that cross-kernel comparison.
+
+At a fixed physical ubatch near 2048, batching does not reduce the number of
+full-model passes: three 2,046-token serial prompts are three 2,046-row passes;
+splitting each prompt into 682-token chunks is also three 2,046-row passes.
+Three interleaved release A/B pairs on idle GPU 0 confirmed that the smaller
+per-sequence attention shape is a slight loss:
+
+| pair | N=3 flattened, 682 rows/sequence | three serial 2,046-row passes | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,065.52 tok/s | 3,085.72 tok/s | 0.993x |
+| 2 | 3,034.49 tok/s | 3,036.67 tok/s | 0.999x |
+| 3 | 2,997.94 tok/s | 3,022.30 tok/s | 0.992x |
+
+This rejects cross-sequence flattening as a prefill throughput optimization at
+equal total ubatch on this model. The primitive remains useful for one-pass
+N=3 scheduling and is the shared representation needed to tune GDN/MoE across
+sequences, but it is not itself progress against llama.cpp's 3,342.41 tok/s at
+2K with `-ub 4096`.
