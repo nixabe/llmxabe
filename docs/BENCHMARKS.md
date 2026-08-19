@@ -9078,3 +9078,11 @@ repeatable throughput result. At this shape CUDA-event profiling assigns
 39.2% of the pass to GDN mixers, 52.2% to MoE, and 8.5% to attention, so the
 next N=3 work stays inside the tensor-core GDN/MoE kernels rather than trying
 to overlap already-saturating work.
+
+The first MoE follow-up forced the 32-row dispatch/MMA variant at 2,046 rows,
+halving padding relative to the shipped 64-row variant. Three interleaved
+five-repetition pairs measured 32/64 ratios of 1.007x, 0.996x, and 0.994x
+(`3,018.25/2,996.70`, `2,958.66/2,971.43`, and
+`2,952.16/2,970.44` tok/s). It repeated the same thermal false positive and
+then lost twice. The override was removed; reducing the 19% padded dispatch
+slots does not repay the narrow kernel's lower weight reuse at this depth.
