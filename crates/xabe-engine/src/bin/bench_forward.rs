@@ -31,7 +31,8 @@
 //!
 //! Environment: `LLMXABE_MODEL` overrides the model path, `LLMXABE_BENCH_N`
 //! overrides the comma-separated batch sizes, `LLMXABE_BENCH_REPS` the
-//! repetition count.
+//! repetition count. `LLMXABE_PREFILL_SEQUENCES` runs that many independent
+//! prompts through the chunked path in one timed serving batch (default 1).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -291,6 +292,11 @@ fn chunked_prefill(
     free_at_start: u64,
     total: u64,
 ) {
+    let sequences = std::env::var("LLMXABE_PREFILL_SEQUENCES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(1);
     let max_seq = batches.iter().copied().max().unwrap_or(chunk);
     let built = Instant::now();
     let mut forward =
@@ -303,16 +309,19 @@ fn chunked_prefill(
         };
     let build_s = built.elapsed().as_secs_f64();
 
-    let mut state = match forward.new_state(stream, max_seq) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("FAILED to allocate a {max_seq}-position sequence state: {e}");
-            return;
+    let mut states = Vec::with_capacity(sequences);
+    for sequence in 0..sequences {
+        match forward.new_state(stream, max_seq) {
+            Ok(state) => states.push(state),
+            Err(e) => {
+                error!("FAILED to allocate sequence {sequence}'s {max_seq}-position state: {e}");
+                return;
+            }
         }
-    };
+    }
 
     info!(
-        "chunked prefill: {chunk}-token pass built in {build_s:.1} s, state for {max_seq} positions"
+        "chunked prefill: {chunk}-token pass built in {build_s:.1} s, {sequences} independent state(s) for {max_seq} positions"
     );
     info!(
         "{:>8} | {:>7} | {:>16} | {:>14}",
@@ -329,22 +338,35 @@ fn chunked_prefill(
         let chunks = n / chunk;
         // Ids for the whole prompt, sliced per chunk. Same generator as the
         // single-pass path so the routing spread is identical.
-        let ids: Vec<i32> = (0..n)
-            .map(|i| ((i * 7919 + 1234) % config.vocab_size as usize) as i32)
+        let ids: Vec<Vec<i32>> = (0..sequences)
+            .map(|sequence| {
+                (0..n)
+                    .map(|i| {
+                        ((i * 7919 + sequence * 104_729 + 1234) % config.vocab_size as usize) as i32
+                    })
+                    .collect()
+            })
             .collect();
 
-        let mut run_once = |state: &mut _| -> Result<(), String> {
-            for c in 0..chunks {
-                let slice = &ids[c * chunk..(c + 1) * chunk];
-                forward
-                    .run(stream, state, slice, |_, _| {})
-                    .map_err(|e| format!("chunk {c} at position {}: {e}", c * chunk))?;
+        let mut run_once = |states: &mut [_]| -> Result<(), String> {
+            for (sequence, state) in states.iter_mut().enumerate() {
+                for c in 0..chunks {
+                    let slice = &ids[sequence][c * chunk..(c + 1) * chunk];
+                    forward.run(stream, state, slice, |_, _| {}).map_err(|e| {
+                        format!(
+                            "sequence {sequence}, chunk {c} at position {}: {e}",
+                            c * chunk
+                        )
+                    })?;
+                }
             }
             Ok(())
         };
 
-        state.reset(stream).expect("reset");
-        if let Err(e) = run_once(&mut state) {
+        for state in &mut states {
+            state.reset(stream).expect("reset");
+        }
+        if let Err(e) = run_once(&mut states) {
             error!("{n:>8} | FAILED during warmup: {e}");
             continue;
         }
@@ -356,8 +378,10 @@ fn chunked_prefill(
         let mut failed = false;
         for _ in 0..reps {
             let t = Instant::now();
-            state.reset(stream).expect("reset");
-            if let Err(e) = run_once(&mut state) {
+            for state in &mut states {
+                state.reset(stream).expect("reset");
+            }
+            if let Err(e) = run_once(&mut states) {
                 error!("{n:>8} | FAILED: {e}");
                 failed = true;
                 break;
@@ -372,8 +396,8 @@ fn chunked_prefill(
         let (mean, sd) = stats(&samples);
         info!(
             "{n:>8} | {chunks:>7} | {mean:>9.2} ± {sd:>4.2} | {:>8.2} ± {:>3.2}",
-            n as f64 / (mean / 1e3),
-            n as f64 / (mean / 1e3) * (sd / mean),
+            (n * sequences) as f64 / (mean / 1e3),
+            (n * sequences) as f64 / (mean / 1e3) * (sd / mean),
         );
     }
 
@@ -383,8 +407,10 @@ fn chunked_prefill(
         total as f64 / (1u64 << 30) as f64,
     );
     info!(
-        "NOTE: one warmup discarded, {reps} timed repetitions. The prompt is prefilled as \
-         {chunk}-token passes over a carried KV cache and recurrent state — the same thing \
-         llama.cpp does with `-ub {chunk}`, and directly comparable to its `S_PP`.",
+        "NOTE: one warmup discarded, {reps} timed repetitions. {sequences} independent \
+         prompt(s) are currently executed serially inside each timed batch as {chunk}-token \
+         passes over carried KV caches and recurrent states. At one sequence this is directly \
+         comparable to llama.cpp `-ub {chunk}`; at N>1 it is the production baseline that \
+         cross-sequence prefill batching must beat.",
     );
 }

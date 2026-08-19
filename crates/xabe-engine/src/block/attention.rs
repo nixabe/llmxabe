@@ -719,7 +719,13 @@ impl AttnScratch {
             gated: stream.alloc_zeros::<f32>(tokens * q_dim)?,
             projected: stream.alloc_zeros::<f32>(tokens * hidden)?,
             xq: None,
-            decode: (0..tokens)
+            // Prefill uses only entry zero; batched decode needs one entry per
+            // independent sequence. The engine serves three and the isolated
+            // width sweep exercises up to eight.
+            // Allocating one ~4.6 MiB split-K arena per prefill token made a
+            // 2,048-row pass reserve roughly 9.5 GiB for scratch it never
+            // indexed. Keep the fixed serving maximum instead.
+            decode: (0..tokens.min(8))
                 .map(|_| AttnDecodeScratch::new(stream, a.q_heads as usize, a.head_dim as usize))
                 .collect::<Result<Vec<_>, _>>()?,
         })
