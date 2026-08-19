@@ -9007,3 +9007,24 @@ prompts.
 The first `-ub 2048` command incorrectly used `-c 131072` for 65K/128K
 N=3 and failed at admission after completing the 32K cells. Those deep cells
 were rerun with `-c 393216`; the failed harness configuration is not a result.
+
+## 2026-08-19 — MTP accepts natural text, but its current step is only seven percent faster
+
+The existing MTP draft/verify implementation had correctness coverage but no
+acceptance or throughput result in this file. On GPU 1, the natural 19-token
+golden prompt followed by 64 greedy output tokens accepted 43 of 66 drafted
+tokens (65.2%). The speculative and plain sequences were bit-identical for all
+64 requested tokens.
+
+The session's reusable CUDA events measured 605.855 ms across the speculative
+draft, verify, and commit spans for 65 emitted tokens, or 107.3 accepted tok/s.
+The comparable plain short-context path is about 100 tok/s. This is a real but
+roughly 7% gain, not the 30--40% required at N=3, and the production runtime
+does not batch MTP sessions across sequences. Inclusive host wall was also
+measured once (19.311 s plain, 11.950 s speculative), but construction and
+prefill dominate both sides, so it is not used as a serving result.
+
+MTP remains a valid future serving feature; this measurement rejects it as the
+next standalone way to close the current N=3 gap. Integrating three unbatched
+speculative sessions would add a new serialization path before demonstrating a
+large enough per-session win.
