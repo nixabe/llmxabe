@@ -47,7 +47,7 @@
 //! its last three convolution taps, which is finite, plausible, and a
 //! different sequence.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, PinnedHostSlice};
 
@@ -67,6 +67,8 @@ pub enum StateError {
     Driver(cudarc::driver::DriverError),
     /// A host snapshot belongs to a different model geometry or is too long.
     SnapshotShape,
+    /// Every preallocated host snapshot slot is still retained.
+    SnapshotArenaExhausted,
 }
 
 impl std::fmt::Display for StateError {
@@ -76,6 +78,7 @@ impl std::fmt::Display for StateError {
             Self::Attention(e) => write!(f, "key/value cache: {e}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::SnapshotShape => write!(f, "prefix snapshot does not match sequence geometry"),
+            Self::SnapshotArenaExhausted => write!(f, "pinned snapshot arena is exhausted"),
         }
     }
 }
@@ -131,6 +134,155 @@ struct HostGdnState {
     recurrent: PinnedHostSlice<f32>,
 }
 
+struct SnapshotBuffers {
+    attention: Vec<HostKvPrefix>,
+    gdn: Vec<HostGdnState>,
+}
+
+struct LeasePool<T> {
+    free: Mutex<Vec<T>>,
+    capacity: usize,
+}
+
+impl<T> LeasePool<T> {
+    fn new(free: Vec<T>) -> Arc<Self> {
+        let capacity = free.len();
+        Arc::new(Self {
+            free: Mutex::new(free),
+            capacity,
+        })
+    }
+
+    fn checkout(self: &Arc<Self>) -> Option<Lease<T>> {
+        self.free
+            .lock()
+            .expect("snapshot arena poisoned")
+            .pop()
+            .map(|value| Lease {
+                value: Some(value),
+                pool: Arc::clone(self),
+            })
+    }
+}
+
+struct Lease<T> {
+    value: Option<T>,
+    pool: Arc<LeasePool<T>>,
+}
+
+impl<T> Drop for Lease<T> {
+    fn drop(&mut self) {
+        self.pool
+            .free
+            .lock()
+            .expect("snapshot arena poisoned")
+            .push(self.value.take().expect("live lease owns its value"));
+    }
+}
+
+impl<T> std::ops::Deref for Lease<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        self.value.as_ref().expect("live lease owns its value")
+    }
+}
+
+impl<T> std::ops::DerefMut for Lease<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.value.as_mut().expect("live lease owns its value")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotLayout {
+    attention_layers: usize,
+    kv_dim: usize,
+    attention_elements_per_half: usize,
+    gdn_layers: usize,
+    conv_elements: usize,
+    recurrent_elements: usize,
+}
+
+impl SnapshotLayout {
+    fn new(config: &ModelConfig, retention_interval: usize) -> Self {
+        let attention_layers = (0..config.num_layers)
+            .filter(|&layer| {
+                config.layer_kind(layer) == xabe_model::config::LayerKind::GatedAttention
+            })
+            .count();
+        let gdn_layers = config.num_layers as usize - attention_layers;
+        let kv_dim = config.attention.kv_heads as usize * config.attention.head_dim as usize;
+        let conv_dim = (2 * config.gdn.qk_heads as usize + config.gdn.value_heads as usize)
+            * config.gdn.head_dim as usize;
+        Self {
+            attention_layers,
+            kv_dim,
+            attention_elements_per_half: retention_interval * kv_dim,
+            gdn_layers,
+            conv_elements: conv_dim * (config.gdn.conv_kernel as usize - 1),
+            recurrent_elements: config.gdn.value_heads as usize
+                * config.gdn.head_dim as usize
+                * config.gdn.head_dim as usize,
+        }
+    }
+
+    fn attention_bytes(self) -> usize {
+        self.attention_layers * 2 * self.attention_elements_per_half * size_of::<u16>()
+    }
+
+    fn gdn_bytes(self) -> usize {
+        self.gdn_layers * (self.conv_elements + self.recurrent_elements) * size_of::<f32>()
+    }
+}
+
+/// Fixed-capacity page-locked storage for retained sequence snapshots.
+pub(crate) struct SnapshotArena {
+    slots: Arc<LeasePool<SnapshotBuffers>>,
+    layout: SnapshotLayout,
+}
+
+impl SnapshotArena {
+    pub(crate) fn new(
+        ctx: &Arc<CudaContext>,
+        config: &ModelConfig,
+        retention_interval: usize,
+        slots: usize,
+    ) -> Result<Self, StateError> {
+        let layout = SnapshotLayout::new(config, retention_interval);
+        let mut buffers = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            let mut attention = Vec::with_capacity(layout.attention_layers);
+            for _ in 0..layout.attention_layers {
+                // SAFETY: capture initializes the used prefix before publication.
+                let k = unsafe { ctx.alloc_pinned(layout.attention_elements_per_half)? };
+                let v = unsafe { ctx.alloc_pinned(layout.attention_elements_per_half)? };
+                attention.push(HostKvPrefix { k, v });
+            }
+            let mut gdn = Vec::with_capacity(layout.gdn_layers);
+            for _ in 0..layout.gdn_layers {
+                // SAFETY: capture initializes both buffers before publication.
+                let conv = unsafe { ctx.alloc_pinned(layout.conv_elements)? };
+                let recurrent = unsafe { ctx.alloc_pinned(layout.recurrent_elements)? };
+                gdn.push(HostGdnState { conv, recurrent });
+            }
+            buffers.push(SnapshotBuffers { attention, gdn });
+        }
+        Ok(Self {
+            slots: LeasePool::new(buffers),
+            layout,
+        })
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.slots.capacity
+    }
+
+    pub(crate) fn bytes_per_slot(&self) -> usize {
+        self.layout.attention_bytes() + self.layout.gdn_bytes()
+    }
+}
+
 /// A complete resumable prefix, stored in page-locked host memory.
 ///
 /// Attention and GDN retain their natural geometries: attention contains only
@@ -138,8 +290,9 @@ struct HostGdnState {
 /// convolution and recurrent state. No group is padded to the other's size.
 pub struct SequenceSnapshot {
     position: usize,
-    attention: Vec<HostKvPrefix>,
-    gdn: Vec<HostGdnState>,
+    start: usize,
+    kv_dim: usize,
+    buffers: Lease<SnapshotBuffers>,
     next_token: Option<i32>,
     parent: Option<Arc<SequenceSnapshot>>,
 }
@@ -159,11 +312,11 @@ impl SequenceSnapshot {
     }
 
     pub fn attention_bytes(&self) -> usize {
-        let own: usize = self
-            .attention
-            .iter()
-            .map(|prefix| prefix.k.num_bytes() + prefix.v.num_bytes())
-            .sum();
+        let own = self.buffers.attention.len()
+            * 2
+            * (self.position - self.start)
+            * self.kv_dim
+            * size_of::<u16>();
         own + self
             .parent
             .as_ref()
@@ -171,7 +324,8 @@ impl SequenceSnapshot {
     }
 
     pub fn gdn_bytes(&self) -> usize {
-        self.gdn
+        self.buffers
+            .gdn
             .iter()
             .map(|state| state.conv.num_bytes() + state.recurrent.num_bytes())
             .sum()
@@ -251,35 +405,45 @@ impl SequenceState {
     }
 
     /// Copy the filled prefix and recurrent state into page-locked host RAM.
-    pub fn snapshot(
+    pub(crate) fn snapshot(
         &self,
-        ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
+        arena: &SnapshotArena,
         parent: Option<Arc<SequenceSnapshot>>,
     ) -> Result<SequenceSnapshot, StateError> {
         let start = parent.as_ref().map_or(0, |snapshot| snapshot.position);
         if start > self.position {
             return Err(StateError::SnapshotShape);
         }
-        let mut attention = Vec::with_capacity(self.kv.len());
-        for cache in &self.kv {
-            attention.push(cache.snapshot_range(ctx, stream, start, self.position)?);
+        if self.position - start
+            > arena.layout.attention_elements_per_half
+                / (self
+                    .kv
+                    .first()
+                    .map_or(1, |cache| cache.keys().len() / cache.max_seq()))
+        {
+            return Err(StateError::SnapshotShape);
         }
-        let mut gdn = Vec::with_capacity(self.gdn.len());
-        for state in &self.gdn {
-            // SAFETY: each pinned allocation is initialized by memcpy_dtoh
-            // before the snapshot is returned.
-            let mut conv = unsafe { ctx.alloc_pinned::<f32>(state.conv.len())? };
-            let mut recurrent = unsafe { ctx.alloc_pinned::<f32>(state.recurrent.len())? };
-            stream.memcpy_dtoh(&state.conv, &mut conv)?;
-            stream.memcpy_dtoh(&state.recurrent, &mut recurrent)?;
-            gdn.push(HostGdnState { conv, recurrent });
+        let mut buffers = arena
+            .slots
+            .checkout()
+            .ok_or(StateError::SnapshotArenaExhausted)?;
+        if buffers.attention.len() != self.kv.len() || buffers.gdn.len() != self.gdn.len() {
+            return Err(StateError::SnapshotShape);
+        }
+        for (cache, prefix) in self.kv.iter().zip(&mut buffers.attention) {
+            cache.snapshot_range_into(stream, start, self.position, prefix)?;
+        }
+        for (state, host) in self.gdn.iter().zip(&mut buffers.gdn) {
+            stream.memcpy_dtoh(&state.conv, &mut host.conv)?;
+            stream.memcpy_dtoh(&state.recurrent, &mut host.recurrent)?;
         }
         stream.synchronize()?;
         Ok(SequenceSnapshot {
             position: self.position,
-            attention,
-            gdn,
+            start,
+            kv_dim: arena.layout.kv_dim,
+            buffers,
             next_token: None,
             parent,
         })
@@ -292,23 +456,13 @@ impl SequenceState {
         snapshot: &SequenceSnapshot,
     ) -> Result<(), StateError> {
         if snapshot.position > self.max_seq
-            || snapshot.attention.len() != self.kv.len()
-            || snapshot.gdn.len() != self.gdn.len()
+            || snapshot.buffers.attention.len() != self.kv.len()
+            || snapshot.buffers.gdn.len() != self.gdn.len()
         {
             return Err(StateError::SnapshotShape);
         }
-        let mut chain = Vec::new();
-        let mut cursor = Some(snapshot);
-        while let Some(current) = cursor {
-            chain.push(current);
-            cursor = current.parent.as_deref();
-        }
-        for current in chain.into_iter().rev() {
-            for (cache, prefix) in self.kv.iter_mut().zip(&current.attention) {
-                cache.restore_prefix(stream, prefix)?;
-            }
-        }
-        for (state, host) in self.gdn.iter_mut().zip(&snapshot.gdn) {
+        self.restore_attention_chain(stream, snapshot)?;
+        for (state, host) in self.gdn.iter_mut().zip(&snapshot.buffers.gdn) {
             if state.conv.len() != host.conv.len() || state.recurrent.len() != host.recurrent.len()
             {
                 return Err(StateError::SnapshotShape);
@@ -319,6 +473,20 @@ impl SequenceState {
         self.position = snapshot.position;
         stream.memcpy_htod(&[self.position as i32], &mut self.d_position)?;
         stream.synchronize()?;
+        Ok(())
+    }
+
+    fn restore_attention_chain(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        snapshot: &SequenceSnapshot,
+    ) -> Result<(), StateError> {
+        if let Some(parent) = snapshot.parent.as_deref() {
+            self.restore_attention_chain(stream, parent)?;
+        }
+        for (cache, prefix) in self.kv.iter_mut().zip(&snapshot.buffers.attention) {
+            cache.restore_prefix(stream, prefix, snapshot.start, snapshot.position)?;
+        }
         Ok(())
     }
 
@@ -361,5 +529,28 @@ impl SequenceState {
     /// claiming positions that no cache actually holds.
     pub(crate) fn advance(&mut self, tokens: usize) {
         self.position += tokens;
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn default_retention_slot_keeps_natural_groups_separate() {
+        let layout = SnapshotLayout::new(&ModelConfig::qwen3_6_35b_a3b(), 2048);
+        assert_eq!(layout.attention_bytes(), 40 * 1024 * 1024);
+        assert_eq!(layout.gdn_bytes(), 65_863_680);
+        assert_eq!(layout.attention_bytes() + layout.gdn_bytes(), 107_806_720);
+    }
+
+    #[test]
+    fn a_lease_returns_its_slot_only_after_drop() {
+        let pool = LeasePool::new(vec![7u32]);
+        let lease = pool.checkout().expect("one slot available");
+        assert!(pool.checkout().is_none());
+        assert_eq!(*lease, 7);
+        drop(lease);
+        assert_eq!(*pool.checkout().expect("slot returned"), 7);
     }
 }

@@ -22,8 +22,15 @@ use xabe_sched::ngram::{NgramConfig, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
-use crate::state::SequenceSnapshot;
+use crate::state::{SequenceSnapshot, SnapshotArena};
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
+
+/// Pinned snapshot capacity per worker. One default-retention slot is
+/// 102.8125 MiB, so 24 slots consume 2.41 GiB per worker and 7.23 GiB
+/// process-wide.
+/// This stays below the host's locked-memory limit while covering eight
+/// simultaneous retention points for each of the three serving sequences.
+const SNAPSHOT_SLOTS_PER_WORKER: usize = 24;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -120,6 +127,7 @@ struct RuntimeSequence {
     max_output: u32,
     last_snapshot_position: usize,
     last_snapshot: Option<Arc<SequenceSnapshot>>,
+    retention_disabled: bool,
 }
 
 fn choose_prefill_width(
@@ -184,6 +192,7 @@ pub struct DeviceRuntime {
     vocab: u32,
     ngram: Option<NgramConfig>,
     retention_interval: usize,
+    snapshot_arena: SnapshotArena,
     sampled: Vec<i32>,
     eos_token: Option<i32>,
 }
@@ -374,6 +383,16 @@ impl DeviceRuntime {
         // per-allocation event tracking; disable it before the first upload.
         unsafe { ctx.disable_event_tracking() };
 
+        let snapshot_slots = SNAPSHOT_SLOTS_PER_WORKER.max(max_batch);
+        let snapshot_arena =
+            SnapshotArena::new(&ctx, &config, retention_interval.max(1), snapshot_slots)?;
+        debug!(
+            device = device_ordinal,
+            slots = snapshot_arena.capacity(),
+            bytes_per_slot = snapshot_arena.bytes_per_slot(),
+            "worker pinned snapshot arena ready"
+        );
+
         let file = GgufFile::open(model_path)?;
         let eos_token = stop_on_eos
             .then(|| file.get_u32("tokenizer.ggml.eos_token_id"))
@@ -468,6 +487,7 @@ impl DeviceRuntime {
             vocab: config.vocab_size,
             ngram,
             retention_interval,
+            snapshot_arena,
             sampled: Vec::with_capacity(max_batch),
             eos_token,
         })
@@ -518,6 +538,7 @@ impl DeviceRuntime {
                 max_output: req.max_output_tokens,
                 last_snapshot_position: 0,
                 last_snapshot: None,
+                retention_disabled: false,
             },
         );
         Ok(())
@@ -549,6 +570,7 @@ impl DeviceRuntime {
         seq.prefilled = prefix;
         seq.last_snapshot_position = prefix;
         seq.last_snapshot = Some(Arc::clone(&snapshot));
+        seq.retention_disabled = false;
         if prefix == seq.prompt.len() {
             seq.next_token = snapshot.next_token();
         }
@@ -568,7 +590,11 @@ impl DeviceRuntime {
             .state
             .as_ref()
             .ok_or(RuntimeError::UnknownRequest(id))?
-            .snapshot(&self.ctx, &self.stream, seq.last_snapshot.clone())?;
+            .snapshot(
+                &self.stream,
+                &self.snapshot_arena,
+                seq.last_snapshot.clone(),
+            )?;
         if let Some(token) = seq.next_token {
             snapshot.set_next_token(token);
         }
@@ -712,19 +738,32 @@ impl DeviceRuntime {
                     .expect("state was restored above")
                     .position();
                 if self.retention_interval > 0
+                    && !seq.retention_disabled
                     && position > seq.last_snapshot_position
                     && position.is_multiple_of(self.retention_interval)
                 {
-                    let mut snapshot = seq
+                    let snapshot = seq
                         .state
                         .as_ref()
                         .expect("state was restored above")
-                        .snapshot(&self.ctx, &self.stream, seq.last_snapshot.clone())?;
-                    snapshot.set_next_token(output);
-                    let snapshot = Arc::new(snapshot);
-                    seq.last_snapshot = Some(Arc::clone(&snapshot));
-                    retained.push((*id, snapshot));
-                    seq.last_snapshot_position = position;
+                        .snapshot(
+                            &self.stream,
+                            &self.snapshot_arena,
+                            seq.last_snapshot.clone(),
+                        );
+                    match snapshot {
+                        Ok(mut snapshot) => {
+                            snapshot.set_next_token(output);
+                            let snapshot = Arc::new(snapshot);
+                            seq.last_snapshot = Some(Arc::clone(&snapshot));
+                            retained.push((*id, snapshot));
+                            seq.last_snapshot_position = position;
+                        }
+                        Err(StateError::SnapshotArenaExhausted) => {
+                            seq.retention_disabled = true;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 seq.next_token = Some(output);
                 if self.eos_token == Some(output) {
@@ -838,6 +877,7 @@ impl DeviceRuntime {
                 .expect("resident sequence has state")
                 .position();
             if self.retention_interval > 0
+                && !seq.retention_disabled
                 && position > seq.last_snapshot_position
                 && position.is_multiple_of(self.retention_interval)
             {
@@ -860,17 +900,29 @@ impl DeviceRuntime {
                         .expect("narrow prefill width was prebuilt")
                         .sample_argmax(&self.stream)?
                 };
-                let mut snapshot = seq
+                let snapshot = seq
                     .state
                     .as_ref()
                     .expect("resident sequence has state")
-                    .snapshot(&self.ctx, &self.stream, seq.last_snapshot.clone())?;
-                snapshot.set_next_token(next);
-                let snapshot = Arc::new(snapshot);
-                seq.last_snapshot = Some(Arc::clone(&snapshot));
-                retained.push((id, snapshot));
+                    .snapshot(
+                        &self.stream,
+                        &self.snapshot_arena,
+                        seq.last_snapshot.clone(),
+                    );
                 seq.next_token = Some(next);
-                seq.last_snapshot_position = position;
+                match snapshot {
+                    Ok(mut snapshot) => {
+                        snapshot.set_next_token(next);
+                        let snapshot = Arc::new(snapshot);
+                        seq.last_snapshot = Some(Arc::clone(&snapshot));
+                        retained.push((id, snapshot));
+                        seq.last_snapshot_position = position;
+                    }
+                    Err(StateError::SnapshotArenaExhausted) => {
+                        seq.retention_disabled = true;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         seq.prefilled = end;

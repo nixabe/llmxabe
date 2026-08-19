@@ -12,13 +12,14 @@ common:
 | Group | Layers | Natural page | Scaling |
 | --- | --- | --- | --- |
 | Attention | 10 | 5 MiB (256 tokens × 20,480 B) | **O(n)** — grows with position |
-| Gated DeltaNet | 30 | 60 MiB (full recurrent state) | **O(1)** — constant per sequence |
+| Gated DeltaNet | 30 | 62.8125 MiB (full recurrent state) | **O(1)** — constant per sequence |
 
 The attention page is 256 tokens of KV across all ten attention layers. The
 GDN page is one complete recurrent-state snapshot across all thirty GDN
-layers — 32 heads × 128 × 128 × fp32 × 30 layers.
+layers, including the convolution history as well as the 32 × 128 × 128 fp32
+recurrent matrix per layer.
 
-They differ by roughly 12×, and that difference is the whole point.
+They differ by roughly 12.6×, and that difference is the whole point.
 
 ### Rule 1: allocate at natural page sizes
 
@@ -47,9 +48,9 @@ Regression tests:
 
 ## Rule 2: retention interval is independent of block size
 
-A GDN prefix snapshot is the full recurrent state — 60 MiB — regardless of how
-much context it summarizes. Retaining one at every attention block boundary is
-therefore catastrophic at small block sizes.
+A GDN prefix snapshot is the full recurrent and convolution state — 62.8125
+MiB — regardless of how much context it summarizes. Retaining one at every
+attention block boundary is therefore catastrophic at small block sizes.
 
 vLLM PR #45845 measured exactly that. At block size 128, **snapshots occupied
 roughly 80% of the KV pool**, leaving no uncached headroom and forcing the
@@ -81,12 +82,12 @@ truncation to a snapshot boundary is plain integer division.
 attention KV accumulated over one retention interval. At the defaults:
 
 ```
-60 MiB snapshot / (20,480 B/token × 2048 tokens = 40 MiB KV) = 1.5
+62.8125 MiB snapshot / (20,480 B/token × 2048 tokens = 40 MiB KV) = 1.5703125
 ```
 
 A ratio near or above 1 means snapshot overhead is comparable to the KV growth
-it sits alongside. 1.5 is worth watching but is far from the pathological case
-that produced the numbers above.
+it sits alongside. 1.5703125 is worth watching but is far from the pathological
+case that produced the numbers above.
 
 **Tune `R` against measured hit rate, not intuition.** Lowering it buys finer
 GDN reuse granularity and pays in snapshot memory; this ratio is what
@@ -101,8 +102,8 @@ This is the subtle one, and it is why `R` is a first-order parameter rather
 than a tuning detail.
 
 Linear-attention state at position *p* summarizes `[0, p)` **completely**.
-That is excellent for resumption — one 60 MiB blob restores thirty layers of
-history. But it means the state cannot be sliced: you cannot reconstruct a
+That is excellent for resumption — one 62.8125 MiB blob restores thirty layers
+of history. But it means the state cannot be sliced: you cannot reconstruct a
 mid-prefix state from a longer one the way you can simply drop KV blocks past a
 cut point.
 
@@ -157,8 +158,22 @@ When the best-matching worker is saturated, the prefix is looked up in the host
 tree, copied to a less-loaded worker, and only the tail is prefilled.
 
 Staging goes through a **pre-allocated pinned arena** — pageable
-host-to-device transfers roughly halve effective bandwidth — on a dedicated
-low-priority stream per device, so publishing never preempts decode.
+host-to-device transfers roughly halve effective bandwidth. Each slot keeps
+the two natural geometries separate: 40 MiB of attention KV for one 2,048-token
+interval and 62.8125 MiB of GDN state, or 102.8125 MiB in total.
+
+Each worker owns 24 slots (2.41 GiB); the three-worker process reserves 7.23
+GiB of pinned host memory at startup. A snapshot holds its slot for as long as
+it or any child snapshot remains reachable. If all slots are retained, the
+request that reaches the next boundary stops publishing further snapshots but
+continues inference. It does not later publish a delta spanning the missed
+boundary. One chain can therefore retain at most 49,152 tokens at the default
+interval when it owns every slot; this is bounded storage, not full 128K
+retention coverage.
+
+Snapshot copies currently run on and synchronize the serving stream at each
+retention boundary. Moving them to a dedicated copy stream remains future
+work; the arena removes hot-path allocation, not the copy stall.
 
 ## Known limitations
 
@@ -168,8 +183,6 @@ Stated rather than discovered later:
   minimum-`last_used` leaf by scanning all nodes. Adequate for a maintenance
   operation, not benchmarked at scale. A production version wants an LRU heap
   or intrusive list, as vLLM uses in `FreeKVCacheBlockQueue`.
-- The pool and the scheduler are not yet wired together — `xabe-sched` tracks
-  free block counts as integers a caller keeps in sync. Integration belongs to
-  `xabe-engine`.
-- No device memory is touched anywhere in this crate. All 22 tests are
-  host-side logic.
+- `xabe-cache` itself does not touch device memory. `xabe-engine` accounts the
+  per-worker device pools during admission and owns the pinned migration arena.
+  The cache crate's tests remain host-side logic.
