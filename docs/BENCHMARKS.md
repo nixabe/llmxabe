@@ -9103,3 +9103,11 @@ differential unchanged. Three interleaved whole-forward pairs measured 8/4
 warp ratios of 1.009x, 0.998x, and 0.995x (`3,025.64/2,998.54`,
 `2,967.27/2,972.15`, `2,955.16/2,970.25` tok/s). Again the cold first pair
 did not survive temperature. The four-warp scan remains.
+
+The split Q8 projection's token tile was rechecked specifically at the N=3
+2,046-row shape, because its original 4x32x64 sweep was N=1 at 512. Doubling
+the per-warp token tile to 64 passed compilation and used the same arithmetic,
+but three interleaved five-repetition whole-forward pairs gave 64/32 ratios of
+1.003x, 0.991x, and 0.988x (`3,013.71/3,006.14`,
+`2,946.58/2,972.72`, `2,928.33/2,963.76` tok/s). The larger accumulator
+array loses after warmup, so the shipped 32-token tile remains.
