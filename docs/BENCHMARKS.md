@@ -9094,3 +9094,12 @@ narrow kernel bench rejected it before a whole-forward run: at 8,192 tokens it
 took 49.730 ms versus 21.352 ms shipped (2.33x slower), while 512 was level
 (3.551 versus 3.541 ms). Extra barriers and the second activation-staging wave
 cost much more than the nominal occupancy gain. The wave kernel was removed.
+
+An `nsys` trace of the N=3 2,046-row run then separated GDN's 39% mixer share:
+`mma_q8_0_proj_split` was 20.1% of all kernel time and `gdn_scan_prefill`
+17.9%; convolution and remaining GDN elementwise work were small. Doubling
+the scan block from four to eight warps passed the release 512-token scan
+differential unchanged. Three interleaved whole-forward pairs measured 8/4
+warp ratios of 1.009x, 0.998x, and 0.995x (`3,025.64/2,998.54`,
+`2,967.27/2,972.15`, `2,955.16/2,970.25` tok/s). Again the cold first pair
+did not survive temperature. The four-warp scan remains.
