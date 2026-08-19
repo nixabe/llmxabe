@@ -9111,3 +9111,22 @@ but three interleaved five-repetition whole-forward pairs gave 64/32 ratios of
 1.003x, 0.991x, and 0.988x (`3,013.71/3,006.14`,
 `2,946.58/2,972.72`, `2,928.33/2,963.76` tok/s). The larger accumulator
 array loses after warmup, so the shipped 32-token tile remains.
+
+The same split projection was then tested with twice the contraction staging
+depth: `PROJ_KC=256` and a 272-byte shared-memory stride, versus the shipped
+`PROJ_KC=128` and 144-byte stride. The 272-byte stride preserves the same
+conflict-free row-start pattern, while the deeper tile halves the number of
+staging and barrier rounds. The release projection differential passed at the
+production shapes (cosine 0.999992549 and max-relative error at most
+4.196e-3 against the CPU reference; the 128-token, 8,192-row in-place check
+had zero differences). It nevertheless repeated the thermal pattern in three
+interleaved five-repetition whole-forward pairs:
+
+| pair | K=256 | K=128 | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 2,995.13 tok/s | 2,986.86 tok/s | 1.003x |
+| 2 | 2,933.72 tok/s | 2,959.61 tok/s | 0.991x |
+| 3 | 2,922.19 tok/s | 2,958.39 tok/s | 0.988x |
+
+The larger shared tile and contraction loop lose once warm. The experimental
+constants were removed and the shipped K=128 staging remains.
