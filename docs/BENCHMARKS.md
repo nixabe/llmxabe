@@ -9086,3 +9086,11 @@ five-repetition pairs measured 32/64 ratios of 1.007x, 0.996x, and 0.994x
 `2,952.16/2,970.44` tok/s). It repeated the same thermal false positive and
 then lost twice. The override was removed; reducing the 19% padded dispatch
 slots does not repay the narrow kernel's lower weight reuse at this depth.
+
+A second isolated MoE attempt retained 64 accumulators but reused a 32-row
+activation tile in two waves, reducing shared memory enough to request three
+resident blocks per SM. It passed the wide-MMA release differential, but the
+narrow kernel bench rejected it before a whole-forward run: at 8,192 tokens it
+took 49.730 ms versus 21.352 ms shipped (2.33x slower), while 512 was level
+(3.551 versus 3.541 ms). Extra barriers and the second activation-staging wave
+cost much more than the nominal occupancy gain. The wave kernel was removed.
