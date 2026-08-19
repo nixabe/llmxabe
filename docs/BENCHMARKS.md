@@ -9222,3 +9222,14 @@ with the four-column scan measured:
 The whole-pass gain is small but survives both warmed pairs. The fused wide
 path becomes the default; the setup switch used for A/B is retained only as a
 fallback until the next full profile confirms the standalone launch is absent.
+
+Eight projection warps were tested as a different reuse axis from the rejected
+token-tile and contraction-depth changes. Each warp retained the shipped
+32-token accumulator tile, but eight warps shared one staged 64-row weight
+band instead of four, doubling tokens served per staging pass from 128 to 256.
+The release projection differential passed all three cases. Three interleaved
+five-repetition N=3 pairs measured 8/4-warp ratios of 1.014x, 1.004x, and
+1.001x (`3,252.81/3,209.34`, `3,192.58/3,180.33`, and
+`3,181.50/3,179.76` tok/s). The cold gain disappears as the card warms; the
+larger block's scheduling cost cancels its extra reuse. The four-warp launch
+remains.
