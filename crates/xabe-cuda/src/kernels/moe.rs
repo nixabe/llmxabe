@@ -1058,7 +1058,7 @@ __device__ __forceinline__ void store_slot_contribution(
 // other template in this file (`tile_gemm_pair` above): a template needs
 // C++ linkage, and neither body is ever looked up by name from the host --
 // only the `__global__` wrappers just inside `extern "C"` below are.
-template<int M, int MF>
+template<int M, int MF, bool FUSE_IQ = false>
 __device__ __forceinline__ void
 moe_expert_ffn_mma_impl(
     const unsigned char* __restrict__ gate_q,
@@ -1072,7 +1072,9 @@ moe_expert_ffn_mma_impl(
     int block_size,
     int hidden,
     int intermediate,
-    float* __restrict__ inter
+    float* __restrict__ inter,
+    signed char* __restrict__ iq,
+    float* __restrict__ iq_scales
 ) {
     unsigned char* swg = (unsigned char*)xabe_shared;
     unsigned char* swu = swg + MOE_MMA_ROWS * MOE_MMA_WSTRIDE;
@@ -1347,9 +1349,44 @@ moe_expert_ffn_mma_impl(
                     float g = (j == 0) ? accg[mf][0] : accg[mf][1];
                     float u = (j == 0) ? accu[mf][0] : accu[mf][1];
                     float act = g / (1.0f + expf(-g));
-                    inter[((long long)blk * block_size + m) * intermediate + n] = act * u;
+                    float v = act * u;
+                    if constexpr (FUSE_IQ) {
+                        // The contraction staging is dead here. Reuse its
+                        // allocation as one complete [M, 64] output tile so
+                        // each 32-column Q8 block can reduce its absmax in a
+                        // warp without a global fp32 round trip.
+                        ((float*)xabe_shared)[m * MOE_MMA_ROWS + ccol + j] = v;
+                    } else {
+                        inter[((long long)blk * block_size + m) * intermediate + n] = v;
+                    }
                 }
             }
+        }
+    }
+
+    if constexpr (FUSE_IQ) {
+        __syncthreads();
+        float* tile = (float*)xabe_shared;
+        // One warp owns one contiguous 32-column quantization block at a
+        // time. There are M*2 such blocks in this 64-column output tile.
+        for (int qb = warp; qb < M * 2; qb += MOE_MMA_WARPS) {
+            int m = qb >> 1;
+            if (m >= block_size || rows[m] < 0) continue;
+            int qg = qb & 1;
+            float v = tile[m * MOE_MMA_ROWS + qg * 32 + lane];
+            float a = fabsf(v);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+            float d = a > 0.0f ? a / 127.0f : 1.0f;
+            float inv = a > 0.0f ? 127.0f / a : 0.0f;
+            int qv = (int)rintf(v * inv);
+            qv = qv < -127 ? -127 : (qv > 127 ? 127 : qv);
+            long long slot = (long long)blk * block_size + m;
+            int n = r0 + qg * 32 + lane;
+            iq[slot * intermediate + n] = (signed char)qv;
+            if (lane == 0)
+                iq_scales[slot * (intermediate / 32) + (n >> 5)] = d;
         }
     }
 }
@@ -2506,11 +2543,13 @@ moe_expert_ffn_mma_narrow(
     int block_size,
     int hidden,
     int intermediate,
-    float* __restrict__ inter
+    float* __restrict__ inter,
+    signed char* __restrict__ iq,
+    float* __restrict__ iq_scales
 ) {
     moe_expert_ffn_mma_impl<32, 4>(
         gate_q, up_q, xq, xscale, sorted_token_ids, expert_ids, valid_tokens,
-        top_k, block_size, hidden, intermediate, inter);
+        top_k, block_size, hidden, intermediate, inter, iq, iq_scales);
 }
 
 __global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_MMA_BLOCKS_PER_SM)
@@ -2526,11 +2565,35 @@ moe_expert_ffn_mma(
     int block_size,
     int hidden,
     int intermediate,
-    float* __restrict__ inter
+    float* __restrict__ inter,
+    signed char* __restrict__ iq,
+    float* __restrict__ iq_scales
 ) {
     moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF>(
         gate_q, up_q, xq, xscale, sorted_token_ids, expert_ids, valid_tokens,
-        top_k, block_size, hidden, intermediate, inter);
+        top_k, block_size, hidden, intermediate, inter, iq, iq_scales);
+}
+
+__global__ void __launch_bounds__(MOE_MMA_WARPS * 32, MOE_MMA_BLOCKS_PER_SM)
+moe_expert_ffn_mma_fused_iq(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const signed char* __restrict__ xq,
+    const float* __restrict__ xscale,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter,
+    signed char* __restrict__ iq,
+    float* __restrict__ iq_scales
+) {
+    moe_expert_ffn_mma_impl<MOE_MMA_M, MOE_MMA_MF, true>(
+        gate_q, up_q, xq, xscale, sorted_token_ids, expert_ids, valid_tokens,
+        top_k, block_size, hidden, intermediate, inter, iq, iq_scales);
 }
 
 // grid: (ceil(hidden / MOE_ROWS), expert_block_capacity). The same tiling as
@@ -3821,6 +3884,8 @@ pub struct MoeKernels {
     /// from `geometry.block_size` and needed again at launch to pick the
     /// matching `shared_mem_bytes`.
     mma_m: usize,
+    /// Experimental producer-side Q8 quantization, selected once at setup.
+    fused_iq: bool,
 }
 
 impl MoeKernels {
@@ -3916,6 +3981,7 @@ impl MoeKernels {
         // so this reads that choice back rather than making a second one.
         let narrow = geometry.block_size <= MMA_M_NARROW;
         let mma_m = if narrow { MMA_M_NARROW } else { MMA_M };
+        let fused_iq = !narrow && std::env::var_os("LLMXABE_MOE_FUSED_IQ").is_none_or(|v| v != "0");
         Ok(Self {
             route: module.load_function("moe_route")?,
             dispatch_t1: module.load_function("moe_dispatch_t1")?,
@@ -3931,6 +3997,8 @@ impl MoeKernels {
             expert_down_bm1: module.load_function("moe_expert_down_bm1")?,
             expert_ffn_mma: module.load_function(if narrow {
                 "moe_expert_ffn_mma_narrow"
+            } else if fused_iq {
+                "moe_expert_ffn_mma_fused_iq"
             } else {
                 "moe_expert_ffn_mma"
             })?,
@@ -3966,6 +4034,7 @@ impl MoeKernels {
             swiglu: module.load_function("moe_swiglu")?,
             geometry,
             mma_m,
+            fused_iq,
         })
     }
 
@@ -4399,6 +4468,12 @@ impl MoeKernels {
                 .arg(&hidden)
                 .arg(&intermediate)
                 .arg(&mut buffers.inter);
+            // The Q6 wide kernels share one signature so setup can select
+            // the producer-quantizing A/B without a hot-path branch. The Q8
+            // exception remains its original independent implementation.
+            if !q8 {
+                builder.arg(&mut buffers.iq).arg(&mut buffers.iq_scales);
+            }
             // SAFETY: as for the fp32 launch below, plus: `xq` is
             // `max_tokens * hidden` int8 and is indexed by `row * hidden + k`
             // with `row < max_tokens` (the dispatch tables cannot name a
@@ -4567,15 +4642,17 @@ impl MoeKernels {
             // step left in `inter` and are quantized along with the rest; the
             // kernel stages them as zero rather than reading them, so their
             // contents never reach an accumulator.
-            mma.quantize_rows(
-                stream,
-                &buffers.inter,
-                &mut buffers.iq,
-                &mut buffers.iq_scales,
-                g.sorted_capacity(),
-                g.intermediate,
-            )
-            .map_err(MoeError::Mma)?;
+            if !(self.fused_iq && use_mma && mma_quant == Some(ExpertQuant::Q6K)) {
+                mma.quantize_rows(
+                    stream,
+                    &buffers.inter,
+                    &mut buffers.iq,
+                    &mut buffers.iq_scales,
+                    g.sorted_capacity(),
+                    g.intermediate,
+                )
+                .map_err(MoeError::Mma)?;
+            }
 
             let cfg = LaunchConfig {
                 grid_dim: (

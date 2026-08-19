@@ -9163,3 +9163,62 @@ the whole N=3 pass at this shape. This is not yet a win over llama.cpp's tuned
 3,342.41 tok/s at 2K with `-ub 4096`; the warm result is about 0.92x of that
 bar, and the physical ubatch differs. A tuned-width head-to-head remains
 required before making a replacement claim.
+
+## 2026-08-19 — Four GDN columns extend the scan reuse win
+
+After the two-column scan produced a repeatable result, the same reuse shape
+was extended to four adjacent value columns per warp. The block remains four
+warps wide; the grid falls to 256 blocks per GDN layer, still four full waves
+over this card's 64 SMs. State and output accumulators remain independent per
+column, while one q/k load, decay, beta, and address calculation feed four
+columns.
+
+The focused release GDN differential passed all ten tests without changing a
+gate. Three interleaved five-repetition N=3 pairs at 2,046 physical rows
+measured:
+
+| pair | four columns/warp | two columns/warp | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,180.11 tok/s | 3,088.08 tok/s | 1.030x |
+| 2 | 3,136.80 tok/s | 3,066.23 tok/s | 1.023x |
+| 3 | 3,118.25 tok/s | 3,053.10 tok/s | 1.021x |
+
+Both warmed pairs retain more than 2%. Four columns therefore replace two as
+the shipped scan width. The best probe is 0.951x of llama.cpp's tuned
+3,342.41 tok/s at 2K; this narrows the gap but does not meet the replacement
+bar.
+
+Eight columns per warp passed the same ten-test release differential, but
+exhausted the reuse benefit. Three interleaved five-repetition pairs measured
+8/4-column ratios of 1.000x, 0.995x, and 0.994x
+(`3,180.08/3,179.08`, `3,134.46/3,148.84`, and
+`3,119.17/3,138.91` tok/s). Halving the grid again leaves only two waves of
+scan blocks and doubles the live per-column state. The eight-column variant
+was removed; four columns remain.
+
+## 2026-08-19 — Quantize the routed intermediate before it leaves its producer
+
+The wide Q6_K routed-expert gate/up kernel previously wrote its fp32 SwiGLU
+intermediate to global memory, after which a standalone kernel read the whole
+tensor back to quantize it for the Q8 down projection. The contraction's
+shared staging is dead when SwiGLU runs, so the producer now overlays it with
+one 64-by-64 fp32 result tile, applies the same warp absmax, `rintf`, and clamp
+as the standalone quantizer, and writes Q8 codes and scales directly. The
+configured shared allocation is unchanged. Narrow and the block-39 Q8
+exception retain the original path.
+
+The release real-weight MoE differential passed all eleven cases at unchanged
+tolerances. Isolated routed-MoE CUDA-event pairs at 2,046 rows measured fused
+speedups of 1.024x, 1.020x, and 1.016x (`7.521/7.701`, `7.559/7.709`, and
+`7.575/7.696` ms). Three interleaved five-repetition N=3 whole-forward pairs
+with the four-column scan measured:
+
+| pair | producer quantization | standalone quantization | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,203.38 tok/s | 3,153.18 tok/s | 1.016x |
+| 2 | 3,177.50 tok/s | 3,146.82 tok/s | 1.010x |
+| 3 | 3,172.59 tok/s | 3,144.68 tok/s | 1.009x |
+
+The whole-pass gain is small but survives both warmed pairs. The fused wide
+path becomes the default; the setup switch used for A/B is retained only as a
+fallback until the next full profile confirms the standalone launch is absent.
