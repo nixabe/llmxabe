@@ -266,11 +266,16 @@ const MMA_HEADS_PER_BLOCK: usize = 8;
 /// output accumulator: `head_dim / (8 * this)` tiles of four floats each.
 const MMA_WARPS_PER_HEAD: usize = 8 / MMA_HEADS_PER_BLOCK;
 
+/// Key octets each `Q K^T` warp sweeps per staged tile. Mirrors `MMA_KOCT`.
+/// One is the measured optimum at head_dim 256; see the device comment.
+const MMA_KEY_OCTETS: usize = 1;
+
 /// Keys the tensor-core kernel stages per trip. Mirrors `MMA_KT`.
 ///
-/// One octet per `Q K^T` warp of a head group, so this is pinned to
-/// `8 * MMA_WARPS_PER_HEAD`: every warp busy, every octet covered once.
-const MMA_KEY_TILE: usize = 8 * MMA_WARPS_PER_HEAD;
+/// `MMA_KEY_OCTETS` octets per `Q K^T` warp of a head group, so this is
+/// pinned to `8 * MMA_WARPS_PER_HEAD * MMA_KEY_OCTETS`: every warp busy,
+/// every octet covered once per trip.
+const MMA_KEY_TILE: usize = 8 * MMA_WARPS_PER_HEAD * MMA_KEY_OCTETS;
 
 /// Output accumulator tiles a warp can hold. Mirrors `MMA_MAXT`.
 ///
@@ -315,13 +320,27 @@ const fn mma_shared_bytes(head_dim: usize) -> usize {
 /// construction, not per launch.
 const MMA_SHARED_CEILING: usize = 64 * 1024;
 
-/// Key slices flash decoding splits the window into. Mirrors `DEC_SPLITS`.
+/// Key slices the scalar warp decode uses. Mirrors `DEC_WARP_SPLITS`.
+const WARP_DECODE_SPLITS: usize = 96;
+
+/// Key slices the tensor-core decode uses by default.
 ///
-/// The split grid is `(DECODE_SPLITS, kv_heads)`, so this times `kv_heads` is
-/// the block count that replaces decode's old sixteen. 64 gives 128 blocks
-/// against 72 SMs, which is where the card stops being the constraint; raising
-/// it further only shortens each slice and lengthens the combine.
-const DECODE_SPLITS: usize = 288;
+/// NOT pure launch geometry: the slice boundaries are the partial layout
+/// and the combine's reduction shape, so the deep-window differential gate
+/// must pass at whatever ships here (72 and 96 both have; 48 and 36 both
+/// failed it at 2.28e-5, docs/BENCHMARKS.md 2026-08-20).
+/// `LLMXABE_DEC_MMA_SPLITS` overrides at construction. The wave arithmetic,
+/// at 228 registers per thread and 64-thread blocks (4 resident blocks/SM,
+/// 288 block slots on 72 SMs): the N=3 serving shape runs three concurrent
+/// sequence-local calls of `blocks * kv_heads` blocks each. 96 splits at
+/// the batch capture's 48 blocks is 288 — exactly one wave, every block
+/// grid-striding exactly two splits — and measured 151.2/153.2 tok/s
+/// against the prior 72-split/36-block default's 149.5/148.3 at 32K N=3
+/// (two interleaved pairs, idle GPU 1, 2026-08-20).
+const MMA_DECODE_SPLITS: usize = 96;
+
+/// Largest partial count either decode path can write, used for scratch.
+const DECODE_SPLITS: usize = WARP_DECODE_SPLITS;
 
 /// Depth, in cached keys, at and above which [`AttentionKernels::decode`]
 /// prefers the tensor-core kernel over `attn_flash_decode_warp` when the
@@ -808,7 +827,16 @@ ATTN_FLASH(attn_flash_causal, ATTN_QT)
 #define MMA_QT 16
 #define MMA_HPB 8
 #define MMA_WPH (8 / MMA_HPB)
-#define MMA_KT (8 * MMA_WPH)
+// Key octets each `Q K^T` warp sweeps per staged tile. One octet per warp
+// is the measured optimum, not a placeholder: the cross-tile prefetch
+// arrays (`kreg`, `vlo`, `vhi`) scale with the tile and are held live
+// across the whole compute phase by design, and at head_dim 256 they sit
+// against `o` and `qa` at the register ceiling. Widening the tile spills
+// them to local memory -- 4 octets measured −30% (32K prefill 2,109 vs
+// 2,799), 2 octets −13% (2,424) on 2026-08-20, both rejected. Fewer
+// barriers cannot buy back a spilled prefetch.
+#define MMA_KOCT 1
+#define MMA_KT (8 * MMA_WPH * MMA_KOCT)
 #define MMA_MAXT (256 / (8 * MMA_WPH))
 // `Q K^T` steps at the largest head dimension the dispatch admits. The Q
 // fragments are held in registers across the whole key loop, so every index
@@ -1103,26 +1131,34 @@ __global__ void attn_flash_causal_mma(
             MMA_PREFETCH(j0 + MMA_KT);
         }
 
-        // Q K^T. Warp (hslot, sub) takes key octet `sub` of its own head, so
-        // all eight warps are busy and the four octets of both heads are
-        // covered exactly once.
+        // Q K^T. Warp (hslot, sub) sweeps key octets `sub*MMA_KOCT ..
+        // +MMA_KOCT` of its own head, so all eight warps are busy and every
+        // octet of both heads is covered exactly once. Each octet's scores
+        // are the same dot products in the same order as the one-octet
+        // shape -- the accumulators reset per octet -- so widening the tile
+        // changes no `Q K^T` value, only how many octets share one staging
+        // trip and one barrier.
         {
-            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
-            // Compile-time bound so `qa0`/`qa1` stay in registers; the real
-            // step count is the predicate.
             #pragma unroll
-            for (int s = 0; s < MMA_QSTEPS; ++s) {
-                if (s < steps) {
-                    unsigned b0 = k_sh[(8 * sub + g) * qstride + 4 * s + tg];
-                    mma_m16n8k8(s0, s1, s2, s3, qa0[s], qa1[s], b0);
+            for (int oc2 = 0; oc2 < MMA_KOCT; ++oc2) {
+                int oct = sub * MMA_KOCT + oc2;
+                float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                // Compile-time bound so `qa0`/`qa1` stay in registers; the
+                // real step count is the predicate.
+                #pragma unroll
+                for (int s = 0; s < MMA_QSTEPS; ++s) {
+                    if (s < steps) {
+                        unsigned b0 = k_sh[(8 * oct + g) * qstride + 4 * s + tg];
+                        mma_m16n8k8(s0, s1, s2, s3, qa0[s], qa1[s], b0);
+                    }
                 }
+                // Scores and maxima in log2 units; see ATTN_LOG2E.
+                float scale2 = scale * ATTN_LOG2E;
+                my_s[g * MMA_KT + 8 * oct + 2 * tg]           = s0 * scale2;
+                my_s[g * MMA_KT + 8 * oct + 2 * tg + 1]       = s1 * scale2;
+                my_s[(g + 8) * MMA_KT + 8 * oct + 2 * tg]     = s2 * scale2;
+                my_s[(g + 8) * MMA_KT + 8 * oct + 2 * tg + 1] = s3 * scale2;
             }
-            // Scores and maxima in log2 units for this kernel; see ATTN_LOG2E.
-            float scale2 = scale * ATTN_LOG2E;
-            my_s[g * MMA_KT + 8 * sub + 2 * tg]           = s0 * scale2;
-            my_s[g * MMA_KT + 8 * sub + 2 * tg + 1]       = s1 * scale2;
-            my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg]     = s2 * scale2;
-            my_s[(g + 8) * MMA_KT + 8 * sub + 2 * tg + 1] = s3 * scale2;
         }
         // Per head: `my_s` is this head's slice and no other group reads it.
         // See `MMA_HEAD_BAR`.
@@ -1184,6 +1220,13 @@ __global__ void attn_flash_causal_mma(
 
         // P V. Each warp accumulates over every key octet of its own head, for
         // the share of the output head dimension it owns.
+        //
+        // The rescale runs unconditionally even though it is an exact
+        // identity once a row's max has stabilized (`exp2f(0) == 1.0f`).
+        // Guarding it behind a warp-uniform `__all_sync` vote was measured
+        // 2.8% *slower* at 128K (docs/BENCHMARKS.md 2026-08-20): the
+        // multiplies hide under the staged-load latency the schedule already
+        // pays for, and the branch costs more than the work it skips.
         float cg = my_c[g];
         float cg8 = my_c[g + 8];
         #pragma unroll
@@ -1481,7 +1524,8 @@ __global__ void attn_flash_causal_gqa(
 // ---------------------------------------------------------------------------
 // Flash decoding: one query row, the key range split across blocks.
 //
-// grid: (DEC_SPLITS, kv_heads) for the split pass, (q_heads,) for the combine.
+// grid: (path-specific splits, kv_heads) for the split pass, (q_heads,) for
+// the combine.
 // block: (q_heads / kv_heads) warps, one warp per query head, as above.
 //
 // ## Why decode needs its own shape
@@ -1505,14 +1549,15 @@ __global__ void attn_flash_causal_gqa(
 //
 // ## Rule 5
 //
-// `DEC_SPLITS` is a host constant, but no slice boundary is. The slice width is
-// computed on the device from `*key_offset` and rounded up to a whole `DEC_KT`
+// Both split counts are host constants, but no slice boundary is. The slice
+// width is computed on the device from `*key_offset` and rounded up to a whole `DEC_KT`
 // tile, so a tile never straddles a boundary and every block's trip count comes
 // from device state alone. Splits past the end of a short window run zero trips
 // and write the identity partial — `m = -inf`, `l = 0`, `acc = 0` — which the
 // combine folds in as `exp(-inf - gm) = 0`, exactly.
 #define DEC_KT 8
-#define DEC_SPLITS 288
+#define DEC_WARP_SPLITS 96
+#define DEC_MMA_SPLITS 72
 
 // ---------------------------------------------------------------------------
 // Flash decoding again, with a warp as the whole split and no shared memory.
@@ -1597,7 +1642,8 @@ __global__ void attn_flash_decode_warp(
     int kv_heads,
     int head_dim,
     const int* __restrict__ key_offset,
-    float scale
+    float scale,
+    int n_splits
 ) {
     int gqa = q_heads / kv_heads;
     int dpl = head_dim >> 5;          // dimensions this lane owns
@@ -1607,7 +1653,7 @@ __global__ void attn_flash_decode_warp(
     int kvh = blockIdx.y;
 
     long long n_visible = (long long)(*key_offset) + 1;
-    long long per = (n_visible + DEC_SPLITS - 1) / DEC_SPLITS;
+    long long per = (n_visible + n_splits - 1) / n_splits;
     long long begin = (long long)split * per;
     long long end = begin + per;
     if (end > n_visible) end = n_visible;
@@ -1760,7 +1806,8 @@ __global__ void attn_flash_decode_split(
     int kv_heads,
     int head_dim,
     const int* __restrict__ key_offset,
-    float scale
+    float scale,
+    int n_splits
 ) {
     extern __shared__ float smem[];
     int gqa = q_heads / kv_heads;
@@ -1782,7 +1829,7 @@ __global__ void attn_flash_decode_split(
     // [0, *key_offset]. Every quantity below is block-uniform, so the barriers
     // in the trip loop are reached by every warp the same number of times.
     long long n_visible = (long long)(*key_offset) + 1;
-    long long per = (n_visible + DEC_SPLITS - 1) / DEC_SPLITS;
+    long long per = (n_visible + n_splits - 1) / n_splits;
     per = ((per + DEC_KT - 1) / DEC_KT) * DEC_KT;
     long long begin = (long long)split * per;
     long long end = begin + per;
@@ -1903,7 +1950,8 @@ __global__ void attn_flash_decode_combine(
     const float* __restrict__ part_l,
     float* __restrict__ out,
     int q_heads,
-    int head_dim
+    int head_dim,
+    int n_splits
 ) {
     int h = blockIdx.x;
     int d = threadIdx.x;
@@ -1911,11 +1959,11 @@ __global__ void attn_flash_decode_combine(
     // Split 0 always holds at least key 0, so this is never -inf and the
     // subtraction below never forms inf - inf.
     float gm = neg_inf();
-    for (int s = 0; s < DEC_SPLITS; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
+    for (int s = 0; s < n_splits; ++s) gm = fmaxf(gm, part_m[s * q_heads + h]);
 
     float num = 0.0f;
     float den = 0.0f;
-    for (int s = 0; s < DEC_SPLITS; ++s) {
+    for (int s = 0; s < n_splits; ++s) {
         float ms = part_m[s * q_heads + h];
         float f = (ms == neg_inf()) ? 0.0f : expf(ms - gm);
         num += f * part_acc[((long long)s * q_heads + h) * (long long)head_dim + d];
@@ -1998,16 +2046,20 @@ __global__ void NAME(                                                           
     int kv_heads,                                                               \
     int head_dim,                                                               \
     const int* __restrict__ key_offset,                                        \
-    float scale                                                                \
+    float scale,                                                               \
+    int n_splits                                                               \
 ) {                                                                            \
     extern __shared__ float smem_f[];                                          \
     unsigned* smem = (unsigned*)smem_f;                                        \
     int hd2 = head_dim >> 1;                                                   \
     int qstride = hd2 + 4;                                                     \
     int vstride = 4 + 8 * (((4 * (WPO) - 4) + 7) / 8);                         \
+    int k_words = (8 * (WPO)) * qstride;                                      \
+    int v_words = head_dim * vstride;                                         \
+    int stage_words = k_words > v_words ? k_words : v_words;                  \
     unsigned* k_sh = smem;                                    /* KT*qstride */ \
-    unsigned* v_sh = k_sh + (8 * (WPO)) * qstride;             /* head_dim*vstride */ \
-    float* s_sh    = (float*)(v_sh + head_dim * vstride);      /* 8*KT */      \
+    unsigned* v_sh = smem;                                    /* head_dim*vstride */ \
+    float* s_sh    = (float*)(smem + stage_words);             /* 8*KT */      \
     float* m_sh    = s_sh + 8 * (8 * (WPO));                   /* 8 */         \
     float* l_sh    = m_sh + 8;                                 /* 8 */         \
     float* corr_sh = l_sh + 8;                                 /* 8 */         \
@@ -2020,7 +2072,6 @@ __global__ void NAME(                                                           
     int g = lane >> 2;                                                         \
     int tg = lane & 3;                                                         \
                                                                                 \
-    int split = blockIdx.x;                                                    \
     int kvh = blockIdx.y;                                                      \
                                                                                 \
     /* This warp's own `Q K^T` fragment, held for the whole key loop -- see */ \
@@ -2045,22 +2096,23 @@ __global__ void NAME(                                                           
             }                                                                  \
         }                                                                      \
     }                                                                          \
-    if (tid < 8) {                                                             \
-        m_sh[tid] = neg_inf();                                                 \
-        l_sh[tid] = 0.0f;                                                      \
-    }                                                                          \
+    float o[DMMA_MAXT_((WPO))][2];                                             \
                                                                                 \
-    float o[DMMA_MAXT_((WPO))][4];                                             \
-    _Pragma("unroll")                                                          \
-    for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                              \
-        o[t][0] = 0.0f; o[t][1] = 0.0f; o[t][2] = 0.0f; o[t][3] = 0.0f;        \
-    }                                                                          \
-                                                                                \
+    /* `n_splits` is the LOGICAL split count -- the slice boundaries, the */   \
+    /* partial layout, and everything attn_flash_decode_combine merges. */    \
+    /* `gridDim.x` is pure scheduling: a block grid-strides over its */       \
+    /* splits, so launching fewer blocks than splits changes which SM */      \
+    /* computes a slice and nothing else -- the partials are bit-identical */ \
+    /* at any block count. What that buys: at 228 registers a block, four */  \
+    /* blocks per SM are resident (288 slots on 72 SMs), and the N=3 */       \
+    /* serving shape's three concurrent calls at 72 splits x 2 KV heads */    \
+    /* are 432 blocks -- 1.5 waves, with the third call queueing ~0.22 ms */  \
+    /* behind the first two in the trace. 36 blocks per call is 216 */        \
+    /* resident together -- one wave -- at identical numerics, which the */   \
+    /* 48-LOGICAL-split attempt could not claim (rejected: 2.278388e-5 */     \
+    /* against the 1e-5 deep-window gate, docs/BENCHMARKS.md 2026-08-20). */  \
     long long n_visible = (long long)(*key_offset) + 1;                       \
-    long long per = (n_visible + DEC_SPLITS - 1) / DEC_SPLITS;                 \
-    long long begin = (long long)split * per;                                  \
-    long long end = begin + per;                                               \
-    if (end > n_visible) end = n_visible;                                      \
+    long long per = (n_visible + n_splits - 1) / n_splits;                     \
                                                                                 \
     int dpw = head_dim / (WPO);            /* output dims this warp owns */    \
     int dbase = warp * dpw;                                                    \
@@ -2068,6 +2120,24 @@ __global__ void NAME(                                                           
                                                                                 \
     int kw4 = hd2 >> 2;                                                        \
     int dstripes = head_dim / nthr;                                            \
+                                                                                \
+    /* The loop body below keeps the original single-split indentation so */  \
+    /* the per-tile code is diffable against its pre-loop history. The */     \
+    /* leading barrier orders the previous split's partial writes (which */   \
+    /* read m_sh/l_sh at tid == 0) before this split re-initializes them. */  \
+    for (int split = blockIdx.x; split < n_splits; split += gridDim.x) {       \
+    __syncthreads();                                                           \
+    if (tid < 8) {                                                             \
+        m_sh[tid] = neg_inf();                                                 \
+        l_sh[tid] = 0.0f;                                                      \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                              \
+        o[t][0] = 0.0f; o[t][1] = 0.0f;                                       \
+    }                                                                          \
+    long long begin = (long long)split * per;                                  \
+    long long end = begin + per;                                               \
+    if (end > n_visible) end = n_visible;                                      \
                                                                                 \
     /* Same-tile staging only, not the cross-tile register-held double */      \
     /* buffer attn_flash_causal_mma uses. Measured worse: at WPO=2 the */      \
@@ -2108,40 +2178,6 @@ __global__ void NAME(                                                           
                 if (t < (8 * (WPO)) * kw4) {                                   \
                     int r = t / kw4;                                           \
                     *(uint4*)(k_sh + r * qstride + 4 * (t - r * kw4)) = kreg[i]; \
-                }                                                              \
-            }                                                                  \
-        }                                                                      \
-        {                                                                       \
-            /* One entry per key-pair in the tile -- `(8 * WPO) / 2 == */      \
-            /* `4 * WPO` of them, matching the columns `P V`'s fragment */     \
-            /* read below actually covers (`oc` over `WPO` octets, `tg` */     \
-            /* over 4, `4 * oc + tg`). */                                      \
-            unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                 \
-            unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                 \
-            _Pragma("unroll")                                                  \
-            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
-                int vd_col = ds * nthr + tid;                                  \
-                bool active = ds < dstripes;                                   \
-                _Pragma("unroll")                                              \
-                for (int i = 0; i < 4 * (WPO); ++i) {                          \
-                    long long k0 = j0 + 2 * i;                                 \
-                    vlo[ds][i] = (active && k0 < end)                         \
-                        ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
-                        : (unsigned short)0;                                  \
-                    vhi[ds][i] = (active && k0 + 1 < end)                     \
-                        ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
-                        : (unsigned short)0;                                  \
-                }                                                              \
-            }                                                                  \
-            _Pragma("unroll")                                                  \
-            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
-                int vd_col = ds * nthr + tid;                                  \
-                if (ds < dstripes) {                                           \
-                    _Pragma("unroll")                                          \
-                    for (int i = 0; i < 4 * (WPO); ++i) {                      \
-                        v_sh[vd_col * vstride + i] =                          \
-                            (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
-                    }                                                          \
                 }                                                              \
             }                                                                  \
         }                                                                      \
@@ -2216,14 +2252,46 @@ __global__ void NAME(                                                           
         }                                                                      \
         __syncthreads();                                                       \
                                                                                 \
-        /* P V. The dead second half of this operand is zero -- unlike */      \
-        /* Q K^T, P and V are already accepted under MMA_GATE elsewhere in */  \
-        /* this file, so there is no precision trick to spend here. */         \
+        /* K is dead after Q K^T and softmax. Reuse its shared arena for V */   \
+        /* so WPO=2 fits four resident blocks per SM instead of three. */       \
+        {                                                                       \
+            unsigned short vlo[256 / ((WPO) * 32)][4 * (WPO)];                 \
+            unsigned short vhi[256 / ((WPO) * 32)][4 * (WPO)];                 \
+            _Pragma("unroll")                                                  \
+            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
+                int vd_col = ds * nthr + tid;                                  \
+                bool active = ds < dstripes;                                   \
+                _Pragma("unroll")                                              \
+                for (int i = 0; i < 4 * (WPO); ++i) {                          \
+                    long long k0 = j0 + 2 * i;                                 \
+                    vlo[ds][i] = (active && k0 < end)                          \
+                        ? v[(k0 * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
+                        : (unsigned short)0;                                   \
+                    vhi[ds][i] = (active && k0 + 1 < end)                      \
+                        ? v[((k0 + 1) * (long long)kv_heads + kvh) * (long long)head_dim + vd_col] \
+                        : (unsigned short)0;                                   \
+                }                                                              \
+            }                                                                  \
+            _Pragma("unroll")                                                  \
+            for (int ds = 0; ds < 256 / ((WPO) * 32); ++ds) {                  \
+                int vd_col = ds * nthr + tid;                                  \
+                if (ds < dstripes) {                                           \
+                    _Pragma("unroll")                                          \
+                    for (int i = 0; i < 4 * (WPO); ++i) {                      \
+                        v_sh[vd_col * vstride + i] =                           \
+                            (unsigned)vlo[ds][i] | ((unsigned)vhi[ds][i] << 16); \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        __syncthreads();                                                       \
+                                                                                \
+        /* P V. The dead second half of this operand is zero. */                \
         {                                                                       \
             float cg = (g < gqa) ? corr_sh[g] : 0.0f;                          \
             _Pragma("unroll")                                                  \
             for (int t = 0; t < DMMA_MAXT_((WPO)); ++t) {                      \
-                o[t][0] *= cg; o[t][1] *= cg;                                   \
+                o[t][0] *= cg; o[t][1] *= cg;                                  \
             }                                                                  \
             for (int oc = 0; oc < (8 * (WPO)) / 8; ++oc) {                     \
                 unsigned a0 = (g < gqa) ? pack_h2(                             \
@@ -2235,7 +2303,8 @@ __global__ void NAME(                                                           
                     if (t < ntile) {                                           \
                         unsigned b0 =                                          \
                             v_sh[(dbase + 8 * t + g) * vstride + 4 * oc + tg]; \
-                        mma_m16n8k8(o[t][0], o[t][1], o[t][2], o[t][3], a0, a1, b0); \
+                        float dead0 = 0.0f, dead1 = 0.0f;                       \
+                        mma_m16n8k8(o[t][0], o[t][1], dead0, dead1, a0, a1, b0); \
                     }                                                          \
                 }                                                              \
             }                                                                  \
@@ -2266,6 +2335,7 @@ __global__ void NAME(                                                           
             }                                                                  \
         }                                                                      \
     }                                                                          \
+    }  /* split grid-stride loop */                                            \
 }
 
 #define DMMA_QSTEPS 32
@@ -2578,6 +2648,32 @@ pub struct AttentionKernels {
     /// -- and unlike a `Cell`, this keeps `AttentionKernelSet` `Sync`, which
     /// `Arc<AttentionKernelSet>` already promises callers across threads.
     decode_mma: std::sync::atomic::AtomicU8,
+    /// Runtime override for the tensor-core decode's launch block count,
+    /// `0` meaning "one block per split". Same atomic-behind-`Arc` shape as
+    /// `decode_mma`, and set the same way: by the engine right before a
+    /// graph capture, so each captured width bakes its own scheduling. The
+    /// partials are bit-identical at any value (the kernel grid-strides its
+    /// logical splits), so this is a pure wave-shape knob — see
+    /// [`MMA_DECODE_SPLITS`] for the arithmetic and docs/BENCHMARKS.md
+    /// 2026-08-20 for the measurement (+0.4--1.6% at 32K N=3 with 36; -13%
+    /// at N=1, which is why it must be per width and not global).
+    decode_mma_blocks: std::sync::atomic::AtomicUsize,
+    /// Logical key slices per tensor-core decode call — the slice
+    /// boundaries and partial layout the combine merges. Defaults to
+    /// [`MMA_DECODE_SPLITS`]; `LLMXABE_DEC_MMA_SPLITS` overrides it at
+    /// construction (numerics-affecting: 48 was measured and rejected at
+    /// the deep-window gate). Capped at [`DECODE_SPLITS`], which is what
+    /// the partial buffers are sized for.
+    mma_decode_splits: usize,
+    /// Blocks the tensor-core decode launches over those splits. The kernel
+    /// grid-strides `split = blockIdx.x .. n_splits`, so this is pure
+    /// scheduling and the partials are **bit-identical at any value**;
+    /// fewer blocks than splits exists for the N=3 wave shape (three
+    /// concurrent 144-block calls are 1.5 waves of the 288 resident-block
+    /// budget; 36 blocks per call is exactly one wave).
+    /// `LLMXABE_DEC_MMA_BLOCKS` overrides at construction; defaults to the
+    /// logical split count, i.e. one split per block.
+    mma_decode_blocks: usize,
 }
 
 impl AttentionKernels {
@@ -2646,19 +2742,31 @@ impl AttentionKernels {
             kv_heads,
             head_dim,
             decode_mma: std::sync::atomic::AtomicU8::new(0),
+            decode_mma_blocks: std::sync::atomic::AtomicUsize::new(0),
+            mma_decode_splits: std::env::var("LLMXABE_DEC_MMA_SPLITS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&s| s >= 1 && s <= DECODE_SPLITS)
+                .unwrap_or(MMA_DECODE_SPLITS),
+            mma_decode_blocks: std::env::var("LLMXABE_DEC_MMA_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&b| b >= 1)
+                .unwrap_or(0),
         })
     }
 
     /// Dynamic shared memory `attn_flash_decode_mma_wpo{4,2}` requests: the
-    /// staged K/V tiles at `8 * wpo` keys, plus the 8-real-row score, maximum,
-    /// normalizer and correction scratch. Mirrors [`mma_shared_bytes`]'s
-    /// `qstride`/`vstride` formula; see that kernel's own comment for why
-    /// those exact strides keep every fragment read conflict-free.
+    /// aliased K/V tile at `8 * wpo` keys, plus the 8-real-row score, maximum,
+    /// normalizer and correction scratch. Q K^T has stopped reading K before
+    /// P V stages V into the same arena.
     const fn dmma_shared_bytes(head_dim: usize, wpo: usize) -> usize {
         let qstride = head_dim / 2 + 4;
         let vstride = 4 + 8 * ((4 * wpo + 3) / 8);
         let kt = 8 * wpo;
-        let words = kt * qstride + head_dim * vstride;
+        let k_words = kt * qstride;
+        let v_words = head_dim * vstride;
+        let words = if k_words > v_words { k_words } else { v_words };
         let floats = 8 * kt + 24; // s_sh + m_sh/l_sh/corr_sh, 8 rows each
         (words + floats) * size_of::<u32>()
     }
@@ -2702,6 +2810,19 @@ impl AttentionKernels {
             self.decode_mma
                 .store(wpo as u8, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Set how many blocks the tensor-core decode launches over its logical
+    /// splits — `0` restores one block per split. Pure scheduling: the
+    /// kernel grid-strides its splits and the partials are bit-identical at
+    /// any value, so this only reshapes the wave the N=3 serving shape's
+    /// three concurrent calls form. The engine calls it right before each
+    /// graph capture so single-stream and batched captures bake different
+    /// block counts; the `LLMXABE_DEC_MMA_BLOCKS` setup switch, when
+    /// present, still wins for whole-process A/B runs.
+    pub fn set_decode_mma_blocks(&self, blocks: usize) {
+        self.decode_mma_blocks
+            .store(blocks, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether [`Self::decode`] will take the tensor-core kernel this call,
@@ -3247,13 +3368,39 @@ impl AttentionKernels {
         // once each instead of staging them for a KV group to share, which at
         // a 128K window is the difference between 27% and most of the card's
         // bandwidth. See the kernel comment. The tensor-core kernel, when
-        // active, takes the same (DECODE_SPLITS, kv_heads) grid as the warp
-        // kernel it replaces -- only the block width and shared request
-        // change, both driven by `wpo`.
+        // active, uses the smaller split count its longer tensor-core blocks
+        // prefer; the scalar warp path uses more, shorter slices at shallow
+        // depth. Both counts are fixed launch geometry and remain capturable.
         let warp_split = self.decode_warp_is_available();
         let mma = self.active_decode_mma(key_depth);
+        let decode_splits = if mma.is_some() {
+            self.mma_decode_splits
+        } else {
+            WARP_DECODE_SPLITS
+        };
+        let decode_splits_i32 = decode_splits as i32;
+        // Blocks may undershoot the logical split count only on the MMA
+        // path, whose kernel grid-strides over splits; the scalar kernels
+        // still assume one block per split. The setup-time env switch wins
+        // over the per-capture runtime setter, so a whole-process A/B stays
+        // a whole-process A/B.
+        let grid_blocks = if mma.is_some() {
+            let runtime = self
+                .decode_mma_blocks
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let chosen = if self.mma_decode_blocks >= 1 {
+                self.mma_decode_blocks
+            } else if runtime >= 1 {
+                runtime
+            } else {
+                decode_splits
+            };
+            chosen.min(decode_splits)
+        } else {
+            decode_splits
+        };
         let split_cfg = LaunchConfig {
-            grid_dim: (DECODE_SPLITS as u32, self.kv_heads as u32, 1),
+            grid_dim: (grid_blocks as u32, self.kv_heads as u32, 1),
             block_dim: (
                 if let Some(wpo) = mma {
                     (wpo * 32) as u32
@@ -3296,7 +3443,8 @@ impl AttentionKernels {
             .arg(&kv_heads)
             .arg(&head_dim)
             .arg(positions)
-            .arg(&scale);
+            .arg(&scale)
+            .arg(&decode_splits_i32);
         // SAFETY: the grid is (DECODE_SPLITS, kv_heads) with one warp per query
         // head under that KV head, so `h` stays below `q_heads` and every
         // partial index below `DECODE_SPLITS * q_heads`, which the three
@@ -3319,7 +3467,8 @@ impl AttentionKernels {
             .arg(&dec.l)
             .arg(out)
             .arg(&q_heads)
-            .arg(&head_dim);
+            .arg(&head_dim)
+            .arg(&decode_splits_i32);
         // SAFETY: one block per query head, one thread per head dimension, so
         // the read of `part_acc` stays inside the buffer sized above and the
         // write covers `out` exactly once — `out` is `q_heads * head_dim` at
@@ -3651,8 +3800,8 @@ mod tests {
         );
         assert_eq!(
             MMA_KEY_TILE,
-            8 * MMA_WARPS_PER_HEAD,
-            "the staged key tile is no longer one octet per warp of a head",
+            8 * MMA_WARPS_PER_HEAD * MMA_KEY_OCTETS,
+            "the staged key tile is no longer MMA_KEY_OCTETS octets per warp",
         );
 
         // The device sees these through `#define`s, and a Rust constant that
@@ -3661,7 +3810,8 @@ mod tests {
         assert!(
             ATTENTION_SRC.contains(&format!("#define MMA_HPB {MMA_HEADS_PER_BLOCK}"))
                 && ATTENTION_SRC.contains("#define MMA_WPH (8 / MMA_HPB)")
-                && ATTENTION_SRC.contains("#define MMA_KT (8 * MMA_WPH)")
+                && ATTENTION_SRC.contains(&format!("#define MMA_KOCT {MMA_KEY_OCTETS}"))
+                && ATTENTION_SRC.contains("#define MMA_KT (8 * MMA_WPH * MMA_KOCT)")
                 && ATTENTION_SRC.contains("#define MMA_MAXT (256 / (8 * MMA_WPH))"),
             "the device block shape no longer mirrors the host constants",
         );
