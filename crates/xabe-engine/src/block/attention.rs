@@ -633,6 +633,22 @@ pub struct GatedAttentionBlock {
     /// tiles — that a short batch cannot amortize, and a decode step of one
     /// token would pay all of it to fill an eighth of a fragment.
     int8: Option<Arc<AttnInt8>>,
+
+    /// Side streams and events for the batch-prefill per-sequence fan-out.
+    ///
+    /// The flattened pass runs the shared projections batch-wide, but rope,
+    /// the KV append and the causal attention itself are per-sequence: their
+    /// launches touch disjoint scratch slices and each sequence's own cache,
+    /// and at deep KV the attention launch alone is several partial waves
+    /// (512 blocks over 72 SMs at the 128K cells) whose scheduling tail is
+    /// paid once per launch. Running the three sequences' chains serially
+    /// pays that tail three times per layer per chunk; forking them merges
+    /// the blocks into one occupancy pool with a single tail. Two side
+    /// streams, one fork event recorded after the last shared input is
+    /// written, and one join event each before the batch-wide gate resumes
+    /// on the main stream. `None` when `LLMXABE_ATTN_PREFILL_SERIAL=1`
+    /// keeps the serial order for A/B.
+    batch_fork: Option<(Vec<Arc<CudaStream>>, CudaEvent, Vec<CudaEvent>)>,
 }
 
 /// Shape-independent device weights for one Gated Attention layer.
@@ -927,6 +943,14 @@ impl GatedAttentionBlock {
         self.kernels.mixer.set_decode_mma_wpo(wpo);
     }
 
+    /// Set how many blocks this block's tensor-core decode launches over
+    /// its logical splits — `0` restores one block per split. Bit-identical
+    /// scheduling knob; see the mixer's own doc and
+    /// `docs/BENCHMARKS.md` 2026-08-20 for the wave arithmetic.
+    pub fn set_decode_mma_blocks(&mut self, blocks: usize) {
+        self.kernels.mixer.set_decode_mma_blocks(blocks);
+    }
+
     /// Quantize one scratch buffer to int8 for the projections that read it.
     ///
     /// Called twice per pass: once over `normed` for the three projections
@@ -1082,6 +1106,16 @@ impl GatedAttentionBlock {
             rope_theta,
             weights,
             int8,
+            batch_fork: if std::env::var_os("LLMXABE_ATTN_PREFILL_SERIAL").is_some() {
+                None
+            } else {
+                let ctx = stream.context();
+                Some((
+                    vec![ctx.new_stream()?, ctx.new_stream()?],
+                    ctx.new_event(None)?,
+                    vec![ctx.new_event(None)?, ctx.new_event(None)?],
+                ))
+            },
         })
     }
 
@@ -1875,7 +1909,31 @@ impl GatedAttentionBlock {
             self.head_dim,
             self.rms_eps,
         )?;
+        // The per-sequence chains below — rope, the cache append, the causal
+        // attention — touch disjoint scratch slices and each sequence's own
+        // cache, so they are forked onto side streams and rejoined before the
+        // batch-wide gate. See the `batch_fork` field for why. The fork event
+        // orders them after the last shared input written above
+        // (`key_normed`); each join orders the main stream after that
+        // sequence's `pregate` slice is complete.
+        let fork_streams = match self.batch_fork.as_ref() {
+            Some((streams, fork, _)) if n > 1 => {
+                fork.record(stream)?;
+                for side in streams.iter().take(n - 1) {
+                    side.wait(fork)?;
+                }
+                Some(streams)
+            }
+            _ => None,
+        };
         for i in 0..n {
+            // Sequence 0 stays on the main stream; the rest round-robin the
+            // side streams (two cover the N=3 serving shape exactly, wider
+            // batches share them and serialize pairwise, still correct).
+            let seq_stream: &Arc<CudaStream> = match (i, fork_streams) {
+                (0, _) | (_, None) => stream,
+                (_, Some(streams)) => &streams[(i - 1) % streams.len()],
+            };
             let base = i * chunk_tokens;
             let qn = unsafe {
                 crate::viewslice::subslice(
@@ -1910,7 +1968,7 @@ impl GatedAttentionBlock {
                 )
             };
             k.mixer.rope(
-                stream,
+                seq_stream,
                 &qn,
                 &mut qr,
                 chunk_tokens,
@@ -1920,7 +1978,7 @@ impl GatedAttentionBlock {
                 self.rope_theta,
             )?;
             k.mixer.rope(
-                stream,
+                seq_stream,
                 &kn,
                 &mut kr,
                 chunk_tokens,
@@ -1933,7 +1991,7 @@ impl GatedAttentionBlock {
                 crate::viewslice::subslice(stream, &sc.value, base * kv_dim, chunk_tokens * kv_dim)
             };
             k.mixer.append_kv(
-                stream,
+                seq_stream,
                 &kr,
                 &val,
                 &mut caches[i].k,
@@ -1946,7 +2004,7 @@ impl GatedAttentionBlock {
                 crate::viewslice::subslice(stream, &sc.pregate, base * q_dim, chunk_tokens * q_dim)
             };
             k.mixer.forward(
-                stream,
+                seq_stream,
                 &mut sc.decode[0],
                 &qr,
                 &caches[i].k,
@@ -1957,6 +2015,12 @@ impl GatedAttentionBlock {
                 pos_offsets[i] + chunk_tokens,
                 positions[i],
             )?;
+        }
+        if let (Some(streams), Some((_, _, joins))) = (fork_streams, self.batch_fork.as_ref()) {
+            for (side, join) in streams.iter().zip(joins).take(n - 1) {
+                join.record(side)?;
+                stream.wait(join)?;
+            }
         }
         k.elementwise.sigmoid_gate(
             stream,
