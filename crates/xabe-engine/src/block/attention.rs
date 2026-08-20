@@ -21,9 +21,9 @@
 //! | partial rotary on query and key | [`AttentionKernels::rope`] | `Qcur-N` / `Kcur-N` (second) |
 //! | append roped keys and raw values to the cache | [`KvCache`] | — |
 //! | causal GQA attention | [`AttentionKernels::forward`] | `attn_pregate-N` |
-//! | `sigmoid(gate)` and its product | [`AttnElementwise`] | `gate_sigmoid-N` / `attn_gated-N` |
+//! | `sigmoid(gate)` and its product | [`LayerOpsKernels::sigmoid_gate`] | `gate_sigmoid-N` / `attn_gated-N` |
 //! | output projection | [`LmHeadKernels::forward`] | `attn_output-N` |
-//! | residual add | [`AttnElementwise`] | `attn_residual-N` |
+//! | residual add | [`LayerOpsKernels::add`] | `attn_residual-N` |
 //!
 //! Every one of those tensors is exposed by an accessor on
 //! [`GatedAttentionBlock`] after [`GatedAttentionBlock::forward`], because
@@ -66,17 +66,6 @@
 //! `tests/attention_block.rs`, so a model whose sections do not collapse this
 //! way fails loudly instead of being silently rotated wrong.
 //!
-//! # Two elementwise ops live here, and why
-//!
-//! `sigmoid(gate) * x` and `a + b` have no kernel in `xabe-cuda`:
-//! `layer_ops` has SwiGLU (`silu(gate) * up`), which is a different gate, and
-//! nothing at all adds two tensors. Rather than edit a crate this workstream
-//! does not own, [`AttnElementwise`] compiles the two through the same NVRTC
-//! entry point every other kernel uses. They are three lines each and are
-//! gated directly against `gate_sigmoid-N`, `attn_gated-N` and
-//! `attn_residual-N`, which is a stronger oracle than a CPU reference — but
-//! they belong in `xabe_cuda::kernels::layer_ops` once that file is free.
-//!
 //! # Fixed token count, and the KV cache that works with it
 //!
 //! A block is constructed for exactly `tokens` positions per call.
@@ -99,22 +88,20 @@
 //! [`GdnState`](crate::block::gdn::GdnState) are owned by the caller and passed in, so a prefill block at
 //! `tokens = 19` and a decode block at `tokens = 1` write to and read from the
 //! same cache — which is what makes the second of those a continuation of the
-//! first rather than a separate sequence. The weights are aliases into the
-//! A standalone block owns its copied weights. [`crate::forward::Forward`]
-//! shares those copies and their lazy split-layout repacks when it reshapes,
-//! so a second full-model shape adds only shape-local kernels and scratch.
+//! first rather than a separate sequence. The weights are not duplicated
+//! either: [`GatedAttentionBlock::new`] copies a layer out of
+//! [`DeviceWeights`] into a shared `Arc`, and [`crate::forward::Forward`]
+//! hands that same `Arc` — with its lazy split-layout repack — to every shape
+//! it builds, so a second full-model shape adds only shape-local kernels and
+//! scratch.
 
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
-    PinnedHostSlice, PushKernelArg,
-};
+use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DriverError, PinnedHostSlice};
 
 use xabe_cuda::arena::ArenaError;
 use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
-use xabe_cuda::kernels::compile;
-use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
+use xabe_cuda::kernels::layer_ops::{GateShape, LayerOpsError, LayerOpsKernels};
 use xabe_cuda::kernels::lm_head::{LmHeadError, LmHeadGeometry, LmHeadKernels};
 use xabe_cuda::kernels::mma::{MMA_SPLIT_TOKENS, MmaError, MmaKernels};
 use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
@@ -124,151 +111,9 @@ use xabe_model::weights::Role;
 
 use crate::weights::DeviceWeights;
 
-/// The two elementwise operations this block needs and `xabe-cuda` does not
-/// yet provide.
-///
-/// Both are grid-stride over a fixed grid, so the launch shape does not
-/// depend on a host-side length and stays capturable in a CUDA graph
-/// (`AGENTS.md` rule 5).
-const ELEMENTWISE_SRC: &str = r#"
-extern "C" {
-
-// sig = sigmoid(gate); out = pregate * sig.
-//
-// `sigmoid` is spelled 1/(1+exp(-x)) because that is exactly
-// ggml_compute_forward_sigmoid / ggml_cuda_op_sigmoid, which is what produced
-// the `gate_sigmoid-N` tensor this is gated against. The algebraically equal
-// forms (tanh, or silu(x)/x) round differently.
-//
-// The sigmoid is written out as well as applied so a divergence can be
-// localized to the nonlinearity or to the product, not just to "the gate".
-__global__ void attn_sigmoid_gate(
-    const float* __restrict__ pregate,
-    const float* __restrict__ gate,
-    float* __restrict__ sig,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        float s = 1.0f / (1.0f + expf(-gate[i]));
-        sig[i] = s;
-        out[i] = pregate[i] * s;
-    }
-}
-
-// out = a + b. One rounding, so it is bit-identical to the scalar reference.
-__global__ void attn_residual_add(
-    const float* __restrict__ a,
-    const float* __restrict__ b,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        out[i] = a[i] + b[i];
-    }
-}
-
-}
-"#;
-
-/// Threads per block for the two elementwise kernels.
-const ELEMENTWISE_BLOCK: usize = 256;
-
-/// Largest grid the elementwise kernels launch, independent of `n`.
-const ELEMENTWISE_MAX_GRID: usize = 1024;
-
-/// The sigmoid gate and the residual add, compiled once.
-pub struct AttnElementwise {
-    sigmoid_gate: CudaFunction,
-    residual_add: CudaFunction,
-}
-
-impl AttnElementwise {
-    /// Compile both kernels into one module.
-    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, AttentionBlockError> {
-        let ptx =
-            compile(ELEMENTWISE_SRC, "attn_elementwise").map_err(AttentionBlockError::Compile)?;
-        let module = ctx.load_module(ptx)?;
-        Ok(Self {
-            sigmoid_gate: module.load_function("attn_sigmoid_gate")?,
-            residual_add: module.load_function("attn_residual_add")?,
-        })
-    }
-
-    fn launch_config(n: usize) -> LaunchConfig {
-        LaunchConfig {
-            grid_dim: (
-                n.div_ceil(ELEMENTWISE_BLOCK).min(ELEMENTWISE_MAX_GRID) as u32,
-                1,
-                1,
-            ),
-            block_dim: (ELEMENTWISE_BLOCK as u32, 1, 1),
-            shared_mem_bytes: 0,
-        }
-    }
-
-    /// `sig = sigmoid(gate)`, `out = pregate * sig`, over `n` elements.
-    pub fn sigmoid_gate(
-        &self,
-        stream: &Arc<CudaStream>,
-        pregate: &CudaSlice<f32>,
-        gate: &CudaSlice<f32>,
-        sig: &mut CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
-        n: usize,
-    ) -> Result<(), AttentionBlockError> {
-        expect_len("sigmoid gate pregate", pregate.len(), n)?;
-        expect_len("sigmoid gate gate", gate.len(), n)?;
-        expect_len("sigmoid gate sigmoid", sig.len(), n)?;
-        expect_len("sigmoid gate out", out.len(), n)?;
-        if n == 0 {
-            return Ok(());
-        }
-        let n_i64 = n as i64;
-        let mut builder = stream.launch_builder(&self.sigmoid_gate);
-        builder
-            .arg(pregate)
-            .arg(gate)
-            .arg(&mut *sig)
-            .arg(&mut *out)
-            .arg(&n_i64);
-        // SAFETY: the grid-stride loop is bounded by `n`, which was just
-        // checked against all four buffer lengths.
-        unsafe { builder.launch(Self::launch_config(n)) }?;
-        Ok(())
-    }
-
-    /// `out = a + b` over `n` elements.
-    pub fn residual_add(
-        &self,
-        stream: &Arc<CudaStream>,
-        a: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
-        n: usize,
-    ) -> Result<(), AttentionBlockError> {
-        expect_len("residual a", a.len(), n)?;
-        expect_len("residual b", b.len(), n)?;
-        expect_len("residual out", out.len(), n)?;
-        if n == 0 {
-            return Ok(());
-        }
-        let n_i64 = n as i64;
-        let mut builder = stream.launch_builder(&self.residual_add);
-        builder.arg(a).arg(b).arg(&mut *out).arg(&n_i64);
-        // SAFETY: as above.
-        unsafe { builder.launch(Self::launch_config(n)) }?;
-        Ok(())
-    }
-}
-
 /// Something went wrong building or running a Gated Attention block.
 #[derive(Debug)]
 pub enum AttentionBlockError {
-    /// NVRTC rejected the elementwise source, or the module failed to load.
-    Compile(String),
     /// The driver failed.
     Driver(DriverError),
     /// A reserved arena range could not be read back.
@@ -324,7 +169,6 @@ pub enum AttentionBlockError {
 impl std::fmt::Display for AttentionBlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Compile(m) => write!(f, "elementwise kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Arena(e) => write!(f, "{e}"),
             Self::Attention(e) => write!(f, "{e}"),
@@ -439,7 +283,6 @@ pub struct AttentionKernelSet {
     kv: LmHeadKernels,
     /// `q_heads * head_dim` -> hidden.
     out: LmHeadKernels,
-    elementwise: AttnElementwise,
 }
 
 impl AttentionKernelSet {
@@ -483,7 +326,6 @@ impl AttentionKernelSet {
                     max_tokens: tokens,
                 },
             )?,
-            elementwise: AttnElementwise::new(ctx)?,
         })
     }
 }
@@ -1172,7 +1014,6 @@ impl GatedAttentionBlock {
         let hidden_elems = t * self.hidden;
         let q_dim = self.q_heads * self.head_dim;
         let kv_dim = self.kv_heads * self.head_dim;
-        let q_elems = t * q_dim;
         expect_len("block input", hidden_state.len(), hidden_elems)?;
         expect_len("block output", out.len(), hidden_elems)?;
         if pos_offset + t > cache.max_seq {
@@ -1365,13 +1206,15 @@ impl GatedAttentionBlock {
         )?;
 
         // 10. The output gate.
-        k.elementwise.sigmoid_gate(
+        k.ops.sigmoid_gate(
             stream,
             &sc.pregate,
             &sc.gate,
             &mut sc.gate_sigmoid,
             &mut sc.gated,
-            q_elems,
+            t,
+            q_dim,
+            GateShape::Elementwise,
         )?;
 
         // 11. Output projection. Contracts over `q_dim`, not `hidden`, and
@@ -1407,8 +1250,8 @@ impl GatedAttentionBlock {
         }
 
         // 12. Residual.
-        k.elementwise
-            .residual_add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
+        k.ops
+            .add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
 
         Ok(())
     }
@@ -1429,9 +1272,9 @@ impl GatedAttentionBlock {
     /// `w_qgate`, `w_k`, `w_v` and `w_out` once for the whole batch instead
     /// of once per sequence — measured, calling [`Self::forward`] per
     /// sequence instead paid the full ~29 MB per-layer weight read
-    /// `caches.len()` times over, which was the largest single cost this
-    /// workstream's batched-decode benchmark found. See
-    /// `docs/BENCHMARKS.md`'s batched-decode section.
+    /// `caches.len()` times over, which was the largest single cost the
+    /// batched-decode benchmark found. See
+    /// `docs/BENCHMARKS.md`.
     ///
     /// Rotary position, the key/value append and the causal attention read
     /// cannot batch the same way: rotary needs each token's own absolute
@@ -1483,7 +1326,6 @@ impl GatedAttentionBlock {
         let hidden_elems = t * self.hidden;
         let q_dim = self.q_heads * self.head_dim;
         let kv_dim = self.kv_heads * self.head_dim;
-        let q_elems = t * q_dim;
         expect_len("block input", hidden_state.len(), hidden_elems)?;
         expect_len("block output", out.len(), hidden_elems)?;
         for (i, cache) in caches.iter().enumerate() {
@@ -1711,13 +1553,15 @@ impl GatedAttentionBlock {
         }
 
         // 10. The output gate. No position, no state: batches.
-        k.elementwise.sigmoid_gate(
+        k.ops.sigmoid_gate(
             stream,
             &sc.pregate,
             &sc.gate,
             &mut sc.gate_sigmoid,
             &mut sc.gated,
-            q_elems,
+            t,
+            q_dim,
+            GateShape::Elementwise,
         )?;
 
         // 11. Output projection. The third weight read batching amortizes.
@@ -1751,8 +1595,8 @@ impl GatedAttentionBlock {
         }
 
         // 12. Residual. Batches.
-        k.elementwise
-            .residual_add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
+        k.ops
+            .add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
 
         Ok(())
     }
@@ -2022,13 +1866,15 @@ impl GatedAttentionBlock {
                 stream.wait(join)?;
             }
         }
-        k.elementwise.sigmoid_gate(
+        k.ops.sigmoid_gate(
             stream,
             &sc.pregate,
             &sc.gate,
             &mut sc.gate_sigmoid,
             &mut sc.gated,
-            total * q_dim,
+            total,
+            q_dim,
+            GateShape::Elementwise,
         )?;
         if self.int8.is_some() {
             self.quantize_activations(stream, sc, ScratchPick::Gated, total, q_dim)?;
@@ -2058,8 +1904,8 @@ impl GatedAttentionBlock {
                 &mut sc.projected,
             )?;
         }
-        k.elementwise
-            .residual_add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
+        k.ops
+            .add(stream, hidden_state, &sc.projected, out, hidden_elems)?;
         Ok(())
     }
 }
@@ -2070,8 +1916,10 @@ impl GatedAttentionBlock {
 /// checked against the declared geometry, so a sub-range of the weight arena
 /// cannot be passed directly — the arena is one 29.6 GiB slab. The copy is a
 /// device-to-host-to-device round trip of at most 17.8 MiB (`attn_q`), paid
-/// once at construction and never on the forward path. The right fix is a
-/// borrowed device view in `xabe-cuda`, which is not this workstream's file.
+/// once at construction and never on the forward path. The fix is a borrowed
+/// device view that `xabe-cuda` does not expose yet — `cudarc` 0.19 can make a
+/// `CudaView` of a sub-range but not an owned `CudaSlice`, and every kernel
+/// entry point takes the latter.
 fn q8_0_weight(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
@@ -2207,56 +2055,11 @@ mod tests {
     }
 
     #[test]
-    fn the_elementwise_source_spells_ggmls_sigmoid_and_not_an_equal_form() {
-        // silu(x)/x and 0.5*(1+tanh(x/2)) are algebraically the same function
-        // and round differently. `gate_sigmoid-N` came off
-        // ggml_cuda_op_sigmoid, which is 1/(1+expf(-x)).
-        assert!(ELEMENTWISE_SRC.contains("float s = 1.0f / (1.0f + expf(-gate[i]));"));
-        // Scoped to the kernel body, so the comment above it that *names*
-        // the rejected forms does not satisfy its own assertion — the trap
-        // `layer_ops.rs` documents for the same kind of check.
-        let start = ELEMENTWISE_SRC
-            .find("__global__ void attn_sigmoid_gate(")
-            .expect("the sigmoid kernel is present");
-        let end = ELEMENTWISE_SRC
-            .find("// out = a + b.")
-            .expect("the residual kernel's comment is present");
-        let body = &ELEMENTWISE_SRC[start..end];
-        assert!(
-            !body.contains("tanh"),
-            "the sigmoid was rewritten into a form that rounds differently",
-        );
-        assert!(
-            !body.contains("__expf"),
-            "the fast exponential is not what produced the reference",
-        );
-    }
-
-    #[test]
-    fn the_residual_add_is_one_rounding() {
-        // `out = a + b` and nothing else, so it is bit-identical to the
-        // scalar reference and `attn_residual-N` can be gated exactly.
-        assert!(ELEMENTWISE_SRC.contains("out[i] = a[i] + b[i];"));
-    }
-
-    #[test]
     fn a_length_that_matches_the_geometry_is_accepted_and_one_that_does_not_is_not() {
         assert!(expect_len("x", 4, 4).is_ok());
         let err = expect_len("x", 5, 4).unwrap_err();
         assert!(err.to_string().contains('5'));
         assert!(err.to_string().contains('4'));
-    }
-
-    #[test]
-    fn the_elementwise_grid_does_not_depend_on_a_host_sized_length() {
-        // AGENTS.md rule 5: a launch shape derived from a host-side value
-        // cannot be captured in a CUDA graph and replayed at another size.
-        // The grid saturates, and the grid-stride loop covers the rest.
-        let small = AttnElementwise::launch_config(1024);
-        let huge = AttnElementwise::launch_config(1 << 24);
-        assert_eq!(huge.grid_dim.0 as usize, ELEMENTWISE_MAX_GRID);
-        assert!(small.grid_dim.0 <= huge.grid_dim.0);
-        assert_eq!(small.block_dim.0 as usize, ELEMENTWISE_BLOCK);
     }
 
     #[test]

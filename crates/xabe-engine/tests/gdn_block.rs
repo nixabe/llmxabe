@@ -1058,6 +1058,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
             .alloc_zeros::<f32>(tokens * geo.hidden)
             .expect("residual");
         block
+            .layer_ops()
             .add(
                 &stream,
                 &d_gold_mix,
@@ -1364,18 +1365,18 @@ fn the_chunked_prefill_kernel_overflows_on_this_models_decay_rates() {
         failures.is_empty(),
         "the chunked prefill kernel does not reproduce the recurrent form on this \
          model's real decay rates.\n\n{}\n\n\
-         Cause: `gdn_chunk_solve_and_apply` in \
-         crates/xabe-cuda/src/kernels/gdn_chunked.rs computes \
-         `beta_t * (v_t / lambda[t] - sik[...])`, where `lambda` is the cumulative \
-         in-chunk decay `exp(sum log_decay)`. Qwen3.6's per-token log-decays reach \
-         -91.58 (block 0), so `lambda` underflows to a subnormal within two tokens \
-         and the quotient exceeds f32::MAX. The synthetic activations \
-         gdn_chunked_differential.rs uses never reach those decay rates, which is \
-         why that kernel's own differential test passes.\n\
-         llama.cpp avoids this in both of its forms: the fused CUDA op is recurrent \
+         Where to look: the chunked form is only usable here because it solves \
+         for u'_t = lambda_t u_t rather than u_t, so no cumulative decay is ever \
+         divided by. Qwen3.6's per-token log-decays reach -91.58 (block 0), so \
+         lambda underflows to a subnormal within two tokens and any quotient by \
+         it exceeds f32::MAX. `gdn_chunked.rs` carries the derivation and a \
+         source-level test forbidding the division; a non-finite result here \
+         means the substitution was undone or a new one was introduced.\n\
+         The synthetic activations gdn_chunked_differential.rs uses never reach \
+         those decay rates, so its own differential test would not catch it.\n\
+         llama.cpp is immune in both of its forms: the fused CUDA op is recurrent \
          and never accumulates a decay, and build_delta_net_chunking only multiplies \
-         by exp(g_cum) and exp(g_cum_last - g_cum), both bounded above by 1.\n\
-         Outside this workstream's two files; reported rather than fixed here.",
+         by exp(g_cum) and exp(g_cum_last - g_cum), both bounded above by 1.",
         failures.join("\n"),
     );
 }

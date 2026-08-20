@@ -1,11 +1,14 @@
 //! The Gated DeltaNet block: 30 of Qwen3.6's 40 layers.
 //!
-//! This assembles the mixer that [`xabe_cuda::kernels::gdn`] (decode) and
-//! [`xabe_cuda::kernels::gdn_chunked`] (prefill) sit at the centre of, plus
-//! everything around them that turns a residual-stream hidden state into the
-//! next one: the input norm, the fused q/k/v projection, the short causal
-//! convolution, the gating projections, the output norm-and-gate, the output
-//! projection, and the residual add.
+//! This assembles the mixer plus everything around it that turns a
+//! residual-stream hidden state into the next one: the input norm, the fused
+//! q/k/v projection, the short causal convolution, the gating projections, the
+//! output norm-and-gate, the output projection, and the residual add.
+//!
+//! The mixer itself is one of two kernels, chosen by token count:
+//! [`xabe_cuda::kernels::gdn`]'s recurrent step at `tokens == 1`, and
+//! [`xabe_cuda::kernels::gdn_chunked`]'s sequential `scan` above it. They
+//! compute the same recurrence and are gated against each other.
 //!
 //! The authority for every step is `src/models/qwen35moe.cpp`
 //! (`llama_model_qwen35moe::graph::build_layer_attn_linear`) and
@@ -40,37 +43,14 @@
 //! stretches. So value head `h` reads query/key head `h % 16`, and value heads
 //! 0 and 16 share a query/key head — *not* 0 and 1.
 //!
-//! [`xabe_cuda::kernels::gdn`] and [`xabe_cuda::kernels::gdn_chunked`] **used
-//! to** hard-code the other convention, `qk_head = h / heads_per_kv`, and this
-//! block worked around it: [`GdnBlock::split_qkv`] materialised the broadcast
-//! itself and both kernels were constructed with `qk_heads == value_heads` so
-//! their internal mapping became the identity. That cost the chunked form its
-//! two Gram matrices 32 times per chunk instead of 16.
-//!
-//! Both kernels now compute `qk_head = h % qk_heads` themselves (`d4d2f4d`),
-//! so the workaround is gone: they are constructed with the real 16 and
-//! [`GdnBlock::split_qkv`] emits a plain `[tokens][qk_heads][head_dim]` slice.
-//! `gdn_block.rs`'s `the_query_key_head_broadcast_is_modulo_not_division`
-//! still discriminates the two mappings against the captured `final_output-N`,
-//! on captured tensors only, so the convention stays pinned by a measurement
-//! rather than by this paragraph.
-//!
-//! **What removing it bought, measured** — `gdn_chunked::prefill` alone, one
-//! Quadro RTX 8000, 32 value heads, `chunk_len = 64`, the two constructions
-//! driven back to back in the same process:
-//!
-//! | tokens | chunks | `qk_heads = 32` | `qk_heads = 16` |
-//! | --- | --- | --- | --- |
-//! | 19 | 1 | 0.280 ms | 0.267 ms |
-//! | 512 | 8 | 8.798 ms | 7.581 ms |
-//! | 2048 | 32 | 35.203 ms | 30.343 ms |
-//!
-//! Half the Gram work is **14%** of the prefill's wall clock, not half of it:
-//! the two `chunk_len x chunk_len` Gram matrices are a minority of the kernel
-//! sequence and the triangular solve dominates. The q/k buffers do halve
-//! outright — 67 MiB to 33.5 MiB of scratch at 2048 tokens, plus the two Gram
-//! buffers from 1 MiB to 512 KiB — which is the larger of the two wins and the
-//! one that does not depend on how the solve is shaped.
+//! Both mixer kernels compute that mapping themselves, so this block hands
+//! them the real 16 heads and [`GdnBlock::split_qkv`] emits a plain
+//! `[tokens][qk_heads][head_dim]` slice rather than materialising the
+//! broadcast. Halving the q/k buffers is the durable win — 67 MiB to 33.5 MiB
+//! of scratch at 2048 tokens. `gdn_block.rs`'s
+//! `the_query_key_head_broadcast_is_modulo_not_division` discriminates the two
+//! mappings against the captured `final_output-N` on captured tensors only, so
+//! the convention stays pinned by a measurement rather than by this paragraph.
 //!
 //! **`ssm_a` is stored already negated.** `gate-N = softplus(alpha + dt_bias) *
 //! ssm_a` *is* the per-head log-decay; there is no second negation. Every entry
@@ -80,39 +60,19 @@
 //! the whole fused stream, so q, k and v are all convolved *and* activated
 //! before anything is sliced apart.
 //!
-//! # A landed kernel that this block once could not use for prefill
+//! # Precision of the projections
 //!
-//! [`Self::forward`](GdnBlock::forward) dispatches a multi-token batch to
-//! [`xabe_cuda::kernels::gdn_chunked`]. That kernel **used to** fail on this
-//! model's numbers: `gdn_chunk_solve_and_apply` formed `v_t / lambda_t` with
-//! `lambda_t = exp(sum_{i<=t} log_decay_i)`, and Qwen3.6's per-token
-//! log-decays reach **-91.58** (block 0, head 9), so `lambda` was 2.5e-42 by
-//! the second token, the quotient overflowed fp32, and the chunk filled with
-//! `inf` and then `NaN`. Block 20 did the same by token 9; block 4, whose
-//! worst per-token log-decay is only -5.99, came through cleanly throughout.
+//! At `tokens >= MMA_SPLIT_TOKENS` the three Q8_0 projections take the integer
+//! tensor-core path: the activation is quantized to int8 and the weights are
+//! read from [`GdnLayerInt8`]'s repacked copy. Below that the block
+//! dequantizes and accumulates in fp32.
 //!
-//! It was fixed in `d4d2f4d` by substituting `u'_t = lambda_t u_t`, which
-//! leaves every surviving factor as `exp` of a *non-positive* sum of real
-//! per-token log-decays and therefore in `(0, 1]`. llama.cpp was immune in
-//! both of its forms for the same reason: its fused CUDA op is recurrent and
-//! never accumulates a decay, and `build_delta_net_chunking` only ever
-//! *multiplies* by `exp(g_cum)` and `exp(g_cum_last - g_cum)`.
-//! `gdn_block.rs`'s
-//! `the_chunked_prefill_kernel_overflows_on_this_models_decay_rates` still
-//! reports where the cumulative decay would have overflowed, and now gates the
-//! chunked form against the recurrent one instead of failing.
-//!
-//! # What is deliberately not done here
-//!
-//! The projections are computed in fp32 against dequantized Q8_0 weights.
-//! llama.cpp's CUDA backend instead quantizes the *activation* to Q8_1 and uses
-//! integer dot products (`mul_mat_q` / `mul_mat_vec_q`), which is a different
-//! and slightly lossier computation. That is the dominant term in this block's
-//! disagreement with the capture, it is llama.cpp being less accurate rather
-//! than this block being wrong, and `gdn_block.rs` measures both against an f64
-//! host reference rather than asserting the claim in prose. Matching llama.cpp
-//! bit-for-bit would mean reimplementing its activation quantization, which is
-//! an engine-wide decision and not this file's to make.
+//! Neither is bit-identical to llama.cpp, which quantizes the activation to
+//! Q8_1 and uses `mul_mat_q` / `mul_mat_vec_q`. That difference is the
+//! dominant term in this block's disagreement with the capture, and
+//! `gdn_block.rs`'s `the_projection_gap_is_llama_cpps_activation_quantization`
+//! measures it against an f64 host reference rather than asserting it —
+//! showing the gap to be llama.cpp's loss, not this block's.
 //!
 //! # Allocation
 //!
@@ -185,7 +145,7 @@ const GATE_TT: u32 = 8;
 /// declared tile, which sends 3 tokens to tile 4 instead — one guarded slice
 /// at 75% live, one weight read, not two. 2 tokens still gets tile 2 as the
 /// exact fit it always was; only the in-between counts changed. See
-/// `docs/BENCHMARKS.md`'s batched-decode section for the regression and the
+/// `docs/BENCHMARKS.md` for the regression and the
 /// fix, and for the original 8/16 floor, which was measured at 19+ tokens
 /// under the old multi-slice rule that still governs tokens at or above the
 /// widest declared tile.
@@ -221,7 +181,7 @@ const PROJ_TILES: [u32; 4] = [2, 4, 8, 16];
 /// geometry (`n_rows.div_ceil(PROJ_WARPS)`), the one already known to stream
 /// well, at the cost of activation traffic that is ~32 KB total at these
 /// widths and was never the bottleneck to begin with. See
-/// `docs/BENCHMARKS.md`'s batched-decode section for the nsys measurement
+/// `docs/BENCHMARKS.md` for the nsys measurement
 /// that found the collapsed grid axis rather than assuming it.
 const PROJ_ROWS: [u32; 4] = [1, 1, 4, 4];
 
@@ -548,7 +508,7 @@ __global__ void NAME(                                                         \
          * contribution to `acc` exactly zero; out-of-range row slots       \
          * re-address a real, already-in-bounds row (`n0`) rather than walk \
          * off the end of `weight`, and are simply never read back below.   \
-         * See docs/BENCHMARKS.md's batched-decode section for the measured \
+         * See docs/BENCHMARKS.md for the measured \
          * cost of the runtime-bound form this replaced. */                 \
         for (int b = 0; b < blocks; ++b) {                                    \
             int kidx = b * 32 + lane;                                         \
@@ -587,17 +547,15 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
 // `gdn_proj_split_gemv`'s per-lane grouping, generalized to TT tokens.
 //
-// The batch-vs-single-stream bit-identity workstream's finding: at
-// `1 < tokens < MMA_SPLIT_TOKENS`, `run_batch_decode` fed the qkv/gate/out
+// At `1 < tokens < MMA_SPLIT_TOKENS`, `run_batch_decode` fed the qkv/gate/out
 // projections through `gdn_proj_q8_0_t*` above -- the *standard* layout,
 // same per-lane grouping as the untiled `gdn_proj_q8_0` -- while true
 // single-stream decode (`tokens == 1`, the repack resident) took
 // `gdn_proj_split_gemv`'s *split* layout with a different per-lane
 // grouping (four consecutive quants per lane, eight lanes covering each
 // Q8_0 block's 32 elements, instead of one lane owning element `lane` of
-// *every* block). `docs/BENCHMARKS.md`'s Phase B, step 2 measured the gap
-// directly: 7.153e-7 max-abs on a real qkv row, real weights, identical
-// input, nothing else different.
+// *every* block). The gap was measured directly: 7.153e-7 max-abs on a
+// real qkv row, real weights, identical input, nothing else different.
 //
 // Matching the GEMV's grouping from the *standard* layout was checked and
 // rejected before writing this: a lane's four consecutive quants land
@@ -958,19 +916,6 @@ __global__ void gdn_gates(
         a_softplus[i] = sp;
         log_decay[i] = sp * ssm_a[h];
         beta[i] = 1.0f / (1.0f + expf(-beta_raw[i]));
-    }
-}
-
-// out = a + b, elementwise. The residual add.
-__global__ void gdn_add(
-    const float* __restrict__ a,
-    const float* __restrict__ b,
-    float* __restrict__ out,
-    long long n
-) {
-    long long stride = (long long)blockDim.x * gridDim.x;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
-        out[i] = a[i] + b[i];
     }
 }
 
@@ -1464,7 +1409,6 @@ pub struct GdnBlock {
     split: CudaFunction,
     silu_split: CudaFunction,
     gates: CudaFunction,
-    add: CudaFunction,
     scratch: Option<Scratch>,
     mixer: Mixer,
     geometry: GdnGeometry,
@@ -1531,7 +1475,6 @@ impl GdnBlock {
             split: module.load_function("gdn_split_qkv")?,
             silu_split: module.load_function("gdn_silu_split_qkv")?,
             gates: module.load_function("gdn_gates")?,
-            add: module.load_function("gdn_add")?,
             scratch: None,
             mixer: Mixer::Chunked,
             geometry,
@@ -1712,8 +1655,8 @@ impl GdnBlock {
     /// Those run once over the whole `[states.len()][hidden]` batch, taking
     /// the same tiled kernel a `states.len()`-token prefill chunk would (see
     /// `GDN_PROJ_TILED` in the module source) — the weight is read once
-    /// instead of once per sequence, which is `docs/OPTIMIZATION.md` R2's
-    /// entire claimed win.
+    /// instead of once per sequence, which is the entire win batched decode
+    /// was built for.
     ///
     /// The causal convolution and the delta-rule update are the two steps
     /// that read and write a *sequence's own* state, so they cannot be
@@ -2091,7 +2034,8 @@ impl GdnBlock {
                 tokens,
             )?;
         }
-        self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+        self.layer_ops
+            .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         Ok(())
     }
 
@@ -2120,14 +2064,14 @@ impl GdnBlock {
         // against `gdn_proj_split_gemv`/`_add`'s 24,967 ns/call blended
         // average in `run` -- 94.7% of the entire measured N=1 batch-vs-
         // single-stream gap, 1.23 ms of 1.30 ms/step. See
-        // `docs/BENCHMARKS.md`'s batched-decode section for the nsys-diff
+        // `docs/BENCHMARKS.md` for the nsys-diff
         // that found it kernel by kernel rather than assuming it.
         //
         // Below the tensor-core tile, `1 < tokens < MMA_SPLIT_TOKENS` used
         // to take `gdn_proj_q8_0_t*` — the *standard* Q8_0 layout, a
         // different per-lane grouping than the GEMV. That is the pairing
-        // `docs/BENCHMARKS.md`'s Phase A audit measured as GDN's first
-        // FMA at layer 0. `split_tiled` is the GEMV's own grouping,
+        // the divergence audit measured as GDN's first disagreeing FMA at
+        // layer 0. `split_tiled` is the GEMV's own grouping,
         // amortized across those tokens, so batch(N) and single-stream
         // now share a reduction order.
         let gemv = tc.filter(|_| tokens == 1);
@@ -2365,7 +2309,8 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
-            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+            self.layer_ops
+                .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else if let Some(i8w) = gemv {
             // The residual add rides out of the projection's own warp, as in
             // `run` -- at one token/one sequence, `hidden` and `out` are
@@ -2396,7 +2341,8 @@ impl GdnBlock {
                 g.hidden,
                 tokens,
             )?;
-            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+            self.layer_ops
+                .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else {
             self.project(
                 stream,
@@ -2407,7 +2353,8 @@ impl GdnBlock {
                 g.hidden,
                 tokens,
             )?;
-            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+            self.layer_ops
+                .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         }
         Ok(())
     }
@@ -2606,7 +2553,8 @@ impl GdnBlock {
                     tokens,
                 )
                 .map_err(GdnBlockError::Mma)?;
-            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+            self.layer_ops
+                .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else if let Some(i8w) = gemv {
             // The residual add rides out of the projection's own warp: at one
             // token it was a 1.8 us launch over 2,048 floats.
@@ -2631,7 +2579,8 @@ impl GdnBlock {
                 g.hidden,
                 tokens,
             )?;
-            self.add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
+            self.layer_ops
+                .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         }
         Ok(())
     }
@@ -3207,29 +3156,6 @@ impl GdnBlock {
         Ok(())
     }
 
-    /// `out = a + b` over `n` elements.
-    pub fn add(
-        &self,
-        stream: &Arc<CudaStream>,
-        a: &CudaSlice<f32>,
-        b: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
-        n: usize,
-    ) -> Result<(), GdnBlockError> {
-        check_len("add a", n, a.len())?;
-        check_len("add b", n, b.len())?;
-        check_len("add out", n, out.len())?;
-        if n == 0 {
-            return Ok(());
-        }
-        let n_i64 = n as i64;
-        let mut builder = stream.launch_builder(&self.add);
-        builder.arg(a).arg(b).arg(&mut *out).arg(&n_i64);
-        // SAFETY: the grid-stride loop is bounded by `n`, checked for all three.
-        unsafe { builder.launch(elementwise_cfg(n)) }?;
-        Ok(())
-    }
-
     /// Advance the recurrent state over `tokens` tokens and write their output.
     ///
     /// `q` and `k` are `[tokens][qk_heads][head_dim]`, `v` is
@@ -3474,7 +3400,7 @@ mod tests {
         // A second negation makes the state grow instead of decay, which stays
         // finite over 19 tokens and diverges over a real context.
         assert!(GDN_BLOCK_SRC.contains("log_decay[i] = sp * ssm_a[h];"));
-        let body = &GDN_BLOCK_SRC[at("__global__ void gdn_gates(")..at("__global__ void gdn_add(")];
+        let body = &GDN_BLOCK_SRC[at("__global__ void gdn_gates(")..];
         assert!(!body.contains("-ssm_a"), "ssm_a was negated a second time");
         assert!(!body.contains("-sp *"), "the softplus was negated");
     }

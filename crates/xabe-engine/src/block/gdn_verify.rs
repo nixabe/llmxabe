@@ -1,6 +1,6 @@
 //! The GDN recurrent-state rollback that makes speculative verify correct.
 //!
-//! `docs/OPTIMIZATION.md` §R6, and see `AGENTS.md`: a verify step folds
+//! A verify step folds
 //! `1 + d` drafted positions through all thirty Gated DeltaNet layers in one
 //! pass, but only `k <= 1 + d` of them may turn out to be accepted. The
 //! recurrent state ([`crate::block::gdn::GdnState`]) has no notion of
@@ -47,7 +47,7 @@
 //! chain of one-token [`GdnBlock::forward`] calls would. Those one-token
 //! calls take `gdn_proj_split_gemv` (the GEMV's 4-per-lane grouping). The
 //! standard-layout `gdn_proj_q8_0_t*` pairing disagrees with that GEMV at
-//! the first FMA (`docs/BENCHMARKS.md`, Phase A / Phase B); `split_tiled`
+//! the first FMA; `split_tiled`
 //! is the GEMV's own grouping amortized across the window. Without that,
 //! `tests/speculative_identity.rs` would reject a draft the target's own
 //! one-token argmax would have emitted. The MMA path is never taken: a
@@ -516,7 +516,8 @@ pub fn run_layer_with_snapshots(
             tokens,
         )?;
     }
-    gdn.add(stream, &scratch.projected, hidden, out, tokens * g.hidden)?;
+    gdn.layer_ops()
+        .add(stream, &scratch.projected, hidden, out, tokens * g.hidden)?;
 
     Ok(())
 }
