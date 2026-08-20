@@ -101,7 +101,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 
 use super::compile;
@@ -286,8 +287,20 @@ __global__ void gdn_chunk_normalize_qk(
 // spills it to local memory and the whole design with it.
 #define SCAN_MAXR 4
 
+// grid.z is the sequence: batched prefill runs equal-length chunks whose
+// activations are sequence-major slices of one flattened buffer, so a z
+// slice is a fixed stride, and only the recurrent state -- one allocation
+// per sequence -- needs the eight scalar pointer slots, selected by a
+// warp-uniform switch exactly as `gdn_recurrent_step` selects its own. Each
+// sequence's scan touches only its own z slice and its own state, which is
+// what kept three sequences' scans bit-identical to three serial launches
+// when this axis was added -- and what un-serialized the 44%-occupancy scan,
+// which used to run once per sequence on one stream.
 __global__ void gdn_scan_prefill(
-    float* __restrict__ state,
+    unsigned long long s0, unsigned long long s1,
+    unsigned long long s2, unsigned long long s3,
+    unsigned long long s4, unsigned long long s5,
+    unsigned long long s6, unsigned long long s7,
     const float* __restrict__ q_norm,
     const float* __restrict__ k_norm,
     const float* __restrict__ v,
@@ -302,6 +315,24 @@ __global__ void gdn_scan_prefill(
     int h  = blockIdx.x;
     int vi0 = (blockIdx.y * SCAN_WARPS + threadIdx.y) * SCAN_COLS;
     if (vi0 >= head_dim) return;
+    int z = blockIdx.z;
+    float* state;
+    switch (z) {
+        case 0: state = (float*)s0; break;
+        case 1: state = (float*)s1; break;
+        case 2: state = (float*)s2; break;
+        case 3: state = (float*)s3; break;
+        case 4: state = (float*)s4; break;
+        case 5: state = (float*)s5; break;
+        case 6: state = (float*)s6; break;
+        default: state = (float*)s7; break;
+    }
+    q_norm    += (long long)z * seq_len * qk_heads * head_dim;
+    k_norm    += (long long)z * seq_len * qk_heads * head_dim;
+    v         += (long long)z * seq_len * value_heads * head_dim;
+    log_decay += (long long)z * seq_len * value_heads;
+    beta      += (long long)z * seq_len * value_heads;
+    out       += (long long)z * seq_len * value_heads * head_dim;
     int lane = threadIdx.x;
     int nr = head_dim >> 5;
 
@@ -1175,16 +1206,10 @@ impl GdnChunkedKernels {
         Ok(())
     }
 
-    /// The whole sequence as a sequential scan, with the state in registers.
+    /// Run the sequential scan over one sequence, advancing `state`.
     ///
-    /// This is what a forward pass runs. [`Self::prefill`] is the chunked
-    /// reference implementation and keeps its own differential tests, but at
-    /// this head dimension the chunked form does about 26% more arithmetic
-    /// than the scan and only pays when its matmul shape buys tensor cores,
-    /// which fp32 on `sm_75` does not have. See `gdn_scan_prefill`.
-    ///
-    /// The normalization pass is shared with the chunked path and runs first,
-    /// unchanged: the scan consumes `q_norm` and `k_norm`, not `q` and `k`.
+    /// [`Self::scan_batch_raw`] at a batch of one — same kernel, so a
+    /// sequence scans identically alone and in a batch.
     #[allow(clippy::too_many_arguments)]
     pub fn scan(
         &self,
@@ -1199,9 +1224,65 @@ impl GdnChunkedKernels {
         out: &mut CudaSlice<f32>,
         seq_len: usize,
     ) -> Result<(), GdnChunkedError> {
-        if seq_len > scratch.max_seq_len {
-            return Err(GdnChunkedError::SequenceTooLong {
+        let (ptr, _sync) = state.device_ptr(stream);
+        // SAFETY: `ptr` is `state`'s own base address, held mutably for the
+        // duration of this call; the batch of one touches nothing else.
+        unsafe {
+            self.scan_batch_raw(
+                stream,
+                scratch,
+                &[ptr],
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                out,
                 seq_len,
+            )
+        }
+    }
+
+    /// Run `states.len()` sequences' scans in one launch, one grid.z slice
+    /// each, advancing every state.
+    ///
+    /// The scan is a whole-chunk sequential walk at 1,024 resident warps —
+    /// 44% of the card — and batched prefill used to run it once per
+    /// sequence on one stream, serializing three walks that share no data.
+    /// One launch runs them concurrently. `q`/`k`/`v`, the gates and `out`
+    /// are the flattened sequence-major batch buffers
+    /// (`[n][seq_len][...]`); the per-sequence states ride in as
+    /// `STEP_MAX_BATCH`-style scalar pointer slots.
+    ///
+    /// # Safety
+    ///
+    /// Each entry of `states` must be the base address of a live
+    /// `[value_heads][head_dim][head_dim]` f32 state allocation, exclusively
+    /// held by the caller for this call, all distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn scan_batch_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        scratch: &mut GdnChunkedScratch,
+        states: &[u64],
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        log_decay: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        seq_len: usize,
+    ) -> Result<(), GdnChunkedError> {
+        const MAX_BATCH: usize = 8;
+        let n = states.len();
+        assert!(
+            (1..=MAX_BATCH).contains(&n),
+            "scan batch of {n} outside 1..={MAX_BATCH}"
+        );
+        let total = n * seq_len;
+        if total > scratch.max_seq_len {
+            return Err(GdnChunkedError::SequenceTooLong {
+                seq_len: total,
                 capacity: scratch.max_seq_len,
             });
         }
@@ -1218,21 +1299,27 @@ impl GdnChunkedKernels {
         let value_heads = self.value_heads as i32;
         let qk_heads = self.qk_heads as i32;
 
-        self.normalize_sequence(stream, scratch, q, k, seq_len)?;
+        // The flattened buffers are contiguous over `n * seq_len` tokens, so
+        // one normalization pass covers every sequence.
+        self.normalize_sequence(stream, scratch, q, k, total)?;
 
+        let mut slots = [states[0]; MAX_BATCH];
+        slots[..n].copy_from_slice(states);
         let cfg = LaunchConfig {
             grid_dim: (
                 self.value_heads as u32,
                 (self.head_dim as u32).div_ceil(SCAN_WARPS * SCAN_COLS),
-                1,
+                n as u32,
             ),
             block_dim: (32, SCAN_WARPS, 1),
             shared_mem_bytes: 0,
         };
         let seq_i32 = seq_len as i32;
         let mut builder = stream.launch_builder(&self.scan);
+        for slot in &slots {
+            builder.arg(slot);
+        }
         builder
-            .arg(&mut *state)
             .arg(&scratch.q_norm)
             .arg(&scratch.k_norm)
             .arg(v)
@@ -1243,13 +1330,14 @@ impl GdnChunkedKernels {
             .arg(&value_heads)
             .arg(&qk_heads)
             .arg(&seq_i32);
-        // SAFETY: one warp per (value head, value index), both covered by the
-        // grid and the `vi >= head_dim` guard. The state index
-        // `(h * head_dim + vi) * head_dim + r * 32 + lane` stays inside
-        // `value_heads * head_dim * head_dim`; the token indices stay below
-        // `seq_len`, which was checked against the scratch capacity and which
-        // bounds every `q_norm`, `k_norm`, `v`, `log_decay`, `beta` and `out`
-        // access. No shared memory is requested and none is indexed.
+        // SAFETY: one warp per (value head, value index) per sequence, all
+        // covered by the grid and the `vi >= head_dim` guard; `grid.z = n`
+        // bounds the pointer slots to the caller-asserted live states, each
+        // indexed inside `value_heads * head_dim * head_dim`. Every token
+        // index stays below `seq_len` within a z slice whose stride the
+        // kernel derives from the same `seq_len`, and `n * seq_len` was
+        // checked against the scratch capacity, which bounds every flattened
+        // buffer access. No shared memory is requested and none is indexed.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }

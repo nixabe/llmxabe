@@ -464,6 +464,65 @@ __global__ void conv1d_step(
     }
 }
 
+// `conv1d_step` over `n` sequences at once, one grid.y slice each.
+//
+// Batched decode ran this once per sequence -- 2n launches of launch floor
+// per GDN layer for a kernel that is over in ~3 us. The activations are the
+// batch scratch (`[n][channels]`, sequence-major); only the conv cache is
+// per-sequence, and it rides in as eight scalar pointer slots selected by a
+// warp-uniform switch, exactly as `gdn_recurrent_step` takes its states.
+// Each sequence's arithmetic reads and writes only its own z slice, so batch
+// and single-stream stay bit-identical through this kernel by construction.
+//
+// grid: (ceil(channels / 256), n). block: 256.
+__global__ void conv1d_step_batch(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    unsigned long long s0, unsigned long long s1,
+    unsigned long long s2, unsigned long long s3,
+    unsigned long long s4, unsigned long long s5,
+    unsigned long long s6, unsigned long long s7,
+    float* __restrict__ out,
+    int channels,
+    int conv_kernel
+) {
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels) return;
+    int z = blockIdx.y;
+    float* state;
+    switch (z) {
+        case 0: state = (float*)s0; break;
+        case 1: state = (float*)s1; break;
+        case 2: state = (float*)s2; break;
+        case 3: state = (float*)s3; break;
+        case 4: state = (float*)s4; break;
+        case 5: state = (float*)s5; break;
+        case 6: state = (float*)s6; break;
+        default: state = (float*)s7; break;
+    }
+    int carry = conv_kernel - 1;
+
+    float staged[MAX_CONV_KERNEL];
+    for (int j = 0; j < carry; ++j) {
+        staged[j] = state[(long long)ch * carry + j];
+    }
+    float xv0 = x[(long long)z * channels + ch];
+
+    float acc = 0.0f;
+    for (int i = 0; i < conv_kernel; ++i) {
+        float xv = (i < carry) ? staged[i] : xv0;
+        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
+    }
+    out[(long long)z * channels + ch] = acc;
+
+    for (int j = 0; j + 1 < carry; ++j) {
+        state[(long long)ch * carry + j] = staged[j + 1];
+    }
+    if (carry > 0) {
+        state[(long long)ch * carry + carry - 1] = xv0;
+    }
+}
+
 // Advance the convolution cache to the last conv_kernel-1 inputs.
 //
 // grid-stride over channels, one thread per channel. Every window value is
@@ -606,6 +665,7 @@ pub struct LayerOpsKernels {
     conv1d: CudaFunction,
     conv1d_state: CudaFunction,
     conv1d_step: CudaFunction,
+    conv1d_step_batch: CudaFunction,
 }
 
 impl LayerOpsKernels {
@@ -624,6 +684,7 @@ impl LayerOpsKernels {
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,
             conv1d_step: module.load_function("conv1d_step")?,
+            conv1d_step_batch: module.load_function("conv1d_step_batch")?,
         })
     }
 
@@ -951,6 +1012,72 @@ impl LayerOpsKernels {
         // SAFETY: the grid-stride loop is bounded by `n`, which is the length
         // checked above for both buffers.
         unsafe { builder.launch(elementwise_cfg(n)) }?;
+        Ok(())
+    }
+
+    /// One decode-step causal convolution over `n` sequences in one launch.
+    ///
+    /// `x` and `out` are `[n][channels]` batch scratch; `states` are the
+    /// per-sequence conv cache base addresses (`[channels][conv_kernel-1]`
+    /// f32 each), updated in place exactly as [`Self::conv1d`] at one token
+    /// updates its single cache.
+    ///
+    /// # Safety
+    ///
+    /// Each entry of `states` must be the base address of a live
+    /// `[channels][conv_kernel - 1]` f32 allocation, exclusively held by the
+    /// caller for this call, all distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn conv1d_step_batch_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        states: &[u64],
+        out: &mut CudaSlice<f32>,
+        channels: usize,
+        conv_kernel: usize,
+    ) -> Result<(), LayerOpsError> {
+        const MAX_BATCH: usize = 8;
+        let n = states.len();
+        assert!(
+            (1..=MAX_BATCH).contains(&n),
+            "conv step batch of {n} outside 1..={MAX_BATCH}"
+        );
+        if conv_kernel == 0 || conv_kernel > MAX_CONV_KERNEL {
+            return Err(LayerOpsError::UnsupportedConvKernel { conv_kernel });
+        }
+        if channels == 0 {
+            return Err(LayerOpsError::UnsupportedWidth { width: channels });
+        }
+        check_len("conv1d batch x", n * channels, x.len())?;
+        check_len("conv1d batch weight", channels * conv_kernel, weight.len())?;
+        check_len("conv1d batch out", n * channels, out.len())?;
+
+        const BLOCK: usize = 256;
+        let channels_i32 = channels as i32;
+        let conv_kernel_i32 = conv_kernel as i32;
+        let mut slots = [states[0]; MAX_BATCH];
+        slots[..n].copy_from_slice(states);
+        let cfg = LaunchConfig {
+            grid_dim: (channels.div_ceil(BLOCK) as u32, n as u32, 1),
+            block_dim: (BLOCK as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.conv1d_step_batch);
+        builder.arg(x).arg(weight);
+        for slot in &slots {
+            builder.arg(slot);
+        }
+        builder
+            .arg(&mut *out)
+            .arg(&channels_i32)
+            .arg(&conv_kernel_i32);
+        // SAFETY: threads past `channels` return before touching memory;
+        // `grid.y = n` bounds the pointer slots to the caller-asserted live
+        // ones, each indexed within `[ch * carry, ch * carry + carry)`; `x`
+        // and `out` were length-checked to `n * channels` above.
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 

@@ -19,9 +19,8 @@
 //! - **`batch N`**: `N` sequences, decoded together through
 //!   [`Forward::capture_batch_step`]/[`Forward::replay_batch_step`] — the same
 //!   graph-capture trade, one level up. An uncaptured batched step issues `N`
-//!   small per-sequence launches for the Gated Attention loop and for the two
-//!   steps `GdnBlock::forward_batch_decode` cannot batch, on top of every
-//!   already-batched call; `tests/batch_decode.rs`'s
+//!   small per-sequence launches for the Gated Attention loop, on top of
+//!   every already-batched call; `tests/batch_decode.rs`'s
 //!   `a_captured_batch_step_generates_the_same_sequence_as_the_launch_path`
 //!   is what gates the capture against the uncaptured path it replaces here.
 //!

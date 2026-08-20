@@ -86,7 +86,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 
 use xabe_cuda::kernels::compile;
@@ -217,6 +218,29 @@ fn proj_tile_for(tokens: usize) -> (usize, u32) {
     (widest, PROJ_TILES[widest])
 }
 
+/// Token tile widths of the split-layout projection family, ascending, and
+/// the row tile each carries. Spelled here and in the
+/// `GDN_PROJ_SPLIT_ENTRY` instantiations, which NVRTC compiles from a string
+/// with no access to Rust constants;
+/// `the_split_projection_tiles_match_the_kernel` asserts the two agree.
+///
+/// The row tile shrinks as the token tile grows because the accumulator
+/// array is `rows * tile` floats per thread and past 16 the register
+/// pressure costs more than the activation-traffic saving buys — the same
+/// trade `PROJ_ROWS` records for the standard layout.
+const SPLIT_TILES: [(u32, u32); 6] = [(1, 4), (2, 4), (3, 4), (4, 4), (8, 2), (16, 1)];
+
+/// Which split-layout specialization to launch for `tokens`: its slot, token
+/// tile and row tile. `proj_tile_for`'s selection rule, over `SPLIT_TILES`.
+fn split_tile_for(tokens: usize) -> (usize, u32, u32) {
+    let i = SPLIT_TILES
+        .iter()
+        .position(|&(t, _)| tokens <= t as usize)
+        .unwrap_or(SPLIT_TILES.len() - 1);
+    let (tt, rt) = SPLIT_TILES[i];
+    (i, tt, rt)
+}
+
 /// Threads per block for the elementwise kernels.
 const ELEMENTWISE_BLOCK: u32 = 256;
 
@@ -285,124 +309,6 @@ __global__ void gdn_proj_q8_0(
     acc = warp_reduce_sum(acc);
     if (lane == 0) {
         out[(long long)t * n_rows + n] = acc;
-    }
-}
-
-// The same projection at one token, over the *repacked* split layout.
-//
-// Q8_0 interleaves a 2-byte scale with every 32 quants, so a row's quants sit
-// at byte `b * 34 + 2` and a warp reading `blk[2 + lane]` covers 32 contiguous
-// bytes that are 32-byte aligned only when `b == 15 (mod 16)`. Fifteen blocks
-// in sixteen straddle a sector boundary, so the fetch is two sectors for
-// thirty-two useful bytes — **half of every read is discarded**, which is most
-// of why `gdn_proj_q8_0` moves its weights at 47% of this card's streaming
-// roofline rather than nearer its ceiling.
-//
-// `GdnLayerInt8` already separates the quants from the scales for the tensor
-// cores. Over that layout a row's quants are `k_dim` contiguous bytes from a
-// 32-byte-aligned base, so the same warp reads exactly one sector.
-//
-// The scale is the identical fp16 value widened the identical way, and each
-// product is still `q * d * x`. The *partition* differs — a lane owns four
-// consecutive elements rather than one element of each block — so the warp
-// reduction sums in a different order and this is equivalent rather than
-// bit-identical. It is a plain dot product feeding a projection, not a
-// selection, so reassociation here is the ordinary kind.
-//
-// grid: (ceil(N / warps),). block: (32, warps).
-__global__ void gdn_proj_split_gemv(
-    const signed char* __restrict__ wq,
-    const float* __restrict__ ws,
-    const float* __restrict__ x,
-    float* __restrict__ out,
-    int k_dim,
-    int n_rows
-) {
-    int lane = threadIdx.x;
-    int n    = blockIdx.x * blockDim.y + threadIdx.y;
-    if (n >= n_rows) return;
-
-    int blocks = k_dim / 32;
-    const signed char* row = wq + (long long)n * k_dim;
-    const float* sc = ws + (long long)n * (k_dim / 32);
-
-    // Four quants and four activations per lane per step, so one instruction
-    // moves 128 bytes of weight across the warp instead of 32. The split
-    // layout is what makes this legal: `k_dim` is a multiple of 128 and the
-    // row base a multiple of `k_dim`, so both the `char4` and the `float4` are
-    // aligned by construction.
-    //
-    // A lane's four elements always share a Q8_0 block — they start at a
-    // multiple of 4 and a block is 32 — so one scale covers all four.
-    float acc = 0.0f;
-    for (int c = 0; c < k_dim; c += 128) {
-        int e0 = c + 4 * lane;
-        char4 q = *(const char4*)(row + e0);
-        float4 xv = *(const float4*)(x + e0);
-        float d = sc[e0 >> 5];
-        acc += (float)q.x * d * xv.x;
-        acc += (float)q.y * d * xv.y;
-        acc += (float)q.z * d * xv.z;
-        acc += (float)q.w * d * xv.w;
-    }
-    acc = warp_reduce_sum(acc);
-    if (lane == 0) {
-        out[n] = acc;
-    }
-}
-
-// The same projection with the block's residual added on the way out.
-//
-// `linear_attn_out-N` and `attn_residual-N` are the same numbers one add
-// apart, and the add was its own launch over 2,048 floats -- 1.8 us against a
-// decode step where the smallest kernels *are* their launch floor. The warp
-// that produced `acc` is the one that would have read it back, so the add
-// costs one instruction and one store here.
-//
-// `out` is still written: it is a captured waypoint, and a block that got the
-// residual source wrong would otherwise have nothing to fail at before
-// `attn_residual-N`.
-__global__ void gdn_proj_split_gemv_add(
-    const signed char* __restrict__ wq,
-    const float* __restrict__ ws,
-    const float* __restrict__ x,
-    const float* __restrict__ residual,
-    float* __restrict__ out,
-    float* __restrict__ summed,
-    int k_dim,
-    int n_rows
-) {
-    int lane = threadIdx.x;
-    int n    = blockIdx.x * blockDim.y + threadIdx.y;
-    if (n >= n_rows) return;
-
-    int blocks = k_dim / 32;
-    const signed char* row = wq + (long long)n * k_dim;
-    const float* sc = ws + (long long)n * (k_dim / 32);
-
-    // Four quants and four activations per lane per step, so one instruction
-    // moves 128 bytes of weight across the warp instead of 32. The split
-    // layout is what makes this legal: `k_dim` is a multiple of 128 and the
-    // row base a multiple of `k_dim`, so both the `char4` and the `float4` are
-    // aligned by construction.
-    //
-    // A lane's four elements always share a Q8_0 block — they start at a
-    // multiple of 4 and a block is 32 — so one scale covers all four.
-    float acc = 0.0f;
-    for (int c = 0; c < k_dim; c += 128) {
-        int e0 = c + 4 * lane;
-        char4 q = *(const char4*)(row + e0);
-        float4 xv = *(const float4*)(x + e0);
-        float d = sc[e0 >> 5];
-        acc += (float)q.x * d * xv.x;
-        acc += (float)q.y * d * xv.y;
-        acc += (float)q.z * d * xv.z;
-        acc += (float)q.w * d * xv.w;
-    }
-    acc = warp_reduce_sum(acc);
-    if (lane == 0) {
-        out[n] = acc;
-        summed[n] = acc + residual[n];
     }
 }
 
@@ -544,102 +450,6 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t2,  2,  1)
 GDN_PROJ_TILED(gdn_proj_q8_0_t4,  4,  1)
 GDN_PROJ_TILED(gdn_proj_q8_0_t8,  8,  4)
 GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
-
-// `gdn_proj_split_gemv`'s per-lane grouping, generalized to TT tokens.
-//
-// At `1 < tokens < MMA_SPLIT_TOKENS`, `run_batch_decode` fed the qkv/gate/out
-// projections through `gdn_proj_q8_0_t*` above -- the *standard* layout,
-// same per-lane grouping as the untiled `gdn_proj_q8_0` -- while true
-// single-stream decode (`tokens == 1`, the repack resident) took
-// `gdn_proj_split_gemv`'s *split* layout with a different per-lane
-// grouping (four consecutive quants per lane, eight lanes covering each
-// Q8_0 block's 32 elements, instead of one lane owning element `lane` of
-// *every* block). The gap was measured directly: 7.153e-7 max-abs on a
-// real qkv row, real weights, identical input, nothing else different.
-//
-// Matching the GEMV's grouping from the *standard* layout was checked and
-// rejected before writing this: a lane's four consecutive quants land
-// inside one Q8_0 block only when the block's own byte offset is 4-byte
-// aligned, which happens for even blocks and not odd ones (34-byte
-// stride) -- the exact misalignment `dequant_tile_q8_0`'s dp4a bug hit,
-// documented above. Reproducing the GEMV's vectorized read over the
-// standard layout would need the same manual byte-packing that fix used,
-// which throws away the coalescing the split layout exists to buy in the
-// first place -- at that point it is not "the tiled kernel matching the
-// GEMV," it is the old 47%-of-roofline kernel wearing the GEMV's math.
-// The split layout is what makes the vectorized read *legal*, so this
-// kernel consumes it, reusing `GdnLayerInt8`'s existing repack -- no new
-// device memory, only a new entry point.
-//
-// Per-lane accumulation is `gdn_proj_split_gemv`'s, operand for operand,
-// in the same order, for each of TT token columns: the dequantized
-// `char4` and its scale are read once per 128-byte step and applied to
-// every live column's own accumulator with the same four sequential
-// `+=` steps the GEMV performs, before the next step's load. Column `i`'s
-// accumulator therefore sees exactly the GEMV's own sequence of additions
-// -- the other columns' arithmetic between one step and the next touches
-// different registers, which does not reorder what happens to this one.
-// `warp_reduce_sum` closes each column out with the exact same butterfly.
-// Out-of-range columns read zero, which contributes exactly zero to a
-// live column and is simply never written back for a padding one -- the
-// same convention `GDN_PROJ_TILED` uses.
-//
-// grid: (ceil(N / warps), ceil(tokens / TT)). block: (32, warps). One warp
-// owns one output row across all TT tokens -- no row tiling, matching the
-// GEMV's own one-row-per-warp granularity exactly, which is what keeps
-// this a pure generalization rather than a new design.
-#define GDN_PROJ_SPLIT_TILED(NAME, TT)                                       \
-__global__ void NAME(                                                        \
-    const signed char* __restrict__ wq,                                     \
-    const float* __restrict__ ws,                                           \
-    const float* __restrict__ x,                                            \
-    float* __restrict__ out,                                                \
-    int k_dim,                                                              \
-    int n_rows,                                                             \
-    int n_tokens                                                            \
-) {                                                                          \
-    int lane = threadIdx.x;                                                  \
-    int n    = blockIdx.x * blockDim.y + threadIdx.y;                        \
-    if (n >= n_rows) return;                                                 \
-    int t0 = blockIdx.y * (TT);                                              \
-    if (t0 >= n_tokens) return;                                              \
-    int live_t = n_tokens - t0; if (live_t > (TT)) live_t = (TT);            \
-                                                                               \
-    const signed char* row = wq + (long long)n * k_dim;                      \
-    const float* sc = ws + (long long)n * (k_dim / 32);                      \
-                                                                               \
-    float acc[TT];                                                           \
-    _Pragma("unroll")                                                        \
-    for (int i = 0; i < (TT); ++i) acc[i] = 0.0f;                            \
-                                                                               \
-    for (int c = 0; c < k_dim; c += 128) {                                   \
-        int e0 = c + 4 * lane;                                               \
-        char4 q = *(const char4*)(row + e0);                                 \
-        float d = sc[e0 >> 5];                                               \
-        _Pragma("unroll")                                                    \
-        for (int i = 0; i < (TT); ++i) {                                     \
-            int t = t0 + i;                                                  \
-            float4 xv = (t < n_tokens)                                       \
-                ? *(const float4*)(x + (long long)t * k_dim + e0)            \
-                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);                       \
-            acc[i] += (float)q.x * d * xv.x;                                 \
-            acc[i] += (float)q.y * d * xv.y;                                 \
-            acc[i] += (float)q.z * d * xv.z;                                 \
-            acc[i] += (float)q.w * d * xv.w;                                 \
-        }                                                                    \
-    }                                                                        \
-                                                                               \
-    for (int i = 0; i < live_t; ++i) {                                       \
-        float sum = warp_reduce_sum(acc[i]);                                 \
-        if (lane == 0) out[(long long)(t0 + i) * n_rows + n] = sum;          \
-    }                                                                        \
-}
-
-GDN_PROJ_SPLIT_TILED(gdn_proj_split_t2,  2)
-GDN_PROJ_SPLIT_TILED(gdn_proj_split_t3,  3)
-GDN_PROJ_SPLIT_TILED(gdn_proj_split_t4,  4)
-GDN_PROJ_SPLIT_TILED(gdn_proj_split_t8,  8)
-GDN_PROJ_SPLIT_TILED(gdn_proj_split_t16, 16)
 
 // out[t][n] = sum_k weight[n][k] * x[t][k], with `weight` an f32 GGUF tensor.
 //
@@ -920,6 +730,209 @@ __global__ void gdn_gates(
 }
 
 }
+
+// The split-layout projection family: out[t][n] = sum_k w[n][k] * x[t][k]
+// over `GdnLayerInt8`'s repacked layout (contiguous int8 quants, separate f32
+// scales), for every decode and sub-tensor-core batch width.
+//
+// One template, every width. `run_batch_decode` at N sequences and
+// single-stream decode at one are the same arithmetic per (row, token) by
+// construction: the accumulation chain for a given (row, token) below never
+// depends on TT or RT, which is what makes batch-vs-single bit-equality a
+// property of the source rather than of a differential that happens to pass.
+// `gdn_proj_differential.rs` still asserts it.
+//
+// What changed against the char4-per-lane predecessor, and why:
+//
+//   - **A lane owns 16 consecutive quants, loaded as one `uint4`.** The warp
+//     still covers 512 contiguous, 16-byte-aligned weight bytes per step —
+//     coalescing is unchanged — but in 1 load instruction per lane instead
+//     of 4. A lane's 16 elements start at a multiple of 16 and a Q8_0 block
+//     is 32 wide, so they never straddle a scale boundary: one scale load
+//     covers the whole `uint4`.
+//   - **RT adjacent rows per warp.** The activation `float4`s are loaded
+//     once per step and feed all RT rows' FMAs from the same registers —
+//     the LM head's row tile (`lm_head.rs`), which reaches 89% of the
+//     streaming roofline on this card, applied to the shape where this
+//     kernel was measured at 64%.
+//   - **The next step's weights are prefetched into registers.** The card
+//     has no `cp.async`; a register double buffer is what hand-rolled
+//     prefetch looks like here, and it is what keeps enough bytes in flight
+//     when the grid is only a wave or two deep: at 2,048 rows and RT = 4
+//     there are 512 warps, and without the prefetch each has a single
+//     16-byte load outstanding — an order of magnitude below what 672 GB/s
+//     at DRAM latency requires in flight.
+//
+// The per-(row, token) chain is: for each 512-element step, for each of its
+// four `uint4` words in order, `acc += w0*x0; acc += w1*x1; acc += w2*x2;
+// acc += w3*x3` with `wN = (float)qN * d` — the same four sequential `+=`
+// per four elements as before, over a different assignment of elements to
+// lanes, closed by the same `warp_reduce_sum` butterfly. Reassociation of a
+// plain dot product feeding a projection, the ordinary kind, re-gated by the
+// golden capture.
+//
+// ADD fuses the residual: `summed[t][n] = sum + residual[t][n]`, and `out`
+// is still written because it is a captured waypoint. This was previously
+// only fused at one token (`gdn_proj_split_gemv_add`); the template fuses it
+// at every width, which retires a `tensor_add` launch per GDN layer from the
+// batched decode step.
+//
+// grid: (ceil(n_rows / (warps * RT)), ceil(tokens / TT)). block: (32, warps).
+// Host guarantees `k_dim % 512 == 0` and `n_rows % RT == 0` (checked at
+// launch), so no partially-live warp group exists and the early returns
+// below are warp-uniform.
+template <int TT, int RT, bool ADD>
+__device__ __forceinline__ void gdn_proj_split_rows(
+    const signed char* __restrict__ wq,
+    const float* __restrict__ ws,
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    float* __restrict__ out,
+    float* __restrict__ summed,
+    int k_dim,
+    int n_rows,
+    int n_tokens
+) {
+    int lane = threadIdx.x;
+    int n0 = (blockIdx.x * blockDim.y + threadIdx.y) * RT;
+    if (n0 >= n_rows) return;
+    int t0 = blockIdx.y * TT;
+    if (t0 >= n_tokens) return;
+    int live_t = n_tokens - t0; if (live_t > TT) live_t = TT;
+
+    const signed char* row[RT];
+    const float* sc[RT];
+    #pragma unroll
+    for (int r = 0; r < RT; ++r) {
+        row[r] = wq + (long long)(n0 + r) * k_dim;
+        sc[r]  = ws + (long long)(n0 + r) * (k_dim >> 5);
+    }
+
+    float acc[RT][TT];
+    #pragma unroll
+    for (int r = 0; r < RT; ++r) {
+        #pragma unroll
+        for (int i = 0; i < TT; ++i) acc[r][i] = 0.0f;
+    }
+
+    int off = 16 * lane;
+    uint4 cur[RT];
+    float dcur[RT];
+    #pragma unroll
+    for (int r = 0; r < RT; ++r) {
+        cur[r]  = *(const uint4*)(row[r] + off);
+        dcur[r] = sc[r][off >> 5];
+    }
+
+    for (int c = 0; c < k_dim; c += 512) {
+        int cn = c + 512;
+        uint4 nxt[RT];
+        float dnxt[RT];
+        if (cn < k_dim) {
+            #pragma unroll
+            for (int r = 0; r < RT; ++r) {
+                nxt[r]  = *(const uint4*)(row[r] + cn + off);
+                dnxt[r] = sc[r][(cn + off) >> 5];
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            int e0 = c + off + 4 * u;
+            float4 xv[TT];
+            #pragma unroll
+            for (int i = 0; i < TT; ++i) {
+                int t = t0 + i;
+                xv[i] = (t < n_tokens)
+                    ? *(const float4*)(x + (long long)t * k_dim + e0)
+                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+            #pragma unroll
+            for (int r = 0; r < RT; ++r) {
+                unsigned int wrd = ((const unsigned int*)&cur[r])[u];
+                float d = dcur[r];
+                // Low byte first: the split repack keeps quants in element
+                // order, and narrowing through `unsigned char` first makes
+                // the int8 sign-extend rather than taking an
+                // implementation-defined conversion from a value above 127
+                // — the same idiom as `lm_head.rs`.
+                float w0 = (float)(signed char)(unsigned char)(wrd)       * d;
+                float w1 = (float)(signed char)(unsigned char)(wrd >> 8)  * d;
+                float w2 = (float)(signed char)(unsigned char)(wrd >> 16) * d;
+                float w3 = (float)(signed char)(unsigned char)(wrd >> 24) * d;
+                #pragma unroll
+                for (int i = 0; i < TT; ++i) {
+                    acc[r][i] += w0 * xv[i].x;
+                    acc[r][i] += w1 * xv[i].y;
+                    acc[r][i] += w2 * xv[i].z;
+                    acc[r][i] += w3 * xv[i].w;
+                }
+            }
+        }
+        if (cn < k_dim) {
+            #pragma unroll
+            for (int r = 0; r < RT; ++r) { cur[r] = nxt[r]; dcur[r] = dnxt[r]; }
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < RT; ++r) {
+        for (int i = 0; i < live_t; ++i) {
+            float sum = warp_reduce_sum(acc[r][i]);
+            if (lane == 0) {
+                long long o = (long long)(t0 + i) * n_rows + (n0 + r);
+                out[o] = sum;
+                if (ADD) summed[o] = sum + residual[o];
+            }
+        }
+    }
+}
+
+#define GDN_PROJ_SPLIT_ENTRY(NAME, TT, RT)                                   \
+extern "C" __global__ void NAME(                                             \
+    const signed char* __restrict__ wq,                                      \
+    const float* __restrict__ ws,                                            \
+    const float* __restrict__ x,                                             \
+    float* __restrict__ out,                                                 \
+    int k_dim,                                                               \
+    int n_rows,                                                              \
+    int n_tokens                                                             \
+) {                                                                          \
+    gdn_proj_split_rows<TT, RT, false>(                                      \
+        wq, ws, x, nullptr, out, nullptr, k_dim, n_rows, n_tokens);          \
+}
+
+#define GDN_PROJ_SPLIT_ADD_ENTRY(NAME, TT, RT)                               \
+extern "C" __global__ void NAME(                                             \
+    const signed char* __restrict__ wq,                                      \
+    const float* __restrict__ ws,                                            \
+    const float* __restrict__ x,                                             \
+    const float* __restrict__ residual,                                      \
+    float* __restrict__ out,                                                 \
+    float* __restrict__ summed,                                              \
+    int k_dim,                                                               \
+    int n_rows,                                                              \
+    int n_tokens                                                             \
+) {                                                                          \
+    gdn_proj_split_rows<TT, RT, true>(                                       \
+        wq, ws, x, residual, out, summed, k_dim, n_rows, n_tokens);          \
+}
+
+// RT falls as TT rises to hold the accumulator array at or below 16 floats
+// per thread; the tile selection lives in `split_tile_for`, which mirrors
+// these pairs.
+GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t1,  1, 4)
+GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t2,  2, 4)
+GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t3,  3, 4)
+GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t4,  4, 4)
+GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t8,  8, 2)
+GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t16, 16, 1)
+
+GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t1_add,  1, 4)
+GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t2_add,  2, 4)
+GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t3_add,  3, 4)
+GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t4_add,  4, 4)
+GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t8_add,  8, 2)
+GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t16_add, 16, 1)
 "#;
 
 /// Something went wrong building or running a Gated DeltaNet block.
@@ -1397,11 +1410,11 @@ pub struct GdnBlock {
     recurrent_scratch: GdnScratch,
     chunked_scratch: GdnChunkedScratch,
     proj_q8_0: CudaFunction,
-    proj_split_gemv: CudaFunction,
-    proj_split_gemv_add: CudaFunction,
     proj_tiled: [CudaFunction; 4],
-    proj_split_t3: CudaFunction,
-    proj_split_tiled: [CudaFunction; 4],
+    /// The split-layout projection family, one entry per `SPLIT_TILES` width,
+    /// paired with its fused-residual form.
+    proj_split: [CudaFunction; 6],
+    proj_split_add: [CudaFunction; 6],
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
     alpha_beta_gates_t1: CudaFunction,
@@ -1453,20 +1466,27 @@ impl GdnBlock {
             recurrent_scratch,
             chunked_scratch,
             proj_q8_0: module.load_function("gdn_proj_q8_0")?,
-            proj_split_gemv: module.load_function("gdn_proj_split_gemv")?,
-            proj_split_gemv_add: module.load_function("gdn_proj_split_gemv_add")?,
             proj_tiled: [
                 module.load_function("gdn_proj_q8_0_t2")?,
                 module.load_function("gdn_proj_q8_0_t4")?,
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
             ],
-            proj_split_t3: module.load_function("gdn_proj_split_t3")?,
-            proj_split_tiled: [
+            proj_split: [
+                module.load_function("gdn_proj_split_t1")?,
                 module.load_function("gdn_proj_split_t2")?,
+                module.load_function("gdn_proj_split_t3")?,
                 module.load_function("gdn_proj_split_t4")?,
                 module.load_function("gdn_proj_split_t8")?,
                 module.load_function("gdn_proj_split_t16")?,
+            ],
+            proj_split_add: [
+                module.load_function("gdn_proj_split_t1_add")?,
+                module.load_function("gdn_proj_split_t2_add")?,
+                module.load_function("gdn_proj_split_t3_add")?,
+                module.load_function("gdn_proj_split_t4_add")?,
+                module.load_function("gdn_proj_split_t8_add")?,
+                module.load_function("gdn_proj_split_t16_add")?,
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
@@ -1943,36 +1963,73 @@ impl GdnBlock {
             tokens,
         )?;
 
+        // The scans share no data across sequences, and each is a 44%-
+        // occupancy whole-chunk sequential walk — serializing them on one
+        // stream was pure wall time. One launch runs every sequence's scan
+        // concurrently; above the kernel's pointer-slot count, or at a
+        // one-token chunk (where `mix` routes to the recurrent kernel and
+        // must keep doing so), the per-sequence path below is the same
+        // arithmetic.
         let key_chunk = chunk_tokens * g.key_dim();
         let value_chunk = chunk_tokens * g.value_dim();
         let heads_chunk = chunk_tokens * g.value_heads;
-        for (seq, state) in states.iter_mut().enumerate() {
-            // SAFETY: each offset and length describes the corresponding
-            // sequence's disjoint contiguous chunk in the flattened scratch.
-            let q = unsafe { crate::viewslice::subslice(stream, &s.q, seq * key_chunk, key_chunk) };
-            let k = unsafe { crate::viewslice::subslice(stream, &s.k, seq * key_chunk, key_chunk) };
-            let v =
-                unsafe { crate::viewslice::subslice(stream, &s.v, seq * value_chunk, value_chunk) };
-            let decay = unsafe {
-                crate::viewslice::subslice(stream, &s.log_decay, seq * heads_chunk, heads_chunk)
-            };
-            let beta = unsafe {
-                crate::viewslice::subslice(stream, &s.beta, seq * heads_chunk, heads_chunk)
-            };
-            let mut core = unsafe {
-                crate::viewslice::subslice(stream, &s.core, seq * value_chunk, value_chunk)
-            };
-            self.mix(
-                stream,
-                state,
-                &q,
-                &k,
-                &v,
-                &decay,
-                &beta,
-                &mut core,
-                chunk_tokens,
-            )?;
+        if chunk_tokens > 1 && states.len() <= xabe_cuda::kernels::gdn::STEP_MAX_BATCH {
+            let state_ptrs: Vec<u64> = states
+                .iter()
+                .map(|state| state.recurrent.device_ptr(stream).0)
+                .collect();
+            // SAFETY: each pointer is a live
+            // `[value_heads][head_dim][head_dim]` recurrent state held
+            // mutably through `states` for this call, all distinct; the
+            // flattened buffers are `[states.len()][chunk_tokens][width]`
+            // per `Scratch::new` and the length checks above.
+            unsafe {
+                self.chunked.scan_batch_raw(
+                    stream,
+                    &mut self.chunked_scratch,
+                    &state_ptrs,
+                    &s.q,
+                    &s.k,
+                    &s.v,
+                    &s.log_decay,
+                    &s.beta,
+                    &mut s.core,
+                    chunk_tokens,
+                )?;
+            }
+        } else {
+            for (seq, state) in states.iter_mut().enumerate() {
+                // SAFETY: each offset and length describes the corresponding
+                // sequence's disjoint contiguous chunk in the flattened
+                // scratch.
+                let q =
+                    unsafe { crate::viewslice::subslice(stream, &s.q, seq * key_chunk, key_chunk) };
+                let k =
+                    unsafe { crate::viewslice::subslice(stream, &s.k, seq * key_chunk, key_chunk) };
+                let v = unsafe {
+                    crate::viewslice::subslice(stream, &s.v, seq * value_chunk, value_chunk)
+                };
+                let decay = unsafe {
+                    crate::viewslice::subslice(stream, &s.log_decay, seq * heads_chunk, heads_chunk)
+                };
+                let beta = unsafe {
+                    crate::viewslice::subslice(stream, &s.beta, seq * heads_chunk, heads_chunk)
+                };
+                let mut core = unsafe {
+                    crate::viewslice::subslice(stream, &s.core, seq * value_chunk, value_chunk)
+                };
+                self.mix(
+                    stream,
+                    state,
+                    &q,
+                    &k,
+                    &v,
+                    &decay,
+                    &beta,
+                    &mut core,
+                    chunk_tokens,
+                )?;
+            }
         }
 
         self.layer_ops.rms_norm_swiglu(
@@ -2183,29 +2240,54 @@ impl GdnBlock {
             )?;
         }
 
-        // 3. conv_output_raw-N, one sequence at a time: the short causal
-        //    convolution reads and advances *that sequence's own* window, so
-        //    it cannot run as one call over tokens that do not share a
-        //    timeline. Each call is one token wide and touches only
-        //    `states[i].conv` and a one-token slice of the batch buffers.
+        // 3. conv_output_raw-N. The short causal convolution reads and
+        //    advances *each sequence's own* window, so it cannot batch over
+        //    the token axis the projections batch over — but it can batch
+        //    over the *launch*: one grid.y slice per sequence, per-sequence
+        //    conv caches as pointer slots. Above the kernel's slot count it
+        //    falls back to one launch per sequence, same arithmetic.
         let conv_dim = g.conv_dim();
-        for (i, state) in states.iter_mut().enumerate() {
-            // SAFETY: `i < tokens` and `conv_dim` is `s.qkv`'s and
-            // `s.conv_raw`'s per-token width, checked by `Scratch::new`
-            // against the same `tokens * conv_dim` this loop covers.
-            let x = unsafe { crate::viewslice::subslice(stream, &s.qkv, i * conv_dim, conv_dim) };
-            let mut y =
-                unsafe { crate::viewslice::subslice(stream, &s.conv_raw, i * conv_dim, conv_dim) };
-            self.layer_ops.conv1d(
-                stream,
-                &x,
-                &w.conv1d,
-                &mut state.conv,
-                &mut y,
-                1,
-                conv_dim,
-                g.conv_kernel,
-            )?;
+        if tokens <= xabe_cuda::kernels::gdn::STEP_MAX_BATCH {
+            let conv_ptrs: Vec<u64> = states
+                .iter()
+                .map(|state| state.conv.device_ptr(stream).0)
+                .collect();
+            // SAFETY: each pointer is a live `[conv_dim][conv_kernel - 1]`
+            // conv cache held mutably through `states` for this call, all
+            // distinct sequences; `s.qkv` and `s.conv_raw` are
+            // `[tokens][conv_dim]`, checked by `Scratch::new`.
+            unsafe {
+                self.layer_ops.conv1d_step_batch_raw(
+                    stream,
+                    &s.qkv,
+                    &w.conv1d,
+                    &conv_ptrs,
+                    &mut s.conv_raw,
+                    conv_dim,
+                    g.conv_kernel,
+                )?;
+            }
+        } else {
+            for (i, state) in states.iter_mut().enumerate() {
+                // SAFETY: `i < tokens` and `conv_dim` is `s.qkv`'s and
+                // `s.conv_raw`'s per-token width, checked by `Scratch::new`
+                // against the same `tokens * conv_dim` this loop covers.
+                let x =
+                    unsafe { crate::viewslice::subslice(stream, &s.qkv, i * conv_dim, conv_dim) };
+                let mut y = unsafe {
+                    crate::viewslice::subslice(stream, &s.conv_raw, i * conv_dim, conv_dim)
+                };
+                self.layer_ops.conv1d(
+                    stream,
+                    &x,
+                    &w.conv1d,
+                    &mut state.conv,
+                    &mut y,
+                    1,
+                    conv_dim,
+                    g.conv_kernel,
+                )?;
+            }
         }
 
         // 4. conv_output_silu-N and the q/k/v split. No state: every element
@@ -2239,42 +2321,67 @@ impl GdnBlock {
             tokens,
         )?;
 
-        // 6. The delta rule, one sequence at a time — the other half of what
-        //    step 3 could not batch, and for the same reason: it reads and
-        //    writes `states[i].recurrent`, not a shared weight.
-        //    `GdnKernels::step` is the one-token recurrent kernel `run` also
-        //    uses at `tokens == 1`; here it runs once per sequence instead of
-        //    once for the whole call, against that sequence's own state and a
-        //    one-token slice of the batch's q/k/v/gates.
+        // 6. The delta rule — the other half of what step 3 could not batch
+        //    over the token axis, batched over the launch the same way: the
+        //    q/k/v/gate/core buffers are already `[tokens][width]`
+        //    sequence-major, so one launch pair normalizes and advances every
+        //    sequence, each against its own state pointer slot. Above the
+        //    slot count, one launch pair per sequence, same arithmetic.
         let key_dim = g.key_dim();
         let value_dim = g.value_dim();
         let value_heads = g.value_heads;
-        for (i, state) in states.iter_mut().enumerate() {
-            // SAFETY: as the convolution loop above, with each buffer's own
-            // per-token width, all checked by `Scratch::new` against
-            // `tokens * width`.
-            let q = unsafe { crate::viewslice::subslice(stream, &s.q, i * key_dim, key_dim) };
-            let k = unsafe { crate::viewslice::subslice(stream, &s.k, i * key_dim, key_dim) };
-            let v = unsafe { crate::viewslice::subslice(stream, &s.v, i * value_dim, value_dim) };
-            let log_decay = unsafe {
-                crate::viewslice::subslice(stream, &s.log_decay, i * value_heads, value_heads)
-            };
-            let beta = unsafe {
-                crate::viewslice::subslice(stream, &s.beta, i * value_heads, value_heads)
-            };
-            let mut core_out =
-                unsafe { crate::viewslice::subslice(stream, &s.core, i * value_dim, value_dim) };
-            self.recurrent.step(
-                stream,
-                &mut self.recurrent_scratch,
-                &mut state.recurrent,
-                &q,
-                &k,
-                &v,
-                &log_decay,
-                &beta,
-                &mut core_out,
-            )?;
+        if tokens <= xabe_cuda::kernels::gdn::STEP_MAX_BATCH {
+            let state_ptrs: Vec<u64> = states
+                .iter()
+                .map(|state| state.recurrent.device_ptr(stream).0)
+                .collect();
+            // SAFETY: each pointer is a live
+            // `[value_heads][head_dim][head_dim]` recurrent state held
+            // mutably through `states` for this call, all distinct; every
+            // batch buffer is `[tokens][width]` per `Scratch::new`.
+            unsafe {
+                self.recurrent.step_batch_raw(
+                    stream,
+                    &mut self.recurrent_scratch,
+                    &state_ptrs,
+                    &s.q,
+                    &s.k,
+                    &s.v,
+                    &s.log_decay,
+                    &s.beta,
+                    &mut s.core,
+                )?;
+            }
+        } else {
+            for (i, state) in states.iter_mut().enumerate() {
+                // SAFETY: as the convolution fallback above, with each
+                // buffer's own per-token width, all checked by
+                // `Scratch::new` against `tokens * width`.
+                let q = unsafe { crate::viewslice::subslice(stream, &s.q, i * key_dim, key_dim) };
+                let k = unsafe { crate::viewslice::subslice(stream, &s.k, i * key_dim, key_dim) };
+                let v =
+                    unsafe { crate::viewslice::subslice(stream, &s.v, i * value_dim, value_dim) };
+                let log_decay = unsafe {
+                    crate::viewslice::subslice(stream, &s.log_decay, i * value_heads, value_heads)
+                };
+                let beta = unsafe {
+                    crate::viewslice::subslice(stream, &s.beta, i * value_heads, value_heads)
+                };
+                let mut core_out = unsafe {
+                    crate::viewslice::subslice(stream, &s.core, i * value_dim, value_dim)
+                };
+                self.recurrent.step(
+                    stream,
+                    &mut self.recurrent_scratch,
+                    &mut state.recurrent,
+                    &q,
+                    &k,
+                    &v,
+                    &log_decay,
+                    &beta,
+                    &mut core_out,
+                )?;
+            }
         }
 
         // 7. final_output-N = ssm_norm(core) * silu(z). No state: batches
@@ -2329,20 +2436,21 @@ impl GdnBlock {
                 g.hidden,
             )?;
         } else if let Some(i8w) = split_tiled {
-            // No fused residual form: `gdn_proj_split_gemv_add` has no token
-            // axis. Project, then add, matching the standard-layout path.
-            self.project_split_tiled(
+            // The residual rides out of the projection's own warp at every
+            // width, exactly as the one-token path below; `s.projected`
+            // stays written because it is a captured waypoint.
+            self.project_split_add(
                 stream,
                 &i8w.out_q,
                 &i8w.out_s,
                 &s.final_output,
+                hidden,
                 &mut s.projected,
+                out,
                 g.value_dim(),
                 g.hidden,
                 tokens,
             )?;
-            self.layer_ops
-                .add(stream, &s.projected, hidden, out, tokens * g.hidden)?;
         } else {
             self.project(
                 stream,
@@ -2627,10 +2735,47 @@ impl GdnBlock {
         Ok(())
     }
 
+    /// The output projection with the block's residual folded in, at any
+    /// width below the tensor-core floor.
+    ///
+    /// `out` is `linear_attn_out-N` and `summed` is `attn_residual-N`; both
+    /// are written because `out` is a captured waypoint. Fusing the add at
+    /// every width (not just one token, as before) retires a `tensor_add`
+    /// launch per GDN layer from the batched decode step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_split_add(
+        &self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        residual: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        summed: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        check_len("split add residual", tokens * n_rows, residual.len())?;
+        check_len("split add summed", tokens * n_rows, summed.len())?;
+        self.launch_split_proj(
+            stream,
+            wq,
+            ws,
+            x,
+            Some((residual, summed)),
+            out,
+            k_dim,
+            n_rows,
+            tokens,
+        )
+    }
+
     /// The one-token output projection with the block's residual folded in.
     ///
-    /// See `gdn_proj_split_gemv_add`: `out` is `linear_attn_out-N` and
-    /// `summed` is `attn_residual-N`.
+    /// [`Self::project_split_add`] at one token, kept as a named entry point
+    /// because `run`'s single-stream decode is the path the batch-vs-single
+    /// contract is stated against.
     #[allow(clippy::too_many_arguments)]
     pub fn project_split_gemv_add(
         &self,
@@ -2644,39 +2789,15 @@ impl GdnBlock {
         k_dim: usize,
         n_rows: usize,
     ) -> Result<(), GdnBlockError> {
-        check_len("split gemv x", k_dim, x.len())?;
-        check_len("split gemv residual", n_rows, residual.len())?;
-        check_len("split gemv out", n_rows, out.len())?;
-        check_len("split gemv summed", n_rows, summed.len())?;
-        check_len("split gemv wq", n_rows * k_dim, wq.len())?;
-        check_len("split gemv ws", n_rows * k_dim / QK8_0, ws.len())?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n_rows as u32).div_ceil(PROJ_WARPS), 1, 1),
-            block_dim: (32, PROJ_WARPS, 1),
-            shared_mem_bytes: 0,
-        };
-        let (k_i32, n_i32) = (k_dim as i32, n_rows as i32);
-        let mut builder = stream.launch_builder(&self.proj_split_gemv_add);
-        builder
-            .arg(wq)
-            .arg(ws)
-            .arg(x)
-            .arg(residual)
-            .arg(&mut *out)
-            .arg(&mut *summed)
-            .arg(&k_i32)
-            .arg(&n_i32);
-        // SAFETY: as `project_split_gemv` below, plus `residual` and `summed`
-        // checked to `n_rows` and indexed by the same `n` the output is.
-        unsafe { builder.launch(cfg) }?;
-        Ok(())
+        self.project_split_add(stream, wq, ws, x, residual, out, summed, k_dim, n_rows, 1)
     }
 
     /// The one-token projection over the repacked split layout.
     ///
-    /// See `gdn_proj_split_gemv`: this exists because Q8_0's 34-byte block
-    /// stride makes the untiled kernel's warp read straddle a sector boundary
-    /// fifteen times in sixteen, and the repacked quants do not.
+    /// The split layout exists because Q8_0's 34-byte block stride makes a
+    /// straight per-block read straddle a sector boundary fifteen times in
+    /// sixteen; the repacked quants are contiguous and 16-byte aligned, which
+    /// is also what legalizes `gdn_proj_split_rows`'s `uint4` weight loads.
     #[allow(clippy::too_many_arguments)]
     pub fn project_split_gemv(
         &self,
@@ -2688,41 +2809,16 @@ impl GdnBlock {
         k_dim: usize,
         n_rows: usize,
     ) -> Result<(), GdnBlockError> {
-        check_len("split gemv x", k_dim, x.len())?;
-        check_len("split gemv out", n_rows, out.len())?;
-        check_len("split gemv wq", n_rows * k_dim, wq.len())?;
-        check_len("split gemv ws", n_rows * k_dim / QK8_0, ws.len())?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n_rows as u32).div_ceil(PROJ_WARPS), 1, 1),
-            block_dim: (32, PROJ_WARPS, 1),
-            shared_mem_bytes: 0,
-        };
-        let (k_i32, n_i32) = (k_dim as i32, n_rows as i32);
-        let mut builder = stream.launch_builder(&self.proj_split_gemv);
-        builder
-            .arg(wq)
-            .arg(ws)
-            .arg(x)
-            .arg(&mut *out)
-            .arg(&k_i32)
-            .arg(&n_i32);
-        // SAFETY: one warp per output row over a grid covering `n_rows` and
-        // returning above it; every buffer was length-checked immediately
-        // above against exactly the extent the kernel indexes.
-        unsafe { builder.launch(cfg) }?;
-        Ok(())
+        self.launch_split_proj(stream, wq, ws, x, None, out, k_dim, n_rows, 1)
     }
 
-    /// The split-layout projection, tiled over tokens: `gdn_proj_split_gemv`'s
-    /// own per-lane grouping and reduction order, generalized to
-    /// `1 < tokens < MMA_SPLIT_TOKENS` by amortizing the dequantized weight
-    /// across `tokens` columns instead of reading it once per token. See
-    /// `GDN_PROJ_SPLIT_TILED` in the module source for why this exists and
-    /// why it reads the repacked layout rather than the standard one.
+    /// The split-layout projection tiled over tokens, for
+    /// `1 < tokens < MMA_SPLIT_TOKENS`.
     ///
-    /// `tokens` must be at least 2 — the one-token case is
-    /// [`Self::project_split_gemv`], which this does not replace, because a
-    /// tile of one column carries `TT - 1` unused accumulators for nothing.
+    /// The same `gdn_proj_split_rows` template as the one-token path, so the
+    /// batch and single-stream chains agree bit for bit by construction —
+    /// `gdn_proj_differential.rs` asserts it rather than trusting this
+    /// sentence.
     #[allow(clippy::too_many_arguments)]
     pub fn project_split_tiled(
         &self,
@@ -2735,28 +2831,67 @@ impl GdnBlock {
         n_rows: usize,
         tokens: usize,
     ) -> Result<(), GdnBlockError> {
-        check_len("split tiled x", tokens * k_dim, x.len())?;
-        check_len("split tiled out", tokens * n_rows, out.len())?;
-        check_len("split tiled wq", n_rows * k_dim, wq.len())?;
-        check_len("split tiled ws", n_rows * k_dim / QK8_0, ws.len())?;
-        if tokens < 2 {
+        self.launch_split_proj(stream, wq, ws, x, None, out, k_dim, n_rows, tokens)
+    }
+
+    /// Select and launch one `gdn_proj_split_*` entry point.
+    ///
+    /// Tile selection follows `proj_tile_for`'s rule — the smallest tile that
+    /// covers `tokens` in a single grid.y slice, the widest tile in repeated
+    /// slices past it — over `SPLIT_TILES`, whose row tile shrinks as the
+    /// token tile grows to hold the accumulator array at or below 16 floats
+    /// per thread.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_split_proj(
+        &self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<f32>,
+        x: &CudaSlice<f32>,
+        add: Option<(&CudaSlice<f32>, &mut CudaSlice<f32>)>,
+        out: &mut CudaSlice<f32>,
+        k_dim: usize,
+        n_rows: usize,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        check_len("split proj x", tokens * k_dim, x.len())?;
+        check_len("split proj out", tokens * n_rows, out.len())?;
+        check_len("split proj wq", n_rows * k_dim, wq.len())?;
+        check_len("split proj ws", n_rows * k_dim / QK8_0, ws.len())?;
+        if tokens == 0 {
             return Err(GdnBlockError::ShapeMismatch {
-                what: "project_split_tiled tokens (use project_split_gemv at 1)",
-                expected: 2,
-                got: tokens,
+                what: "split proj tokens",
+                expected: 1,
+                got: 0,
             });
         }
-
-        let (slot, tile) = proj_tile_for(tokens);
-        let (kernel, tile) = if tokens == 3 {
-            (&self.proj_split_t3, 3)
-        } else {
-            (&self.proj_split_tiled[slot], tile)
+        // A lane owns 16 consecutive quants of a 512-element warp step, and a
+        // warp group is RT whole rows; both are geometry facts (every
+        // projection is 2,048 or 4,096 wide and 2,048-8,192 tall), checked so
+        // a future geometry fails here rather than reading past a row.
+        if !k_dim.is_multiple_of(512) {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "split proj k_dim (must be a multiple of 512)",
+                expected: k_dim.next_multiple_of(512),
+                got: k_dim,
+            });
+        }
+        let (slot, tt, rt) = split_tile_for(tokens);
+        if !n_rows.is_multiple_of(rt as usize) {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "split proj n_rows (must be a multiple of the row tile)",
+                expected: n_rows.next_multiple_of(rt as usize),
+                got: n_rows,
+            });
+        }
+        let kernel = match add {
+            Some(_) => &self.proj_split_add[slot],
+            None => &self.proj_split[slot],
         };
         let cfg = LaunchConfig {
             grid_dim: (
-                (n_rows as u32).div_ceil(PROJ_WARPS),
-                (tokens as u32).div_ceil(tile),
+                (n_rows as u32 / rt).div_ceil(PROJ_WARPS),
+                (tokens as u32).div_ceil(tt),
                 1,
             ),
             block_dim: (32, PROJ_WARPS, 1),
@@ -2764,18 +2899,20 @@ impl GdnBlock {
         };
         let (k_i32, n_i32, t_i32) = (k_dim as i32, n_rows as i32, tokens as i32);
         let mut builder = stream.launch_builder(kernel);
-        builder
-            .arg(wq)
-            .arg(ws)
-            .arg(x)
-            .arg(&mut *out)
-            .arg(&k_i32)
-            .arg(&n_i32)
-            .arg(&t_i32);
-        // SAFETY: as `project_split_gemv`, plus the token axis covered by
-        // `ceil(tokens / tile)` blocks that return above `n_tokens`, and the
-        // ragged final tile takes the guarded (zero-padded) path, so no lane
-        // reads `x` or writes `out` past `tokens - 1`.
+        builder.arg(wq).arg(ws).arg(x);
+        if let Some((residual, summed)) = add {
+            builder.arg(residual);
+            builder.arg(&mut *out);
+            builder.arg(summed);
+        } else {
+            builder.arg(&mut *out);
+        }
+        builder.arg(&k_i32).arg(&n_i32).arg(&t_i32);
+        // SAFETY: a warp group covers RT whole rows (`n_rows % RT` checked
+        // above) under a grid returning past `n_rows`; the token axis is
+        // covered by `ceil(tokens / TT)` slices whose ragged tail takes the
+        // guarded zero-padded path; every buffer was length-checked above
+        // against exactly the extent the kernel indexes.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }

@@ -76,24 +76,22 @@ processes. Prefill on GPU 2, decode on GPU 1.
 | cell | llmxabe tok/s | llama.cpp tok/s | margin |
 | :--- | ---: | ---: | ---: |
 | prefill 512 | 3,281.0 ± 8.6 | 3,007.5 | **+9.1%** |
-| prefill 2K | 3,796.5 ± 8.0 | 3,201.5 | **+18.6%** |
+| prefill 2K | 3,819.4 ± 23.4 | 3,201.5 | **+19.3%** |
 | prefill 8K | 3,665.5 ± 16.8 | 3,201.8 | **+14.5%** |
 | prefill 32K | 2,790.3 ± 5.8 | 2,655.1 | **+5.1%** |
 | prefill 65K | 2,226.0 ± 0.2 | 2,142.8 | **+3.9%** |
 | prefill 128K | 1,564.5 ± 0.3 | 1,551.6 | **+0.8%** |
-| decode 2K | 193.3 | 185.2 | **+4.4%** |
-| decode 32K | 150.8 / 151.4 / 152.8 | 150.7 / 150.8 / 150.6 | **won every pair** |
+| decode 2K | 206.4 | 185.2 | **+11.4%** |
+| decode 32K | 158.3 / 157.8 / 158.2 | 150.7 / 150.8 / 150.6 | **+4.9%** |
 
 Provenance, in the spirit of the drift rules above: the 512–32K prefill rows
 ran a binary predating the per-sequence prefill fork, whose effect at those
 depths is orders of magnitude inside the reported margins; the 65K row was
 measured while gates ran on a neighbouring card and its margin is therefore a
-floor; the 128K rows ran clean and uncontended. Decode 2K compares the
-regression-check run against the same-day llama.cpp `S_TG` at `-npp 2048`.
-
-Read decode 32K as **level-to-slightly-ahead**, not as a headline: the margin
-is half a percent, thinner than this card's own thermal drift, and it stands
-only because it was taken as alternating same-hour pairs and won all of them.
+floor; the 128K rows ran clean and uncontended. The prefill 2K and both
+decode rows are alternating same-card runs of the current tree; their
+llama.cpp columns are the standing head-to-head rather than a same-hour
+re-run, so read those three margins with llama.cpp's ~1%/day drift in mind.
 
 Single sequence, same tree, for reference: **~87.5 tok/s** decode at 32K and
 ~101 tok/s at 2K. Aggregate across three cards, one session each, is a
@@ -288,6 +286,27 @@ read — forks onto side streams and rejoins before the batched projections. Thi
 is worth 2–4% where the launches are several partial waves whose scheduling
 tail was otherwise paid once per sequence per layer.
 
+Sequence-owned state forbids batching over the *token* axis, and for a long
+time that was read as forcing one launch per sequence — 2n GDN launches per
+layer per decode step, and n serialized whole-chunk scans per layer at
+prefill. It only forces one *state pointer* per sequence: the kernels take
+`STEP_MAX_BATCH` scalar pointer slots, `grid.z` picks a sequence, and one
+launch advances every sequence's state against the batch scratch it was
+already reading. Graph capture sees exactly the pointer stability the
+per-sequence launches gave it, and batch-vs-single bit-equality is a property
+of the source — each z slice runs the identical arithmetic. The recurrent
+step went from 291 GB/s across three serial launches to **~583 GB/s (87% of
+streaming peak)** in one; the batched scan is bounded instead by its own
+register-limited occupancy (~1.8 waves at N=3), which is why prefill gained
+one point where decode gained several.
+
+A warp per state row, not a block. The delta-rule step's block-per-row form
+paid two block-wide reductions — two `__syncthreads`, a shared round trip
+and a serial cross-warp combine — per 512-byte row, and moved state at 44% of
+peak. One warp per row holds the row in four `float4` registers per lane,
+reduces with barrier-free shuffle butterflies, and loads and stores nothing
+narrower than 16 bytes.
+
 ## Prefill: delete the chunking, and widen the pass
 
 llama.cpp does not chunk the Gated DeltaNet at all — `gated_delta_net_cuda` is
@@ -362,6 +381,8 @@ proposed twice.
 
 | Attempt | Result |
 | --- | --- |
+| GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call against RT=4's 33.9. RT=1 octuples the warps and the in-flight bytes and is the *worst* of the three, so memory-level parallelism was never the binding constraint — instruction count per byte is, and it falls with RT. |
+| GDN split projection, char4 partition + row tile + prefetch | 40.0/36.7 us against the shipped `uint4` form's 33.9/29.3, despite fully-coalesced activation loads and ~2.7x fewer L1 wavefronts per byte on paper. The wavefront model predicted the wrong winner; the wide weight load won anyway. |
 | `q8_0` KV cache (llama.cpp side) | −2.5% at depth 0, **−15.5%** at 32K, **−35.8%** at 128K. Turing's in-kernel dequant costs more than the halved traffic saves, and the KV path already ran at ~80% of peak. Keep `-ctk f16 -ctv f16`. |
 | Requantize experts Q6_K → Q8_0 | 4–8% for **+30% VRAM**. The dequantization format is not what limits that kernel. |
 | Marlin-style register prefetch on the MoE MMA kernels | 20% slower at 512 tokens. `__launch_bounds__` already trades registers for occupancy on purpose; a register pipeline competes with that trade and ptxas spills instead of exceeding the occupancy target. |
