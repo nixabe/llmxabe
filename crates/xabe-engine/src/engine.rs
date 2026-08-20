@@ -97,6 +97,12 @@ pub struct Placement {
     pub score: f64,
 }
 
+/// Whether a chain of `block_hashes` names every attention block a snapshot
+/// at `position` covers.
+fn hashes_reach(position: usize, block_size: u32, block_hashes: usize) -> bool {
+    block_hashes >= position / block_size as usize
+}
+
 /// Three workers, one router, one shared prefix cache.
 pub struct Engine {
     workers: Vec<Worker>,
@@ -321,28 +327,40 @@ impl Engine {
     }
 
     /// Publish a worker's current retained state into the shared host cache.
+    ///
+    /// Reports whether the snapshot was published; see [`Self::install_snapshot`]
+    /// for the case where it cannot be.
     pub fn publish_snapshot(
         &mut self,
         worker: WorkerId,
         request: RequestId,
         block_hashes: &[BlockHash],
-    ) -> Result<Arc<SequenceSnapshot>, EngineExecutionError> {
+    ) -> Result<(Arc<SequenceSnapshot>, bool), EngineExecutionError> {
         let source = self
             .worker(worker)
             .ok_or(EngineExecutionError::MissingWorker(worker))?;
         let snapshot = source
             .snapshot(request)
             .map_err(|source| EngineExecutionError::Worker { worker, source })?;
-        self.install_snapshot(worker, Arc::clone(&snapshot), block_hashes)?;
-        Ok(snapshot)
+        let published = self.install_snapshot(worker, Arc::clone(&snapshot), block_hashes)?;
+        Ok((snapshot, published))
     }
 
+    /// Publish a snapshot into the shared prefix tree, keyed by the caller's
+    /// block hashes.
+    ///
+    /// Returns `false` when `block_hashes` does not reach the snapshot's
+    /// position. That is not a failure: a sequence grows past the prompt it
+    /// was admitted with, and the caller only ever supplied hashes for the
+    /// prompt, so blocks made of generated tokens have no name to file them
+    /// under. Sharing them would mean inventing one. The snapshot is simply
+    /// not shared, and the sequence keeps using it locally.
     fn install_snapshot(
         &self,
         worker: WorkerId,
         snapshot: Arc<SequenceSnapshot>,
         block_hashes: &[BlockHash],
-    ) -> Result<(), EngineExecutionError> {
+    ) -> Result<bool, EngineExecutionError> {
         let source = self
             .worker(worker)
             .ok_or(EngineExecutionError::MissingWorker(worker))?;
@@ -351,10 +369,11 @@ impl Engine {
         if position == 0 || !(position as u32).is_multiple_of(interval) {
             return Err(EngineExecutionError::SnapshotNotRetained { position, interval });
         }
-        let blocks = position as u32 / source.cache_config().attention_block_size();
-        if block_hashes.len() < blocks as usize {
-            return Err(EngineExecutionError::SnapshotNotRetained { position, interval });
+        let block_size = source.cache_config().attention_block_size();
+        if !hashes_reach(position, block_size, block_hashes.len()) {
+            return Ok(false);
         }
+        let blocks = position as u32 / block_size;
         let prefix: Vec<PrefixBlock> = block_hashes[..blocks as usize]
             .iter()
             .enumerate()
@@ -375,7 +394,7 @@ impl Engine {
                 snapshots.remove(&entry.hash);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Execute one scheduler step on every device-bound worker concurrently.
@@ -407,6 +426,8 @@ impl Engine {
                     self.install_snapshot(*worker, snapshot, hashes)?;
                 }
             }
+            // Snapshots past the prompt are retained on the worker but not
+            // shared; see `install_snapshot`.
             for request in &step.completed {
                 self.request_hashes.remove(&(*worker, *request));
                 if let Some(hashes) = self.request_refs.remove(&(*worker, *request)) {
@@ -540,6 +561,25 @@ mod tests {
             "GDN slot must remain its own natural size"
         );
     }
+    #[test]
+    fn a_snapshot_past_the_prompt_has_no_name_to_be_filed_under() {
+        // A sequence generating past its first retention boundary produces a
+        // snapshot the prompt's hashes cannot name: a 20-token prompt yields
+        // one hash, and a snapshot at 2048 covers eight blocks. Treating that
+        // as an engine error failed the whole scheduler step, which drops
+        // *every* in-flight request on the worker — one long generation
+        // taking out its neighbours.
+        let block = CacheConfig::with_defaults(ModelConfig::qwen3_6_35b_a3b())
+            .unwrap()
+            .attention_block_size();
+        assert!(
+            !hashes_reach(2048, block, 1),
+            "a one-block prompt cannot name a snapshot eight blocks in"
+        );
+        assert!(hashes_reach(2048, block, 8));
+        assert!(hashes_reach(2048, block, 9));
+    }
+
     #[test]
     fn cancellation_removes_a_waiting_request_from_its_worker() {
         let mut e = engine(1024);
