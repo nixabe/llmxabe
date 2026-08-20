@@ -29,6 +29,7 @@ xabe-log = { path = "crates/xabe-log" }
 xabe-cuda = { path = "crates/xabe-cuda" }
 xabe-engine = { path = "crates/xabe-engine" }
 
+clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 memmap2 = "0.9"
 half = "2"

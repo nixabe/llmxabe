@@ -166,6 +166,7 @@ instance; text-only requests go to this engine.
 | [docs/SCHEDULER.md](docs/SCHEDULER.md) | Chunked prefill, admission, preemption |
 | [docs/KERNELS.md](docs/KERNELS.md) | Kernel inventory, risk, and porting notes |
 | [docs/TESTING.md](docs/TESTING.md) | Differential harness and numerics thresholds |
+| [docs/CLI.md](docs/CLI.md) | The server binary's command-line arguments |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Environment, reference checkouts, and the llama.cpp baseline configuration |
 
 ## License

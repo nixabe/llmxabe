@@ -1,25 +1,27 @@
-//! `llmxabe` — engine preflight.
+//! `llmxabe` — engine preflight and HTTP server.
 //!
 //! ```sh
-//! cargo run -p xabe-server
+//! cargo run -p xabe-server -- --help
 //! ```
 //!
-//! There is no HTTP surface yet, and this binary does not serve requests. What
-//! it does is run the startup path the engine will need regardless: validate
-//! the model configuration, check the device fleet against the sm_75 gate,
-//! derive the VRAM and bandwidth budgets, construct the two-group cache
-//! geometry, and construct the scheduler — which is where the token-budget
-//! rule is enforced.
+//! Startup first runs the preflight: validate the model configuration, check
+//! the device fleet against the sm_75 gate, derive the VRAM and bandwidth
+//! budgets, construct the two-group cache geometry, and construct the
+//! scheduler — which is where the token-budget rule is enforced. Only then
+//! does the HTTP surface come up.
 //!
-//! That last part is the point. Three of the project's design rules are
+//! That ordering is the point. Three of the project's design rules are
 //! enforced by construction (`SchedulerConfig::new` rejects a budget at or
 //! below the block size; `CacheConfig::new` rejects a misaligned retention
-//! interval; the device gate rejects a heterogeneous fleet), so a preflight
-//! that successfully builds these types has checked them.
+//! interval; the device gate rejects a heterogeneous fleet), so command-line
+//! arguments feed those constructors directly and an invalid combination
+//! fails preflight instead of serving. The arguments are documented in
+//! `docs/CLI.md`.
 
 mod http;
 mod tokenizer;
 
+use clap::Parser;
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 use xabe_cache::config::CacheConfig;
@@ -29,19 +31,79 @@ use xabe_model::budget;
 use xabe_model::{ModelConfig, verify};
 use xabe_sched::config::SchedulerConfig;
 
-/// Per-step token budget. Must exceed `block_size + max_concurrent_decodes`.
-const TOKEN_BUDGET: u32 = 4096;
-/// Concurrent slots per worker, matching the llama.cpp baseline's `-np 3`.
-const SLOTS_PER_WORKER: u32 = 3;
-/// Total context across slots, matching the baseline's `-c 393216`.
-const TOTAL_CONTEXT: u32 = 393_216;
 /// f16 KV cache, matching the baseline's `-ctk f16 -ctv f16`.
 const KV_ELEM_BYTES_F16: u64 = 2;
 /// Measured tensor-data size of `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`.
 const WEIGHTS_BYTES: u64 = (296 * (1024 * 1024 * 1024)) / 10;
 const DEFAULT_MODEL_PATH: &str =
     "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
-const PREFILL_CHUNK: usize = 4096;
+
+/// `--help` addendum for the flag clap never sees (see [`Args`] docs).
+fn log_flag_help() -> String {
+    format!("Logging:\n{}", xabe_log::FLAG_HELP)
+}
+
+/// Three-worker CUDA inference engine for Qwen3.6-35B-A3B.
+//
+// `--log-level` is absent on purpose: `xabe_log::init_from_args` strips it
+// from the argument list before clap runs, so every binary in the workspace
+// parses it identically. It is appended to `--help` via `log_flag_help`.
+#[derive(Parser)]
+#[command(
+    name = "llmxabe",
+    version,
+    no_binary_name = true,
+    after_help = log_flag_help(),
+)]
+struct Args {
+    /// Path to the GGUF model file
+    #[arg(short, long, env = "LLMXABE_MODEL", default_value = DEFAULT_MODEL_PATH)]
+    model: PathBuf,
+
+    /// Host the HTTP server binds
+    #[arg(long, env = "LLMXABE_HOST", default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port the HTTP server binds
+    #[arg(long, env = "LLMXABE_PORT", default_value_t = 8000)]
+    port: u16,
+
+    /// Per-step token budget (also -tb); must exceed block_size + max_concurrent_decodes
+    #[arg(long, default_value_t = 4096)]
+    token_budget: u32,
+
+    /// Concurrent slots per worker, matching the llama.cpp baseline's -np 3
+    #[arg(short, long, default_value_t = 3)]
+    slots_per_worker: u32,
+
+    /// Total context across slots, matching the baseline's -c 393216
+    #[arg(short = 'c', long, default_value_t = 393_216)]
+    total_context: u32,
+
+    /// Prefill chunk size in tokens (also -pc)
+    #[arg(long, default_value_t = 4096)]
+    prefill_chunk: usize,
+}
+
+/// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
+/// their long forms before parsing. Both bare and `=value` forms are handled.
+fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .map(|arg| {
+            for (short, long) in [("-pc", "--prefill-chunk"), ("-tb", "--token-budget")] {
+                if arg == short {
+                    return long.to_owned();
+                }
+                if let Some(value) = arg.strip_prefix(short)
+                    && let Some(value) = value.strip_prefix('=')
+                {
+                    return format!("{long}={value}");
+                }
+            }
+            arg
+        })
+        .collect()
+}
 
 /// Bytes as GiB, for display.
 fn gib(bytes: u64) -> f64 {
@@ -49,7 +111,8 @@ fn gib(bytes: u64) -> f64 {
 }
 
 fn main() -> std::process::ExitCode {
-    xabe_log::init_from_args();
+    let rest = xabe_log::init_from_args();
+    let args = Args::parse_from(expand_two_letter_shorts(rest));
 
     info!("llmxabe preflight\n");
 
@@ -98,9 +161,9 @@ fn main() -> std::process::ExitCode {
 
     // 3. Scheduler. Construction rejects the budget-versus-block trap.
     let sched = match SchedulerConfig::with_defaults(
-        TOKEN_BUDGET,
+        args.token_budget,
         cache.attention_block_size(),
-        SLOTS_PER_WORKER,
+        args.slots_per_worker,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -153,8 +216,8 @@ fn main() -> std::process::ExitCode {
     // 5. VRAM budget, against this card's measured memory.
     let vram = budget::vram_budget(
         &model,
-        u64::from(TOTAL_CONTEXT),
-        SLOTS_PER_WORKER,
+        u64::from(args.total_context),
+        args.slots_per_worker,
         KV_ELEM_BYTES_F16,
         WEIGHTS_BYTES,
     );
@@ -173,7 +236,7 @@ fn main() -> std::process::ExitCode {
     }
 
     // 6. Engine. One worker per device, sharing one prefix tree.
-    let attention_blocks = TOTAL_CONTEXT / cache.attention_block_size();
+    let attention_blocks = args.total_context / cache.attention_block_size();
     let attention_block_size = cache.attention_block_size() as usize;
     let ordinals: Vec<usize> = devices.iter().map(|d| d.ordinal).collect();
     let mut engine = Engine::new(
@@ -181,7 +244,7 @@ fn main() -> std::process::ExitCode {
         cache,
         sched,
         attention_blocks,
-        SLOTS_PER_WORKER,
+        args.slots_per_worker,
         RouterConfig::balanced(),
     );
     info!(
@@ -190,11 +253,9 @@ fn main() -> std::process::ExitCode {
         attention_blocks
     );
 
-    let model_path = std::env::var_os("LLMXABE_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH));
+    let model_path = args.model;
     info!("\nloading           {}", model_path.display());
-    if let Err((worker, failure)) = engine.bind_devices(&model_path, model, PREFILL_CHUNK) {
+    if let Err((worker, failure)) = engine.bind_devices(&model_path, model, args.prefill_chunk) {
         error!("worker {worker} failed to load: {failure}");
         return std::process::ExitCode::FAILURE;
     }
@@ -205,7 +266,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let address = std::env::var("LLMXABE_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".to_owned());
+    let address = format!("{}:{}", args.host, args.port);
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(failure) => {
