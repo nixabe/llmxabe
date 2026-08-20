@@ -125,6 +125,16 @@ Do not add a `trace!` inside a per-element loop. Per-tensor and per-layer are
 fine; the disabled-level check is cheap against work measured in milliseconds
 and expensive against work measured in nanoseconds.
 
+Every binary takes the same flag, `--log-level info | debug | trace`
+(default `info`). There is deliberately no `warn` or `error` setting:
+`tracing`'s filter is an ordering, so warnings and errors are visible at
+every level the flag accepts, and offering them as values would only let a
+caller hide problems. `INFO`, `DEBUG` and `TRACE` go to stdout and
+`WARN`/`ERROR` to stderr, so piping a table somewhere still leaves
+diagnostics on the terminal. `RUST_LOG` is honoured when the flag is absent,
+including per-target directives (`RUST_LOG=xabe_engine::weights=trace`); an
+explicit `--log-level` overrides it and says so.
+
 ## Reporting results
 
 The project's justification rests on a measurement nobody has taken yet
