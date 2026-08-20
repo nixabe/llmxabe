@@ -24,10 +24,18 @@ the only place they belong — do not restate a ratio anywhere else without a
 link to it.
 
 The standing is that every cell of the one-card N=3 target is clear of
-llama.cpp at its own best settings, by +0.8% to +18.6% on prefill and +4.4% at
-2K decode, with 32K decode level-to-slightly-ahead. The two thinnest margins
-are inside this card's own thermal drift and stand only on same-hour
-alternating pairs. Treat them as parity you have to keep, not as headroom.
+llama.cpp at its own best settings, on both prefill and decode. The thinnest
+margin (128K prefill) is inside this card's own thermal drift and stands only
+on alternating pairs. Treat thin margins as parity you have to keep, not as
+headroom.
+
+**BENCHMARKS.md records the latest state only.** The "Current standing" table
+holds the current numbers and nothing else: when a measurement supersedes a
+cell, replace the cell — never append a dated note, a before/after delta, or
+any "improved from X" narrative to the standing section. The change story
+(what moved, from what, measured how) belongs in the commit message; the
+durable reasoning belongs in WHY, and measured rejections in WHY NOT. Those
+two lists are the only parts of the file that accumulate.
 
 Two standing corrections to older text you may encounter below or elsewhere:
 
@@ -149,14 +157,24 @@ optimizations that were correct for the wrong bound and measured slower.
 ## Working rules
 
 - **Rust 2024 edition.** Nightly is pinned in `rust-toolchain.toml`.
-- **Commit subjects are sentences, one logical change per commit.** The
-  repository's practice moved past the Conventional Commits rule still written
-  in CONTRIBUTING.md: read `git log --oneline -20` and match it. The house
-  style names what was done and, where it fits, what was learned — "Split the
-  key axis at decode, and stop leaving 78% of the card idle". The commit
-  message is where the blow-by-blow lives, so it carries the numbers and the
-  method; BENCHMARKS.md carries only what outlives the change. Negative results
-  get commits too ("…and be wrong about how much that buys").
+- **[Conventional Commits](https://www.conventionalcommits.org/), scoped to
+  the crate, one logical change per commit:**
+
+  ```
+  feat(xabe-cache): add two-group pager with per-group page geometry
+  fix(xabe-sched): reject token budget <= block size at construction
+  docs: document snapshot retention interval rationale
+  test(xabe-kernels): add cosine threshold for chunked delta rule
+  perf(xabe-cuda): hoist shared expert out of the routed path
+  ```
+
+  A commit should build and pass tests on its own. The commit message body is
+  where the blow-by-blow lives, so it carries the numbers and the method;
+  BENCHMARKS.md carries only what outlives the change. Negative results get
+  commits too. When you port something, cite the source in the commit
+  message — file and function, not just project name; upstream paths drift.
+  (A stretch of recent history used sentence-style subjects; that experiment
+  is over and survives only in those log entries.)
 - **Never commit `qwen36-rust-engine-plan.md`.** It is a local design draft and
   is listed in `.gitignore`. Its content belongs in `docs/` once settled.
 - **Never commit model weights**, captured goldens, or benchmark output.

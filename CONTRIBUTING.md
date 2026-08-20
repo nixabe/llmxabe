@@ -85,26 +85,10 @@ needs to find the thing you were looking at.
 
 ## Commits
 
-[Conventional Commits](https://www.conventionalcommits.org/), scoped to the
-crate:
-
-```
-feat(xabe-cache): add two-group pager with per-group page geometry
-fix(xabe-sched): reject token budget <= block size at construction
-docs: document snapshot retention interval rationale
-test(xabe-kernels): add cosine threshold for chunked delta rule
-perf(xabe-cuda): hoist shared expert out of the routed path
-```
-
-One logical change per commit. A commit should build and pass tests on its own.
-
-Before committing:
-
-```sh
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-```
+Commit style and the pre-commit checklist live in
+[AGENTS.md](AGENTS.md)'s Working rules — Conventional Commits scoped to the
+crate, one logical change per commit, fmt/clippy/test clean before
+committing.
 
 ## Things that must never be committed
 
