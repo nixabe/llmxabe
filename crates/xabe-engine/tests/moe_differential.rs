@@ -1079,8 +1079,7 @@ fn the_one_token_dispatch_matches_the_reference_slot_for_slot() {
 }
 
 // ---------------------------------------------------------------------------
-// gemv vs. bm1: the isolated bit-identity probe the batch-vs-single-stream
-// workstream's Phase A audit named.
+// gemv vs. direct decode: bit identity across compiled entry points.
 // ---------------------------------------------------------------------------
 
 /// One live token, decoded twice through two different **compiled entry
@@ -1088,26 +1087,14 @@ fn the_one_token_dispatch_matches_the_reference_slot_for_slot() {
 /// `max_tokens = 1` (the true single-stream shape, `moe_expert_ffn_gemv`/
 /// `moe_expert_down_gemv`), once through `max_tokens = 2` with only one
 /// valid token (`gemv` is false at `max_tokens > 1`, so this takes
-/// `moe_expert_ffn_bm1`/`moe_expert_down_bm1` -- every routed bucket holds
-/// exactly one live slot when there is exactly one live token, so `narrow`'s
-/// `bm <= 1` skip means it never does any real work here; only `bm1` does).
+/// `moe_expert_ffn_direct`/`moe_expert_down_direct`). Every routed bucket
+/// holds exactly one live slot when there is exactly one valid token.
 ///
-/// This isolates the exact pairing `docs/BENCHMARKS.md`'s Phase A audit
-/// named as the ~1e-4 residual's origin from the tiled (`TM > 1`) case
-/// entirely: with one live token there is no tile to stage, no `TM`-wide
-/// loop, nothing but the same "one row, no shared memory" shape on both
-/// sides. If the two still disagree, the divergence is not in tiling at
-/// all -- it is between two independently-compiled kernels whose per-row
-/// source expression is textually near-identical but not the same compiled
-/// function, which NVCC is free to schedule and FMA-contract differently.
-///
-/// Not gated on a tolerance: this prints the measured max-abs diff and
-/// documents Phase B's finding rather than asserting a pass, because at the
-/// time this test was written the two paths do **not** yet agree — see
-/// `docs/BENCHMARKS.md`'s "Phase B, step 1" entry. Once the fix lands this
-/// should become `assert_eq!` on bit-identical output.
+/// With one live token there is no collision and no staged tile: this checks
+/// that independently compiled one-row kernels preserve the established
+/// bit-identical single-stream result.
 #[test]
-fn gemv_and_bm1_isolate_the_one_live_token_case() {
+fn gemv_and_direct_isolate_the_one_live_token_case() {
     let Some((ctx, file)) = device_and_model() else {
         return;
     };
@@ -1215,40 +1202,32 @@ fn gemv_and_bm1_isolate_the_one_live_token_case() {
     let via_gemv = run(1);
     // `MOE_NARROW_DECODE_MAX` is 4 in `xabe-cuda`; 2 is comfortably inside
     // it and above 1, so `gemv` is false and `narrow` is true -- with one
-    // live token, `bucket_live[blk] == 1` for every active bucket, so
-    // `moe_expert_ffn_narrow`/`moe_expert_down_narrow`'s `bm <= 1` skip
-    // means they run zero real tiles here; the whole answer comes from
-    // `moe_expert_ffn_bm1`/`moe_expert_down_bm1`.
-    let via_bm1 = run(2);
+    // live token, `bucket_live[blk] == 1` for every active bucket, so grid.z
+    // slot zero is the only direct block that performs work.
+    let via_direct = run(2);
 
-    let result = compare(&via_gemv, &via_bm1);
-    println!("gemv (max_tokens=1) vs bm1 (max_tokens=2, 1 live token): {result}");
+    let result = compare(&via_gemv, &via_direct);
+    println!("gemv (max_tokens=1) vs direct (max_tokens=2, 1 live token): {result}");
     println!(
         "output magnitude: max |gemv| = {:.4e}",
         via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
     );
 
     assert_eq!(
-        via_gemv, via_bm1,
-        "gemv and bm1 disagree on the one-live-token case -- see \
-         docs/BENCHMARKS.md's Phase B, step 1 entry for the state of this \
-         investigation",
+        via_gemv, via_direct,
+        "gemv and direct decode disagree on the one-live-token case",
     );
 }
 
-/// As [`gemv_and_bm1_isolate_the_one_live_token_case`], for the other half
-/// of the narrow split: two tokens routed to the *same* expert set, forcing
-/// every active bucket's `bucket_live == 2` and so `moe_expert_ffn_narrow`/
-/// `moe_expert_down_narrow`'s tiled (`TM = 2`) path -- the one real
-/// structural difference from a GEMV that a one-live-token probe cannot
-/// exercise at all: a weight tile dequantized once and applied to two
-/// staged, shared-memory-read activation columns instead of one directly
-/// read column.
+/// As [`gemv_and_direct_isolate_the_one_live_token_case`], with two tokens
+/// routed to the same expert set. Every active bucket has `bucket_live == 2`,
+/// so the direct decode kernels launch two independent grid.z blocks that
+/// read the same expert weights and write distinct dispatch slots.
 ///
 /// Token 0's row is compared against the same token, alone, through
 /// `max_tokens = 1` (`gemv`) -- identical hidden state, identical routing.
 #[test]
-fn gemv_and_narrow_isolate_the_two_live_token_case() {
+fn gemv_and_direct_isolate_the_two_live_token_case() {
     let Some((ctx, file)) = device_and_model() else {
         return;
     };
@@ -1343,7 +1322,7 @@ fn gemv_and_narrow_isolate_the_two_live_token_case() {
         full
     };
 
-    let run_narrow_token0 = || -> Vec<f32> {
+    let run_direct_token0 = || -> Vec<f32> {
         let g = MoeGeometry {
             num_experts: config.moe.num_experts as usize,
             experts_per_token: config.moe.experts_per_token as usize,
@@ -1395,20 +1374,18 @@ fn gemv_and_narrow_isolate_the_two_live_token_case() {
     };
 
     let via_gemv = run_gemv();
-    let via_narrow = run_narrow_token0();
+    let via_direct = run_direct_token0();
 
-    let result = compare(&via_gemv, &via_narrow);
-    println!("gemv (alone) vs narrow token 0 (bucket_live=2): {result}");
+    let result = compare(&via_gemv, &via_direct);
+    println!("gemv (alone) vs direct token 0 (bucket_live=2): {result}");
     println!(
         "output magnitude: max |gemv| = {:.4e}",
         via_gemv.iter().fold(0.0f32, |m, v| m.max(v.abs())),
     );
 
     assert_eq!(
-        via_gemv, via_narrow,
-        "gemv and the tiled (TM=2) narrow path disagree on token 0's row \
-         when bucket_live == 2 -- see docs/BENCHMARKS.md's Phase B, step 1 \
-         entry for the state of this investigation",
+        via_gemv, via_direct,
+        "gemv and direct decode disagree on token 0 when bucket_live == 2",
     );
 }
 

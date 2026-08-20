@@ -89,7 +89,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
@@ -121,6 +122,8 @@ const COMBINE_THREADS: u32 = GATE_LANES;
 
 /// Tokens the wide router instantiation carries. Mirrors its `TT`.
 const ROUTER_TT: u32 = 8;
+/// Exact token tile for the serving target's three-sequence decode shape.
+const ROUTER_TT_N3: u32 = 3;
 
 /// Token count below which the shared expert stays on the fp32 kernel.
 ///
@@ -369,6 +372,7 @@ __global__ void NAME(                                                          \
 // accumulators would be a token clamped to the same row — 7/8 of the
 // arithmetic and 7/8 of the staged tile spent recomputing one answer.
 ROUTER_LOGITS(moe_block_router_logits,    8)
+ROUTER_LOGITS(moe_block_router_logits_t3, 3)
 ROUTER_LOGITS(moe_block_router_logits_t1, 1)
 
 // The shared expert's gate and the combine that consumes it, in one launch.
@@ -845,6 +849,7 @@ pub struct MoeBlock {
     moe: MoeKernels,
     layer_ops: LayerOpsKernels,
     router_logits_fn: CudaFunction,
+    router_logits_t3_fn: CudaFunction,
     router_logits_t1_fn: CudaFunction,
     combine_fn: CudaFunction,
     buffers: MoeBuffers,
@@ -855,6 +860,25 @@ pub struct MoeBlock {
     gate: CudaSlice<f32>,
     geometry: MoeGeometry,
     eps: f32,
+    /// Setup-time A/B control for the superseded eight-token router tile at
+    /// the exact N=3 decode shape.
+    router_tt8_n3: bool,
+    /// Side stream plus fork/join events that run the decode-width shared
+    /// expert concurrently with the routed path. The shared pair reads only
+    /// `normed` and `valid_tokens` (both final before the fork) and writes
+    /// only `shexp` and `buffers.shared_inter` (which the routed kernels
+    /// never touch), so overlapping them changes scheduling and nothing
+    /// else — the shared kernels are latency-bound at decode width (156
+    /// GB/s against the routed kernels' DRAM-saturated 470--520,
+    /// docs/BENCHMARKS.md 2026-08-20), which looked like exactly the work
+    /// that hides under a bandwidth-bound neighbour for free. Measured, it
+    /// does not: the interleaved A/B found 32K N=3 flat (149.5 vs 149.7)
+    /// and N=1 down 2.5% from the fork/join events alone, so the serial
+    /// order is the default and `LLMXABE_MOE_SHARED_OVERLAP=1` re-arms the
+    /// side stream for A/B only. The wide MMA shared path stays serial
+    /// regardless: it shares the quantized-activation buffers with the
+    /// routed MMA kernels.
+    shared_overlap: Option<(Arc<CudaStream>, CudaEvent, CudaEvent)>,
 }
 
 impl MoeBlock {
@@ -899,6 +923,7 @@ impl MoeBlock {
         let n = geometry.max_tokens * geometry.hidden;
         Ok(Self {
             router_logits_fn: module.load_function("moe_block_router_logits")?,
+            router_logits_t3_fn: module.load_function("moe_block_router_logits_t3")?,
             router_logits_t1_fn: module.load_function("moe_block_router_logits_t1")?,
             combine_fn: module.load_function("moe_block_gate_and_combine")?,
             moe,
@@ -911,6 +936,12 @@ impl MoeBlock {
             gate: stream.alloc_zeros::<f32>(geometry.max_tokens)?,
             geometry,
             eps,
+            router_tt8_n3: std::env::var_os("LLMXABE_ROUTER_TT8_N3").is_some(),
+            shared_overlap: if std::env::var_os("LLMXABE_MOE_SHARED_OVERLAP").is_some() {
+                Some((ctx.new_stream()?, ctx.new_event(None)?, ctx.new_event(None)?))
+            } else {
+                None
+            },
         })
     }
 
@@ -1050,12 +1081,36 @@ impl MoeBlock {
             self.eps,
         )?;
 
+        // Fork for the shared-expert side stream, recorded HERE — after
+        // `normed` lands and before any routed work is enqueued — so the
+        // side stream's dependency is exactly `normed` and the shared pair
+        // genuinely runs beside the router/dispatch/expert kernels below.
+        // Recording at the shared-expert call site instead would capture
+        // the whole routed path into the fork and overlap nothing.
+        let takes_shared_mma = g.max_tokens >= SHARED_MMA_MIN_TOKENS
+            && w.shared_int8.is_some()
+            && self.moe.tensor_cores_enabled();
+        let overlap_shared = self.shared_overlap.is_some() && !takes_shared_mma;
+        if overlap_shared {
+            let (side, fork, _) = self.shared_overlap.as_ref().expect("checked above");
+            fork.record(stream)?;
+            side.wait(fork)?;
+        }
+
         // 2. router logits, then softmax + top-k + renormalize on the device.
         let hidden_i32 = g.hidden as i32;
         let experts_i32 = g.num_experts as i32;
         let max_tokens_i32 = g.max_tokens as i32;
-        // One token takes the narrow instantiation; see the kernel.
-        let tt = if g.max_tokens == 1 { 1 } else { ROUTER_TT };
+        // Exact N=3 avoids computing the last token five extra times in the
+        // wide TT=8 tile. The environment fallback keeps the old mapping in
+        // this binary for controlled measurements.
+        let tt = if g.max_tokens == 1 {
+            1
+        } else if g.max_tokens == ROUTER_TT_N3 as usize && !self.router_tt8_n3 {
+            ROUTER_TT_N3
+        } else {
+            ROUTER_TT
+        };
         let cfg = LaunchConfig {
             grid_dim: (
                 (g.num_experts as u32).div_ceil(ROUTER_ET),
@@ -1069,10 +1124,10 @@ impl MoeBlock {
             shared_mem_bytes: ((THREADS.div_ceil(32) * ROUTER_ET * tt) as usize * size_of::<f32>())
                 as u32,
         };
-        let f = if tt == 1 {
-            &self.router_logits_t1_fn
-        } else {
-            &self.router_logits_fn
+        let f = match tt {
+            1 => &self.router_logits_t1_fn,
+            ROUTER_TT_N3 => &self.router_logits_t3_fn,
+            _ => &self.router_logits_fn,
         };
         let mut builder = stream.launch_builder(f);
         builder
@@ -1126,6 +1181,14 @@ impl MoeBlock {
         // cost 57% of decode throughput — 15.39 ms per step became 24.13 —
         // while `bench_forward`'s n = 1 column, which builds its own weights
         // and so never repacks, showed nothing wrong.
+        //
+        // The GEMV branch runs on the side stream when one exists: the fork
+        // was recorded after `normed` landed, the join is awaited before the
+        // combine reads `shexp`, and its buffers are disjoint from the
+        // routed kernels running concurrently on `stream` — see
+        // `shared_overlap`'s field doc. The MMA branch keeps the main
+        // stream: it shares the quantized-activation buffers with the
+        // routed MMA path and may not run beside it.
         let wide_enough = g.max_tokens >= SHARED_MMA_MIN_TOKENS;
         match w
             .shared_int8
@@ -1139,24 +1202,40 @@ impl MoeBlock {
                 &self.normed,
                 &mut self.shexp,
             )?,
-            None => self.moe.shared_expert(
-                stream,
-                &mut self.buffers,
-                QuantTensor {
-                    bytes: &w.shared_gate,
-                    quant: w.shared_gate_quant,
-                },
-                QuantTensor {
-                    bytes: &w.shared_up,
-                    quant: w.shared_up_quant,
-                },
-                QuantTensor {
-                    bytes: &w.shared_down,
-                    quant: w.shared_down_quant,
-                },
-                &self.normed,
-                &mut self.shexp,
-            )?,
+            None => {
+                let shared_stream = if overlap_shared {
+                    self.shared_overlap
+                        .as_ref()
+                        .expect("checked at the fork")
+                        .0
+                        .clone()
+                } else {
+                    stream.clone()
+                };
+                self.moe.shared_expert(
+                    &shared_stream,
+                    &mut self.buffers,
+                    QuantTensor {
+                        bytes: &w.shared_gate,
+                        quant: w.shared_gate_quant,
+                    },
+                    QuantTensor {
+                        bytes: &w.shared_up,
+                        quant: w.shared_up_quant,
+                    },
+                    QuantTensor {
+                        bytes: &w.shared_down,
+                        quant: w.shared_down_quant,
+                    },
+                    &self.normed,
+                    &mut self.shexp,
+                )?;
+                if overlap_shared {
+                    let (side, _, join) = self.shared_overlap.as_ref().expect("checked");
+                    join.record(side)?;
+                    stream.wait(join)?;
+                }
+            }
         }
 
         // 5. the routed sum, the shared expert's sigmoid gate, and the

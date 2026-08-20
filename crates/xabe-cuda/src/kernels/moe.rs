@@ -180,11 +180,10 @@ const SHARED_WARPS: u32 = 4;
 
 /// Token tiles for the multi-token generalization of the shared-expert GEMV.
 ///
-/// Same set `gdn.rs` uses for `project_split_tiled`: below the widest, pick
-/// the smallest tile that covers `max_tokens` in one grid.y slice so a
-/// 3-token decode (the audit's own batch width) is one launch of the 4-wide
-/// kernel, not two launches of the 2-wide one.
-const SHARED_GEMV_TILES: [u32; 4] = [2, 4, 8, 16];
+/// Below the widest, pick the smallest tile that covers `max_tokens` in one
+/// grid.y slice. The exact 3-wide entry avoids carrying a zero-padded fourth
+/// column through every shared-expert contraction at the serving width.
+const SHARED_GEMV_TILES: [u32; 5] = [2, 3, 4, 8, 16];
 
 /// `shared_expert` uses the GEMV's reduction tree (tiled over tokens) up to
 /// this width, then the original `moe_shared_ffn` tile. Decode is never
@@ -245,13 +244,11 @@ const MMA_M_NARROW: usize = 32;
 /// decode step of one token, where the integer path loses.
 const MMA_MIN_TOKENS: usize = 8;
 
-/// Batch width at or below which `grouped_forward_partial` picks
-/// `expert_ffn_narrow`/`expert_down_narrow` over `expert_ffn`/`expert_down`
-/// for `N > 1`. Below `MMA_MIN_TOKENS`, so there is no overlap with the
-/// integer-tensor-core path's own threshold. See `moe_expert_ffn_narrow`'s
-/// own comment in `MOE_SRC` for the measurement this bound comes from
-/// (a real win through `N` 4, and why `N` 8 needed a separate compiled
-/// kernel rather than a runtime-gated branch to stay unregressed).
+/// Batch width at or below which `grouped_forward_partial` uses one direct
+/// GEMV block per live routed slot instead of the general fp32 expert tiles.
+/// This is below `MMA_MIN_TOKENS`, so it cannot overlap the integer-tensor-core
+/// path. `LLMXABE_MOE_STAGED_NARROW` retains the previous singleton-plus-staged
+/// implementation as a setup-time A/B fallback at the same widths.
 const MOE_NARROW_DECODE_MAX: usize = 4;
 
 /// Bytes per staged activation row. Mirrors `MOE_MMA_ASTRIDE`.
@@ -547,7 +544,8 @@ __device__ __forceinline__ float q8_0_value(signed char q, float d) {
 // within a superblock decomposes as half = r/128, group = (r%128)/32 and
 // l = r%32. Over this tile half is fixed, group is `lane / 8`, and l runs
 // 4*(lane%8) .. +3.
-__device__ __forceinline__ void dequant_tile_q6k(
+template<bool ALIGNED_DELTA>
+__device__ __forceinline__ void dequant_tile_q6k_impl(
     const unsigned char* __restrict__ src, long long i0, int wlane, float* out
 ) {
     const unsigned char* base = src + (i0 >> 8) * Q6K_SB;
@@ -555,7 +553,9 @@ __device__ __forceinline__ void dequant_tile_q6k(
     const unsigned char* ql = base + half * 64;
     const unsigned char* qh = base + 128 + half * 32;
     const signed char*   sc = (const signed char*)(base + 192 + half * 8);
-    float d = load_half_le(base + 208);
+    float d = ALIGNED_DELTA
+        ? half_bits_to_float(*(const unsigned short*)(base + 208))
+        : load_half_le(base + 208);
 
     int grp = wlane >> 3;
     int l   = (wlane * 4) & 31;
@@ -608,6 +608,12 @@ __device__ __forceinline__ void dequant_tile_q6k(
     }
 }
 
+__device__ __forceinline__ void dequant_tile_q6k(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    dequant_tile_q6k_impl<false>(src, i0, wlane, out);
+}
+
 // The same tile in Q8_0. A Q8_0 block *is* 32 elements, so a lane's four
 // consecutive elements always share one block and its fp16 delta is read
 // once for all four.
@@ -615,17 +621,24 @@ __device__ __forceinline__ void dequant_tile_q6k(
 // Reading the code as `signed char` is load-bearing: the quants are int8 on
 // disk, and reading them unsigned flips the sign of roughly half of every
 // tensor while leaving magnitudes plausible.
-__device__ __forceinline__ void dequant_tile_q8_0(
+__device__ __forceinline__ void dequant_tile_q8_0_wide(
     const unsigned char* __restrict__ src, long long i0, int wlane, float* out
 ) {
     const unsigned char* base = src + ((i0 >> 5) + (wlane >> 3)) * 34;
     float d = load_half_le(base);
     int first = (wlane * 4) & 31;
 
+    // The serialized block is only two-byte aligned (34-byte stride), so a
+    // uint load at `base + 2 + first` would be misaligned every other block.
+    // Two aligned 16-bit loads still replace four scalar byte loads and keep
+    // exactly the same signed codes in registers.
+    const unsigned char* qp = base + 2 + first;
+    unsigned int q4 = (unsigned int)(*(const unsigned short*)qp)
+        | ((unsigned int)(*(const unsigned short*)(qp + 2)) << 16);
+
     #pragma unroll
     for (int t = 0; t < MOE_TN; ++t) {
-        int lane = first + t;
-        signed char q = (signed char)base[2 + lane];
+        signed char q = (signed char)(q4 >> (8 * t));
         out[t] = q8_0_value(q, d);
     }
 }
@@ -636,7 +649,7 @@ __device__ __forceinline__ void dequant_tile(
     const unsigned char* __restrict__ src, int quant, long long i0, int wlane, float* out
 ) {
     if (quant == 0) dequant_tile_q6k(src, i0, wlane, out);
-    else            dequant_tile_q8_0(src, i0, wlane, out);
+    else            dequant_tile_q8_0_wide(src, i0, wlane, out);
 }
 
 // Stage MOE_TM rows x MOE_TK columns of activations into shared memory, in
@@ -950,6 +963,129 @@ __device__ __forceinline__ void tile_gemm_single_direct1(
     warp_reduce_tile<1>(ad);
 }
 
+// Q6-only decode contraction. The general direct helper above carries both
+// unpack families because its quant code is a runtime argument; this entry
+// point is selected only when setup has proved gate and up are both Q6_K.
+template<bool ALIGNED_DELTA>
+__device__ __forceinline__ void tile_gemm_pair_direct1_q6(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ src, const long long* rows,
+    long long wrow, int k_len, int lane, int live, float* ag, float* au
+) {
+    ag[0] = 0.0f;
+    au[0] = 0.0f;
+    if (!live) return;
+    if (rows[0] < 0) {
+        warp_reduce_tile<1>(ag);
+        warp_reduce_tile<1>(au);
+        return;
+    }
+    #pragma unroll 2
+    for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
+        float wg[MOE_TN];
+        float wu[MOE_TN];
+        dequant_tile_q6k_impl<ALIGNED_DELTA>(gate_q, wrow + j0, lane, wg);
+        dequant_tile_q6k_impl<ALIGNED_DELTA>(up_q,   wrow + j0, lane, wu);
+        float4 xv = *(const float4*)(src + rows[0] + j0 + 4 * lane);
+        ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
+        ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
+        ag[0] += wg[2] * xv.z;  au[0] += wu[2] * xv.z;
+        ag[0] += wg[3] * xv.w;  au[0] += wu[3] * xv.w;
+    }
+    warp_reduce_tile<1>(ag);
+    warp_reduce_tile<1>(au);
+}
+
+// The staged form of the Q6-only decode contraction: identical arithmetic
+// to `tile_gemm_pair_direct1_q6<true>` — same half-superblock tile order,
+// same per-lane four-element FMA sequence, same reduction — with the
+// superblock bytes carried global->shared first and the unpack reading
+// shared. Only the load pattern changes, and that is the point: the direct
+// form issues sixty-four 4-byte weight loads per 256-element superblock
+// pair, with the nibble plane read twice (groups 0/2 and 1/3 address the
+// same `ql` words) and the high-bit plane four times; the staged form
+// issues twenty-eight 16-byte loads, each byte once. The flat kernels this
+// feeds moved weights at 473--519 GB/s against the LM head GEMV's 556+ on
+// the same card (docs/BENCHMARKS.md 2026-08-20), and the load-issue rate
+// on those small redundant words is the difference between them.
+//
+// `sg` is this warp's private `2 * Q6K_SB` staging slot, so `__syncwarp`
+// is the only fence needed: once before the unpack reads what lanes 0--27
+// staged, once after the last read before the slot is rewritten. Requires
+// the padded `Q6K_SB` device stride (every superblock 16-byte aligned) and
+// `k_len` a whole number of superblocks; the caller checks both.
+__device__ __forceinline__ void tile_gemm_pair_staged_q6(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    unsigned char* sg,
+    const float* __restrict__ src, long long row,
+    long long wrow, int k_len, int lane, float* ag, float* au
+) {
+    ag[0] = 0.0f;
+    au[0] = 0.0f;
+    for (int s0 = 0; s0 < k_len; s0 += 256) {
+        const int4* gsb = (const int4*)(gate_q + ((wrow + s0) >> 8) * Q6K_SB);
+        const int4* usb = (const int4*)(up_q   + ((wrow + s0) >> 8) * Q6K_SB);
+        if (lane < Q6K_SB / 16) {
+            ((int4*)sg)[lane] = gsb[lane];
+        } else if (lane < 2 * (Q6K_SB / 16)) {
+            ((int4*)sg)[lane] = usb[lane - Q6K_SB / 16];
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float wg[MOE_TN];
+            float wu[MOE_TN];
+            dequant_tile_q6k_impl<true>(sg,          128 * h, lane, wg);
+            dequant_tile_q6k_impl<true>(sg + Q6K_SB, 128 * h, lane, wu);
+            float4 xv = *(const float4*)(src + row + s0 + 128 * h + 4 * lane);
+            ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
+            ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
+            ag[0] += wg[2] * xv.z;  au[0] += wu[2] * xv.z;
+            ag[0] += wg[3] * xv.w;  au[0] += wu[3] * xv.w;
+        }
+        __syncwarp();
+    }
+    warp_reduce_tile<1>(ag);
+    warp_reduce_tile<1>(au);
+}
+
+// As above for a single Q8_0 weight matrix: the staged down projection.
+// A Q8_0 block is 34 bytes on its packed device stride, which no int4 can
+// address — but eight blocks are one 272-byte group of 256 elements, and
+// 272 is 17 int4s, so the group is stageable whenever the row's byte
+// offset is 16-aligned. It always is here: a down row is `k_len / 32`
+// blocks and `k_len` is a multiple of 256, so rows advance in whole
+// 272-byte groups from an aligned base. The caller checks `k_len`.
+__device__ __forceinline__ void tile_gemm_single_staged_q8(
+    const unsigned char* __restrict__ w_q,
+    unsigned char* sw,
+    const float* __restrict__ src, long long row,
+    long long wrow, int k_len, int lane, float* ad
+) {
+    ad[0] = 0.0f;
+    for (int s0 = 0; s0 < k_len; s0 += 256) {
+        const int4* wsb = (const int4*)(w_q + ((wrow + s0) >> 5) * 34);
+        if (lane < 17) {
+            ((int4*)sw)[lane] = wsb[lane];
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float wd[MOE_TN];
+            dequant_tile_q8_0_wide(sw, 128 * h, lane, wd);
+            float4 xv = *(const float4*)(src + row + s0 + 128 * h + 4 * lane);
+            ad[0] += wd[0] * xv.x;
+            ad[0] += wd[1] * xv.y;
+            ad[0] += wd[2] * xv.z;
+            ad[0] += wd[3] * xv.w;
+        }
+        __syncwarp();
+    }
+    warp_reduce_tile<1>(ad);
+}
+
 // Write one slot's weighted contribution, or nothing at all if the slot is
 // padding.
 //
@@ -963,6 +1099,40 @@ __device__ __forceinline__ void store_slot_contribution(
 ) {
     if (flat >= numel) return;
     partial[(long long)flat * hidden + h] = topk_weights[flat] * s;
+}
+
+__device__ __forceinline__ void moe_expert_ffn_direct_q6_body(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
+    int top_k, int block_size, int hidden, int intermediate,
+    float* __restrict__ inter
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+    int slot = blockIdx.z;
+    if (slot >= bucket_live[blk]) return;
+
+    int flat = sorted_token_ids[(long long)blk * block_size + slot];
+    long long rows[1] = {(long long)(flat / top_k) * hidden};
+    float ag[1];
+    float au[1];
+    tile_gemm_pair_direct1_q6<true>(
+        gate_q, up_q, hidden_states, rows, wrow, hidden, lane, 1, ag, au);
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[((long long)blk * block_size + slot) * intermediate + r] = act * au[0];
+    }
 }
 
 #define MOE_MMA_WARPS 8
@@ -1332,6 +1502,22 @@ moe_expert_ffn_mma_impl(
                 }
             }
         }
+    }
+
+    // The k-loop's own barriers sit at the TOP of each staging trip, so
+    // nothing orders the last trip's consume phase against what comes next.
+    // The FUSE_IQ tile below reuses the staging allocation, and without this
+    // barrier a warp that finished its fragments early overwrote staged
+    // weight and activation bytes a sibling warp was still contracting --
+    // a real race, and the cause of the 2026-08-20 wide-flattened-prefill
+    // divergence: the corruption pattern follows the block schedule, so it
+    // changed with the pass width and masqueraded as flattening error
+    // (first divergence layer 1 MoE at 5.7e-5, amplified to 2.39 by layer
+    // 39 through routing flips; bit-exact at every waypoint once the fused
+    // path was disabled). The non-fused instantiation writes only to global
+    // `inter` and needs no barrier here.
+    if constexpr (FUSE_IQ) {
+        __syncthreads();
     }
 
     // SwiGLU, written exactly as `xabe_kernels::norm::silu`: x / (1 + exp(-x)),
@@ -2153,28 +2339,21 @@ __global__ void moe_expert_ffn(
     }
 }
 
-// `moe_expert_ffn`'s own body, unchanged, with one difference: `bm == 1`
-// takes `tile_gemm_pair_direct1` instead of the staged `TM` 2 tile. A
-// separate `__global__` entry point rather than a branch inside
-// `moe_expert_ffn` itself -- see "2a." above for why the branch-inside
-// version was rejected, and `moe_shared_ffn`/`moe_shared_down` deliberately
-// keep the original three-way `MOE_TILE_DISPATCH` unchanged rather than
-// gaining a `_narrow` twin of their own: the shared expert's `bm` is the
-// live token count directly (no sparse routing), so `bm == 1` there means
-// `N == 1`, already served by `moe_expert_ffn_gemv`'s dedicated one-token
-// path before this function is ever reached.
+// Retained staged collision half of the previous narrow decode path. The
+// default direct path below handles every live slot independently; this
+// kernel now runs only under `LLMXABE_MOE_STAGED_NARROW`, paired with the
+// singleton-only direct fallback. `moe_shared_ffn`/`moe_shared_down` keep the
+// original three-way `MOE_TILE_DISPATCH`: the shared expert has no sparse
+// routing, and N==1 already takes its dedicated GEMV path.
 //
-// The host picks this over `moe_expert_ffn` by batch width
-// (`MoeKernels::grouped_forward_partial`, gated `1 < max_tokens <=
-// MOE_NARROW_DECODE_MAX`), a launch-time decision from a host-known value,
-// not a device readback -- unchanged from how `max_tokens == 1` already
-// picks `moe_expert_ffn_gemv` over both.
+// The host can pick this by batch width and a setup-time environment switch;
+// neither choice requires a device readback or a hot-path host-sized launch.
 //
-// `__launch_bounds__(256, 3)` is a correction, not a tuning choice: removing
-// the `bm == 1` branch (now `moe_expert_ffn_bm1`'s) left only the tiled
-// path, and `ptxas`'s allocator responded by climbing from 79 to 100
-// registers with the branch gone -- fewer live ranges to reconcile at the
-// branch join, not fewer registers needed. 100 drops this kernel's own
+// `__launch_bounds__(256, 3)` is a correction, not a tuning choice: moving
+// the `bm == 1` case into a separate singleton kernel left only the tiled
+// collision path here, and `ptxas`'s allocator responded by climbing from 79
+// to 100 registers with the branch gone -- fewer live ranges to reconcile at
+// the branch join, not fewer registers needed. 100 drops this kernel's own
 // occupancy a full tier (3 blocks/SM to 2), which was eating most of the
 // split's gain back on exactly the buckets (`bm` 2-4) this kernel still
 // owns. The hint caps it back at the pre-split 80 registers, zero spill,
@@ -2216,14 +2395,9 @@ __global__ void __launch_bounds__(256, 3) moe_expert_ffn_narrow(
         // below `MOE_NARROW_DECODE_MAX`) skip both `__syncthreads()` below
         // rather than pay them to discover there is nothing to do.
         //
-        // `bm == 1` is `moe_expert_ffn_bm1`'s alone now, not this kernel's:
-        // with `bm` a table read instead of a derivation, splitting the two
-        // cases into two kernels no longer means deriving `bm` twice -- see
-        // that kernel's own comment for why this is the same lever the
-        // split-kernel reject wanted, minus the cost that sank it. The two
-        // kernels partition every bucket's every sub-tile exactly once
-        // between them; skipping `bm <= 1` here is the other half of that
-        // partition.
+        // The A/B fallback's singleton kernel owns `bm == 1`; this staged
+        // kernel owns collision tiles only. Together they partition each
+        // fallback bucket exactly once.
         int bm = bucket_bm - m0;
         if (bm < 0) bm = 0;
         if (bm > MOE_TM) bm = MOE_TM;
@@ -2263,22 +2437,14 @@ __global__ void __launch_bounds__(256, 3) moe_expert_ffn_narrow(
     }
 }
 
-// `moe_expert_ffn_narrow`'s `bm == 1` half, pulled into its own entry point
-// now that `bucket_live` makes finding it a load and a clamp rather than a
-// populate-then-scan.
+// One independent direct GEMV per live dispatch slot at decode width.
 //
-// This is the same lever the split-kernel reject two sections back tried
-// and lost: a `bm == 1`-only kernel needs none of the tiled fallback's
-// registers, so it can reach the standalone GEMV kernels' occupancy class
-// instead of `moe_expert_ffn_narrow`'s. What sank that attempt was not the
-// register math -- it landed within a register of this section's own
-// measurement -- it was that deriving `bm` a second time, by walking
-// `sorted_token_ids` and scanning for the sentinel a second time, cost more
-// than the leaner kernel saved, and that cost scaled with `grid.x`. With
-// `bm` a table read shared by both kernels, that second derivation does not
-// happen at all: this kernel and `moe_expert_ffn_narrow` each pay exactly
-// one load and one clamp per sub-tile, the same one `bucket_live`'s
-// predecessor already priced in.
+// Almost every N<=4 bucket holds one row. The rare collision used to run a
+// staged `TM=2`/`TM=8` kernel over one expert only: at N=3 that underfilled
+// path cost 3.7 ms of a 20.1 ms step across gate/up and down. Giving each
+// live slot its own `grid.z` block duplicates only the collided expert's
+// weights (D(3) is 23.26 distinct experts for 24 routed pairs, about 3%),
+// while restoring the many-block geometry the direct one-row path reaches.
 //
 // No shared memory, no `rows[]`/`xs` tile, no `tile_gemm_pair<TM>` fallback
 // compiled in at all: `tile_gemm_pair_direct1` only ever touches index 0 of
@@ -2287,10 +2453,152 @@ __global__ void __launch_bounds__(256, 3) moe_expert_ffn_narrow(
 // without `moe_expert_ffn_narrow`'s tiled dispatch dragging in registers
 // this kernel's own arithmetic never needs.
 //
-// grid/block/shared: identical to `moe_expert_ffn_narrow`'s own launch --
-// same `intermediate x expert_block_capacity` tiling, so the two share one
-// `LaunchConfig` on the host side.
-__global__ void moe_expert_ffn_bm1(
+// grid: (ceil(intermediate/MOE_ROWS), expert_block_capacity, max_tokens).
+// block: 256 threads. No shared memory.
+__global__ void moe_expert_ffn_direct_q6(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_direct_q6_body(
+        gate_q, up_q, hidden_states, sorted_token_ids, expert_ids, bucket_live,
+        top_k, block_size, hidden, intermediate, inter);
+}
+
+// Decode-width direct mapping without the sorted dispatch indirection. One
+// grid.y block names one routed pair directly, so all blocks below
+// `valid_tokens * top_k` do useful work and collisions need no special case.
+// The grid remains fixed at `max_tokens * top_k`; the device scalar only
+// gates work, preserving graph capture.
+#define MOE_EXPERT_FFN_FLAT_Q6_BODY(ALIGNED_DELTA) do {                     \
+    int flat = blockIdx.y;                                                   \
+    if (flat >= (*valid_tokens) * top_k) return;                             \
+    int e = topk_ids[flat];                                                  \
+    int lane = threadIdx.x & 31;                                             \
+    int warp = threadIdx.x >> 5;                                             \
+    int r = blockIdx.x * MOE_ROWS + warp;                                    \
+    if (r >= intermediate) return;                                           \
+    long long wrow = ((long long)e * intermediate + r) * hidden;             \
+    long long rows[1] = {(long long)(flat / top_k) * hidden};                 \
+    float ag[1];                                                              \
+    float au[1];                                                              \
+    tile_gemm_pair_direct1_q6<ALIGNED_DELTA>(                                \
+        gate_q, up_q, hidden_states, rows, wrow, hidden, lane, 1, ag, au);    \
+    if (lane == 0) {                                                         \
+        float act = ag[0] / (1.0f + expf(-ag[0]));                           \
+        inter[(long long)flat * intermediate + r] = act * au[0];             \
+    }                                                                        \
+} while (0)
+
+__global__ void moe_expert_ffn_flat_q6(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    MOE_EXPERT_FFN_FLAT_Q6_BODY(true);
+}
+
+__global__ void moe_expert_ffn_flat_q6_bytes(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    MOE_EXPERT_FFN_FLAT_Q6_BODY(false);
+}
+
+#undef MOE_EXPERT_FFN_FLAT_Q6_BODY
+
+// The staged twin of `moe_expert_ffn_flat_q6`: same grid, same arguments,
+// same routed pair per grid.y block and warp per output row, with the
+// superblock loads carried through `tile_gemm_pair_staged_q6` instead of
+// the direct unpack. Selected when gate and up are Q6_K on the padded
+// device stride and `hidden` is a whole number of superblocks.
+__global__ void moe_expert_ffn_flat_q6_staged(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    __shared__ __align__(16) unsigned char stage[MOE_ROWS][2 * Q6K_SB];
+    int flat = blockIdx.y;
+    if (flat >= (*valid_tokens) * top_k) return;
+    int e = topk_ids[flat];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+    long long row = (long long)(flat / top_k) * hidden;
+    float ag[1];
+    float au[1];
+    tile_gemm_pair_staged_q6(
+        gate_q, up_q, stage[warp], hidden_states, row, wrow, hidden, lane,
+        ag, au);
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[(long long)flat * intermediate + r] = act * au[0];
+    }
+}
+
+__global__ void moe_expert_ffn_flat(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    int flat = blockIdx.y;
+    if (flat >= (*valid_tokens) * top_k) return;
+    int e = topk_ids[flat];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+    long long rows[1] = {(long long)(flat / top_k) * hidden};
+    float ag[1];
+    float au[1];
+    tile_gemm_pair_direct1(
+        gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
+        wrow, hidden, lane, 1, ag, au);
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[(long long)flat * intermediate + r] = act * au[0];
+    }
+}
+
+__global__ void moe_expert_ffn_direct(
     const unsigned char* __restrict__ gate_q, int gate_quant,
     const unsigned char* __restrict__ up_q,   int up_quant,
     const float* __restrict__ hidden_states,
@@ -2314,31 +2622,60 @@ __global__ void moe_expert_ffn_bm1(
     if (r >= intermediate) return;
     int live = 1;
     long long wrow = ((long long)e * intermediate + r) * hidden;
-    int bucket_bm = bucket_live[blk];
+    int slot = blockIdx.z;
+    if (slot >= bucket_live[blk]) return;
 
-    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
-        int bm = bucket_bm - m0;
-        if (bm < 0) bm = 0;
-        if (bm > MOE_TM) bm = MOE_TM;
-        if (bm != 1) continue;
+    int flat = sorted_token_ids[(long long)blk * block_size + slot];
+    long long rows[1];
+    rows[0] = (long long)(flat / top_k) * hidden;
 
-        // The only live slot in this sub-tile is local index 0: `bm == 1`
-        // means `bucket_bm == m0 + 1`, so the bucket's whole live prefix
-        // ends one row into this sub-tile, at global slot `m0`.
-        int flat = sorted_token_ids[(long long)blk * block_size + m0];
-        long long rows[1];
-        rows[0] = (long long)(flat / top_k) * hidden;
+    float ag[1];
+    float au[1];
+    tile_gemm_pair_direct1(
+        gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
+        wrow, hidden, lane, live, ag, au);
 
-        float ag[1];
-        float au[1];
-        tile_gemm_pair_direct1(
-            gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
-            wrow, hidden, lane, live, ag, au);
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[((long long)blk * block_size + slot) * intermediate + r] = act * au[0];
+    }
+}
 
-        if (lane == 0) {
-            float act = ag[0] / (1.0f + expf(-ag[0]));
-            inter[((long long)blk * block_size + m0) * intermediate + r] = act * au[0];
-        }
+// A/B fallback: the previous direct kernel only accepted singleton buckets;
+// buckets with two or more rows were left to `moe_expert_ffn_narrow`.
+__global__ void moe_expert_ffn_singleton(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0 || bucket_live[blk] != 1) return;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+    int flat = sorted_token_ids[(long long)blk * block_size];
+    long long rows[1] = {(long long)(flat / top_k) * hidden};
+    float ag[1];
+    float au[1];
+    tile_gemm_pair_direct1(
+        gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
+        wrow, hidden, lane, 1, ag, au);
+    if (lane == 0) {
+        float act = ag[0] / (1.0f + expf(-ag[0]));
+        inter[(long long)blk * block_size * intermediate + r] = act * au[0];
     }
 }
 
@@ -2712,8 +3049,8 @@ __global__ void moe_expert_down_narrow(
     for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
         // See `moe_expert_ffn_narrow`: `bm` is a precomputed load and a
         // clamp, so a fully-empty sub-tile skips both `__syncthreads()`
-        // rather than paying them to find that out. `bm == 1` is
-        // `moe_expert_down_bm1`'s alone now, for the same reason.
+        // rather than paying them to find that out. The A/B fallback's
+        // singleton down kernel owns `bm == 1`; this kernel owns collisions.
         int bm = bucket_bm - m0;
         if (bm < 0) bm = 0;
         if (bm > MOE_TM) bm = MOE_TM;
@@ -2753,13 +3090,9 @@ __global__ void moe_expert_down_narrow(
     }
 }
 
-// `moe_expert_down_narrow`'s `bm == 1` half, pulled out for the same reason
-// and the same way as `moe_expert_ffn_bm1` -- see that kernel's own comment
-// for the full account of why this is the split-kernel reject's own shape,
-// minus the doubled `bm`-derivation that sank it.
-//
-// grid/block/shared: identical to `moe_expert_down_narrow`'s own launch.
-__global__ void moe_expert_down_bm1(
+// The down half of `moe_expert_ffn_direct`, with the same one-live-slot per
+// block mapping and the same deliberate collision-weight duplication.
+__global__ void moe_expert_down_direct(
     const unsigned char* __restrict__ down_q, int down_quant,
     const float* __restrict__ inter,
     const float* __restrict__ topk_weights,
@@ -2784,25 +3117,119 @@ __global__ void moe_expert_down_bm1(
     if (h >= hidden) return;
     int live = 1;
     long long wrow = ((long long)e * hidden + h) * intermediate;
-    int bucket_bm = bucket_live[blk];
+    int slot = blockIdx.z;
+    if (slot >= bucket_live[blk]) return;
 
-    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
-        int bm = bucket_bm - m0;
-        if (bm < 0) bm = 0;
-        if (bm > MOE_TM) bm = MOE_TM;
-        if (bm != 1) continue;
+    int flat = sorted_token_ids[(long long)blk * block_size + slot];
+    long long rows[1];
+    rows[0] = ((long long)blk * block_size + slot) * intermediate;
 
-        int flat = sorted_token_ids[(long long)blk * block_size + m0];
-        long long rows[1];
-        rows[0] = ((long long)blk * block_size + m0) * intermediate;
+    float ad[1];
+    tile_gemm_single_direct1(
+        down_q, down_quant, inter, rows, wrow, intermediate, lane, live, ad);
 
-        float ad[1];
-        tile_gemm_single_direct1(
-            down_q, down_quant, inter, rows, wrow, intermediate, lane, live, ad);
+    if (lane == 0) {
+        store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, ad[0]);
+    }
+}
 
-        if (lane == 0) {
-            store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, ad[0]);
-        }
+// Down half of the flat routed-pair mapping above. `inter` and `partial`
+// share the same flat id, so neither dispatch table nor a sorted-slot-to-flat
+// lookup participates in the hot contraction.
+__global__ void moe_expert_down_flat(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    int flat = blockIdx.y;
+    if (flat >= (*valid_tokens) * top_k) return;
+    int e = topk_ids[flat];
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+    long long rows[1] = {(long long)flat * intermediate};
+    float ad[1];
+    tile_gemm_single_direct1(
+        down_q, down_quant, inter, rows, wrow, intermediate, lane, 1, ad);
+    if (lane == 0) {
+        partial[(long long)flat * hidden + h] = topk_weights[flat] * ad[0];
+    }
+}
+
+// The staged twin of `moe_expert_down_flat`, Q8_0 only: the quant code
+// argument is gone because selection already proved the format. Same
+// staging contract as the ffn twin above, one 272-byte eight-block group
+// per slot.
+__global__ void moe_expert_down_flat_q8_staged(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    __shared__ __align__(16) unsigned char stage[MOE_ROWS][272];
+    int flat = blockIdx.y;
+    if (flat >= (*valid_tokens) * top_k) return;
+    int e = topk_ids[flat];
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+    long long row = (long long)flat * intermediate;
+    float ad[1];
+    tile_gemm_single_staged_q8(
+        down_q, stage[warp], inter, row, wrow, intermediate, lane, ad);
+    if (lane == 0) {
+        partial[(long long)flat * hidden + h] = topk_weights[flat] * ad[0];
+    }
+}
+
+// A/B fallback paired with `moe_expert_ffn_singleton`.
+__global__ void moe_expert_down_singleton(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ bucket_live,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0 || bucket_live[blk] != 1) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+    int flat = sorted_token_ids[(long long)blk * block_size];
+    long long rows[1] = {(long long)blk * block_size * intermediate};
+    float ad[1];
+    tile_gemm_single_direct1(
+        down_q, down_quant, inter, rows, wrow, intermediate, lane, 1, ad);
+    if (lane == 0) {
+        store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, ad[0]);
     }
 }
 
@@ -3272,6 +3699,7 @@ __global__ void NAME(                                                        \
 }
 
 MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t2,  2)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t3,  3)
 MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t4,  4)
 MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t8,  8)
 MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t16, 16)
@@ -3331,6 +3759,7 @@ __global__ void NAME(                                                        \
 }
 
 MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t2,  2)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t3,  3)
 MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t4,  4)
 MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t8,  8)
 MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t16, 16)
@@ -3846,21 +4275,25 @@ pub struct MoeKernels {
     expert_ffn: CudaFunction,
     expert_ffn_gemv: CudaFunction,
     expert_down_gemv: CudaFunction,
-    /// `1 < N <= MOE_NARROW_DECODE_MAX` batch-decode path: `moe_expert_ffn`'s
-    /// own body, `bm > 1` only. A separate compiled entry point from
-    /// `expert_ffn`, not a runtime branch inside it — see the CUDA source's
-    /// own comment above `moe_expert_ffn_narrow` for why a same-function
-    /// branch was tried first and rejected. `bm == 1` is `expert_ffn_bm1`'s,
-    /// below: the two partition every dispatch bucket's every sub-tile
-    /// between them.
+    /// Retained staged narrow path for the setup-time A/B fallback.
     expert_ffn_narrow: CudaFunction,
     expert_down_narrow: CudaFunction,
-    /// The `bm == 1` half `expert_ffn_narrow`/`expert_down_narrow` no longer
-    /// handle. See `moe_expert_ffn_bm1`'s own comment for why this is the
-    /// split-kernel reject's shape, re-tried once `bucket_live` removed the
-    /// cost that sank the first attempt.
-    expert_ffn_bm1: CudaFunction,
-    expert_down_bm1: CudaFunction,
+    /// Decode-width direct path: one independently scheduled block per live
+    /// dispatch slot, including the rare slots that share an expert.
+    expert_ffn_direct: CudaFunction,
+    expert_down_direct: CudaFunction,
+    /// Q6-specialized gate/up variant that omits the unused Q8 unpack family.
+    expert_ffn_direct_q6: CudaFunction,
+    /// Default decode-width mapping, indexed directly by routed pair rather
+    /// than by the sorted dispatch tables.
+    expert_ffn_flat: CudaFunction,
+    expert_ffn_flat_q6: CudaFunction,
+    expert_ffn_flat_q6_bytes: CudaFunction,
+    expert_ffn_flat_q6_staged: CudaFunction,
+    expert_down_flat: CudaFunction,
+    expert_down_flat_q8_staged: CudaFunction,
+    expert_ffn_singleton: CudaFunction,
+    expert_down_singleton: CudaFunction,
     expert_ffn_mma: CudaFunction,
     expert_ffn_mma_q8: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
@@ -3875,8 +4308,8 @@ pub struct MoeKernels {
     shared_down_gemv: CudaFunction,
     /// `moe_shared_ffn_gemv` / `moe_shared_down_gemv` tiled over tokens at
     /// `SHARED_GEMV_TILES` widths. Index matches `shared_gemv_tile_for`.
-    shared_ffn_gemv_tiled: [CudaFunction; 4],
-    shared_down_gemv_tiled: [CudaFunction; 4],
+    shared_ffn_gemv_tiled: [CudaFunction; 5],
+    shared_down_gemv_tiled: [CudaFunction; 5],
     swiglu: CudaFunction,
     geometry: MoeGeometry,
     /// The dispatch-slot ceiling `expert_ffn_mma`/`expert_down_mma` were
@@ -3886,6 +4319,25 @@ pub struct MoeKernels {
     mma_m: usize,
     /// Experimental producer-side Q8 quantization, selected once at setup.
     fused_iq: bool,
+    /// Setup-time A/B control for the superseded staged collision path.
+    staged_narrow: bool,
+    /// Setup-time A/B control for the runtime-quant gate/up direct kernel.
+    generic_direct: bool,
+    /// Setup-time A/B control for the superseded dispatch-bucket grid.
+    bucketed_direct: bool,
+    /// Setup-time A/B control that retains dispatch construction even though
+    /// the flat direct kernels do not consume its output.
+    build_flat_dispatch: bool,
+    /// Setup-time A/B control for the defensive routed-partial clear.
+    skip_partial_clear: bool,
+    /// Setup-time A/B control for the old byte-assembled Q6 delta load.
+    q6_byte_delta: bool,
+    /// Setup-time A/B control for the shared-staged flat decode GEMVs.
+    /// Measured slower than the direct unpack at every decode shape
+    /// (docs/BENCHMARKS.md 2026-08-20): the flat kernels are bound by the
+    /// integer pipe, not load issue, so the staging round trip only adds
+    /// work. Retained for A/B via `LLMXABE_MOE_FLAT_STAGE=1`.
+    flat_staged: bool,
 }
 
 impl MoeKernels {
@@ -3982,6 +4434,14 @@ impl MoeKernels {
         let narrow = geometry.block_size <= MMA_M_NARROW;
         let mma_m = if narrow { MMA_M_NARROW } else { MMA_M };
         let fused_iq = !narrow && std::env::var_os("LLMXABE_MOE_FUSED_IQ").is_none_or(|v| v != "0");
+        let staged_narrow = std::env::var_os("LLMXABE_MOE_STAGED_NARROW").is_some();
+        let generic_direct = std::env::var_os("LLMXABE_MOE_GENERIC_DIRECT").is_some();
+        let bucketed_direct = std::env::var_os("LLMXABE_MOE_BUCKETED_DIRECT").is_some();
+        let build_flat_dispatch = std::env::var_os("LLMXABE_MOE_BUILD_FLAT_DISPATCH").is_some();
+        let skip_partial_clear = std::env::var_os("LLMXABE_MOE_NO_PARTIAL_CLEAR").is_some();
+        let q6_byte_delta = std::env::var_os("LLMXABE_MOE_Q6_BYTE_DELTA").is_some();
+        let flat_staged =
+            std::env::var_os("LLMXABE_MOE_FLAT_STAGE").is_some_and(|v| v == "1");
         Ok(Self {
             route: module.load_function("moe_route")?,
             dispatch_t1: module.load_function("moe_dispatch_t1")?,
@@ -3993,8 +4453,17 @@ impl MoeKernels {
             expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
             expert_ffn_narrow: module.load_function("moe_expert_ffn_narrow")?,
             expert_down_narrow: module.load_function("moe_expert_down_narrow")?,
-            expert_ffn_bm1: module.load_function("moe_expert_ffn_bm1")?,
-            expert_down_bm1: module.load_function("moe_expert_down_bm1")?,
+            expert_ffn_direct: module.load_function("moe_expert_ffn_direct")?,
+            expert_down_direct: module.load_function("moe_expert_down_direct")?,
+            expert_ffn_direct_q6: module.load_function("moe_expert_ffn_direct_q6")?,
+            expert_ffn_flat: module.load_function("moe_expert_ffn_flat")?,
+            expert_ffn_flat_q6: module.load_function("moe_expert_ffn_flat_q6")?,
+            expert_ffn_flat_q6_bytes: module.load_function("moe_expert_ffn_flat_q6_bytes")?,
+            expert_ffn_flat_q6_staged: module.load_function("moe_expert_ffn_flat_q6_staged")?,
+            expert_down_flat: module.load_function("moe_expert_down_flat")?,
+            expert_down_flat_q8_staged: module.load_function("moe_expert_down_flat_q8_staged")?,
+            expert_ffn_singleton: module.load_function("moe_expert_ffn_singleton")?,
+            expert_down_singleton: module.load_function("moe_expert_down_singleton")?,
             expert_ffn_mma: module.load_function(if narrow {
                 "moe_expert_ffn_mma_narrow"
             } else if fused_iq {
@@ -4021,12 +4490,14 @@ impl MoeKernels {
             shared_down_gemv: module.load_function("moe_shared_down_gemv")?,
             shared_ffn_gemv_tiled: [
                 module.load_function("moe_shared_ffn_gemv_t2")?,
+                module.load_function("moe_shared_ffn_gemv_t3")?,
                 module.load_function("moe_shared_ffn_gemv_t4")?,
                 module.load_function("moe_shared_ffn_gemv_t8")?,
                 module.load_function("moe_shared_ffn_gemv_t16")?,
             ],
             shared_down_gemv_tiled: [
                 module.load_function("moe_shared_down_gemv_t2")?,
+                module.load_function("moe_shared_down_gemv_t3")?,
                 module.load_function("moe_shared_down_gemv_t4")?,
                 module.load_function("moe_shared_down_gemv_t8")?,
                 module.load_function("moe_shared_down_gemv_t16")?,
@@ -4035,6 +4506,13 @@ impl MoeKernels {
             geometry,
             mma_m,
             fused_iq,
+            staged_narrow,
+            generic_direct,
+            bucketed_direct,
+            build_flat_dispatch,
+            skip_partial_clear,
+            q6_byte_delta,
+            flat_staged,
         })
     }
 
@@ -4138,6 +4616,16 @@ impl MoeKernels {
         let g = self.geometry;
         if g.max_tokens != 1 {
             self.route(stream, buffers, logits)?;
+            // At decode width the default flat kernels consume `topk_ids`
+            // directly, so sorting those same ids into expert buckets is
+            // dead work. Keep both launches available for an exact in-binary
+            // A/B and for either legacy kernel mapping.
+            let flat_direct = g.max_tokens <= MOE_NARROW_DECODE_MAX
+                && !self.staged_narrow
+                && !self.bucketed_direct;
+            if flat_direct && !self.build_flat_dispatch {
+                return Ok(());
+            }
             return self.build_dispatch(stream, buffers);
         }
         if g.num_experts > 32 * ROUTE_LANE_EXPERTS {
@@ -4490,79 +4978,113 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: shared,
             };
-            // `narrow` picks a separate compiled entry point
-            // (`expert_ffn_narrow`), not a branch inside `expert_ffn`'s own
-            // launch — same grid, block and shared-memory geometry either
-            // way, since both kernels tile the same `intermediate x
-            // expert_block_capacity` shape. See `MOE_NARROW_DECODE_MAX`'s
-            // comment for why this stayed a second kernel rather than a
-            // runtime gate inside one. `expert_ffn_narrow` also takes
-            // `bucket_live`, which `expert_ffn` does not, so the two launches
-            // no longer share one argument list -- see `bucket_live`'s own
-            // comment on `moe_align_block_size`.
+            // `narrow` selects the direct routed-pair decode kernel by
+            // default. Setup-time A/B fallbacks retain both the bucketed
+            // direct grid and its predecessor's staged collision path.
             if narrow {
-                // `expert_ffn_bm1` first: it and `expert_ffn_narrow` partition
-                // every bucket's every sub-tile by `bm` (1 vs >1), writing
-                // disjoint `inter` slots, so launch order between them does
-                // not affect the result -- this order just runs the cheap,
-                // no-shared-memory kernel before the one that needs
-                // `shared`. See `moe_expert_ffn_bm1`'s own comment.
-                let bm1_cfg = LaunchConfig {
+                let flat_direct = !self.staged_narrow && !self.bucketed_direct;
+                let direct_cfg = LaunchConfig {
                     grid_dim: (
                         (g.intermediate as u32).div_ceil(TILE_ROWS),
-                        g.expert_block_capacity() as u32,
-                        1,
+                        if flat_direct {
+                            g.max_flat_pairs() as u32
+                        } else {
+                            g.expert_block_capacity() as u32
+                        },
+                        if self.staged_narrow || flat_direct {
+                            1
+                        } else {
+                            g.max_tokens as u32
+                        },
                     ),
                     block_dim: (GEMM_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let mut bm1_builder = stream.launch_builder(&self.expert_ffn_bm1);
-                bm1_builder
-                    .arg(gate.bytes)
-                    .arg(&gate_code)
-                    .arg(up.bytes)
-                    .arg(&up_code)
-                    .arg(hidden_states)
-                    .arg(&buffers.sorted_token_ids)
-                    .arg(&buffers.expert_ids)
-                    .arg(&buffers.bucket_live)
-                    .arg(&buffers.valid_tokens)
-                    .arg(&top_k)
-                    .arg(&block_size)
-                    .arg(&hidden)
-                    .arg(&intermediate)
-                    .arg(&mut buffers.inter);
-                // SAFETY: same bounds as `expert_ffn_narrow` below, minus the
-                // shared memory it does not use -- it never stages a tile,
-                // only ever reads `sorted_token_ids`/`hidden_states` at the
-                // one slot `bucket_live` already proved is this sub-tile's
-                // sole live row.
-                unsafe { bm1_builder.launch(bm1_cfg) }?;
+                let q6_direct = !self.staged_narrow
+                    && !self.generic_direct
+                    && gate.quant == ExpertQuant::Q6K
+                    && up.quant == ExpertQuant::Q6K;
+                let direct = if self.staged_narrow {
+                    &self.expert_ffn_singleton
+                } else if flat_direct && q6_direct && self.q6_byte_delta {
+                    &self.expert_ffn_flat_q6_bytes
+                } else if flat_direct
+                    && q6_direct
+                    && self.flat_staged
+                    && g.hidden.is_multiple_of(256)
+                {
+                    &self.expert_ffn_flat_q6_staged
+                } else if flat_direct && q6_direct {
+                    &self.expert_ffn_flat_q6
+                } else if flat_direct {
+                    &self.expert_ffn_flat
+                } else if q6_direct {
+                    &self.expert_ffn_direct_q6
+                } else {
+                    &self.expert_ffn_direct
+                };
+                let mut direct_builder = stream.launch_builder(direct);
+                if flat_direct {
+                    direct_builder.arg(gate.bytes);
+                    if !q6_direct {
+                        direct_builder.arg(&gate_code);
+                    }
+                    direct_builder.arg(up.bytes);
+                    if !q6_direct {
+                        direct_builder.arg(&up_code);
+                    }
+                    direct_builder
+                        .arg(hidden_states)
+                        .arg(&buffers.topk_ids)
+                        .arg(&buffers.valid_tokens)
+                        .arg(&top_k)
+                        .arg(&hidden)
+                        .arg(&intermediate)
+                        .arg(&mut buffers.inter);
+                } else {
+                    direct_builder
+                        .arg(gate.bytes)
+                        .arg(&gate_code)
+                        .arg(up.bytes)
+                        .arg(&up_code)
+                        .arg(hidden_states)
+                        .arg(&buffers.sorted_token_ids)
+                        .arg(&buffers.expert_ids)
+                        .arg(&buffers.bucket_live)
+                        .arg(&buffers.valid_tokens)
+                        .arg(&top_k)
+                        .arg(&block_size)
+                        .arg(&hidden)
+                        .arg(&intermediate)
+                        .arg(&mut buffers.inter);
+                }
+                // SAFETY: the flat grid is exactly `max_tokens * top_k`, and
+                // the device scalar gates it to the live prefix. The bucketed
+                // fallbacks retain their existing grid.z/bucket bounds.
+                unsafe { direct_builder.launch(direct_cfg) }?;
 
-                let mut builder = stream.launch_builder(&self.expert_ffn_narrow);
-                builder
-                    .arg(gate.bytes)
-                    .arg(&gate_code)
-                    .arg(up.bytes)
-                    .arg(&up_code)
-                    .arg(hidden_states)
-                    .arg(&buffers.sorted_token_ids)
-                    .arg(&buffers.expert_ids)
-                    .arg(&buffers.bucket_live)
-                    .arg(&buffers.valid_tokens)
-                    .arg(&top_k)
-                    .arg(&block_size)
-                    .arg(&hidden)
-                    .arg(&intermediate)
-                    .arg(&mut buffers.inter);
-                // SAFETY: grid.y is the dispatch-block capacity, exactly what
-                // `expert_ids` and `bucket_live` hold and `block_size` times
-                // fewer than what `sorted_token_ids` holds; `inter` is
-                // `sorted_capacity * intermediate` floats, the range `(blk *
-                // block_size + m, r)` covers. Shared memory covers the
-                // activation tile plus one slot id per tile row. Weight
-                // indexing is bounded by the element-count check above.
-                unsafe { builder.launch(ffn_cfg) }?;
+                if self.staged_narrow {
+                    let mut builder = stream.launch_builder(&self.expert_ffn_narrow);
+                    builder
+                        .arg(gate.bytes)
+                        .arg(&gate_code)
+                        .arg(up.bytes)
+                        .arg(&up_code)
+                        .arg(hidden_states)
+                        .arg(&buffers.sorted_token_ids)
+                        .arg(&buffers.expert_ids)
+                        .arg(&buffers.bucket_live)
+                        .arg(&buffers.valid_tokens)
+                        .arg(&top_k)
+                        .arg(&block_size)
+                        .arg(&hidden)
+                        .arg(&intermediate)
+                        .arg(&mut buffers.inter);
+                    // SAFETY: grid.y is the dispatch-block capacity, exactly
+                    // what `expert_ids` and `bucket_live` hold. Shared memory
+                    // covers the activation tile and row ids.
+                    unsafe { builder.launch(ffn_cfg) }?;
+                }
             } else {
                 let mut builder = stream.launch_builder(&self.expert_ffn);
                 builder
@@ -4590,11 +5112,16 @@ impl MoeKernels {
             }
         }
 
-        // Every valid flat id is written exactly once by the down kernel, so
-        // this zeroing is belt-and-braces — but a dispatch bug that dropped a
-        // slot would otherwise read a previous step's contribution and
-        // produce a plausible wrong answer instead of an obviously wrong one.
-        stream.memset_zeros(&mut buffers.partial)?;
+        // The flat direct down kernel names every live `(token, k)` pair by
+        // `blockIdx.y` and overwrites its whole hidden row. The combine reads
+        // exactly that live prefix, so no stale or padding row is observable
+        // and clearing it first is redundant. Bucketed and tiled paths keep
+        // the defensive clear: a dispatch bug there could drop a slot and
+        // otherwise surface a plausible contribution from the previous step.
+        let flat_direct_narrow = narrow && !self.staged_narrow && !self.bucketed_direct;
+        if !flat_direct_narrow && !self.skip_partial_clear {
+            stream.memset_zeros(&mut buffers.partial)?;
+        }
 
         if gemv {
             let cfg = LaunchConfig {
@@ -4693,64 +5220,95 @@ impl MoeKernels {
                 shared_mem_bytes: shared,
             };
             // `MMA_MIN_TOKENS` bounds `down_mma` the same way it bounds
-            // `use_mma`, so `narrow` (computed off `use_mma`) is exactly
-            // right here too: at `max_tokens <= MOE_NARROW_DECODE_MAX` (4,
-            // below 8) neither `down_mma` nor `use_mma` can be true regardless
-            // of `down.quant`. `expert_down_narrow` also takes `bucket_live`,
-            // which `expert_down` does not, so (as for the ffn half above)
-            // the two launches no longer share one argument list.
+            // `use_mma`, so `narrow` is also the correct down-path choice:
+            // at N<=4 neither MMA condition can be true.
             if narrow {
-                // `expert_down_bm1` first, same partition-by-`bm` reasoning
-                // as the ffn half above. Both read `buffers.inter`, which the
-                // ffn launches above already fully populated for every live
-                // slot (their own partition covers it), and both write
-                // disjoint `partial` slots.
-                let bm1_cfg = LaunchConfig {
+                let flat_direct = !self.staged_narrow && !self.bucketed_direct;
+                let direct_cfg = LaunchConfig {
                     grid_dim: (
                         (g.hidden as u32).div_ceil(TILE_ROWS),
-                        g.expert_block_capacity() as u32,
-                        1,
+                        if flat_direct {
+                            g.max_flat_pairs() as u32
+                        } else {
+                            g.expert_block_capacity() as u32
+                        },
+                        if self.staged_narrow || flat_direct {
+                            1
+                        } else {
+                            g.max_tokens as u32
+                        },
                     ),
                     block_dim: (GEMM_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let mut bm1_builder = stream.launch_builder(&self.expert_down_bm1);
-                bm1_builder
-                    .arg(down.bytes)
-                    .arg(&down_code)
-                    .arg(&buffers.inter)
-                    .arg(&buffers.topk_weights)
-                    .arg(&buffers.sorted_token_ids)
-                    .arg(&buffers.expert_ids)
-                    .arg(&buffers.bucket_live)
-                    .arg(&buffers.valid_tokens)
-                    .arg(&top_k)
-                    .arg(&block_size)
-                    .arg(&hidden)
-                    .arg(&intermediate)
-                    .arg(&mut buffers.partial);
-                // SAFETY: same bounds as `expert_down_narrow` below, minus
-                // the shared memory it does not use.
-                unsafe { bm1_builder.launch(bm1_cfg) }?;
+                let down_staged = flat_direct
+                    && self.flat_staged
+                    && down.quant == ExpertQuant::Q8_0
+                    && g.intermediate.is_multiple_of(256);
+                let direct = if self.staged_narrow {
+                    &self.expert_down_singleton
+                } else if down_staged {
+                    &self.expert_down_flat_q8_staged
+                } else if flat_direct {
+                    &self.expert_down_flat
+                } else {
+                    &self.expert_down_direct
+                };
+                let mut direct_builder = stream.launch_builder(direct);
+                if flat_direct {
+                    direct_builder.arg(down.bytes);
+                    if !down_staged {
+                        direct_builder.arg(&down_code);
+                    }
+                    direct_builder
+                        .arg(&buffers.inter)
+                        .arg(&buffers.topk_weights)
+                        .arg(&buffers.topk_ids)
+                        .arg(&buffers.valid_tokens)
+                        .arg(&top_k)
+                        .arg(&hidden)
+                        .arg(&intermediate)
+                        .arg(&mut buffers.partial);
+                } else {
+                    direct_builder
+                        .arg(down.bytes)
+                        .arg(&down_code)
+                        .arg(&buffers.inter)
+                        .arg(&buffers.topk_weights)
+                        .arg(&buffers.sorted_token_ids)
+                        .arg(&buffers.expert_ids)
+                        .arg(&buffers.bucket_live)
+                        .arg(&buffers.valid_tokens)
+                        .arg(&top_k)
+                        .arg(&block_size)
+                        .arg(&hidden)
+                        .arg(&intermediate)
+                        .arg(&mut buffers.partial);
+                }
+                // SAFETY: each flat block reads and writes one routed pair;
+                // the bucketed fallbacks retain their existing slot bounds.
+                unsafe { direct_builder.launch(direct_cfg) }?;
 
-                let mut builder = stream.launch_builder(&self.expert_down_narrow);
-                builder
-                    .arg(down.bytes)
-                    .arg(&down_code)
-                    .arg(&buffers.inter)
-                    .arg(&buffers.topk_weights)
-                    .arg(&buffers.sorted_token_ids)
-                    .arg(&buffers.expert_ids)
-                    .arg(&buffers.bucket_live)
-                    .arg(&buffers.valid_tokens)
-                    .arg(&top_k)
-                    .arg(&block_size)
-                    .arg(&hidden)
-                    .arg(&intermediate)
-                    .arg(&mut buffers.partial);
-                // SAFETY: as above, plus `bucket_live` holds `expert_block_
-                // capacity` ints, the same bound `expert_ids` is read under.
-                unsafe { builder.launch(down_cfg) }?;
+                if self.staged_narrow {
+                    let mut builder = stream.launch_builder(&self.expert_down_narrow);
+                    builder
+                        .arg(down.bytes)
+                        .arg(&down_code)
+                        .arg(&buffers.inter)
+                        .arg(&buffers.topk_weights)
+                        .arg(&buffers.sorted_token_ids)
+                        .arg(&buffers.expert_ids)
+                        .arg(&buffers.bucket_live)
+                        .arg(&buffers.valid_tokens)
+                        .arg(&top_k)
+                        .arg(&block_size)
+                        .arg(&hidden)
+                        .arg(&intermediate)
+                        .arg(&mut buffers.partial);
+                    // SAFETY: as above, plus shared memory covers the staged
+                    // activation tile and row ids.
+                    unsafe { builder.launch(down_cfg) }?;
+                }
             } else {
                 let mut builder = stream.launch_builder(&self.expert_down);
                 builder
@@ -5206,10 +5764,12 @@ mod tests {
         }
         assert!(
             MOE_SRC.contains("moe_shared_ffn_gemv_t2")
+                && MOE_SRC.contains("moe_shared_ffn_gemv_t3")
                 && MOE_SRC.contains("moe_shared_ffn_gemv_t4")
                 && MOE_SRC.contains("moe_shared_ffn_gemv_t8")
                 && MOE_SRC.contains("moe_shared_ffn_gemv_t16")
                 && MOE_SRC.contains("moe_shared_down_gemv_t2")
+                && MOE_SRC.contains("moe_shared_down_gemv_t3")
                 && MOE_SRC.contains("moe_shared_down_gemv_t4")
                 && MOE_SRC.contains("moe_shared_down_gemv_t8")
                 && MOE_SRC.contains("moe_shared_down_gemv_t16"),
@@ -5245,7 +5805,7 @@ mod tests {
     fn quants_and_scales_are_read_as_signed() {
         // Reading int8 codes or the per-group scales as unsigned is the most
         // likely transcription error and produces plausible magnitudes.
-        assert!(MOE_SRC.contains("signed char q = (signed char)base[2 + lane];"));
+        assert!(MOE_SRC.contains("signed char q = (signed char)(q4 >> (8 * t));"));
         assert!(MOE_SRC.contains("(const signed char*)(base + 192 + half * 8)"));
     }
 
@@ -5459,13 +6019,13 @@ mod tests {
         // Smallest covering tile, same rule as `gdn.rs`'s `proj_tile_for`.
         // Three is the audit's batch width and must land on one t4 launch.
         assert_eq!(shared_gemv_tile_for(2), (0, 2));
-        assert_eq!(shared_gemv_tile_for(3), (1, 4));
-        assert_eq!(shared_gemv_tile_for(4), (1, 4));
-        assert_eq!(shared_gemv_tile_for(5), (2, 8));
-        assert_eq!(shared_gemv_tile_for(8), (2, 8));
-        assert_eq!(shared_gemv_tile_for(9), (3, 16));
-        assert_eq!(shared_gemv_tile_for(16), (3, 16));
-        assert_eq!(shared_gemv_tile_for(17), (3, 16));
+        assert_eq!(shared_gemv_tile_for(3), (1, 3));
+        assert_eq!(shared_gemv_tile_for(4), (2, 4));
+        assert_eq!(shared_gemv_tile_for(5), (3, 8));
+        assert_eq!(shared_gemv_tile_for(8), (3, 8));
+        assert_eq!(shared_gemv_tile_for(9), (4, 16));
+        assert_eq!(shared_gemv_tile_for(16), (4, 16));
+        assert_eq!(shared_gemv_tile_for(17), (4, 16));
         assert_eq!(SHARED_GEMV_MAX_TOKENS, 16);
     }
 
