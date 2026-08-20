@@ -613,6 +613,133 @@ fn a_batch_of_tokens_matches_the_reference_and_costs_one_pass_over_the_weights()
 }
 
 // ---------------------------------------------------------------------------
+// the three-token row tiles
+// ---------------------------------------------------------------------------
+
+/// The row-tiled three-token entry points (`b3r2`, `b3r4`) against the
+/// untiled path and against three `b1` launches — **bit-identical**, all
+/// 248,320 entries, on the real head.
+///
+/// The row tile changes which warp owns a row and how many accumulators are
+/// in flight; it does not change any row's arithmetic or its order. So this
+/// is the same exactness claim the `b5`-versus-`b1` check makes, extended to
+/// the N=3 decode path that actually serves the three-sequence goal shape.
+/// `b1` is itself gated against the scalar host reference above, which is
+/// what lets this test be exact instead of re-deriving a 3 x 508 M MAC host
+/// reference.
+///
+/// SKIPS — reporting that it skipped — without a driver, a supported device,
+/// or the model file.
+#[test]
+fn the_row_tiled_three_token_paths_are_bit_identical_to_the_untiled_kernel() {
+    let Some((ctx, _info, file)) = device_and_model() else {
+        return;
+    };
+    let g = geometry();
+    let stream = ctx.default_stream();
+    let untiled = LmHeadKernels::with_row_tile(&ctx, g, None).expect("compiles untiled");
+    let rt2 = LmHeadKernels::with_row_tile(&ctx, g, Some(2)).expect("compiles rt2");
+    let rt4 = LmHeadKernels::with_row_tile(&ctx, g, Some(4)).expect("compiles rt4");
+
+    let bytes = lm_head_bytes(&file, &g);
+    let d_weight = upload_head(&stream, bytes);
+    let weight = QuantTensor {
+        bytes: &d_weight,
+        quant: ExpertQuant::Q8_0,
+    };
+
+    const TOKENS: usize = 3;
+    let (live, flat) = hidden_states(&g, BATCH_SEED ^ 0x33, TOKENS);
+    assert_carries_signal("hidden states", &live.concat());
+    let d_hidden = stream.clone_htod(&flat).expect("upload hidden");
+
+    let run = |kernels: &LmHeadKernels, label: &str| -> Vec<f32> {
+        let mut d_logits = stream
+            .alloc_zeros::<f32>(g.max_tokens * g.vocab)
+            .expect("logits allocate");
+        kernels
+            .forward(&stream, weight, &d_hidden, TOKENS, &mut d_logits)
+            .expect(label);
+        let full = stream.clone_dtoh(&d_logits).expect("logits back");
+        stream.synchronize().expect("sync");
+        assert!(
+            full[TOKENS * g.vocab..].iter().all(|&v| v == 0.0),
+            "{label}: wrote past the {TOKENS} live tokens",
+        );
+        full
+    };
+
+    let base = run(&untiled, "untiled b3");
+    let two = run(&rt2, "b3r2");
+    let four = run(&rt4, "b3r4");
+    assert_carries_signal("untiled b3 logits", &base[..TOKENS * g.vocab]);
+
+    for (label, candidate) in [("b3r2", &two), ("b3r4", &four)] {
+        for t in 0..TOKENS {
+            assert_eq!(
+                &candidate[t * g.vocab..(t + 1) * g.vocab],
+                &base[t * g.vocab..(t + 1) * g.vocab],
+                "token {t}: {label} disagrees with the untiled b3 path, which \
+                 is the same per-row arithmetic in the same order",
+            );
+        }
+    }
+
+    // And against b1, which is the instantiation the host reference gates.
+    for t in 0..TOKENS {
+        let mut one = live[t].clone();
+        one.resize(g.max_tokens * g.hidden, 0.0);
+        let d_one = stream.clone_htod(&one).expect("upload single");
+        let mut d_single = stream
+            .alloc_zeros::<f32>(g.max_tokens * g.vocab)
+            .expect("logits allocate");
+        untiled
+            .forward(&stream, weight, &d_one, 1, &mut d_single)
+            .expect("single-token forward");
+        let single = stream.clone_dtoh(&d_single).expect("back");
+        stream.synchronize().expect("sync");
+        assert_eq!(
+            &single[..g.vocab],
+            &base[t * g.vocab..(t + 1) * g.vocab],
+            "token {t}: the b3 tile disagrees with the b1 path",
+        );
+    }
+
+    // Informal timing so the retained tile's win is visible where the gate
+    // runs; the whole-pass A/B in docs/BENCHMARKS.md is the real evidence.
+    let time = |kernels: &LmHeadKernels, label: &str| {
+        let mut d_logits = stream
+            .alloc_zeros::<f32>(g.max_tokens * g.vocab)
+            .expect("logits allocate");
+        for _ in 0..WARMUP {
+            kernels
+                .forward(&stream, weight, &d_hidden, TOKENS, &mut d_logits)
+                .expect("warmup");
+        }
+        stream.synchronize().expect("sync");
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            kernels
+                .forward(&stream, weight, &d_hidden, TOKENS, &mut d_logits)
+                .expect("timed");
+        }
+        stream.synchronize().expect("sync");
+        let per_call = t.elapsed().as_secs_f64() / ITERS as f64;
+        println!("{label}: {:.3} ms/call at 3 tokens", per_call * 1.0e3);
+        per_call
+    };
+    time(&untiled, "untiled b3");
+    time(&rt2, "b3r2");
+    time(&rt4, "b3r4");
+
+    println!(
+        "b3r2 and b3r4 are bit-identical to the untiled b3 and to three b1 \
+         launches on all {} entries x {TOKENS} tokens",
+        g.vocab,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // the device argmax
 // ---------------------------------------------------------------------------
 

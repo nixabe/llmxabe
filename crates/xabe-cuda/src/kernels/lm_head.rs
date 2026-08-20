@@ -236,10 +236,20 @@ __device__ __forceinline__ float load_half_le(const unsigned char* p) {
     return f;
 }
 
-// One warp per vocabulary row; BT tokens share the pass over that row.
+// One warp per RT adjacent vocabulary rows; BT tokens share the pass.
 //
-// grid.x  : ceil(vocab / warps_per_block)
+// grid.x  : ceil(vocab / (warps_per_block * RT))
 // blockDim: (32, warps_per_block)
+//
+// RT is the register tile over rows the module docs name as the next lever
+// past the batch tile: past BT = 1 the activation loads scale with BT while
+// the weight read does not, so a second row per warp lets one `float4`
+// activation load feed two rows' FMAs and halves the activation-pipe traffic
+// per weight element. The weight traffic itself is unchanged — different
+// rows are different bytes — which is why RT tiles the *activation* cost
+// only. RT > 1 requires `vocab % RT == 0` (the launch path checks it), so
+// every row of a warp's group is live together and no per-row guard is
+// needed inside the loop.
 //
 // `weight` is the raw Q8_0 tensor exactly as it appears in the GGUF file,
 // [vocab][hidden] with hidden fastest-varying (GGUF dims [2048, 248320]), so
@@ -263,7 +273,7 @@ __device__ __forceinline__ float load_half_le(const unsigned char* p) {
 // 32-byte-aligned addresses, into a per-warp shared-memory buffer; the
 // 34-byte-granular unpacking then happens against shared memory, where
 // alignment costs nothing.
-template <int BT>
+template <int BT, int RT>
 __device__ __forceinline__ void lm_head_rows(
     const unsigned char* __restrict__ weight,
     const float* __restrict__ hidden_states,
@@ -272,26 +282,32 @@ __device__ __forceinline__ void lm_head_rows(
     int token_base,
     float* __restrict__ logits
 ) {
-    // One staging buffer per warp: LM_HEAD_STAGE_U4 uint4 (544 B) each.
+    // One staging buffer per warp: LM_HEAD_STAGE_U4 uint4 (544 B) per row.
     // Declared as uint4 rather than unsigned char so the array's 16-byte
     // alignment is a property of its type, which is what every vector load
     // and store below depends on.
     extern __shared__ uint4 lm_head_stage[];
 
-    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int row = (blockIdx.x * blockDim.y + threadIdx.y) * RT;
     int lane = threadIdx.x;
-    uint4* s4 = lm_head_stage + threadIdx.y * LM_HEAD_STAGE_U4;
+    uint4* s4 = lm_head_stage + threadIdx.y * (LM_HEAD_STAGE_U4 * RT);
     const unsigned char* mine = (const unsigned char*)s4;
 
     // Uniform across the warp: blockDim.x is exactly one warp, so `row`
     // depends only on threadIdx.y. The early return therefore never strands
     // a lane inside a warp barrier or the shuffle reduction below -- and it
     // is the reason the staging buffer is per warp rather than per block: a
-    // block-wide barrier behind this return would hang.
+    // block-wide barrier behind this return would hang. At RT > 1 the launch
+    // path guarantees `vocab % RT == 0`, so the whole group is live or the
+    // whole group is past the end -- there is no partially live warp.
     if (row >= vocab) return;
 
     int nblocks = hidden_dim >> 5;
-    const uint4* g4 = (const uint4*)(weight + (long long)row * nblocks * 34);
+    const uint4* g4[RT];
+    #pragma unroll
+    for (int rt = 0; rt < RT; ++rt) {
+        g4[rt] = (const uint4*)(weight + (long long)(row + rt) * nblocks * 34);
+    }
     const float* x = hidden_states + (long long)token_base * hidden_dim;
 
     // Four consecutive elements per lane, eight lanes per Q8_0 block, four
@@ -302,9 +318,9 @@ __device__ __forceinline__ void lm_head_rows(
     int blk = lane >> 3;
     int sub = lane & 7;
 
-    float acc[BT];
+    float acc[RT * BT];
     #pragma unroll
-    for (int t = 0; t < BT; ++t) acc[t] = 0.0f;
+    for (int t = 0; t < RT * BT; ++t) acc[t] = 0.0f;
 
     // LM_HEAD_STAGE_BLOCKS * 34 = 544 bytes = 34 uint4 per warp per stage.
     // 544 is a multiple of 32, and a row starts at a multiple of
@@ -323,79 +339,103 @@ __device__ __forceinline__ void lm_head_rows(
     // arithmetic instead of stalling in front of it. Keeping the second
     // buffer in registers rather than in shared memory costs two `uint4` per
     // lane and leaves the shared footprint at one segment.
-    uint4 pre[LM_HEAD_STAGE_PER_LANE];
+    uint4 pre[RT][LM_HEAD_STAGE_PER_LANE];
     #pragma unroll
-    for (int k = 0; k < LM_HEAD_STAGE_PER_LANE; ++k) {
-        int i = lane + k * 32;
-        if (i < LM_HEAD_STAGE_U4) pre[k] = g4[i];
+    for (int rt = 0; rt < RT; ++rt) {
+        #pragma unroll
+        for (int k = 0; k < LM_HEAD_STAGE_PER_LANE; ++k) {
+            int i = lane + k * 32;
+            if (i < LM_HEAD_STAGE_U4) pre[rt][k] = g4[rt][i];
+        }
     }
 
     for (int seg = 0; seg < nblocks; seg += LM_HEAD_STAGE_BLOCKS) {
         #pragma unroll
-        for (int k = 0; k < LM_HEAD_STAGE_PER_LANE; ++k) {
-            int i = lane + k * 32;
-            if (i < LM_HEAD_STAGE_U4) s4[i] = pre[k];
+        for (int rt = 0; rt < RT; ++rt) {
+            #pragma unroll
+            for (int k = 0; k < LM_HEAD_STAGE_PER_LANE; ++k) {
+                int i = lane + k * 32;
+                if (i < LM_HEAD_STAGE_U4) s4[rt * LM_HEAD_STAGE_U4 + i] = pre[rt][k];
+            }
         }
         __syncwarp();
 
         int next = seg + LM_HEAD_STAGE_BLOCKS;
         if (next < nblocks) {
-            const uint4* src = g4 + (next / LM_HEAD_STAGE_BLOCKS) * LM_HEAD_STAGE_U4;
             #pragma unroll
-            for (int k = 0; k < LM_HEAD_STAGE_PER_LANE; ++k) {
-                int i = lane + k * 32;
-                if (i < LM_HEAD_STAGE_U4) pre[k] = src[i];
+            for (int rt = 0; rt < RT; ++rt) {
+                const uint4* src = g4[rt] + (next / LM_HEAD_STAGE_BLOCKS) * LM_HEAD_STAGE_U4;
+                #pragma unroll
+                for (int k = 0; k < LM_HEAD_STAGE_PER_LANE; ++k) {
+                    int i = lane + k * 32;
+                    if (i < LM_HEAD_STAGE_U4) pre[rt][k] = src[i];
+                }
             }
         }
 
         #pragma unroll
         for (int r = 0; r < LM_HEAD_STAGE_BLOCKS; r += 4) {
-            const unsigned char* bp = mine + (r + blk) * 34;
-            float d = load_half_le(bp);
-
-            // The four quants as two 16-bit shared loads. `bp` inherits the
-            // staging buffer's 16-byte alignment through a 34-byte block
-            // stride, and `2 + 4*sub` is even, so the address is 2-byte
-            // aligned -- but never reliably 4-byte aligned, which is why this
-            // is two `ushort` loads and not one `uint`. The high byte is
-            // narrowed through `unsigned char` first so that the int8 quant
-            // sign-extends rather than taking an implementation-defined
-            // conversion from a value above 127.
-            const unsigned short* qp = (const unsigned short*)(bp + 2 + 4 * sub);
-            unsigned short p0 = qp[0];
-            unsigned short p1 = qp[1];
-            // Operand order `(float)q * d` throughout, exactly as in
-            // `moe.rs`'s q8_0_element; reassociating to `d * q` rounds
-            // differently and costs bit-identical weights.
-            float w0 = (float)(signed char)(unsigned char)(p0 & 0xFF) * d;
-            float w1 = (float)(signed char)(unsigned char)(p0 >> 8) * d;
-            float w2 = (float)(signed char)(unsigned char)(p1 & 0xFF) * d;
-            float w3 = (float)(signed char)(unsigned char)(p1 >> 8) * d;
-
             int j = ((seg + r + blk) << 5) + 4 * sub;
+            // One `float4` per token per group, loaded before the row loop so
+            // all RT rows' FMAs feed from the same registers. This is the
+            // whole point of the row tile: the activation read no longer
+            // scales with RT while the weight read (which does scale) is the
+            // part DRAM was already paying for.
+            float4 xv[BT];
             #pragma unroll
             for (int t = 0; t < BT; ++t) {
                 // 16-byte aligned: `hidden_dim` is a multiple of 512 and `j`
                 // a multiple of 4, and the base allocation is 256-aligned.
-                float4 xv = *(const float4*)(x + (long long)t * hidden_dim + j);
-                acc[t] += w0 * xv.x + w1 * xv.y + w2 * xv.z + w3 * xv.w;
+                xv[t] = *(const float4*)(x + (long long)t * hidden_dim + j);
+            }
+            #pragma unroll
+            for (int rt = 0; rt < RT; ++rt) {
+                const unsigned char* bp = mine + rt * (LM_HEAD_STAGE_U4 * 16) + (r + blk) * 34;
+                float d = load_half_le(bp);
+
+                // The four quants as two 16-bit shared loads. `bp` inherits
+                // the staging buffer's 16-byte alignment through a 34-byte
+                // block stride, and `2 + 4*sub` is even, so the address is
+                // 2-byte aligned -- but never reliably 4-byte aligned, which
+                // is why this is two `ushort` loads and not one `uint`. The
+                // high byte is narrowed through `unsigned char` first so that
+                // the int8 quant sign-extends rather than taking an
+                // implementation-defined conversion from a value above 127.
+                const unsigned short* qp = (const unsigned short*)(bp + 2 + 4 * sub);
+                unsigned short p0 = qp[0];
+                unsigned short p1 = qp[1];
+                // Operand order `(float)q * d` throughout, exactly as in
+                // `moe.rs`'s q8_0_element; reassociating to `d * q` rounds
+                // differently and costs bit-identical weights.
+                float w0 = (float)(signed char)(unsigned char)(p0 & 0xFF) * d;
+                float w1 = (float)(signed char)(unsigned char)(p0 >> 8) * d;
+                float w2 = (float)(signed char)(unsigned char)(p1 & 0xFF) * d;
+                float w3 = (float)(signed char)(unsigned char)(p1 >> 8) * d;
+
+                #pragma unroll
+                for (int t = 0; t < BT; ++t) {
+                    acc[rt * BT + t] += w0 * xv[t].x + w1 * xv[t].y + w2 * xv[t].z + w3 * xv[t].w;
+                }
             }
         }
         // The next stage overwrites what the loop above is still reading.
         __syncwarp();
     }
 
-    // 32 lane subtotals -> one. Five shuffles per token and no barrier of
-    // any kind: the warp is the whole reduction domain, which is the second
-    // reason a row is owned by a warp rather than by a block.
+    // 32 lane subtotals -> one. Five shuffles per token per row and no
+    // barrier of any kind: the warp is the whole reduction domain, which is
+    // the second reason a row is owned by a warp rather than by a block.
     #pragma unroll
-    for (int t = 0; t < BT; ++t) {
-        float v = acc[t];
-        for (int off = 16; off > 0; off >>= 1) {
-            v += __shfl_down_sync(0xffffffff, v, off);
-        }
-        if (lane == 0) {
-            logits[(long long)(token_base + t) * vocab + row] = v;
+    for (int rt = 0; rt < RT; ++rt) {
+        #pragma unroll
+        for (int t = 0; t < BT; ++t) {
+            float v = acc[rt * BT + t];
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down_sync(0xffffffff, v, off);
+            }
+            if (lane == 0) {
+                logits[(long long)(token_base + t) * vocab + row + rt] = v;
+            }
         }
     }
 }
@@ -424,8 +464,8 @@ extern "C" __global__ void NAME(                                            \
     int token_base,                                                         \
     float* __restrict__ logits                                              \
 ) {                                                                         \
-    lm_head_rows<BT>(weight, hidden_states, hidden_dim, vocab,              \
-                     token_base, logits);                                   \
+    lm_head_rows<BT, 1>(weight, hidden_states, hidden_dim, vocab,           \
+                        token_base, logits);                                \
 }
 
 LM_HEAD_ENTRY(lm_head_gemv_b1, 1)
@@ -436,6 +476,29 @@ LM_HEAD_ENTRY(lm_head_gemv_b5, 5)
 LM_HEAD_ENTRY(lm_head_gemv_b6, 6)
 LM_HEAD_ENTRY(lm_head_gemv_b7, 7)
 LM_HEAD_ENTRY(lm_head_gemv_b8, 8)
+
+// The row-tiled decode entry points. Only the three-token tile gets them:
+// that is the N=3 batched decode shape, the one place the profile shows the
+// activation-pipe cost (2.22 ms against a 0.92 ms weight-read floor,
+// docs/BENCHMARKS.md 2026-08-20). Row arithmetic and order are identical to
+// the RT=1 instantiations -- only the number of accumulators in flight
+// differs -- so `b3r2`/`b3r4` against three `b1` launches must be
+// bit-identical, and the differential test asserts exactly that.
+#define LM_HEAD_ENTRY_RT(NAME, BT, RT)                                      \
+extern "C" __global__ void NAME(                                            \
+    const unsigned char* __restrict__ weight,                               \
+    const float* __restrict__ hidden_states,                                \
+    int hidden_dim,                                                         \
+    int vocab,                                                              \
+    int token_base,                                                         \
+    float* __restrict__ logits                                              \
+) {                                                                         \
+    lm_head_rows<BT, RT>(weight, hidden_states, hidden_dim, vocab,          \
+                         token_base, logits);                               \
+}
+
+LM_HEAD_ENTRY_RT(lm_head_gemv_b3r2, 3, 2)
+LM_HEAD_ENTRY_RT(lm_head_gemv_b3r4, 3, 4)
 
 // ---------------------------------------------------------------------------
 // Greatest logit, lowest index on a tie: `xabe_kernels::gemv::argmax`.
@@ -687,6 +750,14 @@ impl From<DriverError> for LmHeadError {
 pub struct LmHeadKernels {
     /// Indexed by `tile - 1`, for tiles `1..=MAX_BATCH_TILE`.
     tiles: [CudaFunction; MAX_BATCH_TILE],
+    /// The row-tiled three-token entry point and its row count, or `None`
+    /// when `LLMXABE_LMHEAD_RT1=1` selected the untiled path for A/B.
+    ///
+    /// Read once at construction, like `moe.rs`'s setup-time switches, so a
+    /// captured CUDA graph never depends on a mid-run environment change.
+    /// The default is the four-row tile; `LLMXABE_LMHEAD_RT2=1` selects the
+    /// two-row one instead.
+    b3_row_tile: Option<(CudaFunction, usize)>,
     argmax_partial: CudaFunction,
     argmax_final: CudaFunction,
     geometry: LmHeadGeometry,
@@ -698,10 +769,45 @@ impl LmHeadKernels {
     /// The geometry is checked once here so the launch path has nothing left
     /// to reject, matching `MoeKernels::new` and `GdnKernels::new`.
     pub fn new(ctx: &Arc<CudaContext>, geometry: LmHeadGeometry) -> Result<Self, LmHeadError> {
+        // Setup-time A/B switches, matching `moe.rs`'s convention: read once
+        // here so a captured CUDA graph never depends on a mid-run
+        // environment change. The default is the four-row tile — the fastest
+        // correct point of the isolated sweep (1.116 ms against RT=2's 1.376
+        // and the untiled 1.662 at three tokens) and a 4.5--4.8% whole-pass
+        // N=3 win in all three interleaved 2K pairs (docs/BENCHMARKS.md
+        // 2026-08-20). `LLMXABE_LMHEAD_RT1=1` keeps the untiled three-token
+        // path and `LLMXABE_LMHEAD_RT2=1` the two-row tile, both for A/B.
+        let rt = if std::env::var_os("LLMXABE_LMHEAD_RT1").is_some() {
+            None
+        } else if std::env::var_os("LLMXABE_LMHEAD_RT2").is_some() {
+            Some(2)
+        } else {
+            Some(4)
+        };
+        Self::with_row_tile(ctx, geometry, rt)
+    }
+
+    /// [`Self::new`] with the three-token row tile chosen explicitly rather
+    /// than from the environment: `None` is the untiled path, `Some(2)` and
+    /// `Some(4)` the compiled row tiles.
+    ///
+    /// Public so the differential test can gate every compiled path in one
+    /// process without mutating the environment under other threads.
+    pub fn with_row_tile(
+        ctx: &Arc<CudaContext>,
+        geometry: LmHeadGeometry,
+        row_tile: Option<usize>,
+    ) -> Result<Self, LmHeadError> {
         let bad = |reason: &'static str| LmHeadError::UnsupportedGeometry {
             geometry: Box::new(geometry),
             reason,
         };
+        if let Some(rt) = row_tile
+            && rt != 2
+            && rt != 4
+        {
+            return Err(bad("the only compiled row tiles are 2 and 4"));
+        }
         if geometry.hidden == 0 || geometry.vocab == 0 {
             return Err(bad("hidden and vocab must be non-zero"));
         }
@@ -726,6 +832,21 @@ impl LmHeadKernels {
 
         let ptx = compile(LM_HEAD_SRC, "lm_head").map_err(LmHeadError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        // The row tile only serves whole groups of RT adjacent rows; a vocab
+        // that is not a multiple of RT would leave the last group partially
+        // live, which the kernel does not guard. The real 248,320-entry head
+        // is a multiple of both tiles.
+        let b3_row_tile = match row_tile {
+            Some(rt) if geometry.vocab.is_multiple_of(rt) => {
+                let name = if rt == 4 {
+                    "lm_head_gemv_b3r4"
+                } else {
+                    "lm_head_gemv_b3r2"
+                };
+                Some((module.load_function(name)?, rt))
+            }
+            _ => None,
+        };
         Ok(Self {
             tiles: [
                 module.load_function("lm_head_gemv_b1")?,
@@ -737,6 +858,7 @@ impl LmHeadKernels {
                 module.load_function("lm_head_gemv_b7")?,
                 module.load_function("lm_head_gemv_b8")?,
             ],
+            b3_row_tile,
             argmax_partial: module.load_function("argmax_partial")?,
             argmax_final: module.load_function("argmax_final")?,
             geometry,
@@ -809,7 +931,29 @@ impl LmHeadKernels {
         while base < tokens {
             let tile = batch_tile(tokens - base);
             let token_base = base as i32;
-            let mut builder = stream.launch_builder(&self.tiles[tile - 1]);
+            // The three-token tile is the N=3 batched decode shape; it goes
+            // through the row-tiled entry point when one was selected at
+            // construction. A warp then owns RT adjacent rows and one
+            // activation `float4` feeds all of them, which is the lever the
+            // module docs name against the activation-pipe cost that scales
+            // with BT. Row arithmetic is identical, so the logits are
+            // bit-identical to the untiled path.
+            let (func, cfg) = match &self.b3_row_tile {
+                Some((f, rt)) if tile == 3 => {
+                    let rows_per_block = WARPS_PER_BLOCK as usize * rt;
+                    let rt_cfg = LaunchConfig {
+                        grid_dim: (g.vocab.div_ceil(rows_per_block) as u32, 1, 1),
+                        block_dim: (WARP, WARPS_PER_BLOCK, 1),
+                        shared_mem_bytes: (WARPS_PER_BLOCK as usize
+                            * rt
+                            * STAGE_BLOCKS
+                            * BLOCK_Q8_0_BYTES) as u32,
+                    };
+                    (f, rt_cfg)
+                }
+                _ => (&self.tiles[tile - 1], cfg),
+            };
+            let mut builder = stream.launch_builder(func);
             builder
                 .arg(weight.bytes)
                 .arg(hidden_states)
@@ -990,7 +1134,7 @@ mod tests {
         // A block-wide staging buffer would need `__syncthreads`, and the
         // early return would then be a hang — which is precisely why the
         // staging buffer is per warp.
-        assert!(LM_HEAD_SRC.contains("int row = blockIdx.x * blockDim.y + threadIdx.y;"));
+        assert!(LM_HEAD_SRC.contains("int row = (blockIdx.x * blockDim.y + threadIdx.y) * RT;"));
         assert!(LM_HEAD_SRC.contains("v += __shfl_down_sync(0xffffffff, v, off);"));
         let body = &LM_HEAD_SRC[at("void lm_head_rows")..at("#define LM_HEAD_ENTRY")];
         assert!(
@@ -1010,7 +1154,7 @@ mod tests {
         // than of a benchmark run. If any scalar load of `weight` comes
         // back, the 34-byte block stride starts straddling sectors again.
         let body = &LM_HEAD_SRC[at("void lm_head_rows")..at("#define LM_HEAD_ENTRY")];
-        assert!(body.contains("const uint4* g4 = (const uint4*)(weight"));
+        assert!(body.contains("g4[rt] = (const uint4*)(weight"));
         assert!(
             !body.contains("weight["),
             "a scalar index into `weight` came back; the 34-byte block stride \
@@ -1046,7 +1190,18 @@ mod tests {
         assert!(LM_HEAD_SRC.contains("int sub = lane & 7;"));
         assert!(
             LM_HEAD_SRC
-                .contains("float4 xv = *(const float4*)(x + (long long)t * hidden_dim + j);")
+                .contains("xv[t] = *(const float4*)(x + (long long)t * hidden_dim + j);")
+        );
+        // And the row tile's whole point: the float4 loads sit *outside* the
+        // row loop, so RT rows' FMAs feed from the same registers and the
+        // activation read does not scale with RT.
+        assert!(
+            LM_HEAD_SRC.find("xv[t] = *(const float4*)").expect("xv load present")
+                < LM_HEAD_SRC
+                    .find("for (int rt = 0; rt < RT; ++rt) {\n                const unsigned char* bp")
+                    .expect("row unpack loop present"),
+            "the activation load moved inside the row loop; it would then \
+             scale with RT and the tile would buy nothing",
         );
         assert!(LM_HEAD_SRC.contains("for (int r = 0; r < LM_HEAD_STAGE_BLOCKS; r += 4) {"));
 
@@ -1085,6 +1240,28 @@ mod tests {
             MAX_BATCH_TILE,
         );
         assert_eq!(MAX_BATCH_TILE, 8);
+    }
+
+    #[test]
+    fn the_row_tiled_entry_points_exist_and_fit_the_real_geometry() {
+        // The two row tiles the launch path can select. They are separate
+        // macro instantiations so the per-tile entry-point count above stays
+        // a truthful guard on the untiled set.
+        assert!(LM_HEAD_SRC.contains("LM_HEAD_ENTRY_RT(lm_head_gemv_b3r2, 3, 2)"));
+        assert!(LM_HEAD_SRC.contains("LM_HEAD_ENTRY_RT(lm_head_gemv_b3r4, 3, 4)"));
+
+        // Whole groups only: the kernel has no partially-live-group guard,
+        // so the launch path requires vocab % RT == 0 and the real head
+        // satisfies it for both tiles.
+        let g = qwen();
+        assert!(g.vocab.is_multiple_of(2) && g.vocab.is_multiple_of(4));
+
+        // The staging buffer scales with RT; at RT=4 it must still sit under
+        // the 48 KiB a block may request without the opt-in cudarc's
+        // LaunchConfig does not expose.
+        let shared_rt4 = WARPS_PER_BLOCK as usize * 4 * STAGE_BLOCKS * BLOCK_Q8_0_BYTES;
+        assert_eq!(shared_rt4, 17_408);
+        assert!(shared_rt4 <= 48 * 1024);
     }
 
     #[test]
