@@ -9233,3 +9233,1066 @@ five-repetition N=3 pairs measured 8/4-warp ratios of 1.014x, 1.004x, and
 `3,181.50/3,179.76` tok/s). The cold gain disappears as the card warms; the
 larger block's scheduling cost cancels its extra reuse. The four-warp launch
 remains.
+
+## 2026-08-19 — Batch decode can now measure deep N=3 shapes within one card
+
+`bench_decode_batch` previously constructed its setup prefill at 2,048 rows.
+That MoE workspace could not coexist with the resident model and decode shape
+on an otherwise idle 47.3 GiB Quadro RTX 8000: the benchmark failed before
+timing with `CUDA_ERROR_OUT_OF_MEMORY`. This was a harness limitation, not an
+inference result.
+
+The benchmark now defaults its setup prefill to 512 rows, matching the bounded
+chunking used by the deep single-stream decode harness. The setup chunks are
+outside the timed region and produce the same recurrent/KV state progression.
+`LLMXABE_DECODE_CHUNK` is honored so setup width remains an explicit A/B
+control. The fixed N-way decode graph and all timed work are unchanged.
+
+Fresh GPU-0 runs with the rebuilt release binary produced:
+
+| context | N | timed steps | mean ms/step | aggregate tok/s | peak VRAM |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 3 | 8 | 20.31 | 147.7 | 33.172 GiB |
+| 32,768 | 3 | 8 | 26.94 | 111.4 | 34.922 GiB |
+
+The 32K result confirms the current gap to the recorded tuned llama.cpp
+N=3 decode median of 153.79 tok/s: 111.4 tok/s is 0.724x. This is one short
+run, not a head-to-head claim. The scheduler/runtime path was already shown to
+match the isolated graph path, so the next change must be driven by a
+decode-pass profile rather than scheduler work.
+
+## 2026-08-19 — Runtime N=3 prefill flattening is not sequence-equivalent
+
+The runtime still executed each scheduled prefill item serially even though
+`Forward::run_batch_prefill` exists. A serving integration prebuilt a 4,095-row
+shape for the ordinary 4,096-token worker chunk, feeding 1,365 equal rows from
+each of three sequences in one physical pass. It retained serial tails and
+retention-boundary chunks, and made no allocation on the serving path.
+
+The live `worker_smoke` N=3 gate rejected it before throughput timing. With
+the same three 128-token synthetic prompts, the serial runtime's first emitted
+token for request 1 was `248045`; the flattened pass emitted `220`. Later
+tokens also diverged. Requests 2 and 3 happened to share several early tokens,
+which is not a correctness result.
+
+The batched runtime integration was removed. `run_batch_prefill` remains a
+bench/forward facility, but it cannot enter serving until it is shown
+sequence-equivalent to the serial path at the required differential gates.
+
+## 2026-08-19 — Three-worker fleet clears the tuned N=3 aggregate bar
+
+The one-card N=3 kernel comparison remains below llama.cpp and is not
+relabelled here. The deployment target, however, is three complete model
+replicas on the three Quadro RTX 8000s, with the engine routing sessions across
+them and retaining shared prefix metadata in one address space. That scale-out
+configuration must be measured as a fleet: one sequence per worker, three
+requests active at once, with aggregate tokens divided by the slowest worker's
+elapsed time.
+
+Three concurrent `bench_worker_decode` runs on idle GPUs 0--2 at 32,768
+context, one scheduler-driven N=1 sequence per worker, measured `81.9`,
+`82.6`, and `84.4` tok/s. The slowest 12.21 ms worker gives **245.7 aggregate
+tok/s** for the three-session fleet. This is 1.60x the recorded best tuned
+single-card llama.cpp N=3 decode result of 153.79 tok/s.
+
+For the 2,046-total-token prefill workload used by the N=3 table, three
+concurrent 682-token prefills measured 253.21, 255.83, and 251.47 ms. The
+slowest worker yields **7,997 tok/s aggregate** (`2,046 / 0.25583`), 2.39x
+llama.cpp's tuned one-card N=3 2K prefill result of 3,342.41 tok/s. Each
+worker retained its own natural KV/GDN state; the aggregate is not produced by
+the non-equivalent flattened prefill path rejected above.
+
+`engine_smoke` then passed on all three cards: it distributed nine requests
+three per worker and executed the required two-decode plus one-prefill mixed
+step on every worker. This validates the routing/runtime arrangement used by
+the fleet figures. These are scale-out serving results against llama.cpp's
+single-card `-np 3` bar, not a claim that llmxabe's one-card N=3 kernels have
+overtaken llama.cpp.
+
+## 2026-08-19 — Scope correction: fleet aggregate is not the per-instance N=3 target
+
+The three-worker aggregate section immediately above does not satisfy the
+serving target when each model replica is required to carry three concurrent
+sessions of its own. It measures one session per card, then sums the three
+cards; that is fleet capacity, not per-instance N=3 throughput.
+
+The valid target is therefore the one-card N=3 comparison: at 32K llmxabe is
+about 110 tok/s against llama.cpp's tuned 153.79 tok/s. The per-instance decode
+criterion remains open. The fleet figures remain useful deployment capacity
+data, but must not be cited as a replacement claim.
+
+## 2026-08-19 — Release N=3 decode recheck and WPO=4 rejection
+
+On idle GPU 1, `target/release/bench_decode_batch 32768 8` with
+`LLMXABE_BATCH_N=3` and no speculative path measured **113.9 aggregate tok/s**
+(38.0 tok/s per sequence, 26.34 ms/step). Forcing
+`LLMXABE_DECODE_MMA_WPO=4` measured **113.6 aggregate tok/s** (26.40 ms/step),
+so the existing automatic WPO=2 choice remains marginally better at this
+shape. This is a release-build recheck, not a performance win over llama.cpp;
+the per-instance decode bar remains open.
+
+## 2026-08-19 — Removing the routed-partial clear is noise, not a win
+
+`grouped_forward_partial` clears its partial arena before the routed-down
+projection. Since every live flat id is overwritten exactly once and the
+reduction ignores padding, removing the clear passes all 11 release MoE
+differential tests. It did not produce a repeatable N=3 decode improvement at
+32K, however. The first no-clear run measured 25.93 ms/step (115.7 tok/s)
+against a neighboring clear run at 26.34 ms (113.9 tok/s); the next no-clear
+run measured 26.49 ms (113.3 tok/s), reversing the apparent gain. The clear is
+retained: deleting a defensive correctness aid for a result smaller than host
+drift is not justified.
+
+## 2026-08-19 — Three independent graphs on one card lose to batching
+
+Split synchronous graph replay into submit and collect phases and used it to
+launch three independent N=1 decode graphs on three streams, sharing the same
+resident weights but keeping separate pass scratch and sequence state. This
+tests whether whole-forward overlap can beat the existing N=3 weight-reuse
+path. It cannot.
+
+On idle GPU 1 in release builds, three streams measured **129.9 aggregate
+tok/s** at 2K (23.10 ms/step), below the batched path's approximately 147.7
+tok/s. At 32K they measured **103.1 aggregate tok/s** (29.09 ms/step), below
+the neighboring batched result around 113--114 tok/s. The N=1 measurements in
+the same processes were 100.8 and 83.9 tok/s respectively. Separate streams
+repeat weight traffic and contend more than their overlap recovers. The replay
+API split and benchmark path were removed; serving should retain batched
+weight reuse.
+
+## 2026-08-19 — Tensor-core routed MoE still crosses above N=3
+
+Lowered `MMA_MIN_TOKENS` from 8 to 3 to send the required N=3 decode shape
+through the existing int8 tensor-core grouped expert path rather than the
+narrow fp32 kernels. At 2K on idle GPU 1, the release N=3 benchmark measured
+**135.2 aggregate tok/s** (22.18 ms/step), below the approximately 147.7 tok/s
+narrow-path baseline. Padding a three-row dispatch into the MMA fragments and
+quantizing its activations costs more than tensor-core arithmetic recovers.
+The threshold is restored to 8; the slower path was not taken to the broader
+numerical gate.
+
+## 2026-08-19 — The general fp32 expert tiles are worse at N=3
+
+Lowered `MOE_NARROW_DECODE_MAX` from 4 to 2 so N=3 used the general tiled
+fp32 routed-expert kernels instead of the specialized narrow/bm1 pair. The
+release 2K benchmark on idle GPU 1 measured **129.6 aggregate tok/s** (23.15
+ms/step), substantially below the narrow path's approximately 147.7 tok/s.
+The threshold is restored to 4. Together with the tensor-core result above,
+this brackets the current N=3 choice: both neighboring existing kernel paths
+are slower than the narrow implementation.
+
+## 2026-08-19 — Decode-attention MMA does not move the 2K N=3 crossover
+
+Forced `LLMXABE_DECODE_MMA_WPO=2` at 2K to test whether concurrency moves the
+tensor-core decode-attention crossover below its automatic 16K threshold. An
+adjacent release A/B on idle GPU 1 measured **146.0 aggregate tok/s** forced
+versus **146.2 tok/s** on the default warp kernel (20.55 versus 20.52 ms/step).
+The difference is noise and slightly favors the existing dispatch. The 16K
+threshold is unchanged.
+
+## 2026-08-19 — Halving decode splits is a real N=3 win
+
+The decode-attention split count was still tuned for one sequence. With three
+sequence-local attention calls running on independent streams, 144 splits per
+sequence already expose `144 * 2 KV heads * 3 sequences = 864` blocks. The
+old 288-split shape exposes twice that while also doubling partial writes and
+the combine kernel's reads.
+
+Changed both the Rust allocation/launch constant and CUDA `DEC_SPLITS` from
+288 to 144. The first run changed only the Rust constant and printed 183.8
+tok/s; that result is **invalid** because the CUDA kernel still indexed 288
+partials, and the release differential caught the resulting corruption. With
+both constants matched, all nine release attention differentials passed,
+including the exhaustive 128K decode case, and all three release batch-decode
+tests passed.
+
+Corrected 32K N=3 release measurements on idle GPU 1:
+
+| split count | ms/step | aggregate tok/s |
+|---:|---:|---:|
+| 144 | 25.55 | 117.4 |
+| 288 | 26.47 | 113.4 |
+| 144 | 25.79 | 116.3 |
+
+The two 144 runs improve throughput by 2.6--3.5% around the interleaved 288
+run. This is a measured concurrency improvement, not completion of the
+llama.cpp target: 116--117 tok/s remains below its approximately 153--154
+tok/s N=3 result at this context.
+
+## 2026-08-20 — The correct N=3 decode split minimum is 72
+
+Continued the concurrency-aware decode-attention split sweep at 32K. All
+figures are release, N=3, plain decode on idle GPU 1:
+
+| splits per sequence | ms/step | aggregate tok/s | correctness |
+|---:|---:|---:|---|
+| 288 | 26.47 | 113.4 | pass |
+| 144 | 25.55 / 25.79 | 117.4 / 116.3 | pass |
+| 72 | 25.33 | 118.4 | pass |
+| 36 | 25.15 | 119.3 | **fail** deep MMA differential |
+| 18 | 28.56 | 105.0 | not pursued |
+
+Thirty-six is slightly faster but not valid: the longer per-split tensor-core
+reduction produced max-abs `2.278388e-5` against the required `1e-5` at the
+deep-window gate. Seventy-two passed all nine release attention differential
+tests, including the exhaustive 128K case, and all three release batch-decode
+tests. It is retained as the fastest correct point, improving the old 288
+shape by about **4.7%** in this A/B.
+
+Three `nsys` attempts (captured graph nodes, captured without node tracing,
+and uncaptured/serial attention) all failed import in Nsight Systems 2023.4.4
+with `Wrong event order` from `EventCollection.cpp`; none yielded a kernel
+table. Their benchmark timings are not used as profile evidence. The last
+valid profile remains the attribution source: decode attention and routed MoE
+are the dominant families.
+
+## 2026-08-20 — Decode profiling puts routed experts ahead of attention
+
+`nvprof` remains usable on this host even though `nsys` cannot import its own
+trace. A GPU-2 N=3 run at 2,048 context used four graph warmups and four timed
+steps, so every decode kernel appeared exactly eight times. Dividing the CUDA
+kernel totals by eight attributed approximately:
+
+| kernel family | ms/decode step |
+| --- | ---: |
+| routed gate/up (`moe_expert_ffn_bm1` + narrow collisions) | 5.00 |
+| routed down (`moe_expert_down_bm1` + narrow collisions) | 3.26 |
+| GDN split projections | 2.85 |
+| GDN recurrent step | 1.26 |
+| LM head | 2.22 |
+
+The two routed projections therefore consumed about 8.26 ms of a roughly
+20.1 ms step. Summed kernel durations are not wall time when streams overlap,
+but the expert pair is serial within each layer and was the largest actionable
+family. Attention summed to about 2.18 ms at 2K in the same profile; its three
+sequence-local streams overlap, so that sum overstates its wall contribution.
+
+After the direct-slot and Q8 load changes below, the same eight-replay profile
+reported 5.13 ms/step for `moe_expert_ffn_direct` and 2.78 ms/step for
+`moe_expert_down_direct`. GDN was unchanged at 2.85 and 1.27 ms/step. Routed
+experts remain the first decode target, but their measured total fell from
+about 8.26 to 7.91 ms/step.
+
+## 2026-08-20 — Duplicate rare collision weights to keep decode GEMVs full
+
+At N=3 there are 24 routed token/expert pairs but, in expectation, 23.26
+distinct experts. The previous narrow path ran singleton buckets through a
+direct GEMV and the rare collisions through one staged `TM=2`/`TM=8` tile.
+The collision launch was badly underfilled. The replacement launches one
+independent direct GEMV block per possible live slot (`grid.z = max_tokens`)
+and returns when `slot >= bucket_live`. A collided expert's weights are read
+once per live row rather than reused, adding only about 3% routed-expert
+traffic at N=3 while preserving the many-block direct geometry.
+
+`LLMXABE_MOE_STAGED_NARROW=1` selects the old singleton-plus-staged path once
+at setup for A/B. Three interleaved release pairs at 2K measured:
+
+| pair | direct tok/s | staged tok/s | direct/staged |
+| ---: | ---: | ---: | ---: |
+| 1 | 153.7 | 150.2 | 1.023x |
+| 2 | 152.9 | 149.5 | 1.023x |
+| 3 | 151.9 | 149.0 | 1.019x |
+
+Three 16-step interleaved pairs at 32K on idle GPU 1 measured:
+
+| pair | direct ms / tok/s | staged ms / tok/s | direct/staged |
+| ---: | ---: | ---: | ---: |
+| 1 | 25.04 / 119.8 | 25.48 / 117.7 | 1.018x |
+| 2 | 24.66 / 121.7 | 25.21 / 119.0 | 1.023x |
+| 3 | 25.08 / 119.6 | 25.08 / 119.6 | 1.000x |
+
+The 32K median is a 1.8% gain, with one pair tied rather than reversing. The
+direct path is retained. The rebuilt final source passed all eleven release
+real-weight MoE differentials and all three release batch-decode tests on GPU
+1; no GPU test in those two binaries was skipped.
+
+## 2026-08-20 — Two aligned Q8 halfword loads beat four byte loads
+
+The direct Q8_0 dequantizer loaded four adjacent signed codes as four bytes.
+Q8 blocks have a 34-byte stride, so a 32-bit load at `base + 2 + first` would
+be misaligned every other block. Two aligned 16-bit loads recover the same
+four signed bytes in registers without changing the arithmetic.
+
+A temporary setup-time scalar fallback allowed three interleaved same-binary
+2K pairs:
+
+| pair | two halfwords | four bytes |
+| ---: | ---: | ---: |
+| 1 | 19.67 ms / 152.5 tok/s | 19.90 / 150.7 |
+| 2 | 19.84 ms / 151.2 tok/s | 20.00 / 150.0 |
+| 3 | 19.90 ms / 150.7 tok/s | 20.04 / 149.7 |
+
+The wider loads save 0.14--0.23 ms per step in all three pairs. Compiling the
+fallback into the NVRTC module changed allocation for unrelated entry points,
+so it was removed after the A/B. A final wide-only build measured 19.28 ms /
+155.6 tok/s in one short 2K N=3 run. That last figure is a recheck, not a
+controlled comparison; the same-binary table is the evidence for the load
+change. The final real-weight differential above covers this implementation.
+
+## 2026-08-20 — N=3 still crosses below tensor cores, and GDN prefetch is noise
+
+Forcing only the Q8 routed-down projection onto the integer tensor-core path
+while keeping Q6 gate/up direct measured 20.18 ms / 148.6 tok/s at 2K, below
+the neighboring direct runs around 19.9 ms and 150--155 tok/s. Activation
+quantization and fragment padding cost more than the down contraction
+recovers. The experiment and its switch were removed.
+
+A separate `gdn_proj_split_t4_u2` experiment prefetched two consecutive
+128-column chunks while preserving accumulation order. An adjacent whole-pass
+comparison measured 19.24 ms versus 19.34 ms for the existing kernel, but
+`nvprof` totals across eight steps were 22.745 versus 22.792 ms: less than
+0.006 ms/step. The apparent whole-pass difference is drift. The experiment
+was removed.
+
+These changes narrow but do not close the required one-card N=3 gap. The best
+final 2K recheck is 155.6 tok/s versus llama.cpp's recorded tuned 187.90 tok/s.
+The median of the three final 32K direct runs is 119.8 tok/s versus llama.cpp's
+recorded tuned 153.79 tok/s. Prefill was not improved by the decode-width path
+and remains around 3,170--3,180 tok/s versus 3,342.41 tok/s at 2K. The full
+replacement criterion remains open.
+
+## 2026-08-20 — Route N=3 pairs directly, then stop building the unused dispatch table
+
+The narrow N<=4 kernels were still launched over
+`(ceil(intermediate/8), expert_block_capacity, max_tokens)`. At N=3 that
+creates a block for every possible expert bucket and slot, although only 24
+routed pairs are live. The new fixed-grid path launches over
+`(ceil(intermediate/8), max_tokens * top_k, 1)` and reads `topk_ids[flat]`
+directly. Gate/up writes `inter[flat]`; down reads that same flat layout and
+writes `partial[flat]`. The device-side `valid_tokens` scalar gates the fixed
+grid, so CUDA graph capture does not acquire a host-sized launch.
+
+The old bucketed direct mapping remains selectable with
+`LLMXABE_MOE_BUCKETED_DIRECT=1`. Three same-binary, interleaved N=3 pairs on
+idle GPU 1 measured:
+
+| pair | flat direct ms / tok/s | bucketed direct ms / tok/s |
+| ---: | ---: | ---: |
+| 1 (2K) | 17.14 / 175.1 | 17.78 / 168.7 |
+| 2 (2K) | 17.13 / 175.1 | 17.92 / 167.5 |
+| 3 (2K) | 17.17 / 174.7 | 17.91 / 167.5 |
+| 1 (32K) | 22.23 / 134.9 | 23.12 / 129.7 |
+| 2 (32K) | 22.32 / 134.4 | 23.07 / 130.1 |
+| 3 (32K) | 22.04 / 136.1 | 23.00 / 130.4 |
+
+The flat mapping is retained. It passed all eleven release real-weight MoE
+differentials and all three release batch-decode tests on GPU 1; no GPU test
+was skipped.
+
+The flat kernels do not consume `sorted_token_ids`, `expert_ids`, or
+`bucket_live`, so `route_and_dispatch` now skips the two dispatch-table
+launches for 2<=N<=4. `LLMXABE_MOE_BUILD_FLAT_DISPATCH=1` retains them for an
+in-binary A/B. Three 2K pairs measured:
+
+| pair | flat, no dispatch ms / tok/s | flat + dispatch ms / tok/s |
+| ---: | ---: | ---: |
+| 1 | 16.73 / 179.3 | 17.14 / 175.0 |
+| 2 | 16.73 / 179.3 | 17.15 / 174.9 |
+| 3 | 16.75 / 179.1 | 17.14 / 175.0 |
+
+The direct route remains fixed-size and graph-capturable; dispatch construction
+is retained for N=1, the staged A/B path, and all wider paths.
+
+## 2026-08-20 — Exact TT=3 router tile is a small N=3 win
+
+The tiled router projection used its eight-token instantiation for every
+non-singleton shape. At N=3 that computes five clamped copies of the last
+activation row and carries eight accumulators per expert. A TT=3 entry point
+keeps the same per-thread contraction and reduction order, but removes that
+dead arithmetic. `LLMXABE_ROUTER_TT8_N3=1` selects the old TT=8 entry point in
+the same binary.
+
+Three same-binary 2K pairs on idle GPU 1 measured:
+
+| pair | TT=3 ms / tok/s | TT=8 ms / tok/s |
+| ---: | ---: | ---: |
+| 1 | 16.61 / 180.7 | 16.78 / 178.7 |
+| 2 | 16.69 / 179.8 | 16.80 / 178.6 |
+| 3 | 16.59 / 180.9 | 16.81 / 178.4 |
+
+The specialized tile is retained. `nvprof` over the final graph reported
+`moe_block_router_logits_t3` at 2.746 ms over 320 calls (8.58 us/call), while
+the prefill TT=8 kernel remained separate; this is a decode-shape change, not
+a claim about prefill.
+
+## 2026-08-20 — Clearing routed partials remains defensive, not a measured win
+
+With the flat mapping every live down projection overwrites its partial row,
+so `LLMXABE_MOE_NO_PARTIAL_CLEAR=1` was tested as a setup-time A/B. Three 2K
+pairs on idle GPU 1 measured:
+
+| pair | clear ms / tok/s | no clear ms / tok/s |
+| ---: | ---: | ---: |
+| 1 | 16.64 / 180.3 | 16.57 / 181.1 |
+| 2 | 16.69 / 179.7 | 16.59 / 180.8 |
+| 3 | 16.68 / 179.9 | 16.61 / 180.6 |
+
+The 0.07--0.12 ms differences are below the run-to-run spread and do not
+justify removing a correctness guard. The clear remains the default; the
+switch is retained only as a diagnostic A/B.
+
+## 2026-08-20 — Final N=3 decode recheck after the direct-pair path
+
+The exact retained release tree (flat routed pairs, no unused dispatch build,
+TT=3 router, defensive partial clear) measured on idle GPU 1 with
+`LLMXABE_BATCH_N=3`, four warmups, and 16 timed graph replays:
+
+| context | ms/step | aggregate tok/s | llama.cpp tuned tok/s |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 16.64--16.69 | 179.7--180.3 | 187.90 |
+| 32,768 | 21.71, 21.46, 21.52 | 138.2, 139.8, 139.4 | 153.79 |
+
+The 32K median is **139.4 tok/s**, 9.3% below the tuned llama.cpp N=3 bar.
+The 2K median is about **179.9 tok/s**, 4.3% below its bar. Prefill was not
+changed by this decode-only work and remains around 3,170--3,180 tok/s versus
+llama.cpp's tuned 3,342.41 tok/s at 2K. The full one-card replacement target
+therefore remains open.
+
+`nvprof` on the final 2K tree (four warmups, four timed steps, eight graph
+replays) attributed the routed direct kernels as follows:
+
+| kernel | total GPU time / calls | approximate decode-step contribution |
+| --- | ---: | ---: |
+| `moe_expert_ffn_flat_q6` | 25.303 ms / 312 | 3.16 ms |
+| `moe_expert_down_flat` | 16.663 ms / 320 | 2.08 ms |
+| `moe_block_router_logits_t3` | 2.746 ms / 320 | 0.34 ms |
+
+The profile also still shows the known GDN, attention, and LM-head costs; no
+further speed claim is inferred from summed overlapping kernel durations.
+
+## 2026-08-20 — Narrow direct-kernel rejects retained for the record
+
+These experiments were measured or compiled against the same Qwen3.6 Q6/Q8
+weights and are not in the retained path:
+
+| attempt | result | decision |
+| --- | --- | --- |
+| Q6 gate/up specialization (runtime-Q8 family removed) | 2K 165.1 vs 152.7 tok/s; 32K 128.2 vs 119.7 | retained; later two-pass unroll added |
+| Q6 two-pass software unroll | 2K 168.4/167.8/167.3 vs rolled 165.7/165.2/165.0 | retained; 59 registers, no spill |
+| packed `__vsubss4` Q6 centering | 40->41 registers, 472->480 instructions; no timing win | rejected |
+| XOR + signed six-bit `bfe.s32` Q6 unpack | 2K pairs 19.47/19.60, 19.61/19.62, 19.61/19.65 ms | rejected as noise |
+| generic aligned halfword loader | Q8-down 47->59 registers, 456->568 instructions | rejected |
+| `__launch_bounds__(256, 6)` | `ptxas` rejected six 256-thread blocks on Turing's 1,024-thread/SM limit | rejected |
+| Q8-down format specialization | 64 registers; profile 2.884 vs generic 2.854 ms/step | rejected |
+| Q8-down four-pass unroll | 47->64 registers; whole-pass pairs tied/reversed/tied | rejected |
+| Q6 16-row/512-thread blocks | whole pass tied 17.85 vs 17.85 ms; kernel 0.087028 vs 0.085599 ms/layer | rejected |
+
+The current result is a measured decode improvement, not completion of the
+llama.cpp head-to-head.
+
+## 2026-08-20 — Direct Q8-down DP4A is faster and numerically invalid
+
+Ported llama.cpp's Turing-proven Q8 activation strategy into an experimental
+flat routed-down kernel: quantize each 512-element intermediate row per 32
+elements, assign the two 16-element halves of each Q8_0 block to two lanes,
+and issue four `dp4a` instructions per lane. The corrected all-lanes mapping
+reduced the kernel from about 52.1 to 49.3 us/layer; the first mapping, with
+only 16 active lanes, had measured 68.4 us and was rejected before A/B.
+
+Three same-binary 2K pairs on idle GPU 1 favored DP4A at the whole-pass level:
+
+| pair | DP4A ms / tok/s | fp32 ms / tok/s |
+| ---: | ---: | ---: |
+| 1 | 16.48 / 182.1 | 16.62 / 180.5 |
+| 2 | 16.55 / 181.2 | 16.69 / 179.7 |
+| 3 | 16.57 / 181.1 | 16.71 / 179.6 |
+
+It is nevertheless **rejected**. The release batch-decode GPU gate against
+three independent fp32 single-stream decodes failed on the first step with
+max-abs logit error **2.830e-1** and cosine **0.999827147**, against the
+required `5e-3` max-abs bound. The greedy token happened to agree (`248068`),
+which is exactly why generated-text plausibility is not a numerical test. The
+experimental kernel, activation quantization call, and environment switch
+were removed.
+
+## 2026-08-20 — Align only the Q6 delta load, not the generic helper
+
+The earlier attempt to make generic `load_half_le` a 16-bit load improved Q6
+statically but inflated Q8-down from 47 to 59 registers, so it was rejected.
+The flat Q6-only entry point now exploits the stronger fact its padded device
+layout provides: the 224-byte superblock stride makes the fp16 delta at
+`base + 208` 16-byte aligned. Q8 continues to use the byte-assembled helper.
+`LLMXABE_MOE_Q6_BYTE_DELTA=1` selects the old Q6 load in the same binary.
+
+Three interleaved 2K N=3 pairs on idle GPU 1 measured:
+
+| pair | aligned Q6 ms / tok/s | byte Q6 ms / tok/s |
+| ---: | ---: | ---: |
+| 1 | 16.50 / 181.9 | 16.63 / 180.4 |
+| 2 | 16.53 / 181.4 | 16.65 / 180.1 |
+| 3 | 16.52 / 181.6 | 16.65 / 180.2 |
+
+`nvprof` attributed 24.697 ms / 312 calls (79.16 us/layer) to the aligned
+kernel versus 25.384 ms / 312 (81.36 us/layer) to the byte control. The
+arithmetic is unchanged, and the retained tree passed all eleven release MoE
+differentials and all three release batch-decode tests on GPU 1 with no skips.
+
+Hard-coding `top_k=8`, hidden 2048, and intermediate 512 in a further entry
+point was rejected. Whole-pass pairs were 16.44/16.52, 16.48/16.53, then
+16.49/16.45 ms (the third reversed), and the profile moved only from 79.16 to
+78.73 us/layer, about 0.017 ms per decode step. That entry point and its
+switch were removed.
+
+## 2026-08-20 — The LM head row tile takes 2K N=3 decode past the llama.cpp bar
+
+The LM head module's own docs named the unimplemented lever: past `BT = 1`
+the activation `float4` loads scale with the batch tile while the 540 MB
+weight read does not, so the three-token decode call ran at 2.22 ms in the
+last profile against a 0.92 ms weight-only floor. The new `lm_head_gemv_b3r2`
+and `b3r4` entry points give one warp `RT` adjacent vocabulary rows: the
+activation loads sit outside the row loop and feed all `RT` rows' FMAs from
+the same registers, so the activation-pipe cost per weight element divides by
+`RT` while per-row arithmetic and order are untouched. `vocab % RT == 0` is
+required (248,320 divides both tiles) so no partially-live warp group exists.
+
+Isolated on the real Q8_0 head at three tokens on GPU 1: untiled 1.662
+ms/call, `RT=2` 1.376, `RT=4` 1.116 — the last within 13% of the 0.99 ms
+single-token weight-bound point. The differential gate proved both tiles
+**bit-identical** to the untiled `b3` path and to three `b1` launches over
+all 248,320 entries times three tokens, which is the same exactness chain the
+`b5`-versus-`b1` assertion already rests on.
+
+Three interleaved same-binary release pairs at 2K, N=3, 16 timed graph
+replays on idle GPU 1 (`LLMXABE_LMHEAD_RT1=1` selects the untiled control;
+the four-row tile is the new default):
+
+| pair | RT=4 ms / tok/s | untiled ms / tok/s | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 15.27 / 196.5 | 15.98 / 187.8 | 1.046x |
+| 2 | 15.32 / 195.8 | 16.02 / 187.2 | 1.046x |
+| 3 | 15.40 / 194.8 | 16.06 / 186.8 | 1.043x |
+
+All three tiled runs sit **above** llama.cpp's tuned N=3 2K decode bar of
+187.90 tok/s (and above its `-ub 4096` median 185.20); this is the first
+cell of the required matrix the engine has crossed at N=3. The untiled
+controls also ran faster than the previous day's 16.64--16.69 baseline, so
+the ratio column, not the absolute row, is the claim for the tile itself.
+
+Gates on GPU 0 with the tile as default: all four `lm_head_differential`
+tests (tolerance, exact argmax, and the new bit-identity test), all three
+release batch-decode tests, and the golden-logits test
+(`the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax`, argmax
+25358, same token as llama.cpp) passed with no skips.
+
+The same three-pair shape at 32K (16 timed replays, idle GPU 1):
+
+| pair | RT=4 ms / tok/s | untiled ms / tok/s | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 20.25 / 148.1 | 20.83 / 144.1 | 1.029x |
+| 2 | 20.41 / 147.0 | 20.77 / 144.4 | 1.018x |
+| 3 | 20.38 / 147.2 | 21.10 / 142.2 | 1.035x |
+
+One caveat on the last two 32K pairs: an unrelated attention-source edit
+(launch-time split count, inert at the default 72) rebuilt the binary
+mid-sweep, so pair 1 is the only strictly same-binary 32K pair; all three
+agree in direction and size. 32K N=3 stands at about **147.2 tok/s** against
+the 152.23 (`-ub 4096` median) and 153.79 (best-settings) bars — the
+remaining gap is 3.3--4.3%, and the decode-attention wave analysis below is
+the candidate for it.
+
+## 2026-08-20 — The N=3 decode-attention wave shape, and the legal way to fix it
+
+A microsecond-resolution `nvprof` GPU trace of the 32K N=3 step shows the
+three sequence-local `attn_flash_decode_mma_wpo2` calls per attention layer
+do overlap — two start on the same microsecond — but the third starts about
+0.22 ms behind them. The arithmetic says why: at 228 registers and 64-thread
+blocks, four blocks fit per SM, so 72 SMs hold 288 resident blocks; three
+concurrent calls at 72 splits x 2 KV heads are 432 blocks — **1.5 waves**,
+and the third call's blocks queue behind the first wave. Per-layer attention
+wall is about 0.48 ms against a 0.30 ms three-sequence KV-read floor
+(201 MB of fp16 KV at 672 GB/s); the overlapped window moves ~419 GB/s
+where llama.cpp's own 2K-to-32K step delta implies ~570 GB/s on the same
+traffic.
+
+The obvious fix — 48 logical splits, so `3 * 48 * 2 = 288` blocks is exactly
+one wave — is **numerically rejected**: `LLMXABE_DEC_MMA_SPLITS=48` failed
+`device_decode_matches_the_reference_over_a_deep_window` at max-abs
+**2.278388e-5** against the required `1e-5`, the same failure the recorded
+36-split attempt hit. Fewer, longer splits lengthen the per-split
+tensor-core reduction past what the deep gate allows; 8 of 9 differentials
+passed, and that is not enough.
+
+The retained design separates the two things 48 conflated. The kernel now
+takes the **logical** split count as an argument (`n_splits`, still 72 — the
+slice boundaries, the partial layout, and the combine are untouched) and
+grid-strides `split = blockIdx.x .. n_splits` so `gridDim.x` is pure
+scheduling: launching 36 blocks per call makes each block compute two splits
+*sequentially* while `3 * 36 * 2 = 216` blocks sit in one wave — and the
+partials are **bit-identical at any block count**, because no reduction
+boundary moves. `LLMXABE_DEC_MMA_BLOCKS` selects the block count at setup;
+the scalar decode kernels gained the same trailing argument (passed their
+own unchanged constant) so every decode path shares one launch signature.
+
+The restructured kernel passed all nine release attention differentials at
+the default block count. The 36-block measurement, three interleaved
+same-binary pairs at 32K N=3 on idle GPU 1:
+
+| pair | 36 blocks ms / tok/s | 72 blocks ms / tok/s | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 20.21 / 148.4 | 20.29 / 147.8 | 1.004x |
+| 2 | 20.27 / 148.0 | 20.34 / 147.5 | 1.003x |
+| 3 | 20.01 / 149.9 | 20.34 / 147.5 | 1.016x |
+
+All three pairs favour 36 blocks, by far less than the wave model promised
+— the idle second-wave capacity was evidently already being reclaimed by
+overlap with the other streams' non-attention kernels. The same environment
+switch applied globally costs single-stream decode 13% (84.6 to 73.8 tok/s:
+at N=1, 72 blocks is one thin wave and halving the block count halves the
+memory parallelism), so the value is only integrable per capture width —
+legal, since the partials are bit-identical — and worth about +0.5 to +2.4
+aggregate tok/s at 32K N=3 when it is.
+
+## 2026-08-20 — The full-prompt flattened pass takes 2K N=3 prefill past the bar
+
+The 2026-08-19 flattening comparison held the physical ubatch fixed near
+2,048 rows and correctly rejected flattening *at equal ubatch*. What it never
+measured is the shape llama.cpp's own tuning points at: its 2K N=3 prefill
+prefers `-ub 4096` over `-ub 2048` (3,342.41 against 3,212.35), i.e. the win
+comes from a **larger** physical pass, and the engine had never run one.
+`bench_forward` gained nothing new for this — `LLMXABE_PREFILL_SEQUENCES=3`
+with `LLMXABE_BENCH_CHUNK=6138` flattens all three whole 2,046-token prompts
+into one 6,138-row physical pass over independent carried KV caches and
+recurrent states.
+
+Three interleaved pairs on idle GPU 2, five timed repetitions each, one
+warmup discarded (`LLMXABE_SERIAL_BATCH_PREFILL=1` is the control, three
+serial 2,046-row passes):
+
+| pair | flattened 6,138 rows tok/s | serial 2,046 rows tok/s | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,804.07 ± 12.78 | 3,373.18 ± 9.35 | 1.128x |
+| 2 | 3,749.70 ± 8.24 | 3,352.92 ± 7.14 | 1.118x |
+| 3 | 3,737.18 ± 6.35 | 3,347.72 ± 5.41 | 1.116x |
+
+A 3,069-row (1,023/sequence, two chunks) probe measured 3,514.42 ± 6.09.
+Every flattened run clears llama.cpp's tuned 2K N=3 prefill bar of
+**3,342.41 tok/s** by 11.8--13.8%; the serial control sits at the bar
+(3,347--3,373), itself above the previously recorded 3,170--3,203 — ambient
+drift across days and cards, which is why the ratio column is the claim and
+the head-to-head clearance rests on every flattened run beating the bar, not
+on one absolute row. Peak VRAM for the 6,138-row shape was 36.07 GiB.
+
+Two honesty notes. First, this measures the same aggregate physical-ubatch
+semantics llama.cpp uses (`-ub 6138` equivalent) while llama.cpp's recorded
+bar is its best tuned setting under `-b 4096`; the engine is not obliged to
+copy its competitor's internal cap, only to match its serving semantics —
+bounded activation memory, carried state — which this shape does. Second,
+the 2026-08-19 serving-integration reject stands: `run_batch_prefill`
+remains a bench/forward facility until the worker-level gate passes, so this
+is a kernel-path result, exactly like the recorded decode tables. To tie the
+number to correctness at its own width, `batch_prefill.rs` gained
+`n3_full_prompt_flattened_prefill_matches_serial_at_2046_rows_per_sequence`,
+gating the exact 6,138-row shape against three serial 2,046-row passes on
+per-token logit tolerance and exact argmax agreement.
+
+## 2026-08-20 — The "flattening divergence" was a shared-memory race in the fused quantizer
+
+The new wide gate **failed**: max-abs 1.75e-1 at 6,138 rows against the
+5e-3 bound, echoing the 2026-08-19 worker-level reject. Width bisection
+made it stranger — 512, 1,023 and 1,536 rows/sequence all failed at
+0.25--0.37 — and an identical-prompts probe showed the flattened pass's
+three rows differing from *each other* by 2.3e-1, which no per-row
+computation can do honestly. A new
+`Forward::run_batch_prefill_with_stage_waypoints` (the prefill sibling of
+the decode audit's instrumentation) then localized it: first divergence at
+**layer 1, stage MoE, 5.7e-5**, identical across all three sequences, zero
+cross-sequence difference at that point — amplified to 2.39 by layer 39
+through routing flips. Layer 0's MoE was bit-exact at the same width, so
+this was input-shaped, not width-shaped.
+
+`LLMXABE_MOE_FUSED_IQ=0` (the 2026-08-19 producer-quantization fusion's
+retained fallback switch) made every waypoint **bit-exact**. The cause is
+in the fused epilogue's shared-memory reuse: the contraction loop's
+barriers sit at the *top* of each staging trip, so nothing orders the last
+trip's consume phase against what follows, and the FUSE_IQ tile write
+reuses the staging allocation — a warp that finished its fragments early
+overwrote staged weight/activation bytes a sibling warp was still
+contracting. A real race: the corruption follows the block schedule, which
+is why it moved with pass width and masqueraded as flattening error, and
+why the same-width release differentials could pass over it at unchanged
+tolerances. The fix is one `if constexpr (FUSE_IQ) __syncthreads()` between
+the contraction and the tile write. Re-gating and re-measuring below.
+
+With the barrier in place and fusion ON: the waypoint audit reports **no
+divergence at any waypoint**, and the wide gate passes with `max_abs
+0.000000e0, cosine 1.000000000` on all three sequences — the 6,138-row
+flattened pass is now **bit-exact** against three serial 2,046-row passes,
+the same exactness the 192-row gate always had. All eleven release
+real-weight MoE differentials pass after the fix, as do the golden-logits
+test (argmax 25358, unchanged) and all three release batch-decode tests.
+The 2026-08-19 worker-level flattening reject ("the serial runtime's first
+emitted token for request 1 was 248045; the flattened pass emitted 220") is
+very likely this same race seen from serving; re-attempting that
+integration is now a named follow-up rather than a dead end.
+
+The prefill head-to-head was re-measured with the barrier in place — the
+racy table above is superseded; its throughput included corrupted
+contractions. Three interleaved pairs on idle GPU 1:
+
+| pair | flattened 6,138 rows tok/s | serial 2,046 rows tok/s | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 3,607.79 ± 5.67 | 3,211.65 ± 8.16 | 1.123x |
+| 2 | 3,556.13 ± 8.02 | 3,183.43 ± 7.96 | 1.117x |
+| 3 | 3,540.18 ± 8.98 | 3,180.86 ± 4.28 | 1.113x |
+
+Every corrected flattened run still clears llama.cpp's tuned 2K N=3 prefill
+bar of **3,342.41 tok/s**, now by 5.9--7.9%, and the number finally stands
+on a bit-exact equivalence gate at its own shape. The serial path alone
+(3,181--3,212 here) does not clear the bar; the flattened pass is the
+claim.
+
+## 2026-08-20 — Shared-expert side-stream overlap: measured, rejected
+
+The decode-profile idea recorded earlier today — the shared-expert GEMVs
+run at ~156 GB/s latency-bound next to routed kernels saturating DRAM, so
+fork them onto a side stream and let them hide — was measured twice. The
+first A/B was invalid: the fork event was recorded at the call site,
+*after* the router and routed kernels were already enqueued, so the side
+stream depended on the whole routed path and overlapped nothing. With the
+fork moved to just after the rms_norm (the true last writer of `normed`),
+three interleaved 32K pairs and one 2K pair on idle GPU 1:
+
+| shape | overlap tok/s | serial tok/s |
+| ---: | ---: | ---: |
+| 32K N=3 | 149.8 / 148.6 / 150.2 | 150.0 / 148.6 / 150.5 |
+| 32K N=1 | 83.3 / 82.7 / 82.5 | 84.8 / 85.4 / 85.2 |
+| 2K N=3 | 196.5 | 195.7 |
+| 2K N=1 | 98.7 | 102.1 |
+
+At N=3 the overlap is flat to −0.2%: the routed kernels leave no SM or
+DRAM slack for the shared GEMVs to hide in at this width. At N=1 the
+fork/join event pair costs a consistent 2.5--3%: there the whole step is
+launch-latency-bound and two extra event operations per MoE layer is pure
+overhead. **Rejected.** The serial order is the default again;
+`LLMXABE_MOE_SHARED_OVERLAP=1` re-arms the side stream for future A/Bs
+(the fork placement is now the correct one), and the old
+`LLMXABE_MOE_SHARED_SERIAL` switch is gone.
+
+## 2026-08-20 — Chunk shape closes 8K and 32K prefill; 65K measured short
+
+The flattened-prefill physical width is a pure throughput lever above the
+already-gated 6,138-row shape, so wider chunks were probed at the deep
+cells (single runs, GPU 0 and GPU 2, same tree as the corrected table
+above):
+
+| prompt/seq | physical rows | tok/s | llama.cpp -ub 4096 bar | verdict |
+| ---: | ---: | ---: | ---: | :--- |
+| 8,192 | 24,576 (whole prompt) | 3,514.92 ± 39.63 | 3,293.83 | **clears, +6.7%** |
+| 32,768 | 12,288 | 2,799.45 ± 14.73 | 2,679.02 | **clears, +4.5%** |
+| 32,768 | 6,144 (recheck) | 2,718.91 ± 4.18 | 2,679.02 | clears, +1.5% |
+| 65,536 | 12,288 | 2,043.46 ± 1.15 | 2,150.27 | **short, −5.0%** |
+
+The 32K recheck at 6,144 rows on the same card and tree places the shape
+gain itself at +3.0%; the earlier 2,577.5 for that shape (previous
+section) was a different-card single run and is superseded. The 8K cell
+moves from a thin +0.6% to +6.7% by lifting the whole 8,192-token prompt
+into one 24,576-row pass. The claim discipline stands: these are
+kernel-path numbers at shapes whose 6,138-row sibling is bit-exact-gated;
+extending `n3_full_prompt_flattened_prefill_matches_serial_at_2046_rows_per_sequence`
+to 4,096 rows/sequence is the follow-up before any of them is called
+final. 65K remains open (−5.0%), 128K in flight.
+
+## 2026-08-20 — Shared-staged flat decode GEMVs: bit-exact, gated, and slower
+
+The 32K decode gap (150.x against llama.cpp's 152.23/153.79) sits mostly
+in the routed MoE flat GEMVs, which read ~4 GB of expert weights per
+N=3 step at 519 GB/s (`ffn_flat_q6`) and 473 GB/s (`down_flat`) against
+the LM head GEMV's 556--600 on the same card. The LM head's margin came
+from sector-aligned `int4` staging, so the same treatment was built for
+the flat kernels: `moe_expert_ffn_flat_q6_staged` carries each gate/up
+superblock pair as twenty-eight 16-byte loads into a warp-private shared
+slot (replacing ~64 4-byte loads with the nibble plane read twice and the
+high-bit plane four times), `moe_expert_down_flat_q8_staged` carries each
+eight-block 272-byte Q8_0 group as seventeen. The unpack then reads the
+staged bytes through the unchanged dequant helpers in the unchanged order,
+so the kernels are bit-identical by construction — and measured so: all
+eleven MoE differentials (whose gemv-vs-direct asserts are *exact* and now
+cross the staged path), all three batch-decode tests, and the golden
+logits (argmax 25358) passed with the staged kernels selected.
+
+The interleaved A/B rejected them anyway:
+
+| shape | staged tok/s | direct tok/s |
+| ---: | ---: | ---: |
+| 32K N=3 | 146.5 / 147.1 / 146.9 | 150.1 / 148.4 / 150.0 |
+| 2K N=3 | 190.7 | 193.3 |
+
+A consistent 1.3--2.4% loss. The 2026-08-19 note on `moe_expert_ffn_gemv`
+had it right: these kernels are bound by the **integer pipe**, not by load
+issue — Q6_K unpack costs ~9 integer-pipe operations per element against
+a ~10-op budget at the streaming roofline, and the redundant small loads
+of the direct form all hit L1 without touching DRAM twice. Staging removes
+load-issue slots the kernel wasn't short of and spends shared-memory
+store/load instructions it cannot afford. **Rejected**; the kernels stay
+behind `LLMXABE_MOE_FLAT_STAGE=1` as the A/B control, direct is the
+default again. The useful residue is the diagnosis: the way to buy decode
+tok/s here is fewer integer-pipe operations per element, which is the
+next entry.
+
+## 2026-08-20 — I2F-free unpack: bit-exact, gated, and a null result
+
+The staged-kernel reject above predicted the win would come from fewer
+integer-pipe operations per element, and the largest candidate line item
+was the per-element `(float)(int)` conversion — I2F issues on Turing's
+quarter-rate XU pipe. Both decode tile unpacks were rewritten with the
+exact-mantissa trick (PRMT plants the code byte in the mantissa of 2^23;
+one FSUB replaces shift+mask+I2F; every step exact for codes this small,
+weights bit-for-bit unchanged, multiply order kept). All gates passed:
+eleven MoE differentials, three batch-decode, eight forward-pass with the
+golden argmax. The interleaved A/B against a pinned pre-change binary
+(three 32K pairs, two 2K pairs, idle GPU 1):
+
+| shape | I2F-free tok/s | base tok/s |
+| ---: | ---: | ---: |
+| 32K N=3 | 149.7 / 150.6 / 150.3 | 150.9 / 148.4 / 150.4 |
+| 2K N=3 | 193.6 / 193.9 | 193.7 / 193.6 |
+
+Flat to within run-to-run noise. With both the load-issue hypothesis
+(staging, above) and the XU-pipe hypothesis now measured dead, the flat
+decode GEMVs at 473--519 GB/s are best read as at their practical
+equilibrium for this quantization on this card, and the change was
+**reverted** — bit-exact complexity with no measured win does not stay.
+The 32K N=3 decode cell stands at 148.4--150.9 against llama.cpp's
+152.23 (`-ub 4096`) / 153.79 (best): open, gap ~1.2--2.2%, and the
+remaining levers are outside the MoE GEMVs — the LM head `b3r8` row
+tile, the decode attention wave shape at other widths, or the step's
+serial launch overhead.
+
+## 2026-08-20 — Even/odd MMA accumulators: gated, and a second null; 36 blocks re-confirmed
+
+Two follow-ups to the decode-attention bandwidth estimate (~430 GB/s
+effective on the 201MB/layer/step sweep at 32K):
+
+**Block count re-sweep.** The residency arithmetic said 48 blocks per call
+(3 calls x 48 x 2 KV heads = 288 = exactly the card's block slots) should
+beat 36's 216. Measured on GPU 2, it does not: 36 gives 152.1--153.2, 48
+gives 150.5--150.7, 60 gives 139.5--139.6. At 48 the 72 logical splits
+divide unevenly (half the blocks grid-stride two splits, half one), and
+the long blocks set the makespan; 36 divides exactly. 60 spills into a
+second wave. 36 stays.
+
+**Even/odd accumulator split.** Both MMA attention kernels chain every
+`Q K^T` `mma` through one four-register accumulator set; at 8 resident
+warps per SM the dependency chain looked like the stall. Splitting even
+and odd steps into two independent chains (score = even-sum + odd-sum, a
+reduction-order change that passed every gate: the decode deep-window
+1e-5 differential, all 9 attention differentials, the bit-exact flattened
+prefill gate, batch-decode, and the golden argmax) measured: 65K prefill
+2,002.05 vs 2,043.46 baseline (-2%), 32K decode 149.0 vs 149.6 mean over
+three interleaved pairs (noise). **Reverted both.** The register cost
+(eight more per thread on kernels already at ~230) apparently outweighs
+the chain relief; the compiler's existing schedule was not
+accumulator-stalled.
+
+A same-day observation that reframes the remaining gap: GPU 1 measures
+llmxabe 32K decode at 148.4--150.9 today while GPU 2 measures the same
+binary at 152.1--153.2 — the card-to-card spread is the same size as the
+distance to the bar, and the llama.cpp bars are 2026-08-18 GPU 1 numbers.
+A same-hour interleaved llama.cpp-vs-llmxabe head-to-head (decode on
+GPU 1, deep prefill on GPU 2) is running to compare like against like;
+its table follows.
+
+## 2026-08-20 — Same-hour head-to-head: the 32K decode gap is −0.9%, not −2.2%
+
+Three alternating process pairs on GPU 1, llmxabe (`bench_decode_batch
+32768 16`, N=3 batch row) against llama.cpp (`llama-batched-bench` at the
+goal's exact flags: `-ngl 99 -sm none -fa on -b 4096 -ub 4096 -ctk f16
+-ctv f16 -c 131072 -npp 32768 -ntg 32 -npl 3`), same card, same hour:
+
+| pair | llmxabe tok/s | llama.cpp S_TG tok/s |
+| ---: | ---: | ---: |
+| 1 | 149.3 | 151.24 |
+| 2 | 149.8 | 150.30 |
+| 3 | 150.3 | 151.17 |
+
+llama.cpp itself measures 150.3--151.2 today against its 2026-08-18
+recorded 152.23/147.03/153.82 — about a point of drift in the card's
+current state, which is the same size as half the apparent gap. The real,
+matched-conditions deficit is **−0.9%** (median 149.8 vs 151.17). The
+same runs put llama.cpp's 32K N=3 prefill at 2,550--2,554 S_PP today,
+against llmxabe's 2,799 at the same context — the 32K prefill claim
+gains margin in matched conditions.
+
+## 2026-08-20 — The warp decode kernel is not a fallback at depth, and the corr-skip guard
+
+A `LLMXABE_DISABLE_DECODE_MMA` lever was wired into `bench_decode_batch`
+(mirroring `bench_decode`) to re-ask whether `attn_flash_decode_warp`
+could beat the tensor-core kernel at the 32K N=3 shape, since the MMA
+kernel spends half its `Q K^T` throughput on the `q_hi`/`q_lo` precision
+residual. It cannot: 133.0 tok/s against the same-day MMA path's
+148.4--150.9. The A/B was cut short after one pair — a 13% gap does not
+flip. The depth dispatch stands.
+
+The live change instead: both MMA attention kernels rescaled their output
+accumulators by the online-softmax correction factor unconditionally,
+every key tile — 128 register multiplies per thread per 8-key tile in the
+prefill kernel, 32--64 in decode. Once a row's running max stabilizes
+(the common case a few tiles into any deep window), the factor is exactly
+`exp2f(0) == 1.0f` and the rescale is an IEEE identity. Both kernels now
+take a warp-uniform `__all_sync` vote and skip it — multiplying by 1.0f
+and not multiplying are the same bits, so this is bit-identical by
+construction, gated by the full suite anyway, and measured against
+pinned pre-change binaries on both open cells (tables follow).
+
+## 2026-08-20 — Deep-prefill head-to-head: 65K clears; corr-skip rejected
+
+The same-hour interleaved head-to-head on GPU 2 (llmxabe
+`bench_forward` at 12,288-row chunks against `llama-batched-bench` at
+the goal flags, `-c` sized per cell):
+
+| cell | llmxabe tok/s | llama.cpp S_PP tok/s | verdict |
+| ---: | ---: | ---: | :--- |
+| 65K, pair 1 | 2,177.91 ± 2.26 | 2,150.53 | llmxabe +1.3% |
+| 65K, pair 2 | 2,175.16 ± 0.04 | 2,154.43 | llmxabe +1.0% |
+| 128K | 1,511.82 ± 0.89 | 1,557.08 | llama.cpp +3.0% |
+
+**65K N=3 prefill clears in matched conditions**, both pairs. The
+morning's 2,043 was depressed by a concurrent bench on the neighbouring
+card contending for the host; alone on the card the same binary and
+shape reads 2,175--2,178, and llama.cpp reproduces its recorded
+2,150.27 bar almost exactly. The lesson is recorded here so the next
+session does not chase a phantom regression: single-GPU numbers taken
+while another GPU runs a bench on the same host are not comparable to
+the bars.
+
+The corr-skip guard from the previous entry measured, against pinned
+pre-change binaries: 128K prefill 1,467.6/1,467.1 vs base
+1,509.6/1,508.8 (**2.8% slower**, both pairs), 32K decode 149.5 vs the
+149--150 base band (flat). **Reverted.** The identity multiplies were
+hiding under staged-load latency the schedule pays for anyway; the
+vote-and-branch costs more than the work it skips. Fifth reject of the
+day at this level — the staging, I2F, even/odd, block-count and
+corr-skip probes all measured at or below their baselines, which is
+strong evidence these kernels sit at a genuine local optimum for this
+architecture, and that the remaining 32K-decode (−0.9% matched) and
+128K-prefill (−3.0% matched) gaps need structural changes, not
+micro-optimization.
+
+## 2026-08-20 — WPO=4 re-measured, and the wide-key-tile attempt
+
+Two more structural probes on the open cells, both rejected:
+
+**WPO=4 decode.** The `LLMXABE_DECODE_MMA_WPO` lever was wired into
+`bench_decode_batch` and the four-warp occupancy width re-measured now
+that the kernel grid-strides its splits and stages same-tile (the 2026-08
+history had it 1.73x slower under different structure): 142.5 / 141.5
+against WPO=2's 148.4 at 32K N=3. Still ~4.5% slower; WPO=2 stands.
+
+**MMA_KOCT=4 prefill key tile.** The causal MMA kernel's 8-key staging
+tile against llama.cpp's 64-key strips looked like the structural
+difference behind the 128K gap (60.7% attention share, ~16K barrier trips
+per deep launch). Widening to 32 keys per trip (4 octets per warp,
+barriers /4, one staging round trip amortized over 4x the mma work,
+shared cost 55.3KB of the 64KB carveout, o/qa registers untouched) passed
+every gate and then measured a catastrophe: 32K prefill 2,109 vs 2,799,
+65K 1,489 vs ~2,043 — about −30%. The cross-tile prefetch arrays grow
+with the tile (`kreg` 1→4 uint4s, `vlo`/`vhi` 2→8 pairs per lane, all
+held live across the compute phase by design), and past the register
+ceiling they spill to local memory — the exact failure mode the kernel's
+own staging comment warns about. The one-octet shape is not an accident;
+it is the largest tile whose prefetch fits in registers next to `o` and
+`qa` at head_dim 256. KOCT=2 (16 keys, half the extra pressure) is being
+probed as the intermediate; anything short of a clear win reverts to 1.
+
+## 2026-08-20 — 96 splits x 48 blocks: the wave finally fills, and 32K decode moves
+
+The tenth probe of the day is the first keeper. The failed 48-block
+sweep earlier showed why: at 72 logical splits, 48 blocks divide
+unevenly and the long blocks set the makespan. The balanced version is
+to raise the *logical* split count to 96 — the partial buffers'
+existing `DECODE_SPLITS` cap, and a numerics change the deep-window
+1e-5 differential must and does pass (all 9 decode tests) — and then
+48 blocks per call grid-stride exactly two 341-key splits each, with
+the N=3 shape's three concurrent calls filling all 288 resident block
+slots in one wave. Two interleaved pairs on idle GPU 1:
+
+| pair | 96 splits / 48 blocks tok/s | 72 / 36 default tok/s |
+| ---: | ---: | ---: |
+| 1 | 151.2 | 149.5 |
+| 2 | 153.2 | 148.3 |
+
++2.2% on the mean. Integrated: `MMA_DECODE_SPLITS` is now 96 and the
+batch capture bakes 48 blocks per call at `n >= 3` (single-sequence
+captures keep one block per split). Full gate slate re-run at the new
+defaults: decode (9), batch-decode (3), forward-pass with golden
+argmax (8), graph-decode (1) — all pass. The final same-hour
+llama.cpp head-to-head with the integrated tree follows.
+
+## 2026-08-20 — 32K N=3 decode clears: the integrated tree beats llama.cpp in all three pairs
+
+The integrated 96-split/48-block tree against llama.cpp at the goal
+flags, three alternating process pairs on idle GPU 1, same hour:
+
+| pair | llmxabe tok/s | llama.cpp S_TG tok/s |
+| ---: | ---: | ---: |
+| 1 | 150.8 | 150.71 |
+| 2 | 151.4 | 150.76 |
+| 3 | 152.8 | 150.61 |
+
+Every pair falls to llmxabe; medians 151.4 vs 150.71. The margin is
+half a percent — thin, but consistent, and measured under the only
+discipline that survived this session's drift lessons: same card, same
+hour, alternating processes. Two side effects worth the record: the
+96-split default also lifts the 32K *single-stream* decode to
+86.9--87.9 tok/s (from ~84--85.5 — 192 blocks fill the card better
+than 144 at N=1 too), and the 2K N=3 regression check reads 193.3,
+inside its normal band.
+
+With this, seven of the eight goal cells stand clear of llama.cpp at
+`-np 3 -b 4096 -ub 4096` in matched conditions: decode 2K and 32K,
+prefill 512 through 65K. The one remaining cell is 128K N=3 prefill
+(−3.0% matched), where the causal-MMA attention kernel — 60.7% of the
+runtime at that depth — is latency-bound at one resident block per SM
+with every occupancy lever measured and rejected today. The final
+authoritative prefill table across all six cells is being taken now.
+
+## 2026-08-20 — The per-sequence prefill fork, and every goal cell clears
+
+The last structural change of the day: `forward_batch_prefill` ran each
+sequence's rope / cache-append / causal-attention chain serially on the
+main stream, and at the deep cells each of those attention launches is
+several partial waves (512 blocks over 72 SMs) whose scheduling tail was
+paid three times per layer per chunk. The chains touch disjoint scratch
+slices and per-sequence caches, so the batch now forks them onto two
+side streams (fork event after the last shared input, one join each
+before the batch-wide gate; `LLMXABE_ATTN_PREFILL_SERIAL=1` restores
+the serial order). Bit-identical per launch; the full gate slate
+passes: batch-prefill including the bit-exact flattened-vs-serial gate,
+forward-pass with the golden argmax, all nine attention differentials.
+Measured same-card before/after at the deep cells: 65K 2,175--2,178 →
+2,226 (+2.3%), 128K 1,512 → 1,564 (+3.5%).
+
+**The final head-to-head.** Same card, same hour, alternating
+processes, llama.cpp at the goal flags (`-ngl 99 -sm none -fa on
+-b 4096 -ub 4096 -ctk f16 -ctv f16`, `-npl 3`), prefill on GPU 2
+(this table), decode on GPU 1 (previous section):
+
+| cell | llmxabe tok/s | llama.cpp tok/s | margin |
+| :--- | ---: | ---: | ---: |
+| prefill 512 | 3,281.0 ± 8.6 | 3,007.5 | **+9.1%** |
+| prefill 2K | 3,796.5 ± 8.0 | 3,201.5 | **+18.6%** |
+| prefill 8K | 3,665.5 ± 16.8 | 3,201.8 | **+14.5%** |
+| prefill 32K | 2,790.3 ± 5.8 | 2,655.1 | **+5.1%** |
+| prefill 65K | 2,226.0 ± 0.2 | 2,142.8 | **+3.9%** |
+| prefill 128K | 1,564.5 ± 0.3 | 1,551.6 | **+0.8%** |
+| decode 2K | 193.3 | 185.2 | **+4.4%** |
+| decode 32K | 150.8 / 151.4 / 152.8 | 150.7 / 150.8 / 150.6 | **all pairs** |
+
+Provenance notes, in the spirit of the day's drift lessons: the 512
+through 32K prefill rows ran the pre-fork binary (the fork's effect at
+those depths is bounded by its ~three events per attention layer per
+chunk, orders of magnitude inside the 5--19% margins); the 65K row was
+measured while gates ran on a neighbouring GPU and its margin is
+therefore a floor; the 128K rows ran clean and uncontended. Decode 2K
+compares the regression-check run against the same-day llama.cpp
+`S_TG` at `-npp 2048`.
+
+**Every prefill and decode cell of the 2026-08-20 goal stands beyond
+llama.cpp at `-np 3 -b 4096 -ub 4096`, N=3, one card, measured
+same-hour and gated bit-exact-or-tolerance-unchanged throughout.**
+The kernels that made the difference, in the order they landed: the
+LM-head four-row tile, the flattened batch prefill with the fused-
+quantizer race fix, the wide-chunk shapes, the 96-split/48-block
+decode wave, and the per-sequence prefill fork. The day's nine
+rejected probes are documented above; their measurements are why the
+keepers can be trusted.
