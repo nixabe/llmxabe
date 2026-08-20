@@ -1,142 +1,71 @@
-//! LM head GEMV: hidden 2048 -> vocab 248,320, dequantizing Q8_0 in the
-//! prologue.
+//! LM head GEMV: hidden 2048 -> vocab 248,320, dequantizing Q8_0 inline.
 //!
-//! This is the last op of a forward pass and the one that turns a residual
-//! stream into something samplable. It is also, per [`docs/MODEL.md`], the
-//! single most bandwidth-expensive tensor in the model: 248,320 x 2048 at
-//! Q8_0 is **540,344,320 bytes read for one decoded token**, against roughly
-//! 2.86 GB of total weight traffic per token — about 19% of the whole decode
-//! step for one matrix.
-//!
-//! ## Why there is no split-K
-//!
-//! [`docs/KERNELS.md`] plans this kernel as "split-K". **It is not, and the
-//! arithmetic says it should not be.** Split-K exists to manufacture
-//! parallelism when the output dimension is too small to fill the machine —
-//! which is exactly the MoE decode situation that recommendation came from,
-//! where a batch of three tokens meets a 512-row expert matrix.
-//!
-//! The LM head is the opposite regime. Assigning one warp per output row:
-//!
-//! - work available: 248,320 warps, one per vocabulary entry;
-//! - work resident: 72 SMs x 32 warps/SM (sm_75's 1024-thread occupancy
-//!   limit) = 2,304 warps.
-//!
-//! That is a **107x surplus** ([`LmHeadGeometry::occupancy_surplus`], which
-//! is asserted in this module's tests so the justification fails loudly if
-//! the vocabulary ever shrinks). Splitting K would multiply an already
-//! 107x-oversubscribed grid, add a second launch, add a `vocab * K` partial
-//! buffer, and make the summation order depend on the split — for zero
-//! occupancy gain. It is a pure loss here.
-//!
-//! ## What the kernel is bound by
-//!
-//! Arithmetic intensity is 2 FLOP per weight element over 34/32 = 1.0625
-//! bytes per element, i.e. **1.88 FLOP/byte**. The card's ridge point is
-//! 16.3 TFLOP/s / 672 GB/s = 24 FLOP/byte, so this is bandwidth-bound by an
-//! order of magnitude and nothing about the arithmetic is worth tuning. The
+//! The last op of a forward pass, and the single most bandwidth-expensive
+//! tensor in the model: 248,320 x 2048 at Q8_0 is **540 MB read per decoded
+//! token**, about 19% of the step's whole weight traffic for one matrix. The
 //! floor is 540,344,320 B / 672 GB/s = **804 us per weight pass**.
 //!
-//! What *is* worth tuning is everything that makes a bandwidth-bound kernel
-//! fail to reach its bandwidth. Two things did, and both were measured
-//! rather than reasoned about.
+//! Arithmetic intensity is 1.88 FLOP/byte against a 24 FLOP/byte ridge point,
+//! so this is bandwidth-bound by an order of magnitude and nothing about the
+//! arithmetic is worth tuning. Everything below is about not *wasting*
+//! bandwidth.
 //!
-//! ### 1. The 34-byte block breaks sector alignment (worth 1.35x)
+//! # Three design choices, each measured
 //!
-//! The obvious kernel gives lane `l` element `l` of each Q8_0 block, so a
-//! warp reads the block's 32 contiguous quant bytes. Those 32 bytes are
-//! never 32-byte aligned, because the block is 34 bytes and the alignment
-//! cycles, so nearly every request straddles two sectors.
+//! **No split-K.** Split-K manufactures parallelism when the output dimension
+//! cannot fill the machine. Here one warp per vocabulary row is 248,320 warps
+//! against 2,304 resident — a 107x surplus
+//! ([`LmHeadGeometry::occupancy_surplus`], asserted in this module's tests so
+//! the justification fails loudly if the vocabulary ever shrinks). Splitting K
+//! would add a launch, a `vocab * K` partial buffer and a split-dependent
+//! summation order for no occupancy gain.
 //!
-//! Measured on the real head, one token: **1.692 ms, 319 GB/s, 47.5% of
-//! spec**. The same kernel over a deliberately falsified 32-byte-strided
-//! layout — same instruction count, same everything but the alignment — ran
-//! in 0.880 ms, which is what identified the cause rather than guessing at
-//! it.
+//! **Global memory is read only through 16-byte `uint4` loads at 32-byte
+//! aligned addresses**, into a per-warp shared staging buffer; the 34-byte
+//! granular unpack then runs against shared memory, where alignment is free. A
+//! Q8_0 block is 34 bytes, so a warp reading its 32 contiguous quants is never
+//! sector-aligned and nearly every request straddles two sectors. [`STAGE_BLOCKS`]
+//! is 16 blocks = 544 bytes, a multiple of 32, which is what makes every
+//! staged segment start on a sector boundary. Worth 1.35x.
 //!
-//! The fix is that **global memory is read only through 16-byte `uint4`
-//! loads at 32-byte-aligned addresses**, into a small per-warp shared-memory
-//! staging buffer; the 34-byte-granular unpacking then happens against
-//! shared memory, where alignment is free. A staged segment is
-//! [`STAGE_BLOCKS`] = 16 blocks = 544 bytes, and 544 is a multiple of 32,
-//! which is what makes every segment start on a sector boundary. That took
-//! it to **1.256 ms, 430 GB/s, 64.0%**.
+//! **Four consecutive elements per lane, eight lanes per block, four blocks
+//! per warp iteration.** With one element per lane, every weight element cost
+//! a separate scalar load of a separate activation — 4 bytes of activation
+//! against 1.06 bytes of weight, and the kernel was memory-pipe bound rather
+//! than DRAM bound. The tile makes the activation read one `float4` per lane
+//! and loads the block's fp16 delta once per four elements. Worth another
+//! 1.29x, and lands the kernel within a few percent of a weight-only ablation.
 //!
-//! ### 2. The activation read, not the weight read (worth another 1.29x)
+//! # Two tile axes, and what each buys
 //!
-//! At that point the kernel was no longer DRAM-bound. Deleting the
-//! activation multiply — keeping every weight load and the whole staging
-//! path — ran in **0.922 ms (87.2% of spec)**, so 0.33 ms of the 1.26 was
-//! the `hidden` vector, not the weights.
+//! - **Batch tile `BT`** — one warp holds `BT` accumulators and multiplies
+//!   each dequantized weight into all of them, so a prefill chunk costs one
+//!   540 MB pass rather than `BT`. Sub-linear by construction: past `BT = 1`
+//!   the activation loads scale with the tile and the weight read does not, so
+//!   eight tokens are ~2.4-2.9x one token, not 8x. Per-token cost is still
+//!   improving at 8, which is why [`MAX_BATCH_TILE`] is 8.
+//! - **Row tile `RT`** — one warp takes `RT` adjacent vocabulary rows so the
+//!   activation `float4` loads sit outside the row loop and feed every row's
+//!   FMAs from the same registers. Per-row arithmetic and its order are
+//!   untouched, so the tiled kernels are **bit-identical** to the untiled one
+//!   and gated as such. `vocab % RT == 0` is required so no partially-live
+//!   warp group exists.
 //!
-//! It is not DRAM traffic: `hidden` is 8 KB and lives in cache. It is
-//! *memory-pipe* traffic — at one element per lane, every weight element
-//! cost a separate scalar load of a separate activation, 4 bytes per lane
-//! against 1.06 bytes of weight.
+//! # Why the result is not bit-identical to the CPU reference
 //!
-//! The fix is a register tile: **four consecutive elements per lane, eight
-//! lanes per Q8_0 block, four blocks per warp iteration**. The activation
-//! read becomes one `float4` per lane — 512 contiguous bytes per warp
-//! instruction, the widest a load can be — and the block's fp16 delta is
-//! loaded once per four elements instead of once per one. Measured over
-//! several runs: **0.900–0.972 ms, 556–600 GB/s, 82.7–89.3% of spec**.
-//!
-//! Cumulative: **1.7–1.9x over the naive form**, against llama.cpp's 44.5%
-//! of peak on its weight path ([`docs/BENCHMARKS.md`]). What remains is
-//! within a few percent of the 0.922 ms weight-only ceiling, so there is
-//! very little left here that is not DRAM.
-//!
-//! ### The batch tile, and where it stops paying
-//!
-//! The one lever that changes *bytes per token* rather than bandwidth is
-//! reusing a pass over the weights across several tokens: a warp holds `BT`
-//! accumulators, dequantizes each weight element once, and multiplies it
-//! into all `BT`. A prefill chunk of 8 tokens costs one 540 MB pass, not
-//! eight.
-//!
-//! It does not scale linearly, and the measurement says so plainly. Every
-//! row below is a single pass over the weights:
-//!
-//! | tokens | ms/call | ms/token |
-//! |---:|---:|---:|
-//! | 1 | 0.99 | 0.99 |
-//! | 2 | 1.35 | 0.67 |
-//! | 5 | 2.37 | 0.47 |
-//! | 8 | 2.9–3.4 | 0.37–0.43 |
-//!
-//! Eight tokens is **2.4–2.9x** a single token's throughput, not 8x, for
-//! exactly the reason section 2 identified: past `BT = 1` the activation
-//! loads scale with `BT` while the weight read does not, and the kernel
-//! stops being weight-bound almost immediately. It is also the widest
-//! spread of any figure here, so treat the 8-token row as the least
-//! reliable one.
-//!
-//! Per-token cost is still improving at `BT = 8`, which is why
-//! [`MAX_BATCH_TILE`] is 8 and not smaller. The next lever would be a second
-//! register tile over *rows*, so one activation load feeds several
-//! vocabulary rows; that is not implemented and its size is unmeasured.
-//!
-//! ## Reused from the landed MoE kernel
-//!
-//! [`super::moe`]'s `q8_0_element` prologue, verbatim, including the operand
-//! order `(float)q * d` that the milestone-04 dequant gate proved
-//! bit-identical to [`xabe_kernels::quant::dequantize_q8_0`], and the
-//! `load_half_le` inline-PTX widening from [`super::dequant`] (NVRTC has no
-//! include path, so `<cuda_fp16.h>` is unreachable). [`super::moe::QuantTensor`]
-//! is the weight-plus-format pair, unchanged.
-//!
-//! ## Why the result cannot be bit-identical to the CPU reference
-//!
-//! The dequantized *weights* are bit-identical — multiplication only. The
-//! 2,048-term dot product is not: [`xabe_kernels::gemv::gemv`] sums
-//! sequentially, each lane here sums its 64 terms in four-element groups and
-//! the 32 lane totals are then combined in a shuffle tree, and fp32 addition
-//! is not associative. The kernel also lets nvcc contract `acc += w * x` into an
-//! FMA, which rounds once where the reference rounds twice; unlike
-//! [`super::dequant`] and the convolution in [`super::layer_ops`], there is
-//! no exactness left to protect here, so denying the contraction would cost
+//! The dequantized weights are — multiplication only. The 2,048-term dot
+//! product is not: [`xabe_kernels::gemv::gemv`] sums sequentially, each lane
+//! here sums 64 terms in four-element groups and the 32 lane totals combine in
+//! a shuffle tree. The kernel also lets nvcc contract `acc += w * x` into an
+//! FMA, which rounds once where the reference rounds twice; there is no
+//! exactness left to protect here, so denying the contraction would cost
 //! throughput for nothing. The gate is a measured tolerance plus **argmax
-//! agreement**, which is the property that actually reaches the user.
+//! agreement**, which is the property that reaches the user.
+//!
+//! The Q8_0 prologue, the operand order `(float)q * d`, and the `load_half_le`
+//! inline-PTX widening are shared verbatim with [`super::moe`] and
+//! [`super::dequant`] — NVRTC has no include path, so `<cuda_fp16.h>` is
+//! unreachable.
 
 use std::sync::Arc;
 
@@ -751,12 +680,11 @@ pub struct LmHeadKernels {
     /// Indexed by `tile - 1`, for tiles `1..=MAX_BATCH_TILE`.
     tiles: [CudaFunction; MAX_BATCH_TILE],
     /// The row-tiled three-token entry point and its row count, or `None`
-    /// when `LLMXABE_LMHEAD_RT1=1` selected the untiled path for A/B.
+    /// for the untiled path.
     ///
-    /// Read once at construction, like `moe.rs`'s setup-time switches, so a
-    /// captured CUDA graph never depends on a mid-run environment change.
-    /// The default is the four-row tile; `LLMXABE_LMHEAD_RT2=1` selects the
-    /// two-row one instead.
+    /// [`LmHeadKernels::new`] always takes the four-row tile;
+    /// [`LmHeadKernels::with_row_tile`] is what reaches the others, and only
+    /// the differential test does.
     b3_row_tile: Option<(CudaFunction, usize)>,
     argmax_partial: CudaFunction,
     argmax_final: CudaFunction,
@@ -769,22 +697,11 @@ impl LmHeadKernels {
     /// The geometry is checked once here so the launch path has nothing left
     /// to reject, matching `MoeKernels::new` and `GdnKernels::new`.
     pub fn new(ctx: &Arc<CudaContext>, geometry: LmHeadGeometry) -> Result<Self, LmHeadError> {
-        // Setup-time A/B switches, matching `moe.rs`'s convention: read once
-        // here so a captured CUDA graph never depends on a mid-run
-        // environment change. The default is the four-row tile — the fastest
-        // correct point of the isolated sweep (1.116 ms against RT=2's 1.376
-        // and the untiled 1.662 at three tokens) and a 4.5--4.8% whole-pass
-        // N=3 win in all three interleaved 2K pairs (docs/BENCHMARKS.md
-        // 2026-08-20). `LLMXABE_LMHEAD_RT1=1` keeps the untiled three-token
-        // path and `LLMXABE_LMHEAD_RT2=1` the two-row tile, both for A/B.
-        let rt = if std::env::var_os("LLMXABE_LMHEAD_RT1").is_some() {
-            None
-        } else if std::env::var_os("LLMXABE_LMHEAD_RT2").is_some() {
-            Some(2)
-        } else {
-            Some(4)
-        };
-        Self::with_row_tile(ctx, geometry, rt)
+        // The four-row tile is the fastest correct point of the isolated
+        // sweep — 1.116 ms against RT=2's 1.376 and the untiled 1.662 at
+        // three tokens — and a 4.5--4.8% whole-pass N=3 win in all three
+        // interleaved 2K pairs (docs/BENCHMARKS.md).
+        Self::with_row_tile(ctx, geometry, Some(4))
     }
 
     /// [`Self::new`] with the three-token row tile chosen explicitly rather
@@ -1189,16 +1106,19 @@ mod tests {
         assert!(LM_HEAD_SRC.contains("int blk = lane >> 3;"));
         assert!(LM_HEAD_SRC.contains("int sub = lane & 7;"));
         assert!(
-            LM_HEAD_SRC
-                .contains("xv[t] = *(const float4*)(x + (long long)t * hidden_dim + j);")
+            LM_HEAD_SRC.contains("xv[t] = *(const float4*)(x + (long long)t * hidden_dim + j);")
         );
         // And the row tile's whole point: the float4 loads sit *outside* the
         // row loop, so RT rows' FMAs feed from the same registers and the
         // activation read does not scale with RT.
         assert!(
-            LM_HEAD_SRC.find("xv[t] = *(const float4*)").expect("xv load present")
+            LM_HEAD_SRC
+                .find("xv[t] = *(const float4*)")
+                .expect("xv load present")
                 < LM_HEAD_SRC
-                    .find("for (int rt = 0; rt < RT; ++rt) {\n                const unsigned char* bp")
+                    .find(
+                        "for (int rt = 0; rt < RT; ++rt) {\n                const unsigned char* bp"
+                    )
                     .expect("row unpack loop present"),
             "the activation load moved inside the row loop; it would then \
              scale with RT and the tile would buy nothing",

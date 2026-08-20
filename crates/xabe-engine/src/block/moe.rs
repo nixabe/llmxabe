@@ -72,25 +72,27 @@
 //! and rejects any other dense type by name rather than reading it as
 //! something it is not.
 //!
-//! ## Why the weights are uploaded here rather than taken from `DeviceWeights`
+//! ## Why the weights are uploaded here rather than aliased out of the arena
 //!
 //! [`crate::DeviceWeights`] holds the whole model in one
-//! [`xabe_cuda::DeviceArena`], and hands out [`xabe_cuda::Allocation`] byte
-//! ranges into a single `CudaSlice<u8>`. `cudarc` 0.19 can produce a
-//! borrowed `CudaView` of a sub-range but not an owned `CudaSlice`, and
-//! [`xabe_cuda::kernels::moe::QuantTensor`] takes `&CudaSlice<u8>`. Rather
-//! than widen a kernel signature this workstream does not own,
-//! [`MoeLayerWeights`] uploads one layer's tensors into their own
-//! allocations. One layer is ~725 MiB of expert weights against the model's
-//! 29.65 GiB, so a test can walk several layers without the model ever being
-//! resident. Reconciling the two is a G006 integration concern, and is noted
-//! rather than papered over.
+//! [`xabe_cuda::DeviceArena`] and hands out [`xabe_cuda::Allocation`] byte
+//! ranges into a single `CudaSlice<u8>`. `cudarc` 0.19 can produce a borrowed
+//! `CudaView` of a sub-range but not an owned `CudaSlice`, and
+//! [`xabe_cuda::kernels::moe::QuantTensor`] takes `&CudaSlice<u8>`. So
+//! [`MoeLayerWeights`] uploads one layer's tensors into allocations of their
+//! own.
+//!
+//! That does **not** double the model on the device: [`crate::forward`] excludes
+//! the nine roles this type uploads from the arena entirely
+//! ([`crate::DeviceWeights::load_where`]), so every expert tensor is resident
+//! exactly once — in 41 sets of allocations rather than in the slab. It also
+//! keeps a test able to walk several layers without the model ever being
+//! resident, since one layer is ~725 MiB against the model's 29.65 GiB.
 
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
 };
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
@@ -860,25 +862,6 @@ pub struct MoeBlock {
     gate: CudaSlice<f32>,
     geometry: MoeGeometry,
     eps: f32,
-    /// Setup-time A/B control for the superseded eight-token router tile at
-    /// the exact N=3 decode shape.
-    router_tt8_n3: bool,
-    /// Side stream plus fork/join events that run the decode-width shared
-    /// expert concurrently with the routed path. The shared pair reads only
-    /// `normed` and `valid_tokens` (both final before the fork) and writes
-    /// only `shexp` and `buffers.shared_inter` (which the routed kernels
-    /// never touch), so overlapping them changes scheduling and nothing
-    /// else — the shared kernels are latency-bound at decode width (156
-    /// GB/s against the routed kernels' DRAM-saturated 470--520,
-    /// docs/BENCHMARKS.md 2026-08-20), which looked like exactly the work
-    /// that hides under a bandwidth-bound neighbour for free. Measured, it
-    /// does not: the interleaved A/B found 32K N=3 flat (149.5 vs 149.7)
-    /// and N=1 down 2.5% from the fork/join events alone, so the serial
-    /// order is the default and `LLMXABE_MOE_SHARED_OVERLAP=1` re-arms the
-    /// side stream for A/B only. The wide MMA shared path stays serial
-    /// regardless: it shares the quantized-activation buffers with the
-    /// routed MMA kernels.
-    shared_overlap: Option<(Arc<CudaStream>, CudaEvent, CudaEvent)>,
 }
 
 impl MoeBlock {
@@ -936,12 +919,6 @@ impl MoeBlock {
             gate: stream.alloc_zeros::<f32>(geometry.max_tokens)?,
             geometry,
             eps,
-            router_tt8_n3: std::env::var_os("LLMXABE_ROUTER_TT8_N3").is_some(),
-            shared_overlap: if std::env::var_os("LLMXABE_MOE_SHARED_OVERLAP").is_some() {
-                Some((ctx.new_stream()?, ctx.new_event(None)?, ctx.new_event(None)?))
-            } else {
-                None
-            },
         })
     }
 
@@ -1087,26 +1064,15 @@ impl MoeBlock {
         // genuinely runs beside the router/dispatch/expert kernels below.
         // Recording at the shared-expert call site instead would capture
         // the whole routed path into the fork and overlap nothing.
-        let takes_shared_mma = g.max_tokens >= SHARED_MMA_MIN_TOKENS
-            && w.shared_int8.is_some()
-            && self.moe.tensor_cores_enabled();
-        let overlap_shared = self.shared_overlap.is_some() && !takes_shared_mma;
-        if overlap_shared {
-            let (side, fork, _) = self.shared_overlap.as_ref().expect("checked above");
-            fork.record(stream)?;
-            side.wait(fork)?;
-        }
-
         // 2. router logits, then softmax + top-k + renormalize on the device.
         let hidden_i32 = g.hidden as i32;
         let experts_i32 = g.num_experts as i32;
         let max_tokens_i32 = g.max_tokens as i32;
         // Exact N=3 avoids computing the last token five extra times in the
-        // wide TT=8 tile. The environment fallback keeps the old mapping in
-        // this binary for controlled measurements.
+        // wide TT=8 tile.
         let tt = if g.max_tokens == 1 {
             1
-        } else if g.max_tokens == ROUTER_TT_N3 as usize && !self.router_tt8_n3 {
+        } else if g.max_tokens == ROUTER_TT_N3 as usize {
             ROUTER_TT_N3
         } else {
             ROUTER_TT
@@ -1181,14 +1147,6 @@ impl MoeBlock {
         // cost 57% of decode throughput — 15.39 ms per step became 24.13 —
         // while `bench_forward`'s n = 1 column, which builds its own weights
         // and so never repacks, showed nothing wrong.
-        //
-        // The GEMV branch runs on the side stream when one exists: the fork
-        // was recorded after `normed` landed, the join is awaited before the
-        // combine reads `shexp`, and its buffers are disjoint from the
-        // routed kernels running concurrently on `stream` — see
-        // `shared_overlap`'s field doc. The MMA branch keeps the main
-        // stream: it shares the quantized-activation buffers with the
-        // routed MMA path and may not run beside it.
         let wide_enough = g.max_tokens >= SHARED_MMA_MIN_TOKENS;
         match w
             .shared_int8
@@ -1203,17 +1161,8 @@ impl MoeBlock {
                 &mut self.shexp,
             )?,
             None => {
-                let shared_stream = if overlap_shared {
-                    self.shared_overlap
-                        .as_ref()
-                        .expect("checked at the fork")
-                        .0
-                        .clone()
-                } else {
-                    stream.clone()
-                };
                 self.moe.shared_expert(
-                    &shared_stream,
+                    stream,
                     &mut self.buffers,
                     QuantTensor {
                         bytes: &w.shared_gate,
@@ -1230,11 +1179,6 @@ impl MoeBlock {
                     &self.normed,
                     &mut self.shexp,
                 )?;
-                if overlap_shared {
-                    let (side, _, join) = self.shared_overlap.as_ref().expect("checked");
-                    join.record(side)?;
-                    stream.wait(join)?;
-                }
             }
         }
 

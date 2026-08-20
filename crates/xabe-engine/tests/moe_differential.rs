@@ -1507,19 +1507,15 @@ fn shared_gemv_and_tiled_isolate_the_one_live_token_case() {
 
     assert_eq!(
         via_gemv, via_tiled,
-        "shared-expert gemv and tiled disagree on the same row -- this is \
-         the pairing Phase B, step 1 never isolated",
+        "shared-expert gemv and tiled disagree on the same row",
     );
 }
 
 /// The router GEMM's one-token instantiation (`moe_block_router_logits_t1`,
 /// `max_tokens == 1`) against the eight-token tile (`moe_block_router_
-/// logits`, `max_tokens > 1`). Phase B, step 1 named this pairing as
-/// already engineered for bit-identity (`ROUTER_JC` equals the block
-/// width in both instantiations) and deferred the isolated differential
-/// until GDN/Attention closed. GDN layer-0 now measures `0.000e0`; if
-/// MoE layer-0 still does not, this is the next place the residual can
-/// still be generated.
+/// logits`, `max_tokens > 1`). The two are engineered for bit-identity —
+/// `ROUTER_JC` equals the block width in both instantiations — and this is
+/// what checks that they are, rather than assuming it.
 ///
 /// Token 0 of a three-token `MoeBlock` is compared against the same
 /// residual row run alone through a one-token block. The rest of the
@@ -1593,7 +1589,7 @@ fn router_t1_and_tiled_isolate_the_same_row() {
 
     assert_eq!(
         via_t1, via_tiled,
-        "router t1 and the TT=8 tile disagree on the same row -- the \
-         pairing Phase B, step 1 deferred is not bit-identical after all",
+        "router t1 and the TT=8 tile disagree on the same row -- they are \
+         engineered for bit-identity and are not",
     );
 }
