@@ -68,7 +68,12 @@ const DEFAULT_BATCH_WIDTHS: &[usize] = &[1, 2, 3, 4, 8];
 /// Largest single prefill pass. Wider contexts are prefilled in chunks of
 /// this width so scratch stays bounded — see `bench_decode`'s identical
 /// reasoning.
-const MAX_PREFILL_CHUNK: usize = 2048;
+// A 2,048-row MoE prefill workspace cannot coexist with the resident 35B
+// weights and a decode shape on the 48 GiB deployment card. Prefill happens
+// before timing, so use the largest setup chunk that leaves room for the
+// actual N-way decode measurement. The resulting recurrent/KV state is the
+// same sequence of chunked prefill operations production uses.
+const MAX_PREFILL_CHUNK: usize = 512;
 
 fn model_path() -> PathBuf {
     std::env::var_os("LLMXABE_MODEL")
@@ -94,13 +99,21 @@ fn stats(v: &[f64]) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
-/// A chunk width that divides `context` and is at most `MAX_PREFILL_CHUNK`.
-fn chunk_for(context: usize) -> usize {
-    let mut c = context.min(MAX_PREFILL_CHUNK);
+/// A chunk width that divides `context` and is at most `max_chunk`.
+fn chunk_for(context: usize, max_chunk: usize) -> usize {
+    let mut c = context.min(max_chunk);
     while c > 1 && !context.is_multiple_of(c) {
         c -= 1;
     }
     c
+}
+
+fn decode_chunk_limit() -> usize {
+    std::env::var("LLMXABE_DECODE_CHUNK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&chunk| chunk > 0)
+        .unwrap_or(MAX_PREFILL_CHUNK)
 }
 
 /// One synthetic, in-vocabulary, non-degenerate prompt. Distinct per sequence
@@ -175,7 +188,7 @@ fn main() -> ExitCode {
         load.elapsed.as_secs_f64(),
     );
 
-    let chunk = chunk_for(context);
+    let chunk = chunk_for(context, decode_chunk_limit());
     if chunk != context {
         info!("prefill chunk {chunk} (context {context} is not <= {MAX_PREFILL_CHUNK})");
     }
@@ -208,6 +221,11 @@ fn main() -> ExitCode {
         let mut step = prefill
             .reshape(&ctx, &stream, &file, &directory, &weights, 1)
             .expect("decode step builds");
+        // Same A/B lever bench_decode carries: force the warp decode kernel
+        // over the depth-dispatched tensor-core one.
+        if std::env::var("LLMXABE_DISABLE_DECODE_MMA").is_ok() {
+            step.disable_decode_mma();
+        }
         let mut state = prefill
             .new_state(&stream, max_seq)
             .expect("state allocates");
@@ -269,6 +287,13 @@ fn main() -> ExitCode {
         batch
             .enable_batch_decode(&ctx, &stream)
             .expect("batch decode scratch allocates");
+        if std::env::var("LLMXABE_DISABLE_DECODE_MMA").is_ok() {
+            batch.disable_decode_mma();
+        } else if let Ok(wpo) = std::env::var("LLMXABE_DECODE_MMA_WPO")
+            && let Ok(wpo) = wpo.parse::<usize>()
+        {
+            batch.set_decode_mma_wpo(wpo);
+        }
 
         let mut states: Vec<SequenceState> = Vec::with_capacity(n);
         let mut next: Vec<i32> = Vec::with_capacity(n);
@@ -323,4 +348,17 @@ fn main() -> ExitCode {
 
     info!("");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chunk_for;
+
+    #[test]
+    fn prefill_chunk_is_a_context_divisor_within_its_limit() {
+        assert_eq!(chunk_for(2048, 512), 512);
+        assert_eq!(chunk_for(2048, 750), 512);
+        assert_eq!(chunk_for(513, 512), 171);
+        assert_eq!(chunk_for(127, 512), 127);
+    }
 }
