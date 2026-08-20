@@ -181,6 +181,7 @@ optimizations that were correct for the wrong bound and measured slower.
 - `cargo fmt --all` and `cargo clippy --workspace --all-targets` must be clean
   before you commit.
 - `cargo test --workspace` must pass before you commit.
+- **Run tests in release builds only** (`cargo test --workspace --release`) — a debug-build test run is not a signal.
 - **Never `println!` outside a test.** Binaries and examples log through
   `tracing`; libraries emit events and never install a subscriber. Tool
   output — tables, results — is `info!`, because `INFO` is the level that
