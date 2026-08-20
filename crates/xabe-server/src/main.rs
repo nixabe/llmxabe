@@ -83,6 +83,10 @@ struct Args {
     /// Prefill chunk size in tokens (also -pc)
     #[arg(long, default_value_t = 4096)]
     prefill_chunk: usize,
+
+    /// API key callers must present; with none set, every caller is accepted
+    #[arg(long, env = "LLMXABE_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
 }
 
 /// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
@@ -279,6 +283,7 @@ fn main() -> std::process::ExitCode {
         tokenizer,
         attention_block_size,
         &address,
+        args.api_key,
     )) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(failure) => {

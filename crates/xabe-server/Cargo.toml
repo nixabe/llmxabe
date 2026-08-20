@@ -20,6 +20,7 @@ xabe-sched.workspace = true
 xabe-engine.workspace = true
 xabe-cuda.workspace = true
 xabe-gguf.workspace = true
+async-stream = "0.3"
 axum = "0.8"
 clap.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
