@@ -1,7 +1,6 @@
 //! MTP speculative decode — the draft/verify/accept/rollback driver.
 //!
-//! `docs/OPTIMIZATION.md` §R6. This wires the three pieces built for it
-//! together: [`crate::block::mtp::MtpBlock`] drafts, [`crate::forward::
+//! Wires the three pieces built for it together: [`crate::block::mtp::MtpBlock`] drafts, [`crate::forward::
 //! Forward::run_verify`] verifies `1 + d` positions in one weight-read pass,
 //! and [`crate::block::gdn_verify`]'s window-local snapshot ring commits the
 //! Gated DeltaNet state to exactly the accepted prefix at zero extra
@@ -136,8 +135,8 @@ impl StepTimes {
 }
 
 /// One draft-verify-accept-commit round's outcome, for the caller to record
-/// acceptance statistics with (see `docs/BENCHMARKS.md`'s honest-throughput
-/// discipline: "accepted tokens per wall-clock second", not drafted).
+/// acceptance statistics with. The honest measure is accepted tokens per
+/// wall-clock second, not drafted ones.
 pub struct StepOutcome {
     /// Newly emitted tokens this step, oldest first: `k` accepted drafts
     /// plus the bonus token, `1 <= len() <= d + 1`.

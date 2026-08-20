@@ -1,7 +1,7 @@
 //! `block::gdn_verify`'s window-local snapshot composition, checked against
 //! the plain chunked forward pass on the real model's weights.
 //!
-//! `docs/OPTIMIZATION.md` §R6: a speculative-decode verify step needs the
+//! A speculative-decode verify step needs the
 //! Gated DeltaNet recurrent state snapshotted at every position boundary
 //! inside the window, not just at the end, so a partially-accepted draft can
 //! roll back to exactly the right point without a second weight-read pass.

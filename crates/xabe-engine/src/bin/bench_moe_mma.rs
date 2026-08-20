@@ -1,8 +1,8 @@
 //! `moe_expert_ffn_mma` and `moe_expert_down_mma` alone, at the shapes a
 //! chunked prefill actually launches them at.
 //!
-//! `docs/BENCHMARKS.md`'s "Integer tensor cores, wired end to end" nsys table
-//! puts these two kernels at 17.3% and 10.2% of an 8,192-token chunked pass —
+//! An nsys profile puts these two kernels at 17.3% and 10.2% of an
+//! 8,192-token chunked pass —
 //! the single biggest named cost after attention. The routed-expert MMA
 //! kernel measured 16.1% of the card's 198 TOP/s int8 peak at its own real
 //! shape and 31% of bandwidth peak, so it is latency-bound rather than

@@ -1,6 +1,6 @@
 //! The MTP (multi-token-prediction) draft head: block 40 of the GGUF.
 //!
-//! `docs/OPTIMIZATION.md` §R6. The reference is llama.cpp's `graph_mtp`
+//! The reference is llama.cpp's `graph_mtp`
 //! (`src/models/qwen35moe.cpp:553-742`): `hnorm(h) ++ enorm(embed(tok))`,
 //! concatenated and projected through `eh_proj` down to `hidden`, then one
 //! ordinary dense-attention + MoE decoder block — this GGUF's block 40,

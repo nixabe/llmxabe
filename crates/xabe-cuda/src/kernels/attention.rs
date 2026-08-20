@@ -1,174 +1,65 @@
 //! Gated Attention (flash-attention style) on sm_75.
 //!
-//! Ten of Qwen3.6's forty layers, plus the MTP head at block 40. Geometry is
-//! 16 query heads against 2 KV heads (GQA ratio 8), head dimension **256**,
-//! partial rotary over the leading 64 dimensions. The reference is
-//! `xabe_kernels::attention::causal_attention_streaming` — the online-softmax
-//! form — which is itself cross-checked against
-//! `causal_attention_naive` in that crate.
+//! Ten of Qwen3.6's forty layers plus the MTP head. Geometry is 16 query heads
+//! against 2 KV heads (GQA ratio 8), head dimension 256, partial rotary over
+//! the leading 64 dimensions, binary16 K/V cache. The reference is
+//! `xabe_kernels::attention::causal_attention_streaming`.
 //!
-//! Ported as an *algorithm* from llama.cpp's `fattn-vec.cuh` shape (one query
-//! row per block, K and V streamed), not from `fattn-wmma`. `docs/KERNELS.md`
-//! names `fattn-tile.cu` / `fattn-vec.cuh` as the sm_75 sources and explicitly
-//! excludes the WMMA path.
+//! # The kernel set, and what selects it
 //!
-//! ## Three kernels, and why the first one exists
+//! | Shape | Kernel | Why this one |
+//! | --- | --- | --- |
+//! | prefill, `n_query >= 16` | `attn_flash_causal_mma` | `m16n8k8` tensor cores, fp32 accumulate; eight query heads share one staged K/V tile |
+//! | prefill, narrower | `attn_flash_causal_gqa` | same GQA-shared staging, scalar fp32 |
+//! | prefill, one row | `attn_flash_causal_t1` | no query tile to amortize |
+//! | decode, depth >= 16,384 | `attn_flash_decode_mma` | tiled softmax on the tensor cores; wins only where the per-key loop dominates |
+//! | decode, shallower | `attn_flash_decode_warp` + `_combine` | per-key online softmax, key axis split 96 ways |
 //!
-//! `blk.N.attn_q.weight` is `[n_embd, head_dim * n_head * 2]` = `[2048, 8192]`
-//! and packs the query **and its output gate interleaved per head**:
-//! `[q_h0, gate_h0, q_h1, gate_h1, ...]`. Upstream reads the query half with
-//! `ggml_view_3d(.., head_dim, n_head, n_tokens, stride = head_dim*2, ..)` in
-//! `src/models/qwen35moe.cpp`, which is where that was confirmed — it was not
-//! inferred from the dimensions. Splitting the tensor into two contiguous
-//! halves is arithmetically valid, produces finite plausible activations, and
-//! is a different model: query heads 8..15 would be fed the gates of heads
-//! 0..7. [`attn_packed_query_offset`] / [`attn_packed_gate_offset`] state the
-//! layout in Rust so the host side and the kernel cannot drift, and
-//! `attn_split_query_gate` is the kernel that applies it.
+//! [`AttentionKernels::uses_tensor_cores`] and `active_decode_mma` are the
+//! dispatch rules, exposed so a differential test picks its tolerance from the
+//! kernel that will actually run rather than from a hardcoded copy of the rule.
 //!
-//! The gate itself is *not* applied here. There is no CPU reference for the
-//! gating nonlinearity in `xabe-kernels`, so applying it would put arithmetic
-//! into this kernel that the differential harness cannot check — which
-//! `AGENTS.md` forbids. The gate is deinterleaved and handed back to the
-//! caller.
+//! # Invariants a change here must not break
 //!
-//! ## Shared-memory budget, and why the textbook tile does not fit
+//! **The packed query/gate layout.** `blk.N.attn_q.weight` is `[2048, 8192]`
+//! and interleaves the query and its output gate *per head*:
+//! `[q_h0, gate_h0, q_h1, gate_h1, ...]`. Confirmed against upstream's
+//! `ggml_view_3d(.., stride = head_dim*2, ..)` in `src/models/qwen35moe.cpp`,
+//! not inferred from the dimensions. Splitting the tensor into two contiguous
+//! halves is arithmetically valid, produces plausible activations, and is a
+//! different model — query heads 8..15 would be fed the gates of heads 0..7.
+//! [`attn_packed_query_offset`] / [`attn_packed_gate_offset`] state it once so
+//! the host and the kernel cannot drift.
 //!
-//! `docs/KERNELS.md` records **48 KiB of shared memory per block** on this
-//! hardware, measured. (Turing's SM carries 64 KiB of unified L1/shared, and a
-//! block can reach the full 64 KiB only by opting in through
-//! `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`; the
-//! default static ceiling is 48 KiB. This kernel budgets against 48 KiB and
-//! needs no opt-in.)
+//! **The gate is deinterleaved here and applied elsewhere.** There is no CPU
+//! reference for the gating nonlinearity in `xabe-kernels`, so applying it
+//! here would put arithmetic in this module that the differential harness
+//! cannot check.
 //!
-//! A classic flash-attention block stages Q, K and V tiles plus a score tile:
+//! **Causal bound.** Query row `i` sits at absolute position `key_offset + i`
+//! and attends to `key_offset + i + 1` keys. `key_offset` is a *device*
+//! scalar, which is what lets one decode step be recorded as a CUDA graph and
+//! replayed at every later position, and what makes chunked prefill and decode
+//! the same kernel. The bound appears exactly once, as the loop limit
+//! `n_visible`, so there is no separate mask to get off by one against.
 //!
-//! ```text
-//! bytes = (BM + 2*BN) * head_dim * 4  +  BM * BN * 4
+//! **`ATTN_MAXD` bounds head_dim at 256.** The query tile lives in registers
+//! only while every index folds to a constant, so wider head dimensions are
+//! rejected at construction rather than silently spilled to local memory.
 //!
-//!   BM=BN=64 -> (64 + 128) * 256 * 4 + 16384  =  212,992 B = 208 KiB   4.3x over
-//!   BM=BN=32 -> ( 32 +  64) * 256 * 4 +  4096 =   102,400 B = 100 KiB   2.1x over
-//!   BM=BN=16 -> ( 16 +  32) * 256 * 4 +  1024 =    50,176 B =  49 KiB   just over
-//!   BM=BN= 8 -> (  8 +  16) * 256 * 4 +   256 =    24,832 B =  24 KiB   fits
-//! ```
+//! **Softmax reductions stay serial and ascending within a row.** The
+//! normalizer is a floating-point sum; a warp butterfly would reassociate it,
+//! and the differential test gates on that exactness.
 //!
-//! head_dim 256 in fp32 is 1 KiB per row, so the whole family is 4x more
-//! expensive than the head_dim-64 shapes these tile sizes were chosen for.
-//! Nothing above `BM=BN=8` fits, and an 8x8 tile buys almost none of the
-//! arithmetic-intensity multiplier that tiling exists for.
+//! **The decode split count is a numerics parameter, not a scheduling one.**
+//! Each split reduces its own key range, so widening the splits lengthens that
+//! reduction: 96 passes the deep-window 1e-5 gate and 48 does not. The *block*
+//! count is the scheduling knob and is free — blocks grid-stride the splits,
+//! so no reduction boundary moves and the partials are bit-identical at any
+//! block count.
 //!
-//! **Chosen shape: `BM = 8`, K and V not staged at all.**
-//!
-//! ```text
-//!   score_sh  BM * (head_dim/32 * 4) floats (256) = 1024 B
-//!   w_sh      BM * (head_dim/32 * 4) floats (256) = 1024 B
-//!   m/l/corr  3 * BM floats                (24)   =   96 B
-//!                                                  -------
-//!                                                   2144 B  =  2.1 KiB  (4.4% of 48 KiB)
-//! ```
-//!
-//! One block owns **eight** query rows of one query head. Its 256 threads are
-//! 8 warps; each warp scores `ATTN_KT` keys per trip against all eight rows,
-//! so a tile is 32 keys. Each thread owns one output dimension of eight
-//! running accumulators. K and V are still read straight from global memory,
-//! coalesced.
-//!
-//! **The query tile is in registers, not shared.** That is the whole point of
-//! it. `BM = 1` was not slow because of bandwidth — it was slow because it did
-//! one memory instruction per multiply-add:
-//!
-//! ```text
-//!   scores:  per key, per lane   8 global k + 8 shared q  + 8 FMA + 5 shfl
-//!   values:  per key, per thread 1 global v + 1 shared w  + 1 FMA
-//! ```
-//!
-//! Turing issues 4 LSU operations per SM per clock against 64 FMAs, so a
-//! kernel at one load per multiply-add is running at a sixteenth of the FMA
-//! pipe and no amount of L2 hit rate changes that. Holding `q` in registers
-//! removes the shared read from the score loop entirely and makes one `k`
-//! element feed eight multiply-adds; one `v` element likewise feeds eight.
-//!
-//! ```text
-//!   scores:  per key, per lane   8 global k + 0 shared    + 64 FMA + 40 shfl
-//!   values:  per key, per thread 1 global v + 8 shared w  +  8 FMA
-//! ```
-//!
-//! Measured at 512 tokens: **21.1 ms -> 8.5 ms** per forward pass over the ten
-//! attention layers, which is 1,823 -> 1,922 tok/s end to end.
-//!
-//! The register array is what bounds `head_dim`: `qr[ATTN_QT][ATTN_MAXD]` is
-//! only in registers while every index folds to a constant, so `ATTN_MAXD` is
-//! a compile-time 8 and head dimensions above 256 are rejected rather than
-//! silently spilled to local memory.
-//!
-//! **Why the softmax bookkeeping is one thread per slot.** Widening the query
-//! tile multiplies the per-tile reductions by `BM` as well, and the obvious
-//! version — every thread sweeping `BM * tile` shared floats for the max and
-//! the normalizer — costs more than the value loop it was meant to amortize.
-//! `ATTN_QT * ATTN_KT` is therefore pinned to 32, which makes `ATTN_QT * tile`
-//! exactly the block width at every head dimension, so the exponential phase
-//! is one thread per (row, key) slot with no loop at all. The max and the
-//! normalizer stay serial and ascending in one thread per row, because the
-//! normalizer is a floating-point sum and a warp butterfly would reassociate
-//! it — see the differential test's exactness gate.
-//!
-//! Staging K in shared memory would still buy nothing: a block touches each K
-//! row once, so there is no intra-block reuse to amortize the staging
-//! against. The reuse is *across* blocks — 16 query heads share 2 KV heads —
-//! and that is served by the 6 MiB L2, not by shared memory.
-//!
-//! **Occupancy consequence, stated honestly.** Shared memory is not the
-//! limiter at 2.1 KiB per block; the register file is. The query tile costs
-//! `ATTN_QT * head_dim / 32` registers per thread on top of the accumulators,
-//! which puts the kernel around two blocks of 256 threads per SM rather than
-//! four. That is half the thread occupancy for eight times the arithmetic per
-//! byte, and the measurement above is which way that trade goes.
-//!
-//! ## Tensor cores: not used, and what that costs
-//!
-//! **This is the scalar fp32 path. It does not use the `m16n8k8` tensor-core
-//! MMA family that `kernels::mod::TARGET_ARCH` (`compute_75`) makes reachable.
-//! Calling it "flash attention" refers to the online-softmax streaming form
-//! and the absence of a materialized score matrix, not to tensor cores.**
-//!
-//! What that gives up, and why it is second in line rather than first:
-//!
-//! - Turing's fp16 `m16n8k8` MMA with fp32 accumulate runs at roughly 8x the
-//!   fp32 FMA rate (about 130 vs 16.3 TFLOP/s on this part). That is the whole
-//!   headline number, and none of it is available here.
-//! - It is not reachable at `BM = 1`. `m16n8k8` consumes a 16x8 operand tile,
-//!   so it needs at least 16 query rows resident per block — which means
-//!   staging Q, and staging K to feed the B operand. At head_dim 256 in fp16
-//!   that is `(16 + 2*BN) * 256 * 2` bytes; `BN = 16` is 24 KiB and does fit.
-//!   So the tensor-core path is *available*, but only after the tiling is
-//!   redesigned, and only in fp16.
-//! - fp16 K/V would end the fp32-exact comparison this kernel is gated on.
-//!   The differential test currently measures agreement with the scalar
-//!   reference at the fp32 rounding floor; an fp16 MMA path has to be re-gated
-//!   at `Tolerance::reduced_precision_gpu()` (5e-2), which is three orders of
-//!   magnitude looser and would hide a formulation bug this gate catches.
-//! - The workload is bandwidth-bound at this shape (see above), so 8x more
-//!   FLOP/s on its own converts to far less than 8x. The tiling that unlocks
-//!   tensor cores is also the tiling that raises arithmetic intensity — the
-//!   two are the same change, and the intensity is the part that pays.
-//!
-//! The correct order is: get the numerics right against the reference at fp32,
-//! then re-tile for reuse, then take the MMA path and re-gate. This module is
-//! step one, and it should not be described as more than that.
-//!
-//! ## Causal masking
-//!
-//! Query row `i` of a launch sits at absolute position `key_offset + i` and
-//! attends to keys `[0, key_offset + i]` inclusive — `key_offset + i + 1`
-//! keys. `key_offset` is what makes chunked prefill and decode the same
-//! kernel, and it is a **device scalar**: it is the only thing that differs
-//! between two consecutive decode steps, so keeping it out of the launch
-//! arguments is what lets a whole step be recorded once as a CUDA graph.
-//! The bound appears exactly once, as the loop limit `n_visible`, so
-//! there is no separate mask to get off by one against; an off-by-one would
-//! have to be an off-by-one in `+ 1`, and the differential test proves that
-//! `+ 1` is right by perturbing key `t+1` and requiring output row `t` to come
-//! back bit-identical.
+//! Where the time actually goes, and the levers that were tried and rejected
+//! on this kernel family, are in `docs/BENCHMARKS.md`.
 
 use std::sync::Arc;
 
@@ -2027,8 +1918,7 @@ __global__ void attn_flash_decode_combine(
 // half here. The `q_hi`/`q_lo` trick is `Q K^T`-only because `Q K^T`'s
 // rounding was the one that broke the gate.
 //
-// Templated on `WPO` (`ATTN_DECODE_MMA` below) so the occupancy knob named in
-// docs/BENCHMARKS.md ("what this leaves for a future attempt") can be
+// Templated on `WPO` (`ATTN_DECODE_MMA` below) so the occupancy knob can be
 // measured without a second hand-written copy of this kernel: `WPO = 4` was
 // the value the original attempt built and measured 1.73x slower than
 // attn_flash_decode_warp at a 131,072-key window, diagnosed as one resident
@@ -2746,7 +2636,7 @@ impl AttentionKernels {
             mma_decode_splits: std::env::var("LLMXABE_DEC_MMA_SPLITS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&s| s >= 1 && s <= DECODE_SPLITS)
+                .filter(|&s| (1..=DECODE_SPLITS).contains(&s))
                 .unwrap_or(MMA_DECODE_SPLITS),
             mma_decode_blocks: std::env::var("LLMXABE_DEC_MMA_BLOCKS")
                 .ok()

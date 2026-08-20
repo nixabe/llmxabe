@@ -197,7 +197,10 @@ fn n3_full_prompt_flattened_prefill_matches_serial_at_2046_rows_per_sequence() {
             max_abs <= MAX_ABS_DIFF,
             "max_abs {max_abs:e} exceeds {MAX_ABS_DIFF:e}"
         );
-        assert!(cos >= MIN_COSINE, "cosine {cos:.9} is below {MIN_COSINE:.9}");
+        assert!(
+            cos >= MIN_COSINE,
+            "cosine {cos:.9} is below {MIN_COSINE:.9}"
+        );
         assert_eq!(
             batch_ids[sequence], reference_ids[sequence],
             "sequence {sequence}: the flattened pass sampled a different token",

@@ -1,51 +1,42 @@
 //! Turing integer tensor cores: `mma.sync.aligned.m8n8k16.s32.s8.s8.s32`.
 //!
-//! This is the instruction the whole prefill argument turns on.
-//! `docs/OPTIMIZATION.md` §8.1 shows llama.cpp's prefill throughput is 61.9%
-//! of this engine's absolute *fp32* ceiling, and `docs/BENCHMARKS.md` measures
-//! the MoE grouped GEMM at 27% of fp32 peak against a ~50% structural ceiling
-//! for its instruction mix. Both say the same thing: **fp32 cannot win
-//! prefill, and no amount of tuning changes that.** Integer tensor cores are
-//! the only path, and this module is the primitive they are built on.
+//! The instruction the prefill argument turns on. `docs/OPTIMIZATION.md` §4.1
+//! shows llama.cpp's prefill throughput sitting at ~61% of this engine's
+//! absolute *fp32* ceiling: fp32 cannot win prefill, and no amount of tuning
+//! changes that. Integer tensor cores are the only path, and this module is
+//! the primitive they are built on.
 //!
 //! # Why int8 and not fp16
 //!
 //! Measured on this card: `m8n8k16` s8 runs at ~198 TOP/s against `m16n8k8`
 //! fp16's ~99 TFLOP/s and scalar fp32's ~17.9 TFLOP/s. Twice the fp16 rate is
-//! the smaller reason. The larger one is that **the weights are already
-//! quantized**: the model ships Q6_K and Q8_0, so an int8 operand is the
-//! native format, while an fp16 operand would mean dequantizing to a *wider*
-//! type than the data actually carries.
+//! the smaller reason. The larger one is that the weights are **already**
+//! quantized — the model ships Q6_K and Q8_0, so an int8 operand is the native
+//! format, while an fp16 operand would mean dequantizing to a type *wider*
+//! than the data carries.
 //!
-//! # What is and is not reachable here
+//! # What is reachable, verified against SASS rather than NVRTC
 //!
-//! Verified by compiling to SASS on this host rather than trusting NVRTC:
-//!
-//! - `m8n8k16.s32.s8.s8.s32` assembles at `sm_75` and is what this module
-//!   uses.
-//! - `m16n8k8.f32.f16.f16.f32` assembles at `sm_75` and lowers to a genuine
-//!   `HMMA.1688.F32`.
-//! - **`m16n8k16` does not.** NVRTC *accepts* it at `compute_75` and emits
-//!   PTX; ptxas then rejects it with `Feature '.m16n8k16' requires .target
-//!   sm_80 or higher`. NVRTC success is therefore not evidence of
-//!   reachability, and anything wanting a wider K must decompose into
-//!   `m8n8k16` steps sharing one accumulator. Upstream does exactly this —
-//!   llama.cpp's `ggml/src/ggml-cuda/mma.cuh`, TurboMind's
-//!   `kernels/core/mma.h`, and vLLM's `marlin_mma.h` all split the Ampere
-//!   shape into Turing halves.
+//! `m8n8k16.s32.s8.s8.s32` and `m16n8k8.f32.f16.f16.f32` both assemble at
+//! `sm_75`. **`m16n8k16` does not**: NVRTC accepts it at `compute_75` and
+//! emits PTX, then ptxas rejects it (`Feature '.m16n8k16' requires .target
+//! sm_80 or higher`). NVRTC success is not evidence of reachability. Anything
+//! wanting a wider K decomposes into `m8n8k16` steps sharing one accumulator,
+//! which is what llama.cpp's `mma.cuh`, TurboMind's `core/mma.h` and vLLM's
+//! `marlin_mma.h` all do.
 //!
 //! # The fragment layout, and why it is gated exactly
 //!
 //! A wrong fragment layout is *the* characteristic defect of a hand-written
-//! MMA port: it produces finite, plausible, entirely wrong numbers. There is
-//! no tolerance that separates it from arithmetic noise.
+//! MMA port: it produces finite, plausible, entirely wrong numbers, and no
+//! tolerance separates it from arithmetic noise.
 //!
 //! So this kernel is gated on **bit-exact equality** with
-//! [`xabe_kernels::mma::int8_gemm`], which is possible only because integer
-//! addition is associative — the device and the reference sum the same
-//! products in different orders and must still agree to the last bit. Every
-//! fp32 kernel in this workspace has to accept a tolerance for exactly the
-//! reason this one does not.
+//! [`xabe_kernels::mma::int8_gemm`] — possible only because integer addition
+//! is associative, so the device and the reference may sum the same products
+//! in different orders and must still agree to the last bit. Every fp32 kernel
+//! in this workspace accepts a tolerance for exactly the reason this one does
+//! not.
 //!
 //! Layout, from the PTX ISA, with lane `l` in `0..32`:
 //!
@@ -55,9 +46,9 @@
 //!   C/D (8x8)            row = l >> 2,  columns (l & 3) * 2 + {0,1}
 //! ```
 //!
-//! Note the accumulator's stride is 2 and the operands' is 4. Assuming they
-//! match is the easy mistake, and `xabe_kernels::mma` spells all three in Rust
-//! so a host-side test can check the tiling covers each element exactly once.
+//! The accumulator's stride is 2 and the operands' is 4. Assuming they match
+//! is the easy mistake, and `xabe_kernels::mma` spells all three in Rust so a
+//! host test can check the tiling covers each element exactly once.
 
 use std::sync::Arc;
 

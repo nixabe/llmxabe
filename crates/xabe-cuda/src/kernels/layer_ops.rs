@@ -1,88 +1,49 @@
 //! RMSNorm, partial rotary embedding, SwiGLU, sigmoid gating, tensor add,
 //! softplus, and the GDN short convolution.
 //!
-//! The glue between the three big kernels. Individually none of these is
-//! interesting; collectively they are every operation a forward pass needs
-//! that [`super::gdn`], [`super::gdn_chunked`], [`super::attention`] and
-//! [`super::moe`] do not already cover, so G006 cannot exist without them.
+//! Every operation a forward pass needs that [`super::gdn`],
+//! [`super::gdn_chunked`], [`super::attention`] and [`super::moe`] do not
+//! already cover. They live here, as standalone tested kernels, rather than
+//! inline in the blocks that use them: an engine-side inline kernel is
+//! invisible to the kernel inventory and gets no differential test against the
+//! `xabe-kernels` oracle. Fusing one *into* a block is still legitimate — the
+//! GDN gate kernel computes softplus, the log-decay and beta's sigmoid in one
+//! pass — but the standalone op has to exist and be the thing a fused variant
+//! is checked against.
 //!
 //! References: [`xabe_kernels::norm::rms_norm`],
 //! [`xabe_kernels::rope::apply_rope`], [`xabe_kernels::norm::swiglu`],
 //! [`xabe_kernels::norm::sigmoid_gate`], [`xabe_kernels::norm::residual_add`],
-//! [`xabe_kernels::norm::softplus`], and
+//! [`xabe_kernels::norm::softplus`],
 //! [`xabe_kernels::conv::causal_depthwise_conv1d`].
 //!
-//! ## Why the elementwise three live here and not in a block
+//! # Geometry is per launch, not per instance
 //!
-//! `sigmoid(gate) * x`, `a + b` and `softplus(x)` were each already written
-//! inline inside `xabe-engine`'s block implementations, because `xabe-cuda`
-//! had none of them: the attention block compiled its own two-kernel NVRTC
-//! module for the first two, the MoE block fused a sigmoid into its
-//! shared-expert router and an add into its combine kernel, and the GDN block
-//! fused a softplus into its gate kernel and carried its own `gdn_add`. Three
-//! blocks, three private copies. That is the wrong place for them: an
-//! engine-side inline kernel is invisible to the kernel
-//! inventory, gets no differential test of its own against the `xabe-kernels`
-//! oracle, and gets duplicated once per block type. Fusion inside a block is
-//! still legitimate — the GDN gate kernel computes `softplus`, the log-decay
-//! and `beta`'s sigmoid in one pass over one buffer, which three separate
-//! launches would not — but the *standalone* op has to exist, be tested, and
-//! be the thing a fused variant is checked against.
+//! [`super::gdn`] fixes its geometry at construction because the model fixes
+//! it. These cannot: RMSNorm alone runs at three widths in one pass — hidden
+//! 2048 for the input, post-mixer and final norms; head_dim 256 for the
+//! attention layers' `attn_q_norm`/`attn_k_norm`; head_dim 128 for the GDN
+//! output norm. So the width is a launch argument, validated per launch. The
+//! sigmoid gate has the same problem in a sharper form: its gate is
+//! elementwise for the attention output gate and **one scalar per token** for
+//! the MoE shared expert, so the shape is a [`GateShape`] argument and the
+//! gate buffer's length is checked against it on every launch.
 //!
-//! ## One module, one compile, geometry per launch
+//! # What is exact, and what cannot be
 //!
-//! [`super::gdn`] and [`super::gdn_chunked`] fix their geometry at
-//! construction because the model fixes it. These cannot: RMSNorm alone
-//! runs at **three different widths** in one forward pass —
-//!
-//! - hidden 2048, for each layer's input norm and post-mixer norm and for the
-//!   final output norm;
-//! - head_dim 256, for the attention layers' per-head `attn_q_norm` /
-//!   `attn_k_norm` (`ssm`-free layers in `src/models/qwen35moe.cpp` create
-//!   both at `{ n_embd_head_k }`);
-//! - head_dim 128, for the GDN output norm (`ssm_norm`, created at
-//!   `{ head_v_dim }`).
-//!
-//! so the width is a launch argument and is validated per launch. The sigmoid
-//! gate has the same problem in a sharper form: its gate is elementwise for
-//! the attention output gate and **one scalar per token** for the MoE shared
-//! expert, so the shape is an argument ([`GateShape`]) and the gate buffer's
-//! length is checked against it on every launch rather than one of the two
-//! being assumed. The kernels share one NVRTC module because they share
-//! nothing else and eight separate compiles would be eight separate driver
-//! round-trips at startup.
-//!
-//! ## What is exact and what is not
-//!
-//! - **The tensor add is bit-exact.** One rounding per element in the operand
-//!   order given is the reference's exact operand sequence, and a lone add
-//!   has nothing to contract into an FMA, so it needs no intrinsic to get
-//!   there and is gated with `Tolerance::exact()`.
-//! - **The rotary tail is bit-exact.** Dimensions `[rope_dim, head_dim)` are
-//!   copied, not computed, so they come back byte-identical and the
-//!   differential test gates them with `Tolerance::exact()`. This is the
-//!   documented invariant from `xabe_kernels::rope`, not a nicety: partial
-//!   rotary is easy to accidentally rotate, truncate, or reorder past its
-//!   boundary, and a tolerance would pass all three.
-//! - **The convolution is bit-exact.** Four taps accumulated in ascending
-//!   order is the reference's exact operand sequence, so the only thing that
-//!   could break equality is the compiler contracting the multiply and the
-//!   add into an FMA — which rounds once where the reference rounds twice.
-//!   The kernel therefore spells the accumulation `__fadd_rn(acc,
-//!   __fmul_rn(x, w))`, which nvcc may not contract, and the gate is exact
-//!   equality. Exactness is worth the two intrinsics here for the same reason
-//!   it was in [`super::dequant`]: a tolerance can hide a reversed tap order
-//!   on smooth input, and exact equality cannot.
-//! - **RMSNorm, SwiGLU, the sigmoid gate and softplus are not exact**, and
-//!   cannot be. RMSNorm reduces 2048 squares in a warp-shuffle tree where the
-//!   reference sums them sequentially, and fp32 addition is not associative.
-//!   The other three are elementwise, so they have no reduction to
-//!   reassociate and their entire disagreement with the reference is `expf`
-//!   against `f32::exp` (and `logf` against `f32::ln`) — about an ulp each.
-//!   That is a much tighter situation than a matmul's, and the differential
-//!   test gates them accordingly rather than inheriting a matmul-era
-//!   tolerance. All are unbiased and bounded, so all are gated on a measured
-//!   tolerance.
+//! - **The tensor add, the rotary tail, and the convolution are bit-exact**
+//!   and gated with `Tolerance::exact()`. The rotary tail is copied, not
+//!   computed — partial rotary is easy to accidentally rotate, truncate or
+//!   reorder past its boundary, and a tolerance would pass all three. The
+//!   convolution spells its accumulation `__fadd_rn(acc, __fmul_rn(x, w))`
+//!   because contracting into an FMA would round once where the reference
+//!   rounds twice, and a tolerance can hide a reversed tap order on smooth
+//!   input where exact equality cannot.
+//! - **RMSNorm, SwiGLU, the sigmoid gate and softplus cannot be.** RMSNorm
+//!   reduces 2048 squares in a shuffle tree where the reference sums
+//!   sequentially. The other three are elementwise, so their entire
+//!   disagreement is `expf` against `f32::exp` — about an ulp. All four are
+//!   gated on a measured tolerance sized for that, not on a matmul-era one.
 
 use std::sync::Arc;
 

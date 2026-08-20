@@ -1,17 +1,24 @@
-//! Gated DeltaNet, chunked-parallel (prefill) form, on the device.
+//! Gated DeltaNet, prefill forms, on the device.
 //!
-//! The sibling of [`super::gdn`]. Decode advances the recurrence one token at
-//! a time; prefill cannot afford to, because the per-token dependency chain
-//! serialises a 32K-token prompt into 32K dependent kernel launches. The
-//! chunked form breaks `chunk_len` tokens out of that chain at a time by
-//! solving for all of their state corrections *simultaneously*, at the cost of
-//! one triangular solve per chunk per head.
+//! Two entry points over one set of kernels:
+//!
+//! - [`GdnChunkedKernels::scan`] — a sequential token-by-token scan with the
+//!   whole state row in registers, no shared memory and no `__syncthreads`.
+//!   **This is what a forward pass runs.** Turing has no fp32 tensor cores, so
+//!   the chunked form's extra arithmetic buys nothing here; llama.cpp reaches
+//!   the same conclusion and ships only a scan.
+//! - [`GdnChunkedKernels::prefill`] — the chunked-parallel form below.
+//!   Retained and gated against the same references, because it is the form
+//!   that pays once a matmul shape can reach tensor cores, and because it
+//!   cross-checks the scan from a different direction.
 //!
 //! The reference is `xabe_kernels::gdn::chunked::chunked_forward`, whose
-//! module doc carries the full derivation. It is reproduced here only as far
-//! as the kernel needs it. Within one chunk of `C` tokens, with `S_in` the
-//! state carried in, `g_t = sum_{i<=t} log_decay_i` the cumulative in-chunk
-//! log-decay, `lambda_t = exp(g_t)`, and unit-norm keys `k_t`:
+//! module doc carries the full derivation.
+//!
+//! # The chunked recurrence, and the frame it must be solved in
+//!
+//! Within one chunk of `C` tokens, with `S_in` the state carried in,
+//! `g_t = sum_{i<=t} log_decay_i`, `lambda_t = exp(g_t)`, unit-norm keys:
 //!
 //! ```text
 //! W[t]      = beta_t * (v_t / lambda_t  -  S_in k_t)
@@ -20,21 +27,14 @@
 //! S_out     = lambda_{C-1} * (S_in + sum_i u_i k_i^T)
 //! ```
 //!
-//! ## Why the kernel does not solve for `U`, but for `lambda_t u_t`
-//!
-//! That statement is unusable in fp32 on this model. `1/lambda_t` is
-//! unbounded: Qwen3.6's per-token log-decays reach **-91.58** (block 0, head
-//! 9), so `lambda_1` is already `1.691e-40` (subnormal) and `v_1 / lambda_1`
-//! overflows fp32 at `|v| > 5.75e-2` — the measured `max|v_1|` there is `6.95`,
-//! two orders past it. Run as written,
-//! block 0's chunked prefill was 38912/38912 `NaN` and block 20's was
-//! 20480/38912. Block 4, whose worst per-token log-decay is only -5.99, came
-//! through and agreed with the recurrent form to `5.96e-8`, so the formulation
-//! was right and only its *frame* was wrong.
+//! **That statement is unusable in fp32 on this model.** `1/lambda_t` is
+//! unbounded: Qwen3.6's per-token log-decays reach -91.58 (block 0, head 9),
+//! so `lambda_1` is already subnormal and `v_1 / lambda_1` overflows fp32 at
+//! `|v| > 5.75e-2` against a measured `max|v_1|` of 6.95. Run as written,
+//! block 0's chunked prefill was 38912/38912 `NaN`.
 //!
 //! The fix is a change of unknown, not a clamp. Substitute `u'_t = lambda_t
-//! u_t` into the system above and multiply the `t`-th row through by
-//! `lambda_t`:
+//! u_t` and multiply row `t` through by `lambda_t`:
 //!
 //! ```text
 //! u'_t + beta_t sum_{i<t} (k_i . k_t) (lambda_t/lambda_i) u'_i
@@ -43,107 +43,60 @@
 //! S_out = lambda_{C-1} * S_in + sum_i (lambda_{C-1}/lambda_i) u'_i k_i^T
 //! ```
 //!
-//! Every surviving decay factor is either `lambda_t = exp(g_t)` or a ratio
-//! `lambda_a / lambda_i = exp(g_a - g_i)` with `a >= i`, and `g_a - g_i =
-//! sum_{i<m<=a} log_decay_m` is a sum of *actual per-token log-decays over a
-//! sub-range of the chunk*. **No division by a decay remains anywhere.** For
-//! this model every `log_decay <= 0` structurally — `gate-N = softplus(alpha +
-//! dt_bias) * ssm_a` with every entry of `ssm_a` negative and softplus
-//! positive — so every exponent is `<= 0`, every factor is in `(0, 1]`, and
-//! `expf` of a non-positive argument cannot overflow. The failure mode that
-//! remains is underflow to `+0`, which is the correct limit: a state that has
-//! decayed below fp32 really has stopped contributing. The kernel therefore
-//! keeps `g_t` in shared memory and never materialises `1/lambda_t`.
+//! Every surviving factor is `exp` of a sum of actual per-token log-decays
+//! over a sub-range of the chunk, so **no division by a decay remains
+//! anywhere**. For this model every `log_decay <= 0` structurally, so every
+//! factor is in `(0, 1]` and `expf` cannot overflow. The remaining failure
+//! mode is underflow to `+0`, which is the correct limit. The kernel keeps
+//! `g_t` in shared memory and never materialises `1/lambda_t`.
 //!
-//! This is also what llama.cpp does. `build_delta_net_chunking`
-//! (`src/models/delta-net-base.cpp:89-216`) builds `decay_mask = exp(g_cs_j -
-//! g_cs_i)` over the lower-diagonal triangle and `g_diff = exp(g_last -
-//! g_cum)`, multiplies them in, and never divides. Its comment quotes the
-//! PyTorch reference's `torch.clamp(..., max=50.0)` around both exponentials;
-//! **llama.cpp's own graph does not emit that clamp**, and it cannot bind
-//! here, because a clamp at `+50` only fires on a positive exponent and every
-//! exponent above is non-positive. No clamp is added: one would change the
-//! answer silently on exactly the inputs it fired for, and there is nothing
-//! for it to protect against.
+//! llama.cpp's `build_delta_net_chunking` does the same and never divides. Its
+//! comment quotes the PyTorch reference's `clamp(..., max=50.0)`; its own
+//! graph does not emit that clamp, and it could not bind here — a clamp at +50
+//! only fires on a positive exponent. None is added: one would change the
+//! answer silently on exactly the inputs it fired for.
 //!
-//! ## Shape
+//! # The triangular solve: forward substitution, not explicit inversion
 //!
-//! Identical to the recurrent form: state `S` is `head_dim x head_dim` fp32
-//! per value head, laid out `S[v][k]` with the key index contiguous, 32 value
-//! heads sharing 16 query/key heads by **modulo** — `qk_head = v_head %
-//! qk_heads`, see [`super::gdn`]'s module docs for the measurement that
-//! settles it — `head_dim` 128, `chunk_len` 64. The triangular system is
-//! therefore 64x64 per chunk per head, and `U` is 64x128.
-//!
-//! ## The triangular solve: forward substitution, not explicit inversion
-//!
-//! This is the one place where the device kernel deliberately does *not*
-//! transcribe the reference. `chunked_forward` calls
-//! `tri::invert_unit_lower_triangular` to form `M^-1 = (I + A)^-1` explicitly
-//! and then computes `U = M^-1 W`. This kernel forward-substitutes for `U`
-//! directly and never materialises `M^-1`. In exact arithmetic the two are the
-//! same answer; in floating point and in silicon they are not equivalent, and
-//! three arguments all point the same way.
-//!
-//! **Shared memory.** This argument held while a block owned a whole head's
-//! `U` — `C x head_dim` = 32 KiB at `C = 64`, against `M^-1`'s `C x C` = 16
-//! KiB, for 48 KiB exactly at Turing's per-block limit with nothing left over.
-//! It no longer does: a solve block now owns a `SOLVE_VB`-wide band of value
-//! indices, so its `U` slice is 8 KiB and an inverse would fit beside it.
-//! **The shared-memory case against inversion is void; the arithmetic one
-//! below is what the choice now rests on.** Recorded rather than deleted
-//! because the conclusion outlived its first reason, and a reader who
-//! rediscovers the 48 KiB sum should know it was already accounted for.
+//! The one place this kernel deliberately does not transcribe the reference,
+//! which forms `M^-1 = (I + A)^-1` and multiplies. In exact arithmetic the two
+//! agree; in fp32 they do not, and two arguments point the same way.
 //!
 //! **Arithmetic.** Inverting costs `C^3/6` ~= 44k multiply-adds per head per
-//! chunk and the following `C x C x head_dim` product costs 524k. Forward
-//! substitution costs `C^2 head_dim / 2` = 262k and there is no inversion —
-//! 2.2x less work for the same result.
+//! chunk plus a 524k-op product. Forward substitution costs
+//! `C^2 head_dim / 2` = 262k and no inversion — 2.2x less work.
 //!
-//! **Numerics.** Substitution is backward stable for triangular systems: the
-//! computed `U` is the exact solution of `(M + dM) U = W` with `|dM| <=
-//! gamma_C |M|` elementwise (Higham, *Accuracy and Stability of Numerical
-//! Algorithms*, 2nd ed., Thm. 8.5). Inverting and then multiplying is not
-//! backward stable, and it materialises intermediates the substitution never
-//! forms: row `t` of the inverse of a unit lower-triangular matrix can grow
-//! like `2^(t-1)`, so at `C = 64` the worst case is ~9.2e18 — far past what an
-//! fp32 significand can carry into the subsequent product without the small
-//! entries of `W` being annihilated by cancellation. Whether that growth is
-//! *realised* is data-dependent, and here it is not: keys are L2-normalized so
-//! `|A[t][i]| = beta_t |k_i . k_t| <= beta_t < 1`, and at `head_dim = 128` the
-//! observed off-diagonal magnitudes are ~`beta / sqrt(128)` ~= 0.04, nowhere
-//! near the bound. That is exactly the point — forward substitution does not
-//! depend on that remaining true and explicit inversion does. The reference
-//! keeps the explicit inverse because it is graded on being a legible
-//! transcription of the derivation; this kernel is graded on agreeing with it,
-//! and `crates/xabe-engine/tests/gdn_chunked_differential.rs` measures the gap
-//! rather than assuming it.
+//! **Numerics.** Substitution is backward stable for triangular systems
+//! (Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed.,
+//! Thm. 8.5). Inverting then multiplying is not, and it materialises
+//! intermediates the substitution never forms: row `t` of the inverse of a
+//! unit lower-triangular matrix can grow like `2^(t-1)`, ~9.2e18 at `C = 64`,
+//! far past what an fp32 significand carries into the following product
+//! without annihilating the small entries of `W`. Whether that growth is
+//! *realised* is data-dependent — here keys are L2-normalized so
+//! `|A[t][i]| <= beta_t < 1` and the observed off-diagonals are ~0.04. That is
+//! the point: substitution does not depend on that staying true, and explicit
+//! inversion does.
 //!
-//! ## Why four kernels
+//! # Shape and launches
 //!
-//! Chunks are sequentially dependent through `S`, so the host loops over
-//! chunks and each chunk runs four launches:
+//! State `S` is `head_dim x head_dim` fp32 per value head, laid out `S[v][k]`
+//! with the key index contiguous; 32 value heads share 16 query/key heads by
+//! **modulo** (`qk_head = v_head % qk_heads` — see [`super::gdn`] for the
+//! measurement that settles it); `head_dim` 128, `chunk_len` 64.
 //!
-//! 1. `gdn_chunk_normalize_qk` — L2-normalize `q`/`k` per (token, qk head) and
-//!    fold `1/sqrt(head_dim)` into `q`. Runs **once for the whole sequence**,
-//!    not per chunk: normalization has no cross-token dependency.
-//! 2. `gdn_chunk_gram` — the two Gram matrices `k_i . k_t` and `k_i . q_t`.
-//!    Both depend only on the query/key head, not the value head, so computing
-//!    them once and letting the two value heads that share a qk head read them
-//!    halves the work. `beta_t`, which *is* per value head, is folded in later.
-//! 3. `gdn_chunk_inter` — `S_in k_t` and `S_in q_t` for every token in the
-//!    chunk. Must run before the state is overwritten.
-//! 4. `gdn_chunk_solve_and_apply` — the substitution, the per-token output and
-//!    the chunk-end state, fused into one block per value head because all
-//!    three consume `U`, and `U` is 32 KiB of shared memory that would
-//!    otherwise round-trip through global.
+//! Chunks are sequentially dependent through `S`, so the host loops over them
+//! and each chunk runs three launches, after a whole-sequence normalization
+//! pass that has no cross-token dependency:
 //!
-//! The fused kernel launches one block per value head — 32 blocks — which
-//! leaves most of a 72-SM card idle. That is a known and untuned cost: the
-//! solve is inherently sequential over the `C` tokens of a chunk, so the
-//! parallelism available inside it is `head_dim` threads, and batching several
-//! sequences is what fills the machine. This module is gated on correctness
-//! against the reference, not on throughput.
+//! 1. `gdn_chunk_gram` — the Gram matrices `k_i . k_t` and `k_i . q_t`. Both
+//!    depend only on the query/key head, so the two value heads sharing one
+//!    read them once. `beta_t`, which is per value head, folds in later.
+//! 2. `gdn_chunk_inter` — `S_in k_t` and `S_in q_t`, before the state is
+//!    overwritten.
+//! 3. `gdn_chunk_solve_and_apply` — substitution, per-token output and the
+//!    chunk-end state fused, because all three consume `U` and `U` would
+//!    otherwise round-trip through global memory.
 
 use std::sync::Arc;
 

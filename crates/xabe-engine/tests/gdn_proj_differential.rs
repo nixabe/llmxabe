@@ -1,6 +1,5 @@
-//! Isolates the exact kernel pairing `docs/BENCHMARKS.md`'s Phase A audit
-//! named as the origin of the batch-vs-single-stream residual in Gated
-//! DeltaNet: `GdnBlock::project`'s untiled and tiled forms (standard Q8_0
+//! Isolates the exact kernel pairing that was the origin of the
+//! batch-vs-single-stream residual in Gated DeltaNet: `GdnBlock::project`'s untiled and tiled forms (standard Q8_0
 //! layout) against `GdnBlock::project_split_gemv` (the repacked split
 //! layout, the one-token path single-stream decode actually takes whenever
 //! the int8 repack is resident).
@@ -180,7 +179,7 @@ fn untiled_and_tiled_standard_layout_already_agree() {
 /// Not gated on a tolerance: this documents where the two-kernel-family
 /// mismatch actually lives, per the kernel's own comment
 /// ("the warp reduction sums in a different order... equivalent rather
-/// than bit-identical") and `docs/BENCHMARKS.md`'s Phase B, step 2 entry.
+/// than bit-identical").
 #[test]
 fn split_layout_gemv_disagrees_with_the_standard_layout() {
     let Some((ctx, file, config)) = setup() else {

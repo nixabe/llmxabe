@@ -1,9 +1,8 @@
 //! The correctness contract R6 is legal under: speculative decode must emit
 //! **exactly** what plain, non-speculative greedy decode emits.
 //!
-//! `docs/OPTIMIZATION.md` §R6 and the design brief that authorized building
-//! it are explicit about why this is a hard gate rather than a tolerance:
-//! under greedy decoding, a drafted token is accepted only if it equals the
+//! This is a hard gate rather than a tolerance because under greedy
+//! decoding, a drafted token is accepted only if it equals the
 //! target model's own argmax at that position, and a rejected draft is
 //! replaced by the target's own argmax (the "bonus" token) rather than
 //! dropped. So the emitted sequence is a pure function of the target model
