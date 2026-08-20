@@ -6,7 +6,7 @@
 //! the int8 repack is resident).
 //!
 //! Same method `moe_proj_differential`... no, `moe_differential.rs`'s
-//! `gemv_and_bm1_isolate_the_one_live_token_case` / `gemv_and_narrow_
+//! `gemv_and_direct_isolate_the_one_live_token_case` / `gemv_and_direct_
 //! isolate_the_two_live_token_case` established: real weights, identical
 //! input, two different compiled entry points, direct comparison, no
 //! tolerance. Two questions, two tests:

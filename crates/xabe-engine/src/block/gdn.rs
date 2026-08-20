@@ -678,6 +678,7 @@ __global__ void NAME(                                                        \
 }
 
 GDN_PROJ_SPLIT_TILED(gdn_proj_split_t2,  2)
+GDN_PROJ_SPLIT_TILED(gdn_proj_split_t3,  3)
 GDN_PROJ_SPLIT_TILED(gdn_proj_split_t4,  4)
 GDN_PROJ_SPLIT_TILED(gdn_proj_split_t8,  8)
 GDN_PROJ_SPLIT_TILED(gdn_proj_split_t16, 16)
@@ -1454,6 +1455,7 @@ pub struct GdnBlock {
     proj_split_gemv: CudaFunction,
     proj_split_gemv_add: CudaFunction,
     proj_tiled: [CudaFunction; 4],
+    proj_split_t3: CudaFunction,
     proj_split_tiled: [CudaFunction; 4],
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
@@ -1515,6 +1517,7 @@ impl GdnBlock {
                 module.load_function("gdn_proj_q8_0_t8")?,
                 module.load_function("gdn_proj_q8_0_t16")?,
             ],
+            proj_split_t3: module.load_function("gdn_proj_split_t3")?,
             proj_split_tiled: [
                 module.load_function("gdn_proj_split_t2")?,
                 module.load_function("gdn_proj_split_t4")?,
@@ -2796,6 +2799,11 @@ impl GdnBlock {
         }
 
         let (slot, tile) = proj_tile_for(tokens);
+        let (kernel, tile) = if tokens == 3 {
+            (&self.proj_split_t3, 3)
+        } else {
+            (&self.proj_split_tiled[slot], tile)
+        };
         let cfg = LaunchConfig {
             grid_dim: (
                 (n_rows as u32).div_ceil(PROJ_WARPS),
@@ -2806,7 +2814,7 @@ impl GdnBlock {
             shared_mem_bytes: 0,
         };
         let (k_i32, n_i32, t_i32) = (k_dim as i32, n_rows as i32, tokens as i32);
-        let mut builder = stream.launch_builder(&self.proj_split_tiled[slot]);
+        let mut builder = stream.launch_builder(kernel);
         builder
             .arg(wq)
             .arg(ws)
