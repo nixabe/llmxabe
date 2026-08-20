@@ -1,21 +1,21 @@
-//! Phase A of the batch-vs-single-stream bit-identity workstream: instrument
-//! *where* the ~1e-4-scale residual `tests/batch_decode.rs`'s
-//! `batched_decode_agrees_with_independent_single_stream_decodes` already
-//! tolerates actually comes from, before anything is changed to close it.
+//! Locate the ~1e-4-scale batch-vs-single-stream residual that
+//! `tests/batch_decode.rs`'s
+//! `batched_decode_agrees_with_independent_single_stream_decodes` tolerates:
+//! *which layer, and which family within it*, first disagrees.
 //!
-//! `docs/BENCHMARKS.md`'s "The N=3 ceiling" §4 names the residual's rough
-//! location -- "further up, in `GatedAttentionBlock`'s and `GdnBlock`'s own
-//! batched-vs-single-stream reduction order" -- but that was inferred from
-//! the final logits, not measured layer by layer. This dumps the per-layer,
-//! per-stage hidden state both paths produce, via
+//! Its rough location -- "further up, in `GatedAttentionBlock`'s and
+//! `GdnBlock`'s own batched-vs-single-stream reduction order" -- was inferred
+//! from the final logits, not measured layer by layer. This dumps the
+//! per-layer, per-stage hidden state both paths produce, via
 //! [`Forward::run_with_stage_waypoints`] and
-//! [`Forward::run_batch_decode_with_stage_waypoints`] (new methods, built
-//! for this audit, that duplicate `run`/`run_batch_decode`'s loops rather
-//! than add a callback parameter to `body`/`body_batch_decode` -- see their
-//! doc comments), and reports max-abs divergence per layer, tagged by which
-//! family produced it: the layer's mixer (Gated DeltaNet or Gated
-//! Attention, whichever `layer_kind` says that layer is) and, separately,
-//! that layer's MoE block.
+//! [`Forward::run_batch_decode_with_stage_waypoints`], and reports max-abs
+//! divergence per layer, tagged by which family produced it: the layer's
+//! mixer (Gated DeltaNet or Gated Attention, whichever `layer_kind` says that
+//! layer is) and, separately, that layer's MoE block.
+//!
+//! Both of those drive the same `body`/`body_batch_decode` the engine and the
+//! graph capture do -- they only pass a callback that reads the mixer
+//! waypoint -- so what this measures is what the engine runs.
 //!
 //! ```sh
 //! CUDA_VISIBLE_DEVICES=<n> cargo run --release -p xabe-engine --bin audit_batch_divergence
