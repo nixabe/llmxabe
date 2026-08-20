@@ -8,11 +8,11 @@
 | Gated DeltaNet, scan (prefill) | 30 | **critical** | Sequential scan, state in registers, no shared memory — what a forward pass runs | **sm_75 kernel, max_abs 1e-7 vs both host forms; +4.5% prefill** |
 | Gated DeltaNet, chunked (reference) | 30 | **critical** | Forward substitution per chunk, not explicit inverses; retained and tested, not on the forward path | **sm_75 kernel, max_abs 2.61e-8 vs reference** |
 | GDN short convolution (depthwise, width 4) | 30 | medium | Causal depthwise conv over the fused qkv stream, before the delta rule | **sm_75 kernel, bit-identical to reference** |
-| MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue | **sm_75 kernel, max_abs 9.78e-9 vs reference; tiled, 9.3× at 512 tokens** |
+| MoE dispatch + grouped GEMM | 40 | high | Port algorithm from vLLM; mixed Q6_K/Q8_0 dequant in prologue; a kernel family selected by token width, not one kernel | **sm_75 kernels, max_abs 9.78e-9 vs reference; int8 tensor cores at prefill width, direct flat GEMVs at decode width** |
 | Flash attention, prefill (GQA 16:2, head 256) | 10 | medium | Online softmax on `m16n8k8` fp16 tensor cores with an fp32 accumulator; four query heads and a 16-key tile per block, binary16 KV staged through a register prefetch, per-head named barriers | **sm_75 kernel, gated at 8x the binary16 half-ulp; 2.27x on attention alone at a 128K window, 277 GB/s of 672** |
 | Flash attention, decode (split-K) | 10 | medium | Key range split across blocks, partial `(m, l, acc)` merged in a second pass — the only axis a one-row query has | **sm_75 kernel, gated at 4,096 keys against the scalar reference; +114% at ctx 8192** |
 | Flash attention, one-row fallback | 10 | low | Pre-tiling kernel, kept for geometries the split path cannot service | **sm_75 kernel, unchanged** |
-| LM head GEMV (2048 × 248,320) | 1 | medium | ~~split-K~~ — one warp per row; dominates weight bandwidth | **sm_75 kernel, argmax exact, 81–89% of roofline** |
+| LM head GEMV (2048 × 248,320) | 1 | medium | one warp per row band, not split-K; dominates weight bandwidth | **sm_75 kernel, argmax exact, 81–89% of roofline** |
 | `moe_align_block_size` equivalent | 40 | medium | Write; must be on-device for graph capture | **sm_75 kernel, tables exact vs reference** |
 | mRoPE (64 of 256 dims) | 10 | low | Write; partial rotary is unusual — test carefully | **sm_75 kernel, tail bit-identical** |
 | Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | **sm_75 kernel, bit-identical to reference** |
@@ -41,48 +41,31 @@ into the delta rule; see [MODEL.md](MODEL.md).
 > convolution, matching `ggml_ssm_conv`'s boundary exactly; the caller applies
 > the SiLU. Whoever assembles the GDN block owns that step.
 
-### What the landed kernels do not yet do
+### What the correctness gate does and does not mean
 
-Every kernel above is gated on **correctness against the CPU reference**. Only
-the MoE path has been tuned (see [As landed](#as-landed-2026-08-16-and-where-the-plan-above-was-wrong));
-the rest are correct and untouched. Three limits are worth stating so the
-numbers above are not read as more than they are:
+Every kernel above is gated on **correctness against the CPU reference**. Two
+things about that gate are worth stating so the numbers are not read as more
+than they are:
 
-- ~~**No tensor cores anywhere.**~~ Fixed: prefill attention runs on
-  `m16n8k8` with fp32 accumulation, and the re-tiling it needed (16 resident
-  query rows) is what made the traffic reductions since possible. The
-  prediction in this bullet was half right and half wrong, which is worth
-  keeping rather than deleting. Right: attention is bandwidth-bound, and
-  arithmetic intensity is the half that pays — every gain since has come from
-  moving fewer bytes or moving them with more requests in flight, none from
-  the tensor cores being faster. Wrong: "fp16 operands would end the fp32
-  comparison the kernel is gated on". The error against a scalar fp32 CPU
-  reference did rise, but the error against **llama.cpp** — which runs the
-  same fp16 tensor cores, and is the thing being reproduced — fell sharply.
-  The gate moved to a tolerance derived from the binary16 half-ulp instead of
-  being abandoned. See docs/BENCHMARKS.md.
-- **Attention is still traffic-bound, by a factor of 64.** The launch issues
-  17.2 GB at a 128K window where one pass per KV head would be 0.27 GB,
-  because every block streams the whole prefix for its own query tile. Halving
-  the block count has measured close to its full 2x twice now. The next
-  halving needs Q out of shared memory and into registers; the budget for it
-  is worked out in docs/BENCHMARKS.md.
-- ~~**The MoE dispatch kernel is single-block.**~~ Fixed: dispatch is now
-  parallelized across `num_experts` blocks in two launches
-  (`moe_align_count`, then `moe_align_block_size`). It was worth **0.12% of
-  runtime** — the single-block scan was a real fact and never a real cost.
-- **Graph capture is argued, not demonstrated.** The MoE path has fixed grids,
-  fixed buffers and a device-side token count precisely so it can be captured,
-  but no capture has been performed yet. That is milestone 06's gate, and
-  until it runs this remains a structural claim.
-- **Batch tiling in the LM head is sublinear.** Eight tokens cost 2.58× one
-  token, not the 8× that reading the weights once instead of eight times would
-  allow, because activation loads scale with the tile while weight loads do
-  not. A register tile over rows is the next lever and is neither implemented
-  nor measured.
+- **Tensor-core paths are gated at a different tolerance, not at none.**
+  Prefill attention runs on `m16n8k8` with fp32 accumulation; decode takes a
+  split-precision `Q` on the same instruction past a depth threshold. Rounding
+  an operand to binary16 raises the error against a scalar fp32 CPU reference
+  and *lowers* it against llama.cpp, which runs the same tensor cores and is
+  the thing being reproduced. So the gate moved to a bound derived from the
+  binary16 half-ulp rather than being abandoned, and the scalar paths keep
+  their tight fp32 bound.
+- **Two kernels that must agree are asserted to agree exactly.** Where a batch
+  kernel and a single-token kernel compute the same row, the differential is an
+  `assert_eq!` on the full vector, not a tolerance. That is what makes the
+  serving contract — a sequence decodes identically whether batched or alone —
+  a checked property rather than a hope.
 
-**This table planned the LM head as split-K. That was wrong**, and the row now
-says so. Split-K manufactures parallelism when the output dimension is too
+Where each kernel actually spends its time, and which bound it is under, is in
+[BENCHMARKS.md](BENCHMARKS.md). Do not optimize one from this file alone.
+
+**This table planned the LM head as split-K. That was wrong.** Split-K
+manufactures parallelism when the output dimension is too
 small to fill the machine — the MoE decode regime, where three tokens meet a
 512-row expert matrix. The LM head is the opposite: one warp per output row is
 248,320 warps against 2,304 resident, a 107× surplus. Splitting K would add a
@@ -90,21 +73,17 @@ launch, a `vocab × K` partial buffer and a split-dependent summation order for
 no occupancy gain. The rejection is asserted in a unit test so it fails loudly
 if the vocabulary ever shrinks.
 
-**Shared memory on this hardware is 48 KiB per block**, not 64 KiB. The 64 KiB
-figure is per-SM; a block reaches it only by opting in through
-`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, which cudarc's
-`LaunchConfig` does not expose. Both landed kernels that budget shared memory
-(attention at 1,088 B and the chunked GDN solve at 33 KiB) are sized against
-48 KiB and need no opt-in.
+**Shared memory is 48 KiB per block by default and 64 KiB by opt-in**, against
+64 KiB per SM. The opt-in is `cuFuncSetAttribute` with
+`CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, which cudarc exposes safely
+as `CudaFunction::set_attribute` — one call, no `unsafe`, no new dependency.
+The tensor-core attention kernels take it; the rest are sized against 48 KiB
+and need no opt-in.
 
-> **Correction (2026-08-16).** "cudarc does not expose it" was true of
-> `LaunchConfig` and false of the crate. cudarc 0.19.9 ships a safe
-> `CudaFunction::set_attribute(attribute, value)`
-> (`driver/safe/core.rs:2446`) wrapping `cuFuncSetAttribute`, so the opt-in is
-> one call with no `unsafe` block and no new dependency. Verified against the
-> vendored source. Nothing in this repo calls it yet, and the sentence above
-> had been read as a blocker on any kernel wanting more than 48 KiB — which
-> it is not.
+Budget it before writing the kernel. On this part the shared-memory ceiling and
+the register file are the two things that decide occupancy, and several
+otherwise-correct kernels have been rejected because a wider tile bought one
+and spent the other — see [BENCHMARKS.md](BENCHMARKS.md)'s WHY NOT list.
 
 ## Order of work
 
@@ -117,10 +96,11 @@ That is why milestone 01 deliberately precedes the differential harness in
 milestone 02: you want to know in week three, not week twelve.
 
 Milestone 06 — graph capture over on-device MoE indirection — was the
-continue/stop gate for the project as a whole. Benchmarking has since shown
-llama.cpp already does both graph capture and MoE fusion, so the gate must be
-restated as measured throughput against the baseline's 104.79 tok/s rather than
-as "does graph capture help". See [BENCHMARKS.md](BENCHMARKS.md).
+continue/stop gate for the project as a whole. Benchmarking showed llama.cpp
+already does both graph capture and MoE fusion, and that on Turing a graph node
+costs roughly what the launch gap it replaces cost, so the gate was restated as
+measured throughput against llama.cpp's own best settings. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ### What the baseline already does
 
@@ -134,10 +114,11 @@ Anything written here has to beat, not merely match, the following:
 | CUDA graph capture and replay | `USE_CUDA_GRAPH`, `cudaGraphLaunch` |
 | Turing-tuned quantized matmul tiles | `mmq-config-turing.cuh` |
 
-Measured consequence: 104.79 tok/s at short context, 44.5% of the bandwidth
-roofline, with the weight path at 44.5% of peak and the KV path at ~80%. The
-inefficiency is concentrated in the weight path, which is where kernel work
-should go.
+Measured consequence: the baseline's single-stream decode sits at 44.5% of the
+bandwidth roofline, with the weight path at 44.5% of peak and the KV path at
+~80%. The inefficiency is concentrated in the weight path, which is where
+kernel work goes. The bar this project is actually measured against is the
+three-sequence one in [BENCHMARKS.md](BENCHMARKS.md), not a single stream.
 
 ## Gated DeltaNet
 
@@ -220,70 +201,66 @@ decode batch of three.
   dequantization fuses into the kernel prologue instead. Take llama.cpp's
   K-quant superblock unpacking for that, not vLLM's quantization path.
 
-### As landed (2026-08-16), and where the plan above was wrong
+### As landed, and where the plan above was wrong
 
-`crates/xabe-cuda/src/kernels/moe.rs`. Four entry points: route, dispatch,
-routed grouped GEMM, shared expert. Measured at 9.3× over the untiled
-version at 512 tokens; see
-[BENCHMARKS.md](BENCHMARKS.md#the-moe-path-in-isolation).
+`crates/xabe-cuda/src/kernels/moe.rs`. The routed-expert path is not one
+kernel; it is a family selected by token width, because the right shape at
+2,048 tokens and at three tokens are different kernels rather than different
+constants of one:
 
-**The tiling.** One block owns one dispatch block and a band of
-`MOE_ROWS = 8` output rows, one warp per row, with the block's slot
-activations staged in shared memory. An expert's weight stack is read once
-per (block, row band) rather than once per (token, row) — that reuse is the
-entire win. The Q6_K superblock header is hoisted out of the inner loop:
-each lane takes 4 consecutive elements, which is exactly one superblock
-half, so the scale and high-bit byte resolve once per lane. K-loop is
-hand-double-buffered; tile height is specialized for `{2, 8, 16}` live slots.
+| Width | Kernel | Shape |
+| --- | --- | --- |
+| ≥ 8 tokens | `moe_expert_*_mma` (two compiled M widths) | int8 tensor cores, weight tile staged in shared and reused across the dispatch block's slots |
+| 2–4 tokens | `moe_expert_*_flat` | one direct GEMV block per routed `(token, expert)` pair, read straight from `topk_ids` — no dispatch table built at all |
+| 1 token | `moe_expert_*_gemv` | one block per output row band, no staging |
 
-**New geometry restriction:** `hidden` and `intermediate` must be multiples
-of 128. Validated at construction, reported as `MoeError::UnsupportedGeometry`.
+Three geometry and design rules hold across all of them: `hidden` and
+`intermediate` must be multiples of 128 (validated at construction, reported as
+`MoeError::UnsupportedGeometry`); every grid dimension is a function of the
+geometry alone, gated by
+`every_grid_dimension_is_a_function_of_the_geometry_alone`, which is what keeps
+the path graph-capturable under design rule 5; and where two of these kernels
+can compute the same row, a differential asserts they agree **exactly**.
 
-Corrections to the plan above:
+Corrections to the plan above, kept because the reasoning is what misleads:
 
-- **SplitK was not used and is not needed.** The predicted decode-shape
-  problem does not bind here: at n=1 the tiled kernel is 0.174 ms per layer
-  against 0.774 untiled, and the parallelism shortfall the 20%-from-SplitK
-  figure addresses is supplied by the 256-expert grid, not by splitting K.
-- **"Size the grid from a typical-case hint" was rejected.** The grid is a
-  fixed function of the geometry alone — that is what keeps the path
-  graph-capturable under design rule 5, and the over-provisioning it costs
-  was measured at 0.12% of runtime, far below the risk of a
-  content-dependent launch shape. Test
-  `every_grid_dimension_is_a_function_of_the_geometry_alone` asserts every
-  grid and block dimension against the geometry with the token count varied.
-- **"Hoist the shared expert out" was right, and insufficient.** It was
-  hoisted, and it was still re-reading its whole 2.7 MiB stack once per
-  token. Tiling it was worth **9.9×** on its own at 512 tokens — the second
-  largest single item in the change, and one this section did not predict.
-- **Dequantization cost was overweighted.** Ablating all weight loads *and*
-  all dequant entirely bought 6%. The K-quant unpacking is not the problem;
-  reuse was.
-
-What did not help, with numbers, so it is not re-attempted: `LDS.128`
-vectorization alone (2%), staging activations without tiling (2.5%), cutting
-shared loads 16→1 per iteration (slower), `MOE_ROWS = 16` (worse
-everywhere). A tile-rounding variant was 24% faster and **wrong** — it drops
-rows for tiles with 5–8 live slots, caught by `moe_differential` on token 36
-of 37.
-
-**Honest limit:** 13.3% of fp32 peak at 512 tokens. `ncu` cannot read
-counters on this host (`ERR_NVGPUCTRPERM`), so the remaining ~2× is
-unattributed. The SASS inner loop is 511 instructions for 128 FFMA — 25%
-density — putting ~50% of fp32 peak as the ceiling for this instruction mix.
+- **SplitK was not used and is not needed.** The parallelism it manufactures is
+  already supplied by the 256-expert grid.
+- **"Size the grid from a typical-case hint" was rejected.** Over-provisioning
+  the grid measured at 0.12% of runtime, far below the risk of a
+  content-dependent launch shape.
+- **"Hoist the shared expert out" was right, and insufficient.** Hoisted, it
+  was still re-reading its whole 2.7 MiB stack once per token; tiling it was
+  worth 9.9× on its own at prefill width.
+- **Dequantization cost was overweighted at prefill and underweighted at
+  decode.** Ablating all weight loads *and* all dequant bought 6% at 512
+  tokens — reuse was the problem there. At decode width the same unpack is the
+  binding cost: the flat GEMVs are bound by the **integer pipe**, ~9 integer
+  operations per Q6_K element against a ~10-operation budget at the streaming
+  roofline, which is why two separate attempts to give them better loads
+  measured flat or worse.
 
 ## The LM head
 
 One matrix, 2048 × 248,320, and it costs **540 MB per decoded token** — roughly
 58% of what all forty MoE layers read combined. See [MODEL.md](MODEL.md).
 
-It deserves its own optimization for that reason alone. Two options:
+It deserves its own optimization for that reason alone, and it gets one: a row
+tile gives one warp `RT` adjacent vocabulary rows so the activation `float4`
+loads sit outside the row loop and feed all `RT` rows' FMAs from the same
+registers. Per-row arithmetic and order are untouched, so it is bit-identical
+to the untiled path and gated as such. `vocab % RT == 0` is required, so no
+partially-live warp group exists.
 
-- Keep it at Q6_K rather than Q8_0.
-- Split it across cards and all-reduce the argmax. That is 2 KB of traffic,
-  viable even over PCIe — but note it violates the otherwise-absolute rule that
-  nothing crosses PCIe on the decode path, so it needs measuring before it is
-  adopted.
+Two ideas that are **not** taken:
+
+- **Requantizing it to Q6_K.** Unmeasured, and it trades an exact-agreement
+  gate for bandwidth.
+- **Splitting it across cards and all-reducing the argmax.** It saves 11.6% of
+  per-token bytes at batch 1 and essentially nothing under concurrency,
+  violates the rule that nothing crosses PCIe on the decode path, and requires
+  all three cards to serve one sequence — which is mutually exclusive with the
+  three-worker architecture. Rejected; see [OPTIMIZATION.md](OPTIMIZATION.md).
 
 ## Turing constraints
 
@@ -293,7 +270,8 @@ It deserves its own optimization for that reason alone. Two options:
 - **Tensor cores are the `m16n8k8` fp16 MMA family.** Reachable through inline
   PTX, which the milestone-00 spike verified works — see
   [TOOLCHAIN.md](TOOLCHAIN.md).
-- **48 KiB shared memory per block**, 72 SMs, 6 MiB L2. Measured.
+- **48 KiB shared memory per block by default, 64 KiB by opt-in**, 72 SMs,
+  6 MiB L2. Measured.
 - **Warp shuffle and vote intrinsics lower correctly**, verified numerically.
   The router's top-k over 256 experts depends on them.
 

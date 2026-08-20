@@ -140,21 +140,20 @@ confirmed from `ggml_compute_forward_rope_flt`.
 Stated plainly, because a gap you know about is manageable and one you assume
 away is not.
 
-On 2026-08-18, `worker_smoke`, `engine_smoke`, and
-`cross_worker_restore` passed on the three local RTX 8000s. The engine run
-served nine sequences, balanced three onto each worker, and exercised a mixed
-two-decode/one-prefill step on every card. The cross-worker restore emitted
-exactly the same token ids as the cold path.
+What has passed on the three local RTX 8000s: `worker_smoke`, `engine_smoke`
+and `cross_worker_restore`. The engine run serves nine sequences, balances
+three onto each worker, and exercises a mixed two-decode/one-prefill step on
+every card; the cross-worker restore emits exactly the same token ids as the
+cold path. Nine simultaneous HTTP `/v1/completions` requests are served by one
+server bound to all three cards, every response producing the same
+continuation.
 
-On 2026-08-19, nine simultaneous HTTP `/v1/completions` requests were served
-successfully by one server bound to all three cards; every response produced
-four tokens and the same `" Paris, a city"` continuation. This checks the
-non-streaming HTTP-to-engine path, not streaming (which remains unsupported),
-disconnect cancellation under a live socket, or overload behavior.
+What that does **not** cover: streaming (unsupported), disconnect cancellation
+under a live socket, and overload behaviour.
 
-The same-day scheduler-path N=3 comparison is recorded at the end of
-`BENCHMARKS.md`. The live path is within 0.7% of the isolated kernel path, so
-it does not explain the remaining throughput gap.
+The scheduler-driven path measures within 0.7% of the isolated kernel path, so
+runtime plumbing is not where throughput goes. Serving numbers belong in
+`BENCHMARKS.md`, not here.
 
 ## Running
 
@@ -184,11 +183,9 @@ CUDA_VISIBLE_DEVICES=0,1 \
   cargo run --release -p xabe-engine --bin cross_worker_restore
 ```
 
-These commands are acceptance checks, not benchmarks. Run the dated,
-interleaved benchmark commands from the final section of `BENCHMARKS.md`
-before making a throughput claim. As of 2026-08-18 the serving checks above
-compile, but have not been run since their addition because the CUDA driver is
-unreachable on the development host.
+These commands are acceptance checks, not benchmarks. Run the interleaved
+benchmark commands from `BENCHMARKS.md` before making a throughput claim, and
+follow its measurement discipline — a single pair on this host proves nothing.
 
 Tests needing the 32 GB model file or a GPU **skip and say so**. A skipped test
 is not a passing test — do not read a green run on a GPU-less machine as

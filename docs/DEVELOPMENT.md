@@ -100,9 +100,9 @@ model across three, which is correct here: the model fits, and splitting would
 put PCIe on the decode path. `-t 4 -tb 4` partitions 12 vCPU across three
 replicas, and `--poll 0` avoids three spinning pollers competing for them.
 
-### Baseline tuning — now measured
+### Baseline tuning
 
-These have been benchmarked on this host. Full data in
+Benchmarked on this host; the reasoning behind each is in
 [BENCHMARKS.md](BENCHMARKS.md).
 
 1. **Add `-bs` (`--backend-sampling`). This is the largest free win available.**
@@ -145,36 +145,35 @@ These have been benchmarked on this host. Full data in
 
 ## Open questions
 
-Carried from the design plan. Answered ones are struck through with what was
-found.
+Answered, so they are not re-asked:
 
-1. ~~Measured decode rate at 4K, 32K, and 128K today.~~ **Answered.** 103.4 /
-   92.4 / 68.8 tok/s respectively, against rooflines of 229 / 191 / 121. See
-   [BENCHMARKS.md](BENCHMARKS.md). The weight path runs at 44.5% of peak
-   bandwidth and the KV path at ~80%.
-2. VRAM cost of `mmproj-F16.gguf`. The file is 899 MB on disk; its resident
-   cost is still an estimate.
-3. What fraction of platform traffic is multimodal — determines whether the
-   retained llama.cpp instance is permanent or transitional.
-4. ~~Confirm the GDN state shape from `config.json`.~~ **Answered.**
-   32 × 128 × 128 × fp32 per layer, confirmed against the file's own metadata
-   (`ssm.state_size 128`, `ssm.inner_size 4096`, `ssm.time_step_rank 32`) and
-   against every GDN tensor shape. The device kernel runs at this geometry and
-   agrees with the reference to 2.98e-8.
-8. ~~Is `ModelConfig`'s parameter count 2.4% low?~~ **No — that was an
-   accounting error.** The gap was entirely `blk.40`, the MTP head, counted on
-   the file side but not the config side. Like for like on the text path the
-   derivation is accurate to 0.001%. See [MODEL.md](MODEL.md).
-9. The GDN short convolution cache (~2.8 MiB per sequence) is not modelled by
-   `gdn_state_bytes_per_sequence()`. **Open** — small, but it is a real
-   omission rather than a rounding choice.
-5. ~~Does llama.cpp master support MTP for this architecture?~~ Yes — HEAD
-   includes MTP ubatch serialization.
-6. Observed `sim_best` distribution in the server logs. That is the current
-   cache hit rate and the baseline [CACHE.md](CACHE.md) must beat. **Open.**
-7. Does vLLM's GDN prefill kernel depend on Ampere-or-later features? If the
-   chunked delta rule assumes `cp.async` or bf16, llama.cpp is the only viable
-   reference. **Open.**
+- **Decode rate at depth on the baseline.** 103.4 / 92.4 / 68.8 tok/s at
+  4K / 32K / 128K single stream, against rooflines of 229 / 191 / 121. The
+  weight path runs at 44.5% of peak bandwidth and the KV path at ~80%.
+- **The GDN state shape.** 32 × 128 × 128 × fp32 per layer, confirmed against
+  the file's own metadata (`ssm.state_size 128`, `ssm.inner_size 4096`,
+  `ssm.time_step_rank 32`) and every GDN tensor shape. The device kernel runs
+  at this geometry and agrees with the reference to 2.98e-8.
+- **Was `ModelConfig`'s parameter count 2.4% low?** No — an accounting error.
+  The gap was entirely `blk.40`, the MTP head, counted on the file side and not
+  the config side. Like for like on the text path the derivation is accurate to
+  0.001%. See [MODEL.md](MODEL.md).
+- **Does llama.cpp master support MTP for this architecture?** Yes.
+
+Still open:
+
+- VRAM cost of `mmproj-F16.gguf`. The file is 899 MB on disk; its resident cost
+  is still an estimate.
+- What fraction of platform traffic is multimodal — determines whether the
+  retained llama.cpp instance is permanent or transitional.
+- The GDN short convolution cache (~2.8 MiB per sequence) is not modelled by
+  `gdn_state_bytes_per_sequence()`. Small, but a real omission rather than a
+  rounding choice.
+- Observed `sim_best` distribution in the server logs — the cache hit rate
+  [CACHE.md](CACHE.md) must beat.
+- Whether vLLM's GDN prefill kernel depends on Ampere-or-later features. If the
+  chunked delta rule assumes `cp.async` or bf16, llama.cpp is the only viable
+  reference.
 
 ## Conventions
 

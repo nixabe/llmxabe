@@ -17,14 +17,17 @@ commit messages, or comments that assert those wins as fact.
 
 ## Current standing — read this before trusting any number you find
 
-The head-to-head against llama.cpp moves week to week and every stale copy of
-it in these documents has misled someone. The current numbers live at the
-**end** of [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — that file is
-append-only and dated, so the last section wins. As of 2026-08-17: prefill is
-ahead of llama.cpp's best up to ~2K tokens, roughly level at 8K, and behind at
-32K–128K; single-stream decode is within 5% at short context and 0.71× at
-128K; there is **no cross-sequence batched decode**, so aggregate serving
-throughput loses ~2× to `llama-server -np 3`.
+The head-to-head against llama.cpp moves, and every stale copy of it in these
+documents has misled someone. The current numbers live in **"Current standing"
+at the top of [docs/BENCHMARKS.md](docs/BENCHMARKS.md)**, and that section is
+the only place they belong — do not restate a ratio anywhere else without a
+link to it.
+
+The standing is that every cell of the one-card N=3 target is clear of
+llama.cpp at its own best settings, by +0.8% to +18.6% on prefill and +4.4% at
+2K decode, with 32K decode level-to-slightly-ahead. The two thinnest margins
+are inside this card's own thermal drift and stand only on same-hour
+alternating pairs. Treat them as parity you have to keep, not as headroom.
 
 Two standing corrections to older text you may encounter below or elsewhere:
 
@@ -136,11 +139,12 @@ llama.cpp's Turing-proven primitives.
 Turing has no `cp.async`. Double-buffering is by hand — and it has mattered:
 software-pipelined prefetch was worth 12% on prefill attention. "This workload
 is bandwidth-bound" is true of decode's weight path and nothing else; prefill
-attention is on the tensor cores and traffic/issue-bound, and decode attention
-sits at a third of bandwidth roofline for reasons six eliminated hypotheses
-have not explained. Establish which bound you are under before optimizing —
-the file records several optimizations that were correct for the wrong bound
-and measured slower.
+attention is on the tensor cores and traffic/issue-bound, decode attention is
+bound by its softmax rather than its loads (a calibration kernel with the
+identical grid and loads reaches 90% of streaming roofline), and the decode
+MoE GEMVs are bound by the integer pipe unpacking Q6_K. Establish which bound
+you are under before optimizing — BENCHMARKS.md's WHY NOT list records several
+optimizations that were correct for the wrong bound and measured slower.
 
 ## Working rules
 
@@ -149,9 +153,10 @@ and measured slower.
   repository's practice moved past the Conventional Commits rule still written
   in CONTRIBUTING.md: read `git log --oneline -20` and match it. The house
   style names what was done and, where it fits, what was learned — "Split the
-  key axis at decode, and stop leaving 78% of the card idle". A subject that
-  would survive as a BENCHMARKS.md section heading is the right register.
-  Negative results get commits too ("…and be wrong about how much that buys").
+  key axis at decode, and stop leaving 78% of the card idle". The commit
+  message is where the blow-by-blow lives, so it carries the numbers and the
+  method; BENCHMARKS.md carries only what outlives the change. Negative results
+  get commits too ("…and be wrong about how much that buys").
 - **Never commit `qwen36-rust-engine-plan.md`.** It is a local design draft and
   is listed in `.gitignore`. Its content belongs in `docs/` once settled.
 - **Never commit model weights**, captured goldens, or benchmark output.
@@ -185,12 +190,16 @@ The project's measurement discipline is what has kept it honest; follow it.
 - **Pin a GPU and check it is idle.** Three cards; sibling agents may be
   benchmarking. `nvidia-smi` first, then `CUDA_VISIBLE_DEVICES=<n>` on every
   run.
-- **Record rejects with their numbers** in [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
-  in its voice, dated, appended at the end. A rejected attempt that is not
-  written down will be re-attempted by the next agent; the file's
-  rejected-with-numbers tables have already prevented repeat work several
-  times. When a measurement supersedes an older section, mark the old section
-  superseded in place — do not delete it.
+- **Record rejects with their numbers** in [docs/BENCHMARKS.md](docs/BENCHMARKS.md)'s
+  **WHY NOT** section, in its voice, one row with the mechanism. A rejected
+  attempt that is not written down will be re-attempted by the next agent;
+  those tables have already prevented repeat work several times.
+- **BENCHMARKS.md is not a journal.** It carries the current standing, the
+  method, and the two durable lists — why the engine is shaped as it is, and
+  what was measured and rejected. When a new measurement supersedes an old
+  number, **replace it**; when a change lands, fold its *mechanism* into WHY
+  rather than appending a dated section. The blow-by-blow belongs in commit
+  messages, which is what `git log` is for.
 
 ## Reporting results honestly
 

@@ -3,24 +3,23 @@
 A single-process CUDA inference engine for `Qwen3.6-35B-A3B` on 3× Quadro
 RTX 8000, written in Rust.
 
-> **Status: the model generates.** It is resident on one GPU (733 tensors,
-> 29.65 GiB, read back bit-identical), a full 40-block forward pass runs
-> entirely on the device — Gated DeltaNet, gated attention, and the
-> 256-expert MoE — and it now decodes autoregressively against a KV cache and
-> a carried recurrent state. Against golden data captured from llama.cpp it
-> produces **the same argmax token** (25358, `' Tokyo'`) at logit 19.936268,
-> and prefilling 12 tokens then decoding 7 reaches that same token with
-> cosine 1.000000000 against prefilling all 19 at once.
+> **Status: the engine serves, and it is ahead of the baseline.** The model is
+> resident on one GPU, a full 40-block forward pass runs entirely on the
+> device — Gated DeltaNet, gated attention, and the 256-expert MoE — it
+> decodes autoregressively against a KV cache and a carried recurrent state,
+> and it batches prefill and decode across parallel sequences. Against golden
+> data captured from llama.cpp it produces **the same argmax token** (25358,
+> `' Tokyo'`), and a sequence decodes **bit-identically** whether batched with
+> others or run alone.
 >
-> What it cannot do: there is **no HTTP surface**, no tokenizer, and no
-> batching across sequences. It generates token ids for one sequence at a
-> time — decode steps replay from a captured CUDA graph. See
-> [Milestones](#milestones) for the itemized state.
->
-> Measured against llama.cpp on the same card, interleaved: prefill
-> **2,099 tok/s** at 512 tokens against 2,076 (**1.011× faster**), decode
-> **104.8 tok/s** against `tg128`'s 104.7 (**level**). See
+> Measured one card, three concurrent sequences, against llama.cpp at its own
+> best settings, same card and same hour, alternating processes: **prefill
+> ahead at every context from 512 to 128K** (+0.8% to +18.6%) and **decode
+> ahead at 2K (+4.4%) and 32K (won every pair)**. See
 > [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+>
+> What it cannot do: streaming responses, tokenization, and multimodal input.
+> See [Milestones](#milestones) for the itemized state.
 
 ## Why this exists
 
@@ -44,43 +43,36 @@ takes 0.3 s warm against 9.7 s cold — a **32× improvement in time-to-first-to
 that today is confined to one process, so three replicas hold three copies of
 it.
 
-The performance bets have been benchmarked, and the results were not what the
-design plan expected. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+The *performance* bets were benchmarked, and two of the three turned out to be
+things the baseline already did. **Fused MoE dispatch** and **CUDA graph
+capture** are already implemented in llama.cpp (`mmid.cu`, `topk-moe.cu`,
+`USE_CUDA_GRAPH` — confirmed live at runtime), as is Turing-specific kernel
+tuning, and so is the GPU-side sampler that looked like a third opening
+(`--backend-sampling`, off by default, worth +36% when enabled). None of those
+are wins this project can claim; they are the bar it had to clear.
 
-- **Fused MoE dispatch** and **CUDA graph capture** are *already implemented in
-  llama.cpp* (`mmid.cu`, `topk-moe.cu`, `USE_CUDA_GRAPH` — confirmed live at
-  runtime), as is Turing-specific kernel tuning. These are not wins this
-  project can claim; they are the bar it has to clear.
-- **The real headroom is efficiency.** llama.cpp reaches 104.79 tok/s at short
-  context, which is 44.5% of the 235 tok/s bandwidth roofline. That gap
-  decomposes: the MoE weight path runs at 44.5% of peak bandwidth while flash
-  attention streams KV at ~80%. Closing it is worth roughly 1.8× — but it means
-  beating an already-fused, already-graphed, already-tuned implementation.
-- **A GPU-side sampler looked like a win the plan missed** — a 248,320-token
-  vocabulary makes CPU penalty sampling cost 22–24% of decode throughput. On
-  testing, llama.cpp already ships one (`--backend-sampling`, off by default),
-  and enabling it recovers the whole tax (+36%). That is the second identified
-  opportunity to turn out already-implemented upstream.
-- **Compile-time specialization.** Shapes are fixed and known. A
-  general-purpose engine cannot assume that; this one can. Still unmeasured.
+What was left was efficiency, and that turned out to be enough.
 
-This project does not claim it will be faster than llama.cpp. That backend has
-years of CUDA tuning behind it, and the benchmarks make that concrete.
+**Where it stands** — one card, three concurrent sequences, against llama.cpp
+at `-np 3 -b 4096 -ub 4096`, measured same card, same hour, alternating
+processes:
 
-**Where it actually stands** (2026-08-16, `bench_forward` n = 512 and
-`bench_decode` on one card):
+| cell | llmxabe | llama.cpp | margin |
+| :--- | ---: | ---: | ---: |
+| prefill 512 | 3,281 tok/s | 3,008 | **+9.1%** |
+| prefill 2K | 3,797 | 3,202 | **+18.6%** |
+| prefill 8K | 3,666 | 3,202 | **+14.5%** |
+| prefill 32K | 2,790 | 2,655 | **+5.1%** |
+| prefill 65K | 2,226 | 2,143 | **+3.9%** |
+| prefill 128K | 1,565 | 1,552 | **+0.8%** |
+| decode 2K | 193.3 | 185.2 | **+4.4%** |
+| decode 32K | 151.4 (median) | 150.7 | won every pair |
 
-| | llama.cpp | llmxabe | position |
-| --- | ---: | ---: | --- |
-| Prefill, 512 tokens | 2,076.2 tok/s | **2,099.3** | 1.011× faster |
-| Decode, warm | 104.72 ± 0.36 tok/s | **104.8** | level |
-
-Both rows are three alternating rounds of `llama-bench -p 512` and
-`bench_forward`, run back to back on the same card in the same session, which
-is the only way these two numbers can be compared: llama.cpp's own `pp512`
-reported ±160–180 tok/s run to run, and this card's thermal drift is about
-1.3% — larger than the prefill margin. Read prefill as **a small, repeatable
-win** and decode as **a draw**, not as a 1.011× headline.
+Read the two thinnest rows — 128K prefill and 32K decode — as **level to
+slightly ahead**, not as headlines. This card's thermal drift is ~1.3% and
+card-to-card spread ~1.5%, both larger than those margins; they stand only
+because they were taken as alternating same-hour pairs on one card and won all
+of them. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the method.
 
 Prefill was 29.6× slower, then 10.3×, then 1.20×, and is now ahead. The step
 that closed it was not the MoE GEMM, which was already faster than llama.cpp's:
@@ -89,25 +81,29 @@ update and solve, and the alpha/beta gates — that had each been written with
 one memory instruction per multiply-add, on a part that issues four of the
 former per SM per clock against sixty-four of the latter.
 
-The move that closed most of it was putting every quantized matmul on
-Turing's integer tensor cores — `mma.m8n8k16.s32.s8.s8.s32`, ~198 TOP/s
-against fp32's 16.3 TFLOP/s. Q6_K and Q8_0 weights are *already integers*,
-so this is not a precision downgrade imposed on float weights; it is
-declining to convert integers into floats in order to multiply them more
-slowly. Roughly half the remaining gain, though, came not from arithmetic but
-from finding kernels that re-read the same bytes — the recurrent state read
-once per token instead of once per chunk, the router's weight row read once
-per (expert, token) pair.
+The move that closed most of it was putting every quantized matmul on Turing's
+integer tensor cores — `mma.m8n8k16.s32.s8.s8.s32`, ~198 TOP/s against fp32's
+16.3 TFLOP/s. Q6_K and Q8_0 weights are *already integers*, so this is not a
+precision downgrade imposed on float weights; it is declining to convert
+integers into floats in order to multiply them more slowly. Roughly half the
+remaining gain, though, came not from arithmetic but from finding kernels that
+re-read the same bytes — the recurrent state read once per token instead of
+once per chunk, the router's weight row read once per (expert, token) pair.
 
-Decode needed almost none of that. At one token every matmul is a GEMV, and
-the wins were removing GEMM machinery that had nothing to do at that shape,
-plus one layout accident: Q8_0 puts a row's quants at byte `b * 34 + 2`, so
-fifteen warp reads in sixteen straddle a 32-byte sector boundary and half of
-every fetch is discarded. See [BENCHMARKS.md](docs/BENCHMARKS.md).
+Decode needed almost none of that. At one token every matmul is a GEMV, and the
+wins were removing GEMM machinery that had nothing to do at that shape, filling
+the card's block slots exactly once per step, and one layout accident: Q8_0
+puts a row's quants at byte `b * 34 + 2`, so fifteen warp reads in sixteen
+straddle a 32-byte sector boundary and half of every fetch is discarded.
 
-`ncu` still cannot read performance counters on this host
-(`ERR_NVGPUCTRPERM`), so every attribution above is from `nsys` kernel
-timings and arithmetic, not from hardware counters.
+**Accuracy is a hard gate, not a budget.** Nothing above cost a loosened
+tolerance. A sequence decodes bit-identically whether batched with others or
+alone, which is the serving contract three instances on one card require, and
+several real speedups were rejected for breaking it.
+
+`ncu` cannot read performance counters on this host (`ERR_NVGPUCTRPERM`), so
+every attribution above is from `nsys`/`nvprof` timings, `ptxas`/`cuobjdump`
+and arithmetic, not from hardware counters.
 
 ## Target hardware and model
 
@@ -189,8 +185,12 @@ cargo run -p xabe-server               # full engine preflight
 The preflight validates the whole startup path — model config, cache geometry,
 scheduler construction, device gate, VRAM budget against the card's *measured*
 memory, and engine assembly. Three design rules are enforced by construction,
-so a preflight that builds these types has checked them. It does not serve
-requests; there is no HTTP surface yet.
+so a preflight that builds these types has checked them.
+
+The HTTP surface serves non-streaming `/v1/completions` across all three cards.
+Streaming, disconnect cancellation and overload behaviour are not implemented —
+see [docs/TESTING.md](docs/TESTING.md) for what the serving checks do and do
+not cover.
 
 ### Console output
 
@@ -232,12 +232,12 @@ Numbering follows the design plan. "Gate" is the condition for calling it done.
 | 02 | Differential harness | Per-tensor max-abs + cosine thresholds | done |
 | 03 | FP16 dense forward | Correct logits, any speed | **done** (fp32, not fp16) — full 40-block pass, argmax 25358 matching llama.cpp |
 | 04 | Q6_K dequant + MoE grouped GEMM | Correct, single GPU | **done** — dequant bit-identical over 8.4 M elements; grouped GEMM tiled, 9.3× on the MoE path, expert ids exact on all 37 tokens × top-8 |
-| 05 | Flash attention port, sm_75 | Correct at 128K | **correct at batch and decode shape, unverified at 128K** — scalar fp32, no tensor cores; `BM = 8` with the query tile in registers for prefill and `BM = 1` for decode. Gated against golden data at 19 and 512 tokens and against the batch path at decode shape. At `n_query = 1` the grid is 16 blocks on 72 SMs and the KV read runs at ~2.9% of peak bandwidth — see BENCHMARKS.md |
-| 05b | Autoregressive decode | Incremental path equals batch path | **done** — KV cache + carried recurrent state; prefill-12-then-decode-7 matches a 19-token prefill at cosine 1.000000000, same argmax. 65.25 tok/s at 128-token context vs llama.cpp's 104.72 |
-| 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | not started; launch overhead measured at ~0.4% at n=512, so it is no longer a gate |
-| 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | host side done; the device side runs a **single-sequence contiguous** KV cache (`block::attention::KvCache`), not yet the pager |
-| 08 | Multi-worker + router + shared cache | Hit rate ≥ llama.cpp baseline | host side done |
-| 09 | MTP speculative decode | Accept rate vs n-gram baseline | not started |
+| 05 | Flash attention port, sm_75 | Correct at 128K | **done** — `m16n8k8` tensor cores with fp32 accumulation for prefill, split-K flash decoding with a depth-aware tensor-core path for decode, binary16 KV. Gated at nine depths including a 128K window |
+| 05b | Autoregressive decode | Incremental path equals batch path | **done** — KV cache + carried recurrent state; incremental and batch paths agree at cosine 1.000000000, same argmax |
+| 06 | CUDA graph capture | Was "the justification gate"; llama.cpp already does this — see BENCHMARKS.md | **done**, and worth ~0 on throughput; kept for host cost and launch-shape discipline |
+| 07 | Two-group pager + scheduler | 3 slots, matches llama.cpp `-np 3` | **done** — batched decode and flattened batch prefill at N=1–8, scheduler path within 0.7% of the isolated kernel path |
+| 08 | Multi-worker + router + shared cache | Hit rate ≥ llama.cpp baseline | **done** — nine requests balanced three per card, mixed decode/prefill steps on every worker, cross-worker restore emits identical token ids |
+| 09 | MTP speculative decode | Accept rate vs n-gram baseline | implemented, **not adopted** — 65.2% acceptance for ~7%, and unbatched across sequences |
 
 Milestone 01 deliberately precedes the harness. Gated DeltaNet covers 75% of
 layers, has no equivalent in any flash-attention codebase, and its prefill form
@@ -248,8 +248,9 @@ twelve.
 Milestone 06 was designated the continue/stop gate for the project as a whole,
 on the assumption that graph capture over on-device MoE indirection was an
 unclaimed win. Benchmarking showed llama.cpp already captures graphs on every
-decode step, so that gate needs restating in terms of measured throughput
-against 104.79 tok/s rather than "does graph capture help".
+decode step, and that on Turing a graph node costs roughly what the launch gap
+it replaces cost. The gate was restated as measured throughput against
+llama.cpp's own best settings, which is what the table above reports.
 
 ## Scope
 
@@ -263,7 +264,8 @@ instance; text-only requests go to this engine.
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | Instructions for AI agents; the binding design rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Setup, workflow, commit and review conventions |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | **Measured llama.cpp baseline — start here for performance** |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | **Current standing, and why / why not — start here for performance** |
+| [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) | The bandwidth model, what transfers from vLLM, and the ceilings |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component design and rationale |
 | [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md) | Milestone-00 gate results and the cudarc decision |
 | [docs/MODEL.md](docs/MODEL.md) | Qwen3.6 structure, VRAM and bandwidth analysis |
@@ -275,7 +277,7 @@ instance; text-only requests go to this engine.
 
 ## Baseline
 
-The configuration this project is measured against:
+The serving configuration this project replaces:
 
 ```sh
 llama-server -a qwen3.6-35b-a3b -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
@@ -287,12 +289,15 @@ llama-server -a qwen3.6-35b-a3b -m Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
   --temp 1.0 --top-p 0.95 --top-k 20 --presence-penalty 1.5
 ```
 
-`-bs` (`--backend-sampling`) is off by default and is the largest free win
-measured here. It keeps sampling on the GPU, which makes penalty samplers cost
-nothing — **+36%** on this configuration — so Qwen's published thinking-mode
-defaults, `--presence-penalty 1.5` included, become free.
+`-bs` (`--backend-sampling`) is off by default and is the largest free win in
+it. It keeps sampling on the GPU, which makes penalty samplers cost nothing —
+**+36%** — so Qwen's published thinking-mode defaults, `--presence-penalty 1.5`
+included, become free.
 
-Measured baseline tuning results need no Rust at all — see [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#baseline-tuning--now-measured).
+The throughput bar is the same model and flags under `llama-batched-bench` at
+`-npl 3`, taken at whichever of `-ub 2048` / `-ub 4096` is faster for the cell.
+Comparing against llama.cpp's *defaults* is not a result; see
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## License
 
