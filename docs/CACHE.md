@@ -186,3 +186,20 @@ Stated rather than discovered later:
 - `xabe-cache` itself does not touch device memory. `xabe-engine` accounts the
   per-worker device pools during admission and owns the pinned migration arena.
   The cache crate's tests remain host-side logic.
+- **Only the prompt is shared.** A request is admitted with the block hashes
+  of its prompt, and nothing extends that chain as the sequence generates. So
+  a snapshot taken at a retention boundary the prompt does not reach has no
+  name to be filed under, and `Engine::install_snapshot` declines to share it
+  — the sequence keeps using it locally, but no other request can find it.
+
+  The cost is cross-turn reuse: the second turn of a conversation matches only
+  as far as the first turn's *prompt*, not through the reply the model
+  generated. Closing this means hashing generated tokens into the chain as
+  they are produced, which must agree exactly with the runtime's own idea of
+  the sequence position — a chain that disagrees files a snapshot under a
+  prefix it does not describe, and the next request to match that hash resumes
+  from the wrong state. That is worth building deliberately, with a test that
+  pins the agreement, rather than as a side effect.
+
+  Until then, note that this is *not* free: declining is the safe branch, and
+  it silently gives up the reuse rather than misreporting it.

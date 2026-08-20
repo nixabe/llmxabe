@@ -26,6 +26,10 @@ working; new invocations should prefer the flags. The old `LLMXABE_ADDR`
 variable (a combined `host:port`) is gone, replaced by `LLMXABE_HOST` and
 `LLMXABE_PORT`.
 
+`--api-key` is the exception to preferring the flag: an argument is visible in
+`ps` output to every user on the host, so prefer `LLMXABE_API_KEY`. Neither
+the value nor the variable's contents appear in `--help` or in any log line.
+
 ## Options
 
 | Flag | Env | Default | Meaning |
@@ -37,6 +41,7 @@ variable (a combined `host:port`) is gone, replaced by `LLMXABE_HOST` and
 | `-s, --slots-per-worker <N>` | — | `3` | Concurrent request slots per worker. The default matches the llama.cpp baseline's `-np 3` (see [DEVELOPMENT.md](DEVELOPMENT.md)). |
 | `-c, --total-context <N>` | — | `393216` | Total context tokens across all slots, used to size the KV pool and the VRAM budget. The default matches the baseline's `-c 393216`. |
 | `-pc, --prefill-chunk <N>` | — | `4096` | Tokens per chunked-prefill step. |
+| `--api-key <KEY>` | `LLMXABE_API_KEY` | none | Key callers must present, in `Authorization: Bearer <key>` or `x-api-key: <key>`. With none set the server is open. See [API.md](API.md#authentication). |
 
 The two-letter shorts `-pc` and `-tb` are rewritten to their long forms before
 clap parses (clap itself only supports single-character shorts), so they accept

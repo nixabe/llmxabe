@@ -148,8 +148,31 @@ cold path. Nine simultaneous HTTP `/v1/completions` requests are served by one
 server bound to all three cards, every response producing the same
 continuation.
 
-What that does **not** cover: streaming (unsupported), disconnect cancellation
-under a live socket, and overload behaviour.
+The HTTP surface itself is checked by hand against a live server, because the
+engine below it needs a GPU and a 30 GiB model and so cannot be stood up in a
+`cargo test`. What that check has covered, on one RTX 8000:
+
+- All four generation endpoints, streaming and not, plus `/v1/models` and
+  `/v1/messages/count_tokens`.
+- API-key authentication: accepted via both header spellings, refused with
+  each dialect's own `401` envelope, and open when no key is set.
+- Every refusal in [API.md](API.md): tools, `n > 1`, a `tool` role, a late
+  system message, an image content part, `previous_response_id`, malformed
+  JSON.
+- Three concurrent streams on one worker, each returning its own correct
+  answer.
+- Disconnect cancellation: a prompt that runs 42 s to `max_tokens` leaves the
+  card idle within 3 s of the client vanishing.
+- A 4000-token generation, which crosses a GDN retention boundary — the case
+  that used to fail the whole scheduler step.
+
+Everything below the wire format is covered by the unit tests in
+`crates/xabe-server/src/http/`: the ChatML rendering is pinned string by
+string, and stop-sequence hold-back, header parsing, and constant-time key
+comparison have their own tests.
+
+What none of that covers: overload behaviour, and any of it under sustained
+load rather than by hand.
 
 The scheduler-driven path measures within 0.7% of the isolated kernel path, so
 runtime plumbing is not where throughput goes. Serving numbers belong in

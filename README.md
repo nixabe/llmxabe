@@ -135,10 +135,13 @@ The preflight validates the whole startup path — model config, cache geometry,
 scheduler construction, device gate, VRAM budget against the card's *measured*
 memory, and engine assembly.
 
-The HTTP surface serves non-streaming `/v1/completions` across all three cards.
-Streaming, disconnect cancellation and overload behaviour are not implemented —
-see [docs/TESTING.md](docs/TESTING.md) for what the serving checks do and do
-not cover.
+The HTTP surface serves OpenAI's `/v1/completions`, `/v1/chat/completions` and
+`/v1/responses`, and Anthropic's `/v1/messages`, across all three cards —
+streaming or not, with optional API-key authentication. Decoding is greedy
+argmax; sampling parameters are accepted and ignored. See
+[docs/API.md](docs/API.md) for the endpoints and what they refuse, and
+[docs/TESTING.md](docs/TESTING.md) for what the serving checks do and do not
+cover.
 
 Every binary logs through `tracing` and takes `--log-level info | debug |
 trace`; the levels and their meanings are in
@@ -166,6 +169,7 @@ instance; text-only requests go to this engine.
 | [docs/SCHEDULER.md](docs/SCHEDULER.md) | Chunked prefill, admission, preemption |
 | [docs/KERNELS.md](docs/KERNELS.md) | Kernel inventory, risk, and porting notes |
 | [docs/TESTING.md](docs/TESTING.md) | Differential harness and numerics thresholds |
+| [docs/API.md](docs/API.md) | HTTP endpoints, streaming, authentication, and what they refuse |
 | [docs/CLI.md](docs/CLI.md) | The server binary's command-line arguments |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Environment, reference checkouts, and the llama.cpp baseline configuration |
 
