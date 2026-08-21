@@ -226,7 +226,7 @@ impl TensorSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeightError {
     /// The schema names a tensor the file does not contain.
-    Missing { name: String, role: Role },
+    Missing { name: String },
     /// The tensor exists but its dimensions differ from what the config
     /// implies. This is the check that catches a wrong `ModelConfig`.
     ShapeMismatch {
@@ -244,8 +244,8 @@ pub enum WeightError {
 impl fmt::Display for WeightError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing { name, role } => {
-                write!(f, "missing tensor `{name}` (role {role})")
+            Self::Missing { name } => {
+                write!(f, "missing tensor `{name}`")
             }
             Self::ShapeMismatch {
                 name,
@@ -434,7 +434,6 @@ impl WeightSchema {
             let Some(info) = file.tensor(&spec.name) else {
                 errors.push(WeightError::Missing {
                     name: spec.name.clone(),
-                    role: spec.role,
                 });
                 continue;
             };
