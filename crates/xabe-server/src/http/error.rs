@@ -45,6 +45,12 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, dialect, message)
     }
 
+    /// What the tests assert against; responses carry it via `payload`.
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     /// The error type string this dialect uses for this status.
     fn kind(&self) -> &'static str {
         match (self.dialect, self.status) {

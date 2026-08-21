@@ -75,6 +75,16 @@ struct Args {
     #[arg(short, long, env = "LLMXABE_MODEL", default_value = DEFAULT_MODEL_PATH)]
     model: PathBuf,
 
+    /// Path to the multimodal projector GGUF (the `mmproj-*.gguf` shipped
+    /// beside the model); enables image input
+    #[arg(long, env = "LLMXABE_MMPROJ")]
+    mmproj: Option<PathBuf>,
+
+    /// Most language-model tokens one image may occupy; larger images are
+    /// resized down to fit
+    #[arg(long, default_value_t = 1024)]
+    image_max_tokens: u32,
+
     /// Host the HTTP server binds
     #[arg(long, env = "LLMXABE_HOST", default_value = "127.0.0.1")]
     host: String,
@@ -252,6 +262,30 @@ fn main() -> std::process::ExitCode {
         }
     }
 
+    // Vision serving. The projector file is only opened at worker bind; what
+    // preflight can check is that the path exists and the token ceiling is
+    // inside the model's own budget, so a typo fails here with the flag's
+    // name on it.
+    use xabe_kernels::vision::preprocess::{MAX_IMAGE_TOKENS, MIN_IMAGE_TOKENS};
+    if let Some(mmproj) = &args.mmproj
+        && !mmproj.is_file()
+    {
+        error!(
+            "vision           FAIL — --mmproj {} is not a file",
+            mmproj.display()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    if !(MIN_IMAGE_TOKENS..=MAX_IMAGE_TOKENS).contains(&args.image_max_tokens) {
+        error!(
+            "vision           FAIL — --image-max-tokens {} must be between {MIN_IMAGE_TOKENS} \
+             and {MAX_IMAGE_TOKENS}",
+            args.image_max_tokens
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+    let vision_config = xabe_model::VisionConfig::qwen3_6_35b_a3b();
+
     // 1. Model configuration.
     let model = ModelConfig::qwen3_6_35b_a3b();
     match verify::check_config(&model) {
@@ -398,7 +432,11 @@ fn main() -> std::process::ExitCode {
         size::gib(usable),
         headroom as f64 / (1024.0 * 1024.0 * 1024.0)
     );
-    info!("                 (text-only; excludes the ~1.5 GiB vision encoder)");
+    if args.mmproj.is_some() {
+        info!("                 (excludes the mmproj vision tower, loaded per worker)");
+    } else {
+        info!("                 (text-only; excludes the ~1.5 GiB vision encoder)");
+    }
     if headroom < 0 {
         error!("\nPreflight failed: this configuration does not fit in VRAM.");
         return std::process::ExitCode::FAILURE;
@@ -458,10 +496,10 @@ fn main() -> std::process::ExitCode {
         prefill_chunk: args.prefill_chunk,
         snapshot_slots: slots_per_worker,
         speculation,
-        // Wired to --mmproj / --image-max-tokens by the vision serving
-        // surface; text-only until then.
-        mmproj: None,
-        max_image_patches: xabe_engine::runtime::DEFAULT_MAX_IMAGE_PATCHES,
+        mmproj: args.mmproj.clone(),
+        // The runtime's encode buffers are sized in pre-merge patches; the
+        // serving ceiling is in post-merge tokens.
+        max_image_patches: (args.image_max_tokens * vision_config.merge_factor()) as usize,
     };
     if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");
@@ -492,6 +530,10 @@ fn main() -> std::process::ExitCode {
             top_p: args.top_p,
             min_p: args.min_p,
         },
+        vision: args.mmproj.is_some().then_some(http::VisionServingConfig {
+            config: vision_config,
+            max_tokens: args.image_max_tokens,
+        }),
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,

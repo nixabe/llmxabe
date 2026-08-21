@@ -23,6 +23,7 @@ mod generate;
 mod openai;
 mod responses;
 mod tools;
+mod vision;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -40,6 +41,8 @@ use xabe_engine::Engine;
 use xabe_sched::request::RequestId;
 
 pub use generate::SamplingDefaults;
+pub use vision::VisionServingConfig;
+
 use generate::{ClientEvent, EngineFinish};
 
 type ClientSender = mpsc::UnboundedSender<ClientEvent>;
@@ -69,6 +72,9 @@ pub struct ServerConfig {
     /// makes silent requests greedy, which is what this server always did
     /// before it had a sampler.
     pub sampling_defaults: SamplingDefaults,
+    /// `Some` when `--mmproj` loaded a vision tower; `None` serves text
+    /// only and refuses image parts with a 400 that names the flag.
+    pub vision: Option<VisionServingConfig>,
 }
 
 #[derive(Clone)]
@@ -85,6 +91,8 @@ struct AppState {
     default_max_tokens: u32,
     default_reasoning: bool,
     sampling_defaults: SamplingDefaults,
+    /// The vision serving state, with the pad token already resolved.
+    vision: Option<Arc<vision::VisionServing>>,
 }
 
 impl AppState {
@@ -236,6 +244,33 @@ pub async fn serve(
             "tokenizer has no `{THINK_CLOSE}` token — reasoning will not be separated from answers"
         );
     }
+    // Image expansion pivots on the pad token, and the rendered markers must
+    // tokenize as the single ids the model was trained on — a vocabulary
+    // without them cannot serve images correctly, so that fails startup
+    // rather than every request.
+    let vision = config
+        .vision
+        .map(|serving| {
+            for spelling in [vision::VISION_START, vision::VISION_END] {
+                if tokenizer.token_to_id(spelling).is_none() {
+                    return Err(format!(
+                        "--mmproj was given, but the tokenizer has no `{spelling}` token"
+                    ));
+                }
+            }
+            let image_pad = tokenizer.token_to_id(vision::IMAGE_PAD).ok_or_else(|| {
+                format!(
+                    "--mmproj was given, but the tokenizer has no `{}` token",
+                    vision::IMAGE_PAD
+                )
+            })?;
+            Ok(Arc::new(vision::VisionServing {
+                config: serving.config,
+                max_tokens: serving.max_tokens,
+                image_pad,
+            }))
+        })
+        .transpose()?;
     let state = AppState {
         engine: Arc::new(Mutex::new(engine)),
         tokenizer: Arc::new(tokenizer),
@@ -247,6 +282,7 @@ pub async fn serve(
         default_max_tokens: config.default_max_tokens,
         default_reasoning: config.default_reasoning,
         sampling_defaults: config.sampling_defaults,
+        vision,
     };
     let scheduler_state = state.clone();
     std::thread::Builder::new()
@@ -266,7 +302,10 @@ pub async fn serve(
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,
-        ));
+        ))
+        // axum's default 2 MB body cap is plenty for text but not for
+        // base64 images; admission still bounds what a prompt can cost.
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
     let app = Router::new()
         .route("/health", get(health))
         .merge(api)
@@ -281,6 +320,13 @@ pub async fn serve(
         info!("                 API key required (Authorization: Bearer, or x-api-key)");
     } else {
         info!("                 no API key configured — every caller is accepted");
+    }
+    match &state.vision {
+        Some(vision) => info!(
+            "                 image input enabled — up to {} tokens per image",
+            vision.max_tokens
+        ),
+        None => info!("                 text only — image parts are refused (no --mmproj)"),
     }
     axum::serve(listener, app)
         .await

@@ -11,9 +11,11 @@
 //!
 //! The tool-calling section is reproduced too: the `# Tools` system block,
 //! the `<tool_call>`/`<function=`/`<parameter=` markup for replayed calls,
-//! and tool results as `<tool_response>` blocks inside user turns. The one
-//! part that is *not* reproduced is vision, and callers that ask for it are
-//! refused rather than served a prompt that quietly drops what they sent.
+//! and tool results as `<tool_response>` blocks inside user turns. Images
+//! are reproduced as the template's `<|vision_start|><|image_pad|>
+//! <|vision_end|>` markup, with the decoded pixels carried alongside the
+//! text (see `super::vision`); they are only meaningful in user messages,
+//! and anywhere else they are refused rather than quietly dropped.
 
 use std::fmt::Write as _;
 
@@ -22,6 +24,7 @@ use serde_json::Value;
 
 use super::error::{ApiError, Dialect};
 use super::tools::{ParsedToolCall, ToolDefinition};
+use super::vision::{DecodedImage, IMAGE_MARKER, decode_base64_image, decode_image_url};
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
@@ -61,6 +64,65 @@ pub(crate) enum KnownPart {
         #[serde(default)]
         content: Option<Value>,
     },
+    /// OpenAI chat: `{"type":"image_url","image_url":{"url":"data:..."}}`.
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlField },
+    /// Anthropic: `{"type":"image","source":{"type":"base64",...}}`.
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+    /// Responses API: `{"type":"input_image","image_url":"data:..."}`.
+    #[serde(rename = "input_image")]
+    InputImage {
+        #[serde(default)]
+        image_url: Option<String>,
+    },
+}
+
+/// OpenAI's `image_url` field: the documented object, or the bare string
+/// some clients send.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ImageUrlField {
+    Url(String),
+    Object { url: String },
+}
+
+impl ImageUrlField {
+    fn url(&self) -> &str {
+        match self {
+            Self::Url(url) | Self::Object { url } => url,
+        }
+    }
+}
+
+/// An Anthropic image source. `media_type` is not needed — the decoder
+/// sniffs the container format from the bytes.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ImageSource {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+impl ImageSource {
+    fn decode(&self) -> Result<DecodedImage, String> {
+        match self.kind.as_str() {
+            "base64" => decode_base64_image(
+                self.data
+                    .as_deref()
+                    .ok_or("a base64 image source needs a `data` field")?,
+            ),
+            "url" => decode_image_url(
+                self.url
+                    .as_deref()
+                    .ok_or("a url image source needs a `url` field")?,
+            ),
+            kind => Err(format!("image source type `{kind}` is not supported")),
+        }
+    }
 }
 
 /// A content part.
@@ -78,12 +140,18 @@ pub(crate) enum Part {
 }
 
 /// Content folded down to what the prompt renders.
+///
+/// Each image part contributes its [`IMAGE_MARKER`] to `text` (so the
+/// markup sits exactly where the part sat) and its pixels to `images`, in
+/// the same order — which is what lets the pads and the images be zipped
+/// back together after tokenization.
 #[derive(Debug, Default)]
 pub(crate) struct FoldedContent {
     pub(crate) text: String,
     pub(crate) thinking: String,
     pub(crate) tool_calls: Vec<ParsedToolCall>,
     pub(crate) tool_results: Vec<String>,
+    pub(crate) images: Vec<DecodedImage>,
 }
 
 /// A `tool_result` block's content: a bare string, or text blocks joined.
@@ -103,8 +171,8 @@ fn tool_result_text(content: Option<&Value>) -> Result<String, String> {
                     }
                     kind => {
                         return Err(format!(
-                            "tool_result content of type `{}` is not supported: this engine \
-                             is text-only",
+                            "tool_result content of type `{}` is not supported: tool results \
+                             fold to text",
                             kind.unwrap_or("(untyped)"),
                         ));
                     }
@@ -128,14 +196,14 @@ impl Content {
             Self::Parts(parts) => parts,
         };
         for part in parts {
-            let (target, value) = match part {
+            let (target, value): (_, &str) = match part {
                 Part::Known(
                     KnownPart::Text { text: value }
                     | KnownPart::InputText { text: value }
                     | KnownPart::OutputText { text: value },
-                ) => (&mut folded.text, value),
+                ) => (&mut folded.text, value.as_str()),
                 Part::Known(KnownPart::Thinking { thinking: value }) => {
-                    (&mut folded.thinking, value)
+                    (&mut folded.thinking, value.as_str())
                 }
                 Part::Known(KnownPart::ToolUse { name, input }) => {
                     folded.tool_calls.push(ParsedToolCall {
@@ -150,14 +218,29 @@ impl Content {
                         .push(tool_result_text(content.as_ref())?);
                     continue;
                 }
+                Part::Known(KnownPart::ImageUrl { image_url }) => {
+                    folded.images.push(decode_image_url(image_url.url())?);
+                    (&mut folded.text, IMAGE_MARKER)
+                }
+                Part::Known(KnownPart::Image { source }) => {
+                    folded.images.push(source.decode()?);
+                    (&mut folded.text, IMAGE_MARKER)
+                }
+                Part::Known(KnownPart::InputImage { image_url }) => {
+                    let url = image_url.as_deref().ok_or(
+                        "an `input_image` part needs an `image_url`; file ids are not supported",
+                    )?;
+                    folded.images.push(decode_image_url(url)?);
+                    (&mut folded.text, IMAGE_MARKER)
+                }
                 Part::Other(value) => {
                     let kind = value
                         .get("type")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("(untyped)");
                     return Err(format!(
-                        "content parts of type `{kind}` are not supported: this engine is \
-                         text-only and does not load the model's vision encoder"
+                        "content parts of type `{kind}` are not supported; send text, \
+                         image, or tool parts"
                     ));
                 }
             };
@@ -170,13 +253,16 @@ impl Content {
     }
 
     /// Split content into its answer text and its reasoning text, for the
-    /// places where tool blocks have no meaning.
+    /// places where tool blocks and images have no meaning.
     pub(crate) fn split(&self) -> Result<(String, String), String> {
         let folded = self.fold()?;
         if !folded.tool_calls.is_empty() || !folded.tool_results.is_empty() {
             return Err(
                 "`tool_use` and `tool_result` content blocks are not valid here".to_owned(),
             );
+        }
+        if !folded.images.is_empty() {
+            return Err(image_misplaced().to_owned());
         }
         Ok((folded.text, folded.thinking))
     }
@@ -219,6 +305,9 @@ pub(crate) struct Conversation {
     /// system section; the caller's `tool_choice: "none"` simply leaves this
     /// empty while tool history still renders.
     pub(crate) tools: Vec<ToolDefinition>,
+    /// Decoded images, in the order their markers appear across the user
+    /// turns — the order `expand_images` zips them back to their pads in.
+    pub(crate) images: Vec<DecodedImage>,
 }
 
 /// The template's tool-format instructions, verbatim from the GGUF's
@@ -380,6 +469,13 @@ pub(crate) fn unsupported_role(dialect: Dialect, role: &str) -> ApiError {
     ApiError::bad_request(dialect, format!("the `{role}` role is not supported"))
 }
 
+/// The refusal for an image anywhere but a user message. The model's
+/// template only places vision markup in user turns; rendering it elsewhere
+/// would feed the encoder's output where the model never saw one.
+pub(crate) fn image_misplaced() -> &'static str {
+    "image content is only supported in user messages"
+}
+
 /// Reject a `tool_choice` that would require constrained decoding.
 ///
 /// `"auto"` and `"none"` cost nothing to honour. Forcing a call — `required`,
@@ -414,6 +510,7 @@ mod tests {
             system: Some("You are terse.".to_owned()),
             turns: vec![user("Hi")],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         assert_eq!(
             conversation.render(true),
@@ -429,6 +526,7 @@ mod tests {
             system: None,
             turns: vec![user("Hi")],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         assert_eq!(
             conversation.render(false),
@@ -445,6 +543,7 @@ mod tests {
             system: None,
             turns: vec![user("First"), assistant("pondering", "One"), user("Second")],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         let rendered = conversation.render(true);
         assert!(
@@ -460,6 +559,7 @@ mod tests {
             system: None,
             turns: vec![user("First"), assistant("pondering", "One")],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         assert!(
             conversation
@@ -474,6 +574,7 @@ mod tests {
             system: Some("   ".to_owned()),
             turns: vec![user("Hi")],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         assert!(!conversation.render(true).contains("system"));
     }
@@ -529,6 +630,7 @@ mod tests {
             system: Some("Be terse.".to_owned()),
             turns: vec![user("Hi")],
             tools: vec![weather_tool()],
+            images: Vec::new(),
         };
         let rendered = conversation.render(true);
         let expected_open = "<|im_start|>system\n# Tools\n\nYou have access to the following \
@@ -557,6 +659,7 @@ mod tests {
                 Turn::ToolResults(vec!["Sunny".to_owned()]),
             ],
             tools: vec![weather_tool()],
+            images: Vec::new(),
         };
         let rendered = conversation.render(true);
         // Empty content: the call follows the header with no blank line. The
@@ -590,6 +693,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         let rendered = conversation.render(true);
         assert!(
@@ -612,6 +716,7 @@ mod tests {
                 Turn::ToolResults(vec!["one".to_owned(), "two".to_owned()]),
             ],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         let rendered = conversation.render(true);
         assert!(
@@ -640,6 +745,7 @@ mod tests {
                 Turn::ToolResults(vec!["Sunny".to_owned()]),
             ],
             tools: Vec::new(),
+            images: Vec::new(),
         };
         assert!(
             conversation.render(true).contains("let me check"),
@@ -687,17 +793,66 @@ mod tests {
         );
     }
 
+    /// A 1x1 red PNG, small enough to inline in every image test.
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4\
+                           2mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
     #[test]
-    fn an_image_part_is_refused_by_name() {
-        // Serde would report only that no variant of an untagged enum matched,
-        // which does not tell the caller this engine is text-only.
+    fn each_dialects_image_part_folds_to_the_same_marker_and_pixels() {
+        let openai = format!(
+            r#"[{{"type":"text","text":"look"}},
+                {{"type":"image_url","image_url":{{"url":"data:image/png;base64,{PNG_1X1}"}}}}]"#
+        );
+        let anthropic = format!(
+            r#"[{{"type":"text","text":"look"}},
+                {{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{PNG_1X1}"}}}}]"#
+        );
+        let responses = format!(
+            r#"[{{"type":"input_text","text":"look"}},
+                {{"type":"input_image","image_url":"data:image/png;base64,{PNG_1X1}"}}]"#
+        );
+        for body in [openai, anthropic, responses] {
+            let content: Content = serde_json::from_str(&body).expect("image parts parse");
+            let folded = content.fold().expect("image parts fold");
+            assert_eq!(folded.text, format!("look\n{IMAGE_MARKER}"));
+            assert_eq!(folded.images.len(), 1);
+            assert_eq!(
+                (folded.images[0].width, folded.images[0].height),
+                (1, 1),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_image_url_is_refused_with_the_data_uri_hint() {
+        let content: Content = serde_json::from_str(
+            r#"[{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}]"#,
+        )
+        .expect("the part parses");
+        let failure = content.fold().expect_err("remote fetch is refused");
+        assert!(failure.contains("does not fetch"), "{failure}");
+    }
+
+    #[test]
+    fn split_refuses_images_where_only_text_belongs() {
+        let content: Content = serde_json::from_str(&format!(
+            r#"[{{"type":"input_image","image_url":"data:image/png;base64,{PNG_1X1}"}}]"#
+        ))
+        .expect("the part parses");
+        let failure = content.split().expect_err("split has no image channel");
+        assert!(failure.contains("user messages"), "{failure}");
+    }
+
+    #[test]
+    fn an_unknown_part_is_refused_by_name() {
+        // Serde would report only that no variant of an untagged enum
+        // matched, which does not tell the caller what this server refused.
         let content: Content =
-            serde_json::from_str(r#"[{"type":"image_url","image_url":{"url":"x"}}]"#)
+            serde_json::from_str(r#"[{"type":"video_url","video_url":{"url":"x"}}]"#)
                 .expect("an unknown part should still parse");
-        let failure = content
-            .split()
-            .expect_err("an image part should be refused");
-        assert!(failure.contains("`image_url`"), "{failure}");
-        assert!(failure.contains("text-only"), "{failure}");
+        let failure = content.split().expect_err("a video part should be refused");
+        assert!(failure.contains("`video_url`"), "{failure}");
+        assert!(failure.contains("not supported"), "{failure}");
     }
 }

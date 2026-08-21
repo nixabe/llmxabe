@@ -17,7 +17,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::chat::{Content, Conversation, Turn, unsupported_role, unsupported_tool_choice};
+use super::chat::{
+    Content, Conversation, Turn, image_misplaced, unsupported_role, unsupported_tool_choice,
+};
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
 use super::tools::{ParsedToolCall, ToolCallParser, ToolDefinition};
@@ -125,6 +127,7 @@ impl ResponsesRequest {
             system: self.instructions.clone(),
             turns: Vec::new(),
             tools: Vec::new(),
+            images: Vec::new(),
         };
         match &self.input {
             Input::Text(text) => conversation.turns.push(Turn::User(text.clone())),
@@ -196,13 +199,25 @@ impl ResponsesRequest {
                             ));
                         }
                     }
-                    let (text, thinking) = item
+                    let folded = item
                         .content
                         .as_ref()
-                        .map(Content::split)
+                        .map(Content::fold)
                         .transpose()
                         .map_err(|failure| ApiError::bad_request(DIALECT, failure))?
                         .unwrap_or_default();
+                    // Tool traffic travels as `function_call` items in this
+                    // dialect, never as content blocks.
+                    if !folded.tool_calls.is_empty() || !folded.tool_results.is_empty() {
+                        return Err(ApiError::bad_request(
+                            DIALECT,
+                            "`tool_use` and `tool_result` content blocks are not valid here",
+                        ));
+                    }
+                    if !folded.images.is_empty() && item.role.as_deref() != Some("user") {
+                        return Err(ApiError::bad_request(DIALECT, image_misplaced()));
+                    }
+                    let (text, thinking) = (folded.text, folded.thinking);
                     match item.role.as_deref() {
                         Some("system" | "developer") => {
                             if !conversation.turns.is_empty() {
@@ -217,7 +232,10 @@ impl ResponsesRequest {
                             }
                             system.push_str(&text);
                         }
-                        Some("user") => conversation.turns.push(Turn::User(text)),
+                        Some("user") => {
+                            conversation.images.extend(folded.images);
+                            conversation.turns.push(Turn::User(text));
+                        }
                         Some("assistant") => conversation
                             .turns
                             .push(Turn::assistant_text(thinking, text)),
@@ -356,8 +374,15 @@ pub(crate) async fn create(
         .tokenizer
         .encode(prompt, false)
         .map_err(|error| ApiError::bad_request(DIALECT, error.to_string()))?;
+    let (prompt, images) = super::vision::expand_images(
+        state.vision.as_deref(),
+        DIALECT,
+        encoding.get_ids().to_vec(),
+        &conversation.images,
+    )?;
     let spec = GenerationSpec {
-        prompt: encoding.get_ids().to_vec(),
+        prompt,
+        images,
         max_tokens: request
             .max_output_tokens
             .unwrap_or(state.default_max_tokens),

@@ -20,8 +20,12 @@ xabe-sched.workspace = true
 xabe-engine.workspace = true
 xabe-cuda.workspace = true
 xabe-gguf.workspace = true
+xabe-kernels.workspace = true
+rustc-hash.workspace = true
 async-stream = "0.3"
 axum = "0.8"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 clap.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

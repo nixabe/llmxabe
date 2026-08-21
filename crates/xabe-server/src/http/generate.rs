@@ -58,6 +58,9 @@ pub(crate) enum Chunk {
 /// A prompt that has already been templated and tokenized.
 pub(crate) struct GenerationSpec {
     pub(crate) prompt: Vec<u32>,
+    /// Preprocessed images paired with their pad spans in `prompt`, built by
+    /// `super::vision::expand_images`. Empty for a text-only request.
+    pub(crate) images: Vec<xabe_engine::image::SequenceImage>,
     pub(crate) max_tokens: u32,
     pub(crate) stop: Vec<String>,
     /// Whether the prompt leaves the model inside an open `<think>` span, so
@@ -349,7 +352,7 @@ impl Generation {
                 max_output_tokens: spec.max_tokens,
             },
             tokens,
-            Vec::new(),
+            spec.images,
             spec.sampling,
         );
         let placement = match placement {

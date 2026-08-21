@@ -7,7 +7,9 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::chat::{Content, Conversation, Turn, unsupported_role, unsupported_tool_choice};
+use super::chat::{
+    Content, Conversation, Turn, image_misplaced, unsupported_role, unsupported_tool_choice,
+};
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
 use super::tools::{ToolCallParser, ToolDefinition};
@@ -113,6 +115,7 @@ impl MessagesRequest {
                 .map_err(|failure| ApiError::bad_request(DIALECT, failure))?,
             turns: Vec::with_capacity(self.messages.len()),
             tools: Vec::new(),
+            images: Vec::new(),
         };
         for message in &self.messages {
             let folded = message
@@ -129,6 +132,7 @@ impl MessagesRequest {
                         conversation.push_tool_result(result);
                     }
                     if !only_results {
+                        conversation.images.extend(folded.images);
                         conversation.turns.push(Turn::User(folded.text));
                     }
                 }
@@ -138,6 +142,9 @@ impl MessagesRequest {
                             DIALECT,
                             "`tool_result` blocks belong in user messages",
                         ));
+                    }
+                    if !folded.images.is_empty() {
+                        return Err(ApiError::bad_request(DIALECT, image_misplaced()));
                     }
                     conversation.turns.push(Turn::Assistant {
                         reasoning: folded.thinking,
@@ -194,8 +201,15 @@ fn start(state: &AppState, request: &MessagesRequest) -> Result<Generation, ApiE
         .tokenizer
         .encode(prompt, false)
         .map_err(|error| ApiError::bad_request(DIALECT, error.to_string()))?;
+    let (prompt, images) = super::vision::expand_images(
+        state.vision.as_deref(),
+        DIALECT,
+        encoding.get_ids().to_vec(),
+        &conversation.images,
+    )?;
     let spec = GenerationSpec {
-        prompt: encoding.get_ids().to_vec(),
+        prompt,
+        images,
         max_tokens: request.max_tokens,
         stop: request
             .stop_sequences
@@ -405,7 +419,12 @@ pub(crate) async fn count_tokens(
         .encode(prompt, false)
         .map_err(|error| ApiError::bad_request(DIALECT, error.to_string()))?;
     Ok(axum::Json(TokenCount {
-        input_tokens: encoding.get_ids().len(),
+        input_tokens: super::vision::expanded_token_count(
+            state.vision.as_deref(),
+            DIALECT,
+            encoding.get_ids().len(),
+            &conversation.images,
+        )?,
     }))
 }
 
