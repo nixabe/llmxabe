@@ -18,7 +18,8 @@
 | Dequant (Q6_K, Q8_0) | all | low | Port llama.cpp K-quant unpacking | **sm_75 kernel, bit-identical to reference** |
 | Router top-k over 256 experts | 40 | low | Write; warp-level bitonic | **sm_75 kernel, expert IDs exact vs reference** |
 | RMSNorm, SwiGLU, residual | all | low | Write; RMSNorm runs at three widths (2048, 256, 128) | **sm_75 kernels, max_abs 3.10e-6 vs reference** |
-| Vision encoder | — | deferred | Out of scope — images stay on llama.cpp | n/a |
+| Vision encoder (mmproj) | 27 | medium | SigLIP tower + merger, f16 GEMM via cuBLASLt | **sm_75 path, cosine 0.999990 vs reference on the real mmproj** |
+| Interleaved M-RoPE (imrope) | 10 | low | Per-token (t, h, w) triples on image chunks | **sm_75 kernel, 1.2e-7 max_abs; bit-exact scalar collapse** |
 
 "CPU reference" means a scalar fp32 implementation exists in `xabe-kernels`
 with differential tests, and no GPU kernel has been written. Where a device

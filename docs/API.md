@@ -214,6 +214,31 @@ from the prompt while still rendering tool history). Forcing a call —
 `required`, `any`, or a named function — is refused with `400`: it is a
 guarantee about the output, and nothing here constrains decoding to keep it.
 
+## Image input
+
+With the server started with `--mmproj` (see [CLI.md](CLI.md#model-and-network)),
+user messages may carry images in each dialect's own spelling:
+
+- **OpenAI chat**: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`
+- **Anthropic**: `{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}`
+  (a `"type": "url"` source is accepted only for `data:` URIs)
+- **Responses**: `{"type": "input_image", "image_url": "data:image/png;base64,..."}`
+
+Images are inline only — `data:` URIs or base64. Remote `http(s)` URLs are
+refused: this server does not fetch content on a caller's behalf. PNG, JPEG,
+and WebP decode; the container format is sniffed from the bytes, not from the
+declared media type. Images are only meaningful in user messages; in a
+system, assistant, or tool message they are refused rather than dropped.
+
+Each image renders into the prompt as the model's own
+`<|vision_start|><|image_pad|><|vision_end|>` markup at the position of its
+content part, and occupies up to `--image-max-tokens` prompt tokens
+(default 1024) once encoded — a 512×512 image costs 256. Those tokens count
+toward context and admission like any others, and
+`/v1/messages/count_tokens` prices them without running the encoder.
+
+Without `--mmproj`, an image part is refused with a 400 that names the flag.
+
 ## What is refused
 
 *Refused with `400`*, because honouring them halfway would answer a different
@@ -227,9 +252,9 @@ question than the one asked:
 | A system message after the first turn | The model's own template silently discards it. Discarding an instruction the caller wrote is worse than refusing it. |
 | A batch of prompts in `/v1/completions` | One prompt per request. |
 
-Image and video content parts are refused as unknown part types: this engine
-is text-only and does not load the vision encoder. See the scope note in
-[../README.md](../README.md).
+Video parts are refused as unknown part types, and images are refused
+whenever the rules in [Image input](#image-input) are not met — no
+`--mmproj`, a remote URL, or an image outside a user message.
 
 ## Conversation rendering
 
@@ -273,7 +298,8 @@ This markup is written directly instead and pinned by unit tests in
 ## Token accounting
 
 `prompt_tokens` / `input_tokens` counts the rendered prompt after templating,
-which is larger than the caller's raw text by the ChatML markup.
+which is larger than the caller's raw text by the ChatML markup — and, for
+requests with images, by the expanded `<|image_pad|>` spans.
 `completion_tokens` / `output_tokens` counts every token the model produced,
 including the reasoning span and the `</think>` that closes it, and excluding
 the end-of-turn token.

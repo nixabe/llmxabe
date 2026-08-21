@@ -167,12 +167,20 @@ Answered, so they are not re-asked:
   0.001%. See [MODEL.md](MODEL.md).
 - **Does llama.cpp master support MTP for this architecture?** Yes.
 
+Answered later:
+
+- **VRAM cost of `mmproj-F16.gguf`.** Measured with this engine's own loader
+  (one worker, device 0, `nvidia-smi`): 36019 MiB text-only, 37171 MiB with
+  the tower loaded, 37339 MiB after the first image request — 1152 MiB
+  resident at load, ~1320 MiB once cuBLASLt has allocated its workspaces.
+  The old ~1.5 GiB estimate was close.
+
 Still open:
 
-- VRAM cost of `mmproj-F16.gguf`. The file is 899 MB on disk; its resident cost
-  is still an estimate.
-- What fraction of platform traffic is multimodal — determines whether the
-  retained llama.cpp instance is permanent or transitional.
+- What fraction of platform traffic is multimodal. It no longer decides
+  whether a llama.cpp instance must be retained — this engine serves images
+  behind `--mmproj` — but it still sizes how much the per-worker 1.3 GiB
+  vision residency and encode time matter.
 - The GDN short convolution cache (~2.8 MiB per sequence) is not modelled by
   `gdn_state_bytes_per_sequence()`. Small, but a real omission rather than a
   rounding choice.

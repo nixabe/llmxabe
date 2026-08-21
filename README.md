@@ -21,10 +21,10 @@ RTX 8000, written in Rust.
 > tokenizes from the vocabulary embedded in the GGUF.
 >
 > It samples — `temperature`, `top_p`, `top_k`, `seed`, with `temperature: 0`
-> as greedy argmax — and it speaks tool calls in all three chat dialects.
-> What it does not do: multimodal input. See [docs/API.md](docs/API.md) for
-> what the endpoints refuse, and [docs/MILESTONES.md](docs/MILESTONES.md) for
-> the engine milestones.
+> as greedy argmax — it speaks tool calls in all three chat dialects, and with
+> `--mmproj` it takes inline images in all three as well. See
+> [docs/API.md](docs/API.md) for what the endpoints accept and refuse, and
+> [docs/MILESTONES.md](docs/MILESTONES.md) for the engine milestones.
 
 ## Why this exists
 
@@ -156,9 +156,12 @@ trace`; the levels and their meanings are in
 
 ## Scope
 
-**Text only.** The model ships a vision encoder, and reimplementing a ViT is a
-separate project. Multimodal requests route to a retained `llama-server`
-instance; text-only requests go to this engine.
+**Text, and images behind `--mmproj`.** The model's vision tower runs on the
+device per worker, differential-tested against a CPU reference that is itself
+validated against llama.cpp executing the same `mmproj-F16.gguf`. Vision is
+opt-in: a server started without `--mmproj` allocates nothing for it and
+serves the text path unchanged. Video is out of scope. See the scope section
+of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 

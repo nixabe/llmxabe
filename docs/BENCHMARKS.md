@@ -369,6 +369,24 @@ surface needs the host for, and capture forces every launch shape to be a
 function of geometry rather than of a host-side value — design rule 5, which
 costs nothing and would be expensive to reinstate later.
 
+## Vision rides along without touching the text path
+
+Image support (the `--mmproj` tower, M-RoPE, embedding injection) is shaped so
+the text path cannot pay for it. The rotary base and the cache slot are two
+values in one position buffer with persistent subslice views, so captured
+decode graphs bind the rope view once and a text sequence publishes the same
+number to both; the per-token M-RoPE kernel shares the scalar kernel's
+double-precision angle arithmetic and collapses bit-exactly when t == h == w,
+so switching kernels is a dispatch decision, not a numerics decision; and the
+prefix cache hashes per-slot content lanes in place of `<|image_pad|>` ids so
+identical pad runs from different images cannot cross-hit — the SGLang pad
+substitution, strengthened to one lane per slot. Verified by alternating-pair
+A/B of the pre-vision and post-vision binaries with vision off (three decode
+pairs on one card, nine prefill pairs including order-reversed ones on
+another): decode N=3 +0.5% with the new binary winning 2 of 3, prefill at
+parity once position-in-session drift (~0.8%, first runner wins regardless of
+binary) is controlled for. Numbers in the enabling commits.
+
 ---
 
 # WHY NOT
@@ -560,5 +578,9 @@ batch-vs-single-stream divergence.
   one session per card, not three sessions per card.
 - Output *quality* over long runs under any of the precision trades; they were
   verified against gates and short samples, not long-horizon generation.
-- The `mmproj` vision encoder's resident VRAM cost.
+- Vision serving throughput. The tower's resident VRAM was measured
+  (1152 MiB at load, ~1320 MiB after first use, per worker — see
+  [DEVELOPMENT.md](DEVELOPMENT.md)), and text-path preservation was A/B'd
+  with vision off; encode latency and image-heavy throughput were not
+  benchmarked.
 - Sustained thermal behaviour; all runs are short.

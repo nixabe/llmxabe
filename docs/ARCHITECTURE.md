@@ -175,13 +175,17 @@ steady state.
 
 ## Scope
 
-**Text only.** The model ships a vision encoder and the baseline runs it with
-`--image-min-tokens 1024`, which means real image traffic. Reimplementing a ViT
-is a separate project with its own timeline.
+**Text, and images behind `--mmproj`.** The model's vision tower (the
+`mmproj-F16.gguf` shipped beside the weights) is implemented: a SigLIP
+encoder plus merger runs per worker on the device, image embeddings are
+injected over the `<|image_pad|>` positions after the token embedding, and
+attention layers switch to interleaved M-RoPE on image-bearing chunks. The
+prefix cache stays correct under images by substituting per-slot content-hash
+lanes for pad tokens when naming blocks. All of it is opt-in: without
+`--mmproj` nothing vision-related is allocated, decode graphs capture the
+scalar-rope path unchanged, and image requests are refused with a 400.
 
-Multimodal requests route to a retained `llama-server` instance; text-only
-requests go to this engine. Whether that instance is permanent or transitional
-depends on the multimodal traffic fraction, which is not yet measured.
+Video stays out of scope, and so does fetching remote image URLs.
 
 ## Reading order
 

@@ -37,6 +37,8 @@ the value nor the variable's contents appear in `--help` or in any log line.
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
 | `-m, --model <PATH>` | `LLMXABE_MODEL` | the `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` path under `~/llama.cpp/models` | GGUF model file to load. The engine is built for this one model; pointing it elsewhere is only useful for other quantizations of the same model. |
+| `--mmproj <PATH>` | `LLMXABE_MMPROJ` | none | Multimodal projector GGUF (the `mmproj-*.gguf` shipped beside the model). Loads the vision tower on every worker and enables image input; without it the server is text-only and image parts get a 400. See [API.md](API.md#image-input). |
+| `--image-max-tokens <N>` | — | `1024` | Most prompt tokens one image may occupy; larger images are resized down to fit. Bounded by the model's own `[8, 4096]` budget. Note this is a *ceiling*; the llama.cpp baseline's `--image-min-tokens 1024` is a floor, so at defaults the two spend image tokens differently. |
 | `--host <HOST>` | `LLMXABE_HOST` | `127.0.0.1` | Host the HTTP server binds. |
 | `--port <PORT>` | `LLMXABE_PORT` | `8000` | Port the HTTP server binds. |
 | `--api-key <KEY>` | `LLMXABE_API_KEY` | none | Key callers must present, in `Authorization: Bearer <key>` or `x-api-key: <key>`. With none set the server is open. See [API.md](API.md#authentication). |
