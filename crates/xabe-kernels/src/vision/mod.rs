@@ -15,7 +15,9 @@
 pub mod preprocess;
 pub mod tower;
 
-pub use preprocess::{PreprocessedImage, preprocess, smart_resize};
+pub use preprocess::{
+    PreprocessedImage, preprocess, preprocess_bounded, smart_resize, smart_resize_bounded,
+};
 pub use tower::{VisionBlockWeights, VisionWeights, encode};
 
 /// Index of patch `(x, y)` in the transformer's token order.

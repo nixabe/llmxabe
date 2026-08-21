@@ -39,10 +39,17 @@ fn floor_by(v: f64, f: f64) -> u32 {
 /// clamped into the pixel budget. Both beta branches divide the
 /// **original** dimensions, matching upstream exactly.
 pub fn smart_resize(cfg: &VisionConfig, w: u32, h: u32) -> (u32, u32) {
+    smart_resize_bounded(cfg, w, h, MAX_IMAGE_TOKENS)
+}
+
+/// [`smart_resize`] with the token ceiling lowered below the model's
+/// [`MAX_IMAGE_TOKENS`] — how a serving limit like `--image-max-tokens`
+/// reaches the resize. `max_tokens` is clamped into the model's own budget.
+pub fn smart_resize_bounded(cfg: &VisionConfig, w: u32, h: u32, max_tokens: u32) -> (u32, u32) {
     let f = f64::from(align_edge(cfg));
     let token_px = f64::from(align_edge(cfg) * align_edge(cfg));
     let min_px = f64::from(MIN_IMAGE_TOKENS) * token_px;
-    let max_px = f64::from(MAX_IMAGE_TOKENS) * token_px;
+    let max_px = f64::from(max_tokens.clamp(MIN_IMAGE_TOKENS, MAX_IMAGE_TOKENS)) * token_px;
     let (wf, hf) = (f64::from(w), f64::from(h));
 
     let mut w_bar = round_by(wf, f).max(align_edge(cfg));
@@ -121,9 +128,21 @@ impl PreprocessedImage {
 /// target, `[0,1]` scaling, mean/std normalization, patchify into cell
 /// order.
 pub fn preprocess(cfg: &VisionConfig, rgb: &[u8], w: u32, h: u32) -> PreprocessedImage {
+    preprocess_bounded(cfg, rgb, w, h, MAX_IMAGE_TOKENS)
+}
+
+/// [`preprocess`] under a lowered token ceiling (see
+/// [`smart_resize_bounded`]).
+pub fn preprocess_bounded(
+    cfg: &VisionConfig,
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    max_tokens: u32,
+) -> PreprocessedImage {
     assert_eq!(rgb.len(), (w * h * 3) as usize, "interleaved RGB8 expected");
     assert!(w > 0 && h > 0);
-    let (tw, th) = smart_resize(cfg, w, h);
+    let (tw, th) = smart_resize_bounded(cfg, w, h, max_tokens);
 
     // Aspect-preserving fit, then centered pad with black — the PAD_CEIL
     // branch of img_tool::resize.
@@ -290,6 +309,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_lowered_ceiling_shrinks_large_images_and_spares_small_ones() {
+        let cfg = cfg();
+        // 1920x1080 lands over 256 tokens at the model budget; a 256-token
+        // ceiling must pull it under while keeping alignment and aspect.
+        let (tw, th) = smart_resize_bounded(&cfg, 1920, 1080, 256);
+        assert!((tw / 32) * (th / 32) <= 256, "{tw}x{th}");
+        assert_eq!(tw % 32, 0);
+        assert_eq!(th % 32, 0);
+        // A small image is untouched by the ceiling.
+        assert_eq!(smart_resize_bounded(&cfg, 96, 96, 256), (96, 96));
+        // A ceiling below the model's floor clamps to the floor, and the
+        // shrink's floor-rounding still bounds the result by it.
+        let (tw, th) = smart_resize_bounded(&cfg, 96, 96, 1);
+        assert!((tw / 32) * (th / 32) <= MIN_IMAGE_TOKENS);
+        assert!(tw >= 32 && th >= 32);
     }
 
     #[test]
