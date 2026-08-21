@@ -255,6 +255,7 @@ pub struct MtpBlock {
     argmax_values: Option<CudaSlice<f32>>,
     argmax_indices: Option<CudaSlice<i32>>,
     argmax_out: Option<CudaSlice<i32>>,
+    argmax_probs: Option<CudaSlice<f32>>,
 }
 
 impl MtpBlock {
@@ -385,25 +386,27 @@ impl MtpBlock {
             },
         )?;
 
-        let (lm_head, logits, argmax_values, argmax_indices, argmax_out) = if needs_lm_head {
-            let lm_head = LmHeadKernels::new(
-                ctx,
-                LmHeadGeometry {
-                    hidden,
-                    vocab,
-                    max_tokens: tokens,
-                },
-            )?;
-            (
-                Some(lm_head),
-                Some(stream.alloc_zeros::<f32>(tokens * vocab)?),
-                Some(stream.alloc_zeros::<f32>(tokens * ARGMAX_BLOCKS)?),
-                Some(stream.alloc_zeros::<i32>(tokens * ARGMAX_BLOCKS)?),
-                Some(stream.alloc_zeros::<i32>(tokens)?),
-            )
-        } else {
-            (None, None, None, None, None)
-        };
+        let (lm_head, logits, argmax_values, argmax_indices, argmax_out, argmax_probs) =
+            if needs_lm_head {
+                let lm_head = LmHeadKernels::new(
+                    ctx,
+                    LmHeadGeometry {
+                        hidden,
+                        vocab,
+                        max_tokens: tokens,
+                    },
+                )?;
+                (
+                    Some(lm_head),
+                    Some(stream.alloc_zeros::<f32>(tokens * vocab)?),
+                    Some(stream.alloc_zeros::<f32>(tokens * ARGMAX_BLOCKS)?),
+                    Some(stream.alloc_zeros::<i32>(tokens * ARGMAX_BLOCKS)?),
+                    Some(stream.alloc_zeros::<i32>(tokens)?),
+                    Some(stream.alloc_zeros::<f32>(tokens)?),
+                )
+            } else {
+                (None, None, None, None, None, None)
+            };
 
         Ok(Self {
             hidden,
@@ -439,6 +442,7 @@ impl MtpBlock {
             argmax_values,
             argmax_indices,
             argmax_out,
+            argmax_probs,
         })
     }
 
@@ -451,6 +455,28 @@ impl MtpBlock {
     /// what the caller feeds back in as the next call's `h`.
     pub fn h_nextn(&self) -> &CudaSlice<f32> {
         &self.h_nextn
+    }
+
+    /// Softmax probabilities of the most recent pass's per-row argmaxes —
+    /// the confidence a greedy `p_min` gate compares against. One reduction
+    /// per row plus a host read; call it only when a gate is configured.
+    /// Requires an instance built with the LM head.
+    pub fn last_argmax_probs(
+        &mut self,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Vec<f32>, MtpBlockError> {
+        let lm_head = self.lm_head.as_ref().expect("built with lm_head");
+        let logits = self.logits.as_ref().expect("built with lm_head");
+        let probs = self.argmax_probs.as_ref().expect("built with lm_head");
+        let vocab = lm_head.geometry().vocab;
+        for i in 0..self.tokens {
+            let row = unsafe { crate::viewslice::subslice(stream, logits, i * vocab, vocab) };
+            let mut out = unsafe { crate::viewslice::subslice(stream, probs, i, 1) };
+            lm_head.argmax_prob(stream, &row, vocab, &mut out)?;
+        }
+        let host = stream.clone_dtoh(probs)?;
+        stream.synchronize()?;
+        Ok(host)
     }
 
     /// One MTP forward pass: `token_ids` and `h` in, `h_nextn` (and, if this

@@ -513,6 +513,45 @@ extern "C" __global__ void argmax_final(
     argmax_reduce_block(bv, bi);
     if (threadIdx.x == 0) out[0] = bi;
 }
+
+// Softmax probability of the row's maximum: p = 1 / sum(exp(x - max)).
+// One block per call; two grid-stride passes over the row (max, then the
+// stabilized exp-sum). The 2 MB the second pass rereads is noise next to
+// the GEMM that produced the row.
+extern "C" __global__ void argmax_prob(
+    const float* __restrict__ x,
+    int n,
+    float* __restrict__ out
+) {
+    __shared__ float sv[ARGMAX_THREADS / 32];
+
+    float bv = x[0];
+    int   bi = 0;
+    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
+        argmax_merge(bv, bi, x[i], i);
+    }
+    argmax_reduce_block(bv, bi);
+    if (threadIdx.x == 0) sv[0] = bv;
+    __syncthreads();
+    const float row_max = sv[0];
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n; i += ARGMAX_THREADS) {
+        acc += expf(x[i] - row_max);
+    }
+    // warp then cross-warp sum
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if ((threadIdx.x & 31) == 0) sv[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < ARGMAX_THREADS / 32; ++w) total += sv[w];
+        out[0] = 1.0f / total;
+    }
+}
 "#;
 
 /// The LM head shape this instance is compiled and sized for.
@@ -688,6 +727,7 @@ pub struct LmHeadKernels {
     b3_row_tile: Option<(CudaFunction, usize)>,
     argmax_partial: CudaFunction,
     argmax_final: CudaFunction,
+    argmax_prob: CudaFunction,
     geometry: LmHeadGeometry,
 }
 
@@ -778,6 +818,7 @@ impl LmHeadKernels {
             b3_row_tile,
             argmax_partial: module.load_function("argmax_partial")?,
             argmax_final: module.load_function("argmax_final")?,
+            argmax_prob: module.load_function("argmax_prob")?,
             geometry,
         })
     }
@@ -961,6 +1002,40 @@ impl LmHeadKernels {
         // SAFETY: reads exactly the `blocks` slots the first pass wrote and
         // writes the single `i32` checked above.
         unsafe { builder.launch(two) }?;
+        Ok(())
+    }
+
+    /// Softmax probability of `values[..n]`'s maximum, written to `out[0]`:
+    /// `1 / sum(exp(x - max))`, the confidence a greedy drafter's `p_min`
+    /// gate compares against. One block, two passes over the row — noise
+    /// next to the GEMM that produced it, and launched only when a gate is
+    /// actually configured.
+    pub fn argmax_prob(
+        &self,
+        stream: &Arc<CudaStream>,
+        values: &CudaSlice<f32>,
+        n: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<(), LmHeadError> {
+        if n == 0 || n > values.len() {
+            return Err(LmHeadError::ShapeMismatch {
+                what: "argmax_prob length",
+                expected: values.len(),
+                got: n,
+            });
+        }
+        check_len("argmax_prob output", 1, out.len())?;
+        let n_i32 = n as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (ARGMAX_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&self.argmax_prob);
+        builder.arg(values).arg(&n_i32).arg(&mut *out);
+        // SAFETY: both grid-stride loops are bounded by `n`, checked against
+        // `values.len()`, and the write is the single `f32` checked above.
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 }

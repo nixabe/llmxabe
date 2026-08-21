@@ -52,11 +52,15 @@ the value nor the variable's contents appear in `--help` or in any log line.
 | `-c, --total-context <N>` | — | `393216` | Total context tokens across all slots, used to size the KV pool and the VRAM budget. The default matches the baseline's `-c 393216`. |
 | `-pc, --prefill-chunk <N>` | — | `4096` | Tokens per chunked-prefill step. |
 | `--cache-ram <SIZE>` | `LLMXABE_CACHE_RAM` | 24 snapshots per worker (≈7.2 GiB for three) | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
-| `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, or `draft-mtp`. See below. |
+| `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, `draft-mtp`, or `spec-dflash`. See below. |
 | `--spec-ngram-n-max <N>` | — | `3` | `ngram`: most tokens proposed from one suffix match. |
 | `--spec-ngram-min <N>` | — | `2` | `ngram`: shortest suffix worth matching on. |
 | `--spec-ngram-max <N>` | — | `4` | `ngram`: longest suffix matched before giving up. |
-| `--spec-draft-n-max <N>` | — | `3` | `draft-mtp`: most tokens the draft head proposes per step. |
+| `--spec-draft-n-max <N>` | — | `3` | `draft-mtp`/`spec-dflash`: most tokens the drafter proposes per step. |
+| `--spec-draft-n-min <N>` | — | `0` | Drop any draft that comes out shorter than this; `0` keeps every draft. |
+| `--spec-draft-p-min <P>` | — | `0` | `draft-mtp`/`spec-dflash`: stop drafting at the first token whose probability under the drafter's own head falls below this; `0` disables the gate. |
+| `--spec-draft-p-split <P>` | — | `0.1` | Accepted for llama.cpp flag compatibility; no current speculative decoder uses a split probability (llama.cpp's ignore it too). |
+| `--spec-dflash <PATH>` | `LLMXABE_DFLASH` | — | `spec-dflash`: the trained drafter GGUF. Required by that type. |
 | `--watermark <F>` | — | `0.01` | Fraction of the KV pool held back as admission headroom, in `[0, 1)`. Raise it if admission thrashes under load. |
 
 ### Serving defaults
@@ -137,6 +141,7 @@ weight-read pass. It ships as `none`.
 | `none` | nothing — one token per step | the default |
 | `ngram` | a suffix match against the sequence's own prompt and output | works |
 | `draft-mtp` | the model's own multi-token-prediction head | works; see below |
+| `spec-dflash` | a trained DFlash drafter (separate GGUF, `--spec-dflash`) | works; see below |
 
 Whatever the type, **the output is the same**. A drafted token is accepted
 only if it equals the token the target model itself chose there — its argmax
@@ -214,6 +219,37 @@ acceptance for about +7% and did not adopt it; the serving path above is the
 batched re-attempt that measurement asked for. Numbers for the batched path
 belong in [BENCHMARKS.md](BENCHMARKS.md) once measured — do not trust this
 paragraph to have kept up with them.
+
+### `spec-dflash`
+
+Block in-fill drafting (arXiv 2602.06036): a small trained drafter — six
+dense layers in a separate GGUF — predicts every drafted position in **one**
+drafter pass per step, instead of one pass per token. Its picture of the
+context is not tokens at all: the target's own residual stream is captured
+at eight fixed layers, fused through the drafter's `fc`, and projected
+directly into the drafter's KV caches. The query is
+`[last_token, MASK × n]`, attended non-causally; the same batched verify as
+the other types accepts.
+
+```sh
+llmxabe --spec-type spec-dflash --spec-dflash qwen36-35b-a3b-dflash-Q8_0.gguf --spec-draft-n-max 3
+```
+
+- `--spec-dflash` names the drafter checkpoint and is required. The
+  drafter's trained block bounds `--spec-draft-n-max` (15 for the shipped
+  checkpoint); a larger ask is refused at startup.
+- Costs: the drafter's weights resident (~420 MB at Q8_0), six small KV
+  caches per resident sequence, and one strided feature-tap copy per
+  configured target layer on every prefill chunk and verify pass. The
+  drafter shares the target's token embeddings and LM head by alias.
+- The same two classes decode plain as under `draft-mtp`:
+  snapshot-restored sequences and image-bearing sequences.
+
+The two upstream implementations disagree about which residual-stream tap
+`target_layers` names (off by one layer) and about causal masking on the
+sliding-window layers; this engine follows llama.cpp, whose ecosystem the
+GGUF comes from — `xabe_model::dflash`'s module docs carry the details.
+Numbers belong in [BENCHMARKS.md](BENCHMARKS.md) once measured.
 
 ## Validation happens at preflight, not at first request
 

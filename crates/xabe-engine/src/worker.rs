@@ -54,6 +54,12 @@ pub enum Speculation {
     /// Costs one extra layer's weights on the device and one draft-head
     /// KV cache per resident sequence.
     Mtp,
+    /// A trained DFlash drafter (a separate GGUF, named in
+    /// [`ServingConfig::dflash_gguf`]) in-fills a block of masked positions
+    /// in one drafter pass per step; the same batched verify accepts.
+    /// Costs the drafter's weights on the device and one six-layer draft
+    /// KV cache per resident sequence.
+    DFlash,
 }
 
 /// The bind-time knobs a worker cannot derive for itself.
@@ -61,7 +67,7 @@ pub enum Speculation {
 /// Everything else the runtime needs — batch width, draft count, retention
 /// interval — the worker reads off its own scheduler and cache
 /// configuration, so those are not repeated here where they could disagree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServingConfig {
     /// Tokens per chunked-prefill step.
     pub prefill_chunk: usize,
@@ -70,6 +76,15 @@ pub struct ServingConfig {
     pub snapshot_slots: usize,
     /// Which speculative decoder to run.
     pub speculation: Speculation,
+    /// DFlash drafter GGUF; required by [`Speculation::DFlash`], ignored
+    /// otherwise.
+    pub dflash_gguf: Option<std::path::PathBuf>,
+    /// Drop any draft shorter than this. Zero keeps every draft.
+    pub draft_n_min: usize,
+    /// Greedy confidence gate for the trained drafters: stop drafting at
+    /// the first token whose probability under the drafter's own head
+    /// falls below this. Zero disables the gate.
+    pub draft_p_min: f32,
     /// Vision tower (mmproj) GGUF, or `None` for text-only serving.
     pub mmproj: Option<std::path::PathBuf>,
     /// Patch budget the vision tower is pre-allocated for.
@@ -83,6 +98,9 @@ impl ServingConfig {
             prefill_chunk,
             snapshot_slots: crate::runtime::DEFAULT_SNAPSHOT_SLOTS_PER_WORKER,
             speculation: Speculation::None,
+            dflash_gguf: None,
+            draft_n_min: 0,
+            draft_p_min: 0.0,
             mmproj: None,
             max_image_patches: crate::runtime::DEFAULT_MAX_IMAGE_PATCHES,
         }
@@ -318,14 +336,28 @@ impl Worker {
                 NgramConfig::new(min, max, drafts, history_capacity)
                     .map_err(RuntimeError::Speculation)?,
             ),
-            Speculation::Ngram { .. } | Speculation::None | Speculation::Mtp => None,
+            Speculation::Ngram { .. }
+            | Speculation::None
+            | Speculation::Mtp
+            | Speculation::DFlash => None,
         };
         // The draft count comes from the scheduler for the same reason the
         // enum carries none: the scheduler charges those tokens against its
         // step budget, and a second copy here could disagree.
         let mtp_drafts = match serving.speculation {
             Speculation::Mtp => drafts,
-            Speculation::None | Speculation::Ngram { .. } => 0,
+            Speculation::None | Speculation::Ngram { .. } | Speculation::DFlash => 0,
+        };
+        let dflash = match serving.speculation {
+            Speculation::DFlash if drafts > 0 => Some(crate::runtime::DFlashServing {
+                gguf: serving.dflash_gguf.clone().ok_or_else(|| {
+                    RuntimeError::Schema(
+                        "--spec-type dflash needs a drafter GGUF (dflash_gguf)".into(),
+                    )
+                })?,
+                drafts,
+            }),
+            _ => None,
         };
         let vocab = model.vocab_size;
         self.runtime = Some(DeviceRuntimeHandle::spawn(
@@ -337,6 +369,9 @@ impl Worker {
                 max_batch,
                 ngram,
                 mtp_drafts,
+                dflash,
+                draft_n_min: serving.draft_n_min,
+                draft_p_min: serving.draft_p_min,
                 retention_interval: self.cache.gdn_retention_interval() as usize,
                 snapshot_slots: serving.snapshot_slots,
                 stop_on_eos,

@@ -11,10 +11,12 @@
 
 pub mod budget;
 pub mod config;
+pub mod dflash;
 pub mod verify;
 pub mod vision;
 pub mod weights;
 
 pub use config::{AttentionConfig, GdnConfig, LayerKind, ModelConfig, MoeConfig};
+pub use dflash::DFlashConfig;
 pub use vision::VisionConfig;
 pub use weights::{Directory, Role, Section, TensorSpec, WeightError, WeightSchema};

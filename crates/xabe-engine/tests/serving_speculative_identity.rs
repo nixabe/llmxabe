@@ -27,6 +27,8 @@ use xabe_sched::request::{NewRequest, RequestId};
 
 const DEFAULT_MODEL_PATH: &str =
     "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+const DEFAULT_DFLASH_PATH: &str =
+    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/qwen36-35b-a3b-dflash-Q8_0.gguf";
 
 const PREFILL_CHUNK: usize = 64;
 const TOKEN_BUDGET: u32 = 4_096;
@@ -42,6 +44,12 @@ fn model_path() -> PathBuf {
     std::env::var_os("LLMXABE_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH))
+}
+
+fn dflash_path() -> PathBuf {
+    std::env::var_os("LLMXABE_DFLASH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DFLASH_PATH))
 }
 
 fn gpu_available() -> bool {
@@ -109,6 +117,7 @@ fn run_serving(
     let mut worker = Worker::new(WorkerId(0), 0, cache, scheduler, attention_blocks, WIDTH);
     let serving = ServingConfig {
         speculation,
+        dflash_gguf: matches!(speculation, Speculation::DFlash).then(dflash_path),
         ..ServingConfig::new(PREFILL_CHUNK)
     };
     // The benchmark bind leaves EOS an ordinary token, so both runs decode
@@ -197,6 +206,59 @@ fn serving_with_mtp_speculation_matches_serving_without() {
     assert!(
         spec.multi_token_steps > 0,
         "no step emitted more than one token; the MTP head never had a draft accepted",
+    );
+}
+
+/// Same contract for the DFlash drafter: `Speculation::DFlash` through the
+/// real serving loop — feature taps riding prefill and verify, context
+/// injection, one block-in-fill drafter pass per step — must emit exactly
+/// what `Speculation::None` emits. SKIPS without the drafter GGUF.
+#[test]
+fn serving_with_dflash_speculation_matches_serving_without() {
+    let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
+    if !gpu_available() {
+        return;
+    }
+    if !dflash_path().exists() {
+        println!(
+            "SKIPPED: DFlash drafter not found at {}; set LLMXABE_DFLASH to override",
+            dflash_path().display(),
+        );
+        return;
+    }
+    let vocab = ModelConfig::qwen3_6_35b_a3b().vocab_size as i64;
+
+    // Natural-ish structure for the drafter (a trained model, not a suffix
+    // matcher) plus a structureless prompt, and a 96-token prompt so the
+    // feature taps cross a prefill-chunk boundary.
+    let cycle = [791i32, 1131, 1721, 2217];
+    let periodic: Vec<i32> = cycle.iter().copied().cycle().take(96).collect();
+    let random = xorshift_prompt(0x5EED_CAFE, 16, vocab);
+    let prompts = vec![periodic, random];
+
+    let plain = run_serving(Speculation::None, 0, &prompts).expect("plain serving runs");
+    let spec = run_serving(Speculation::DFlash, DRAFTS, &prompts).expect("dflash serving runs");
+
+    println!(
+        "plain: {} steps; dflash: {} steps, {} multi-token steps",
+        plain.steps, spec.steps, spec.multi_token_steps,
+    );
+    for (i, (a, b)) in plain.outputs.iter().zip(&spec.outputs).enumerate() {
+        let n = MIN_TOKENS.min(a.len()).min(b.len());
+        assert_eq!(
+            a[..n],
+            b[..n],
+            "request {i}: DFlash serving diverged from plain serving",
+        );
+        println!("request {i}: {n} tokens identical");
+    }
+    // The drafter must actually get drafts accepted. This doubles as the
+    // behavioral gate on the whole feature pipeline: a wrong tap layer, a
+    // wrong rope, or a wrong mask cannot break exactness (the verify
+    // guarantees that) — they break *this*, by dragging acceptance to zero.
+    assert!(
+        spec.multi_token_steps > 0,
+        "no step emitted more than one token; the DFlash drafter never had a draft accepted",
     );
 }
 

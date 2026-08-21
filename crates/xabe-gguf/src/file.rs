@@ -252,6 +252,14 @@ impl GgufFile {
             _ => None,
         }
     }
+
+    /// Fetch an `i32[]`-typed metadata value.
+    pub fn get_i32_array(&self, key: &str) -> Option<&[i32]> {
+        match self.metadata.get(key)? {
+            GgufValue::Array(GgufArray::I32(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 struct Parsed {

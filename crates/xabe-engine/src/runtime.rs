@@ -24,7 +24,8 @@ use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
 use crate::block::mtp::{MtpBlock, MtpBlockError};
-use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
+use crate::dflash::{DFlashDraftCache, DFlashError, DFlashForward, load_dflash_weights};
+use crate::forward::{BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds};
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
     validate_placements,
@@ -65,6 +66,19 @@ pub struct RuntimeConfig {
     /// Mutually exclusive with `ngram`; `crate::worker` enforces that by
     /// construction from the single `Speculation` enum.
     pub mtp_drafts: usize,
+    /// DFlash drafter serving, or `None`. Mutually exclusive with the
+    /// other drafters, enforced the same way.
+    pub dflash: Option<DFlashServing>,
+    /// Drop any draft shorter than this after truncation — a window too
+    /// short to be worth a verify pass. Zero (the default) keeps every
+    /// draft. llama.cpp's `--spec-draft-n-min`.
+    pub draft_n_min: usize,
+    /// Greedy confidence gate: the MTP and DFlash drafters stop drafting at
+    /// the first token whose softmax probability under their own head falls
+    /// below this. Zero (the default) skips the probability reduction
+    /// entirely. llama.cpp's `--spec-draft-p-min`. The n-gram drafter has
+    /// no distribution and ignores it.
+    pub draft_p_min: f32,
     /// Tokens between retained GDN snapshots.
     pub retention_interval: usize,
     /// Pinned host snapshot slots. Zero disables retention, and with it
@@ -82,6 +96,16 @@ pub struct RuntimeConfig {
     /// Patch budget the vision tower is pre-allocated for (4 patches per
     /// language-model token). Ignored without `mmproj`.
     pub max_image_patches: usize,
+}
+
+/// What `Speculation::DFlash` needs beyond the draft count.
+#[derive(Debug, Clone)]
+pub struct DFlashServing {
+    /// The drafter checkpoint.
+    pub gguf: PathBuf,
+    /// Tokens drafted per step (the scheduler's count, bounded by the
+    /// drafter's trained block).
+    pub drafts: usize,
 }
 
 #[derive(Debug)]
@@ -115,6 +139,8 @@ pub enum RuntimeError {
     Speculation(NgramConfigError),
     /// Building or running the MTP draft head failed.
     Mtp(MtpBlockError),
+    /// Building or running the DFlash drafter failed.
+    DFlash(DFlashError),
     RuntimeStopped,
     /// The request carries images but this runtime loaded no mmproj.
     VisionNotEnabled,
@@ -140,6 +166,7 @@ impl core::fmt::Display for RuntimeError {
             Self::State(e) => write!(f, "sequence state failed: {e}"),
             Self::Speculation(e) => write!(f, "speculative decoding: {e}"),
             Self::Mtp(e) => write!(f, "MTP draft head: {e}"),
+            Self::DFlash(e) => write!(f, "DFlash drafter: {e}"),
             Self::ZeroPrefillChunk => write!(f, "prefill chunk must be non-zero"),
             Self::ZeroBatchWidth => write!(f, "maximum decode batch must be non-zero"),
             Self::DuplicateRequest(id) => write!(f, "request {} is already resident", id.0),
@@ -175,6 +202,12 @@ impl From<DriverError> for RuntimeError {
 impl From<MtpBlockError> for RuntimeError {
     fn from(value: MtpBlockError) -> Self {
         Self::Mtp(value)
+    }
+}
+
+impl From<DFlashError> for RuntimeError {
+    fn from(value: DFlashError) -> Self {
+        Self::DFlash(value)
     }
 }
 
@@ -243,6 +276,19 @@ struct MtpRuntime {
     config: ModelConfig,
 }
 
+/// The runtime's half of the DFlash drafter: the forward (kernels, staged
+/// feature rows, step scratch) and the tap map the target's waypoints key
+/// into.
+struct DFlashRuntime {
+    fwd: DFlashForward,
+    /// Tokens drafted per step.
+    drafts: usize,
+    /// `tap_at[l] = Some(k)` when the target's `Moe` waypoint at layer `l`
+    /// is tap `k` — i.e. `l + 1` is `target_layers[k]`, the layer whose
+    /// *input* the drafter's `fc` consumes.
+    tap_at: Vec<Option<usize>>,
+}
+
 struct RuntimeSequence {
     state: Option<SequenceState>,
     prompt: Vec<i32>,
@@ -254,6 +300,8 @@ struct RuntimeSequence {
     /// a restored prefix was never caught up in the draft cache, and
     /// drafting over a hole would propose from garbage attention).
     mtp: Option<MtpSequence>,
+    /// The DFlash drafter's per-sequence caches, same eligibility rules.
+    dflash: Option<DFlashDraftCache>,
     draft: Vec<i32>,
     emitted: u32,
     max_output: u32,
@@ -370,6 +418,12 @@ pub struct DeviceRuntime {
     /// The MTP draft head, present iff `mtp_drafts > 0` was configured — the
     /// non-speculative baseline allocates and runs none of this.
     mtp: Option<MtpRuntime>,
+    /// The DFlash drafter, present iff one was configured. Same rule: off
+    /// means nothing allocated, nothing run.
+    dflash: Option<DFlashRuntime>,
+    /// See [`RuntimeConfig::draft_n_min`] / [`RuntimeConfig::draft_p_min`].
+    draft_n_min: usize,
+    draft_p_min: f32,
     weights: DeviceWeights,
     sequences: HashMap<RequestId, RuntimeSequence>,
     prefill_chunk: usize,
@@ -573,6 +627,9 @@ impl DeviceRuntime {
             max_batch,
             ngram,
             mtp_drafts,
+            dflash: dflash_serving,
+            draft_n_min,
+            draft_p_min,
             retention_interval,
             snapshot_slots,
             stop_on_eos,
@@ -696,12 +753,16 @@ impl DeviceRuntime {
         // behavior for A/B measurement.
         let window = if mtp_drafts > 0 {
             mtp_drafts + 1
+        } else if let Some(serving) = &dflash_serving {
+            serving.drafts + 1
         } else {
             ngram.map_or(0, |config| config.max_draft_tokens + 1)
         };
-        // The gating env is the n-gram A/B lever only: MTP has no
-        // round-gated fallback drafter, so it always verifies batched.
-        let gated = mtp_drafts == 0 && std::env::var_os("LLMXABE_NGRAM_GATED").is_some();
+        // The gating env is the n-gram A/B lever only: MTP and DFlash have
+        // no round-gated fallback drafter, so they always verify batched.
+        let gated = mtp_drafts == 0
+            && dflash_serving.is_none()
+            && std::env::var_os("LLMXABE_NGRAM_GATED").is_some();
         let mut verify: Vec<Option<Forward>> = Vec::with_capacity(max_batch + 1);
         verify.push(None);
         let mut verify_rings = Vec::new();
@@ -805,6 +866,60 @@ impl DeviceRuntime {
             None
         };
 
+        // The DFlash drafter: its own small GGUF, resident next to the
+        // target, sharing the target's embedding table and LM head by
+        // alias. The trained block bounds the draft count — a count the
+        // drafter cannot fill would silently draft garbage tails, so it is
+        // refused here where the message can name both numbers.
+        let dflash = match &dflash_serving {
+            Some(serving) => {
+                let dconfig = xabe_model::DFlashConfig::qwen3_6_35b_a3b();
+                if serving.drafts > dconfig.max_draft_tokens() as usize {
+                    return Err(RuntimeError::Schema(format!(
+                        "draft count {} exceeds the drafter's trained block ({} drafts max)",
+                        serving.drafts,
+                        dconfig.max_draft_tokens(),
+                    )));
+                }
+                let dfile = GgufFile::open(&serving.gguf)?;
+                let dweights = load_dflash_weights(&stream, &dfile, &dconfig)?;
+                let drafter_bytes = dweights.bytes;
+                let ctx_tokens = prefill_chunk
+                    .max(retention_interval)
+                    .max(max_batch * window);
+                let fwd = DFlashForward::new(
+                    &ctx,
+                    &stream,
+                    &weights,
+                    dweights,
+                    ctx_tokens,
+                    // Verify injection reads from row `s * window`; the last
+                    // sequence's offset is the slack the aux buffer needs.
+                    max_batch.saturating_sub(1) * window,
+                    config.vocab_size as usize,
+                )?;
+                let mut tap_at = vec![None; config.num_layers as usize];
+                for (k, &t) in dconfig.target_layers.iter().enumerate() {
+                    // Tap k is the residual stream *entering* layer t: the
+                    // `Moe` waypoint of layer t - 1 (t >= 2 by checkpoint).
+                    tap_at[t as usize - 1] = Some(k);
+                }
+                debug!(
+                    device = device_ordinal,
+                    elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+                    drafter_bytes,
+                    drafts = serving.drafts,
+                    "DFlash drafter resident"
+                );
+                Some(DFlashRuntime {
+                    fwd,
+                    drafts: serving.drafts,
+                    tap_at,
+                })
+            }
+            None => None,
+        };
+
         // Vision tower: opt-in via --mmproj. Loading enables image-row
         // staging on every prefill-capable shape; text-only serving skips
         // all of it, which is what keeps the baseline untouched by
@@ -846,6 +961,9 @@ impl DeviceRuntime {
             verify_rings,
             window,
             mtp,
+            dflash,
+            draft_n_min,
+            draft_p_min,
             weights,
             sequences: HashMap::with_capacity(max_batch),
             prefill_chunk,
@@ -935,6 +1053,16 @@ impl DeviceRuntime {
             }),
             _ => None,
         };
+        // Same admission-time allocation for the DFlash drafter's caches;
+        // headroom for one full query block past the output cap, whose tail
+        // is truncated rather than run out of slots.
+        let dflash = match &self.dflash {
+            Some(rt) if images.is_empty() => Some(
+                rt.fwd
+                    .new_cache(&self.stream, req.full_seq_len() as usize + rt.drafts + 1)?,
+            ),
+            _ => None,
+        };
         self.sequences.insert(
             req.id,
             RuntimeSequence {
@@ -944,6 +1072,7 @@ impl DeviceRuntime {
                 next_token: None,
                 ngram,
                 mtp,
+                dflash,
                 draft,
                 emitted: 0,
                 max_output: req.max_output_tokens,
@@ -1048,11 +1177,12 @@ impl DeviceRuntime {
         seq.last_snapshot_position = prefix;
         seq.last_snapshot = Some(Arc::clone(&snapshot));
         seq.retention_disabled = false;
-        // Snapshots restore the target's state only; the draft head's cache
-        // over the restored prefix was computed by whoever produced the
-        // snapshot and is gone. Drafting over that hole would propose from
+        // Snapshots restore the target's state only; the draft-side caches
+        // over the restored prefix were computed by whoever produced the
+        // snapshot and are gone. Drafting over that hole would propose from
         // zeroed attention slots, so this sequence decodes plain instead.
         seq.mtp = None;
+        seq.dflash = None;
         if prefix == seq.prompt.len() {
             seq.next_token = snapshot.next_token();
         }
@@ -1166,6 +1296,9 @@ impl DeviceRuntime {
         if self.mtp.is_some() {
             self.mtp_draft_chain(&mut owned)?;
         }
+        if self.dflash.is_some() {
+            self.dflash_draft(&mut owned)?;
+        }
         for (_, seq) in &mut owned {
             if let Some(ngram) = &seq.ngram {
                 ngram.propose_into(&mut seq.draft);
@@ -1185,6 +1318,11 @@ impl DeviceRuntime {
                 let to_boundary = self.retention_interval - position % self.retention_interval;
                 seq.draft.truncate(to_boundary.saturating_sub(1));
             }
+            // llama.cpp's n_min, applied to what actually survived every
+            // truncation: a window this short is not worth its verify pass.
+            if seq.draft.len() < self.draft_n_min {
+                seq.draft.clear();
+            }
         }
 
         // Drafted tokens are fed through a single batched verify pass when
@@ -1198,7 +1336,7 @@ impl DeviceRuntime {
         if self.verify[width].is_some()
             && owned
                 .iter()
-                .any(|(_, seq)| !seq.draft.is_empty() || seq.mtp.is_some())
+                .any(|(_, seq)| !seq.draft.is_empty() || seq.mtp.is_some() || seq.dflash.is_some())
         {
             let result = self.verify_decode_step(&mut owned, generated, retained, stopped);
             for (id, seq) in owned {
@@ -1389,6 +1527,7 @@ impl DeviceRuntime {
             ..
         } = rt;
         let (drafts, hidden) = (*drafts, *hidden);
+        let p_min = self.draft_p_min;
         let parts: SmallVec<[usize; 3]> = owned
             .iter()
             .enumerate()
@@ -1426,6 +1565,7 @@ impl DeviceRuntime {
                     .position()
             })
             .collect();
+        let mut active: SmallVec<[bool; 3]> = smallvec::smallvec![true; w];
 
         for j in 0..drafts {
             for (r, &b) in base.iter().enumerate() {
@@ -1467,9 +1607,28 @@ impl DeviceRuntime {
             }
             .expect("draft width shapes are built with the LM head");
             drop(caches);
+            // llama.cpp's greedy p_min: a sequence whose drafted token falls
+            // below the confidence gate stops contributing proposals. The
+            // batch keeps chaining for the others; its rows just go unused.
+            let probs = if p_min > 0.0 {
+                Some(block.last_argmax_probs(&stream)?)
+            } else {
+                None
+            };
             for (r, &i) in parts.iter().enumerate() {
-                owned[i].1.draft.push(sampled[r]);
+                if active[r] {
+                    if let Some(probs) = &probs
+                        && probs[r] < p_min
+                    {
+                        active[r] = false;
+                    } else {
+                        owned[i].1.draft.push(sampled[r]);
+                    }
+                }
                 toks[r] = sampled[r];
+            }
+            if !active.iter().any(|&still| still) {
+                break;
             }
             if j + 1 < drafts {
                 let mut dst = h.slice_mut(0..w * hidden);
@@ -1517,18 +1676,53 @@ impl DeviceRuntime {
         let pass = self.verify[width]
             .as_mut()
             .expect("caller checked the verify pass exists");
-        let rows = match pass.run_batch_verify(
-            &self.stream,
-            &mut states,
-            &mut self.verify_rings[..width],
-            &ids,
-        ) {
+        // Under DFlash the verify pass doubles as the feature source for the
+        // *next* draft: its Moe waypoints at the tap layers stage the rows
+        // the post-commit injection below turns into draft-cache K/V.
+        let verify_rows: Result<Vec<i32>, RuntimeError> = match self.dflash.as_mut() {
+            Some(rt) => {
+                let mut tap_err: Option<DFlashError> = None;
+                let DFlashRuntime { fwd, tap_at, .. } = rt;
+                let stream = &self.stream;
+                let rows = pass.run_batch_verify_with_stage_waypoints(
+                    stream,
+                    &mut states,
+                    &mut self.verify_rings[..width],
+                    &ids,
+                    |layer, stage, buf| {
+                        if tap_err.is_some() || stage != WaypointStage::Moe {
+                            return;
+                        }
+                        if let Some(l) = layer
+                            && let Some(&Some(tap)) = tap_at.get(l as usize)
+                            && let Err(e) = fwd.stage_tap(stream, tap, buf, width * window)
+                        {
+                            tap_err = Some(e);
+                        }
+                    },
+                );
+                match (rows, tap_err) {
+                    (Ok(rows), None) => Ok(rows),
+                    (Ok(_), Some(e)) => Err(e.into()),
+                    (Err(e), _) => Err(e.into()),
+                }
+            }
+            None => pass
+                .run_batch_verify(
+                    &self.stream,
+                    &mut states,
+                    &mut self.verify_rings[..width],
+                    &ids,
+                )
+                .map_err(RuntimeError::from),
+        };
+        let rows = match verify_rows {
             Ok(rows) => rows,
             Err(error) => {
                 for ((_, seq), state) in owned.iter_mut().zip(states) {
                     seq.state = Some(state);
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
 
@@ -1597,6 +1791,7 @@ impl DeviceRuntime {
             // Inputs folded for real: `id_last` plus every emitted token
             // except the last (which has not been fed back yet).
             let commit_positions = emit.len();
+            let pos_before = state.position();
             {
                 let pass = self.verify[width].as_ref().expect("checked above");
                 if let Err(error) = pass.commit_verify_window(
@@ -1605,6 +1800,24 @@ impl DeviceRuntime {
                     &self.verify_rings[s],
                     commit_positions,
                 ) {
+                    result = Err(error.into());
+                    seq.state = Some(state);
+                    continue;
+                }
+            }
+
+            // DFlash: the freshly committed positions' tap rows (staged by
+            // this verify pass) become real draft-cache context, replacing
+            // whatever query-block K/V the last draft left in those slots.
+            if let Some(cache) = seq.dflash.as_mut() {
+                let rt = self
+                    .dflash
+                    .as_mut()
+                    .expect("a sequence has draft caches only when DFlash is on");
+                if let Err(error) =
+                    rt.fwd
+                        .inject_context(&stream, s * window, commit_positions, cache, pos_before)
+                {
                     result = Err(error.into());
                     seq.state = Some(state);
                     continue;
@@ -1702,6 +1915,93 @@ impl DeviceRuntime {
             self.retention_interval,
             width,
         )
+    }
+
+    /// Run one prefill piece through the prebuilt pass of its shape,
+    /// staging the DFlash tap rows from the pass's waypoints when the
+    /// sequence has a draft cache to feed. The taps are the whole of the
+    /// capture cost: one strided row copy per configured target layer,
+    /// enqueued on the same stream mid-pass.
+    fn run_prefill_piece(
+        &mut self,
+        width: usize,
+        state: &mut SequenceState,
+        piece: &[i32],
+        wants_taps: bool,
+    ) -> Result<(), RuntimeError> {
+        let Self {
+            prefill,
+            retention_prefill,
+            prefill_tails,
+            decode,
+            prefill_chunk,
+            retention_interval,
+            dflash,
+            stream,
+            ..
+        } = self;
+        let pass = prefill_pass_in(
+            prefill,
+            retention_prefill,
+            prefill_tails,
+            decode,
+            *prefill_chunk,
+            *retention_interval,
+            width,
+        );
+        match dflash.as_mut() {
+            Some(rt) if wants_taps => {
+                let mut tap_err: Option<DFlashError> = None;
+                let DFlashRuntime { fwd, tap_at, .. } = rt;
+                pass.run(stream, state, piece, |layer, buf| {
+                    if tap_err.is_some() {
+                        return;
+                    }
+                    if let Some(l) = layer
+                        && let Some(&Some(tap)) = tap_at.get(l as usize)
+                        && let Err(e) = fwd.stage_tap(stream, tap, buf, piece.len())
+                    {
+                        tap_err = Some(e);
+                    }
+                })?;
+                match tap_err {
+                    Some(e) => Err(e.into()),
+                    None => Ok(()),
+                }
+            }
+            _ => Ok(pass.run(stream, state, piece, |_, _| {})?),
+        }
+    }
+
+    /// Draft `drafts` tokens per DFlash-eligible scheduled sequence: one
+    /// drafter query pass per sequence (`[id_last, MASK × n]`, one NFE
+    /// regardless of `n`). Proposals only — the batched verify recomputes
+    /// everything, so nothing here can change what is emitted.
+    fn dflash_draft(
+        &mut self,
+        owned: &mut SmallVec<[(RequestId, RuntimeSequence); 3]>,
+    ) -> Result<(), RuntimeError> {
+        let stream = Arc::clone(&self.stream);
+        let rt = self.dflash.as_mut().expect("caller checked DFlash is on");
+        let drafts = rt.drafts;
+        for (_, seq) in owned.iter_mut() {
+            let Some(cache) = seq.dflash.as_mut() else {
+                continue;
+            };
+            let Some(last) = seq.next_token else {
+                continue;
+            };
+            let position = seq
+                .state
+                .as_ref()
+                .expect("resident sequence has state")
+                .position();
+            let ids = rt
+                .fwd
+                .draft(&stream, last, drafts, cache, position, self.draft_p_min)?;
+            seq.draft.extend_from_slice(&ids);
+        }
+        Ok(())
     }
 
     /// Catch the draft head's own KV cache up over the prefill piece that
@@ -1866,11 +2166,12 @@ impl DeviceRuntime {
                 }
                 self.mrope_host = triples;
             }
-            let run_result = self.prefill_pass(width).run(
-                &stream,
+            let wants_taps = seq.dflash.is_some();
+            let run_result = self.run_prefill_piece(
+                width,
                 seq.state.as_mut().expect("resident sequence has state"),
                 piece,
-                |_, _| {},
+                wants_taps,
             );
             {
                 let fwd = self.prefill_pass(width);
@@ -1885,6 +2186,16 @@ impl DeviceRuntime {
             // state is `seq.mtp` — disjoint fields.
             if let Some(sm) = seq.mtp.as_mut() {
                 self.mtp_catchup(width, piece, position, sm)?;
+            }
+            // Likewise the DFlash context: the tap rows this chunk's
+            // waypoints just staged become draft-cache K/V now.
+            if let Some(cache) = seq.dflash.as_mut() {
+                let stream = Arc::clone(&self.stream);
+                let rt = self
+                    .dflash
+                    .as_mut()
+                    .expect("a sequence has draft caches only when DFlash is on");
+                rt.fwd.inject_context(&stream, 0, width, cache, position)?;
             }
             offset += width;
             last_shape = width;

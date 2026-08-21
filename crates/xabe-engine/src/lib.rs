@@ -16,6 +16,7 @@
 //! [`Worker::step_device`] executes scheduler batches on that worker's card.
 
 pub mod block;
+pub mod dflash;
 pub mod engine;
 pub mod forward;
 pub mod image;

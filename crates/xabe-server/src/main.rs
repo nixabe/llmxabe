@@ -51,6 +51,8 @@ enum SpecType {
     Ngram,
     /// The model's own multi-token-prediction head.
     DraftMtp,
+    /// A trained DFlash drafter (block in-fill; needs --spec-dflash).
+    SpecDflash,
 }
 
 /// `--help` addendum for the flag clap never sees (see [`Args`] docs).
@@ -79,6 +81,10 @@ struct Args {
     /// beside the model); enables image input
     #[arg(long, env = "LLMXABE_MMPROJ")]
     mmproj: Option<PathBuf>,
+
+    /// Path to the DFlash drafter GGUF; required by --spec-type spec-dflash
+    #[arg(long, env = "LLMXABE_DFLASH")]
+    spec_dflash: Option<PathBuf>,
 
     /// Most language-model tokens one image may occupy; larger images are
     /// resized down to fit
@@ -118,9 +124,23 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SpecType::None)]
     spec_type: SpecType,
 
-    /// draft-mtp: maximum tokens the draft head proposes per step
+    /// draft-mtp/spec-dflash: maximum tokens the drafter proposes per step
     #[arg(long, default_value_t = xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP)]
     spec_draft_n_max: u32,
+
+    /// Drop any draft that comes out shorter than this (0 keeps every draft)
+    #[arg(long, default_value_t = 0)]
+    spec_draft_n_min: u32,
+
+    /// draft-mtp/spec-dflash: stop drafting at the first token whose
+    /// probability under the drafter's own head falls below this (0 disables)
+    #[arg(long, default_value_t = 0.0)]
+    spec_draft_p_min: f32,
+
+    /// Accepted for llama.cpp flag compatibility; no current speculative
+    /// decoder uses a split probability (llama.cpp's ignore it too)
+    #[arg(long, default_value_t = 0.1)]
+    spec_draft_p_split: f32,
 
     /// ngram: maximum tokens proposed from a suffix match per step
     #[arg(long, default_value_t = xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP)]
@@ -191,6 +211,24 @@ fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
 /// Resolve `--spec-type` and its family into the draft count the scheduler
 /// must budget for and the decoder a worker will run.
 fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
+    if args.spec_draft_n_min > args.spec_draft_n_max {
+        return Err(format!(
+            "--spec-draft-n-min {} exceeds --spec-draft-n-max {}: every draft would be dropped",
+            args.spec_draft_n_min, args.spec_draft_n_max
+        ));
+    }
+    if !(0.0..1.0).contains(&args.spec_draft_p_min) {
+        return Err(format!(
+            "--spec-draft-p-min {} must be in [0, 1)",
+            args.spec_draft_p_min
+        ));
+    }
+    if !(0.0..=1.0).contains(&args.spec_draft_p_split) {
+        return Err(format!(
+            "--spec-draft-p-split {} must be in [0, 1]",
+            args.spec_draft_p_split
+        ));
+    }
     match args.spec_type {
         SpecType::None => Ok((0, Speculation::None)),
         SpecType::Ngram => {
@@ -224,6 +262,23 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
                 );
             }
             Ok((args.spec_draft_n_max, Speculation::Mtp))
+        }
+        SpecType::SpecDflash => {
+            if args.spec_draft_n_max == 0 {
+                return Err("--spec-draft-n-max 0 asks the drafter to draft nothing; \
+                     use --spec-type none instead"
+                    .to_owned());
+            }
+            let Some(path) = &args.spec_dflash else {
+                return Err(
+                    "--spec-type dflash needs --spec-dflash <drafter.gguf>                      (the trained DFlash checkpoint)"
+                        .to_owned(),
+                );
+            };
+            if !path.is_file() {
+                return Err(format!("--spec-dflash {} is not a file", path.display()));
+            }
+            Ok((args.spec_draft_n_max, Speculation::DFlash))
         }
     }
 }
@@ -356,6 +411,10 @@ fn main() -> std::process::ExitCode {
             ),
             SpecType::DraftMtp => format!(
                 "{} tokens per step from the trained MTP head",
+                sched.draft_tokens_per_step(),
+            ),
+            SpecType::SpecDflash => format!(
+                "{} tokens per step from the DFlash drafter",
                 sched.draft_tokens_per_step(),
             ),
         }
@@ -493,6 +552,9 @@ fn main() -> std::process::ExitCode {
         prefill_chunk: args.prefill_chunk,
         snapshot_slots: slots_per_worker,
         speculation,
+        dflash_gguf: args.spec_dflash.clone(),
+        draft_n_min: args.spec_draft_n_min as usize,
+        draft_p_min: args.spec_draft_p_min,
         mmproj: args.mmproj.clone(),
         // The runtime's encode buffers are sized in pre-merge patches; the
         // serving ceiling is in post-merge tokens.
@@ -552,6 +614,7 @@ mod tests {
                 SpecType::None => "none",
                 SpecType::Ngram => "ngram",
                 SpecType::DraftMtp => "draft-mtp",
+                SpecType::SpecDflash => "spec-dflash",
             },
         ])
     }

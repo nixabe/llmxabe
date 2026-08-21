@@ -380,6 +380,17 @@ impl KvCache {
         max_seq: usize,
     ) -> Result<Self, AttentionBlockError> {
         let kv_dim = config.attention.kv_heads as usize * config.attention.head_dim as usize;
+        Self::with_kv_dim(stream, kv_dim, max_seq)
+    }
+
+    /// [`Self::new`] for a cache whose per-token width is not the target
+    /// model's — the DFlash drafter's layers cache `8 heads × 128` where the
+    /// target caches `2 × 256`.
+    pub fn with_kv_dim(
+        stream: &Arc<CudaStream>,
+        kv_dim: usize,
+        max_seq: usize,
+    ) -> Result<Self, AttentionBlockError> {
         Ok(Self {
             k: stream.alloc_zeros::<u16>(max_seq * kv_dim)?,
             v: stream.alloc_zeros::<u16>(max_seq * kv_dim)?,
@@ -413,6 +424,14 @@ impl KvCache {
     /// The cached values, same layout, not normed and not rotated.
     pub fn values(&self) -> &CudaSlice<u16> {
         &self.v
+    }
+
+    /// Both cache halves mutably, for a caller appending through
+    /// `AttentionKernels::append_kv` directly rather than through
+    /// [`GatedAttentionBlock`] — the DFlash drafter, whose injection path
+    /// writes projected context K/V here.
+    pub(crate) fn kv_mut(&mut self) -> (&mut CudaSlice<u16>, &mut CudaSlice<u16>) {
+        (&mut self.k, &mut self.v)
     }
 
     pub(crate) fn snapshot_range_into(
