@@ -6,7 +6,6 @@ use std::process::ExitCode;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_cache::radix::{BlockHash, ROOT_HASH, hash_block};
 use xabe_engine::{Engine, RouterConfig, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::SchedulerConfig;
@@ -15,18 +14,6 @@ use xabe_sched::request::{NewRequest, RequestId};
 const DEFAULT_MODEL_PATH: &str =
     "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 const OUTPUT: u32 = 4;
-
-fn hashes(tokens: &[i32], block_size: usize) -> Vec<BlockHash> {
-    let mut parent = ROOT_HASH;
-    tokens
-        .chunks(block_size)
-        .map(|chunk| {
-            let chunk = chunk.iter().map(|&token| token as u32).collect::<Vec<_>>();
-            parent = hash_block(parent, &chunk);
-            parent
-        })
-        .collect()
-}
 
 fn prompt(id: u64, tokens: usize, vocab: u32) -> Vec<i32> {
     (0..tokens)
@@ -39,10 +26,7 @@ fn admit(
     id: u64,
     tokens: usize,
     model: &ModelConfig,
-    block_size: usize,
 ) -> Result<WorkerId, String> {
-    let prompt = prompt(id, tokens, model.vocab_size);
-    let hashes = hashes(&prompt, block_size);
     engine
         .place_tokens(
             NewRequest {
@@ -50,8 +34,7 @@ fn admit(
                 prompt_tokens: tokens as u32,
                 max_output_tokens: OUTPUT,
             },
-            prompt,
-            &hashes,
+            prompt(id, tokens, model.vocab_size),
         )
         .map(|placement| placement.worker)
         .map_err(|failure| failure.to_string())
@@ -82,7 +65,7 @@ fn main() -> ExitCode {
 
     let mut placements = BTreeMap::<WorkerId, usize>::new();
     for id in 1..=6 {
-        match admit(&mut engine, id, 128, &model, block_size as usize) {
+        match admit(&mut engine, id, 128, &model) {
             Ok(worker) => *placements.entry(worker).or_default() += 1,
             Err(failure) => {
                 error!("initial admission failed: {failure}");
@@ -103,7 +86,7 @@ fn main() -> ExitCode {
         .sum::<usize>();
 
     for id in 7..=9 {
-        match admit(&mut engine, id, 512, &model, block_size as usize) {
+        match admit(&mut engine, id, 512, &model) {
             Ok(worker) => *placements.entry(worker).or_default() += 1,
             Err(failure) => {
                 error!("mixed admission failed: {failure}");

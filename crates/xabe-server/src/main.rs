@@ -241,7 +241,6 @@ fn main() -> std::process::ExitCode {
 
     // 6. Engine. One worker per device, sharing one prefix tree.
     let attention_blocks = args.total_context / cache.attention_block_size();
-    let attention_block_size = cache.attention_block_size() as usize;
     let ordinals: Vec<usize> = devices.iter().map(|d| d.ordinal).collect();
     let mut engine = Engine::new(
         &ordinals,
@@ -278,13 +277,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(http::serve(
-        engine,
-        tokenizer,
-        attention_block_size,
-        &address,
-        args.api_key,
-    )) {
+    match runtime.block_on(http::serve(engine, tokenizer, &address, args.api_key)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(failure) => {
             error!("server           FAIL — {failure}");

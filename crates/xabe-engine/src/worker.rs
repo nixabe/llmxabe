@@ -29,7 +29,7 @@ use xabe_sched::scheduler::Scheduler;
 
 use crate::router::WorkerLoad;
 use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeError};
-use crate::state::SequenceSnapshot;
+use crate::state::{SequenceSnapshot, SnapshotSlots};
 
 #[derive(Debug)]
 pub enum WorkerExecutionError {
@@ -274,6 +274,14 @@ impl Worker {
 
     pub fn is_device_bound(&self) -> bool {
         self.runtime.is_some()
+    }
+
+    /// How much room this worker's pinned snapshot arena has left, or `None`
+    /// for a host-only worker, which has no arena to run out of.
+    pub fn snapshot_slots(&self) -> Option<&SnapshotSlots> {
+        self.runtime
+            .as_ref()
+            .map(crate::runtime::DeviceRuntimeHandle::snapshot_slots)
     }
 
     /// Admit both scheduler metadata and the actual prompt token ids.

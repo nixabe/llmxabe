@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use smallvec::SmallVec;
+use tracing::{debug, warn};
 
 use xabe_cache::config::CacheConfig;
 use xabe_cache::pool::BlockId;
@@ -20,6 +21,7 @@ use xabe_sched::config::SchedulerConfig;
 use xabe_sched::error::AdmissionError;
 use xabe_sched::request::{NewRequest, RequestId};
 
+use crate::prefix::{SequenceChain, SharedSnapshots};
 use crate::router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 use crate::runtime::{DeviceStep, RuntimeError};
 use crate::state::SequenceSnapshot;
@@ -97,12 +99,6 @@ pub struct Placement {
     pub score: f64,
 }
 
-/// Whether a chain of `block_hashes` names every attention block a snapshot
-/// at `position` covers.
-fn hashes_reach(position: usize, block_size: u32, block_hashes: usize) -> bool {
-    block_hashes >= position / block_size as usize
-}
-
 /// Three workers, one router, one shared prefix cache.
 pub struct Engine {
     workers: Vec<Worker>,
@@ -114,10 +110,19 @@ pub struct Engine {
     /// See `docs/ARCHITECTURE.md`.
     prefix_tree: Arc<RadixTree>,
     router: RouterConfig,
-    snapshots: Arc<RwLock<HashMap<BlockHash, Arc<SequenceSnapshot>>>>,
-    request_hashes: HashMap<(WorkerId, RequestId), Vec<BlockHash>>,
+    snapshots: RwLock<SharedSnapshots>,
+    /// What names each live sequence's blocks, extended as it generates.
+    request_chains: HashMap<(WorkerId, RequestId), SequenceChain>,
     request_refs: HashMap<(WorkerId, RequestId), Vec<BlockHash>>,
     max_prefix_nodes: usize,
+    block_size: u32,
+    /// Snapshot slots each worker must keep free for its own live sequences.
+    ///
+    /// One per concurrent sequence, which is exactly enough that every live
+    /// sequence can take its next snapshot the moment it reaches a retention
+    /// boundary. Below that, the shared cache is holding slots a live
+    /// sequence is about to need.
+    slot_reserve: usize,
 }
 
 impl Engine {
@@ -153,10 +158,12 @@ impl Engine {
             workers,
             prefix_tree,
             router,
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
-            request_hashes: HashMap::new(),
+            snapshots: RwLock::new(SharedSnapshots::default()),
+            request_chains: HashMap::new(),
             request_refs: HashMap::new(),
             max_prefix_nodes: attention_blocks_per_worker as usize,
+            block_size: cache.attention_block_size(),
+            slot_reserve: gdn_slots_per_worker as usize,
         }
     }
 
@@ -195,7 +202,7 @@ impl Engine {
         // a worker that cannot actually deliver it. See `docs/CACHE.md`.
         let usable = matched
             .gdn_snapshot_hash
-            .filter(|hash| self.snapshots.read().contains_key(hash))
+            .filter(|&hash| self.snapshots.read().contains(hash))
             .map_or(0, |_| matched.gdn_matched_tokens);
         self.workers
             .iter()
@@ -256,22 +263,28 @@ impl Engine {
     }
 
     /// Route and admit a request together with its tokenized prompt.
+    ///
+    /// The block hashes are derived here, from these tokens, rather than
+    /// supplied: they are what the engine will later file this sequence's
+    /// snapshots under, and a caller-supplied chain that disagreed with the
+    /// tokens would publish a snapshot under a prefix it does not describe.
+    /// See [`SequenceChain`].
     pub fn place_tokens(
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
-        block_hashes: &[BlockHash],
     ) -> Result<Placement, EngineExecutionError> {
         let budget = self
             .workers
             .first()
             .map(|worker| worker.scheduler().config().token_budget())
             .unwrap_or(0);
-        let matched = self.prefix_tree.match_prefix(block_hashes);
+        let chain = SequenceChain::new(self.block_size, &prompt);
+        let matched = self.prefix_tree.match_prefix(chain.hashes());
         let snapshot = matched
             .gdn_snapshot_hash
-            .and_then(|hash| self.snapshots.read().get(&hash).cloned());
-        let loads = self.score_workers(&req, block_hashes);
+            .and_then(|hash| self.snapshots.write().take_for_reuse(hash));
+        let loads = self.score_workers(&req, chain.hashes());
         let Routed {
             worker,
             score,
@@ -288,19 +301,13 @@ impl Engine {
                 .admit_tokens(req, prompt)
         }
         .map_err(|source| EngineExecutionError::Worker { worker, source })?;
-        self.request_hashes
-            .insert((worker, request), block_hashes.to_vec());
-        let referenced = matched_tokens as usize
-            / self
-                .worker(worker)
-                .expect("router returned an existing worker")
-                .cache_config()
-                .attention_block_size() as usize;
+        let referenced = matched_tokens as usize / self.block_size as usize;
         if referenced > 0 {
-            let hashes = block_hashes[..referenced].to_vec();
+            let hashes = chain.hashes()[..referenced].to_vec();
             self.prefix_tree.incr_ref_chain(&hashes);
             self.request_refs.insert((worker, request), hashes);
         }
+        self.request_chains.insert((worker, request), chain);
         Ok(Placement {
             worker,
             request,
@@ -318,7 +325,7 @@ impl Engine {
         }) else {
             return false;
         };
-        self.request_hashes.remove(&(worker, request));
+        self.request_chains.remove(&(worker, request));
         if let Some(hashes) = self.request_refs.remove(&(worker, request)) {
             self.prefix_tree.decr_ref_chain(&hashes);
         }
@@ -326,40 +333,19 @@ impl Engine {
             .is_some_and(|worker| worker.cancel(request))
     }
 
-    /// Publish a worker's current retained state into the shared host cache.
+    /// Publish a snapshot into the shared prefix tree, named by the chain of
+    /// the sequence that produced it.
     ///
-    /// Reports whether the snapshot was published; see [`Self::install_snapshot`]
-    /// for the case where it cannot be.
-    pub fn publish_snapshot(
-        &mut self,
-        worker: WorkerId,
-        request: RequestId,
-        block_hashes: &[BlockHash],
-    ) -> Result<(Arc<SequenceSnapshot>, bool), EngineExecutionError> {
-        let source = self
-            .worker(worker)
-            .ok_or(EngineExecutionError::MissingWorker(worker))?;
-        let snapshot = source
-            .snapshot(request)
-            .map_err(|source| EngineExecutionError::Worker { worker, source })?;
-        let published = self.install_snapshot(worker, Arc::clone(&snapshot), block_hashes)?;
-        Ok((snapshot, published))
-    }
-
-    /// Publish a snapshot into the shared prefix tree, keyed by the caller's
-    /// block hashes.
-    ///
-    /// Returns `false` when `block_hashes` does not reach the snapshot's
-    /// position. That is not a failure: a sequence grows past the prompt it
-    /// was admitted with, and the caller only ever supplied hashes for the
-    /// prompt, so blocks made of generated tokens have no name to file them
-    /// under. Sharing them would mean inventing one. The snapshot is simply
-    /// not shared, and the sequence keeps using it locally.
+    /// Returns `false` when the snapshot was not shared. That is a normal
+    /// outcome, not a failure — the sequence keeps using it locally either
+    /// way — and it happens when the chain cannot name the snapshot's
+    /// position, when the chain and the runtime disagree about what token
+    /// followed it, or when the worker's snapshot arena has no room to spare.
     fn install_snapshot(
         &self,
         worker: WorkerId,
         snapshot: Arc<SequenceSnapshot>,
-        block_hashes: &[BlockHash],
+        chain: &SequenceChain,
     ) -> Result<bool, EngineExecutionError> {
         let source = self
             .worker(worker)
@@ -369,29 +355,71 @@ impl Engine {
         if position == 0 || !(position as u32).is_multiple_of(interval) {
             return Err(EngineExecutionError::SnapshotNotRetained { position, interval });
         }
-        let block_size = source.cache_config().attention_block_size();
-        if !hashes_reach(position, block_size, block_hashes.len()) {
+        let Some(hashes) = chain.hashes_for(position) else {
+            debug!(
+                position,
+                named = chain.position(),
+                "sequence has not named this snapshot's position yet; not sharing it"
+            );
+            return Ok(false);
+        };
+
+        // The chain is assembled here, from the tokens the runtime reported;
+        // the snapshot's `next_token` was recorded there, by the runtime, at
+        // the same position. They are two independent records of the same
+        // fact, so comparing them catches a chain that has drifted out of
+        // step with the sequence it names — the one failure that would
+        // otherwise be silent, and would resume a later request from a prefix
+        // it never sent. It answers only for snapshots past the prompt, which
+        // are exactly the ones the chain had to grow to reach.
+        if let (Some(followed), Some(predicted)) =
+            (chain.generated_token_at(position), snapshot.next_token())
+            && followed != predicted as u32
+        {
+            warn!(
+                position,
+                followed,
+                predicted,
+                "prefix chain disagrees with the runtime about this sequence; not sharing it"
+            );
             return Ok(false);
         }
-        let blocks = position as u32 / block_size;
-        let prefix: Vec<PrefixBlock> = block_hashes[..blocks as usize]
+
+        // Every published snapshot pins at least one of this worker's arena
+        // slots until it is dropped. Yield before publishing rather than let
+        // a live sequence hit `SnapshotArenaExhausted`, which would switch
+        // that sequence's retention off permanently.
+        if let Some(slots) = source.snapshot_slots() {
+            let slots = slots.clone();
+            let reserve = self.slot_reserve;
+            if !self
+                .snapshots
+                .write()
+                .reclaim_for(worker, reserve, || slots.available())
+            {
+                return Ok(false);
+            }
+        }
+
+        let blocks = hashes.len();
+        let prefix: Vec<PrefixBlock> = hashes
             .iter()
             .enumerate()
             .map(|(index, &hash)| PrefixBlock {
                 hash,
                 block: BlockId(index as u32),
-                gdn_snapshot: (index + 1 == blocks as usize).then_some(BlockId(0)),
+                gdn_snapshot: (index + 1 == blocks).then_some(BlockId(0)),
             })
             .collect();
         let leaf = prefix.last().expect("non-zero snapshot has a leaf").hash;
         self.prefix_tree.insert(&prefix);
-        self.snapshots.write().insert(leaf, snapshot);
+        self.snapshots.write().publish(leaf, worker, snapshot);
         let excess = self.prefix_tree.len().saturating_sub(self.max_prefix_nodes);
         if excess > 0 {
             let evicted = self.prefix_tree.evict_unreferenced_entries(excess);
             let mut snapshots = self.snapshots.write();
             for entry in evicted {
-                snapshots.remove(&entry.hash);
+                snapshots.remove(entry.hash);
             }
         }
         Ok(true)
@@ -421,15 +449,28 @@ impl Engine {
                 .collect::<Result<SmallVec<[_; 3]>, _>>()
         })?;
         for (worker, step) in &mut steps {
-            for (request, snapshot) in std::mem::take(&mut step.retained) {
-                if let Some(hashes) = self.request_hashes.get(&(*worker, request)) {
-                    self.install_snapshot(*worker, snapshot, hashes)?;
+            // Extend the chains *before* installing this step's snapshots,
+            // and the order is load-bearing rather than incidental.
+            //
+            // Within a step the runtime interleaves the two: a speculative
+            // round retains at position p and then emits the token at p, and
+            // the next round does the same at p+1. Taking the generated
+            // tokens first means every chain has reached at least the deepest
+            // position this step retained, and `hashes_for` reads only the
+            // blocks below that — so no snapshot is ever named by a chain
+            // that has not yet caught up to it.
+            for (request, token) in &step.generated {
+                if let Some(chain) = self.request_chains.get_mut(&(*worker, *request)) {
+                    chain.push(*token);
                 }
             }
-            // Snapshots past the prompt are retained on the worker but not
-            // shared; see `install_snapshot`.
+            for (request, snapshot) in std::mem::take(&mut step.retained) {
+                if let Some(chain) = self.request_chains.get(&(*worker, request)) {
+                    self.install_snapshot(*worker, snapshot, chain)?;
+                }
+            }
             for request in &step.completed {
-                self.request_hashes.remove(&(*worker, *request));
+                self.request_chains.remove(&(*worker, *request));
                 if let Some(hashes) = self.request_refs.remove(&(*worker, *request)) {
                     self.prefix_tree.decr_ref_chain(&hashes);
                 }
@@ -444,6 +485,7 @@ impl core::fmt::Debug for Engine {
         f.debug_struct("Engine")
             .field("workers", &self.workers.len())
             .field("prefix_tree_nodes", &self.prefix_tree.len())
+            .field("shared_snapshots", &self.snapshots.read().len())
             .field("router", &self.router)
             .finish()
     }
@@ -562,22 +604,25 @@ mod tests {
         );
     }
     #[test]
-    fn a_snapshot_past_the_prompt_has_no_name_to_be_filed_under() {
-        // A sequence generating past its first retention boundary produces a
-        // snapshot the prompt's hashes cannot name: a 20-token prompt yields
-        // one hash, and a snapshot at 2048 covers eight blocks. Treating that
-        // as an engine error failed the whole scheduler step, which drops
-        // *every* in-flight request on the worker — one long generation
-        // taking out its neighbours.
-        let block = CacheConfig::with_defaults(ModelConfig::qwen3_6_35b_a3b())
-            .unwrap()
-            .attention_block_size();
-        assert!(
-            !hashes_reach(2048, block, 1),
-            "a one-block prompt cannot name a snapshot eight blocks in"
+    fn a_generating_sequence_grows_a_name_for_the_snapshots_it_reaches() {
+        // The limitation this replaced: a 20-token prompt yields no complete
+        // block, so the snapshot at 2048 had nothing to be filed under and
+        // the reply was never shareable. Now the chain grows with the reply,
+        // so the boundary the sequence generates through is named by the time
+        // it gets there.
+        let cache = CacheConfig::with_defaults(ModelConfig::qwen3_6_35b_a3b()).unwrap();
+        let block = cache.attention_block_size();
+        let interval = cache.gdn_retention_interval() as usize;
+
+        let mut chain = SequenceChain::new(block, &[7; 20]);
+        assert_eq!(chain.hashes_for(interval), None, "the prompt is 20 tokens");
+
+        chain.extend((0..interval as i32).map(|token| token % 1000));
+        assert_eq!(
+            chain.hashes_for(interval).map(<[u64]>::len),
+            Some(interval / block as usize),
+            "generating past the boundary names every block below it"
         );
-        assert!(hashes_reach(2048, block, 8));
-        assert!(hashes_reach(2048, block, 9));
     }
 
     #[test]

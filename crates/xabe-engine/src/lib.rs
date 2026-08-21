@@ -18,6 +18,7 @@
 pub mod block;
 pub mod engine;
 pub mod forward;
+pub(crate) mod prefix;
 pub mod router;
 pub mod runtime;
 pub mod speculative;
@@ -29,6 +30,6 @@ pub mod worker;
 pub use engine::{Engine, EngineExecutionError, Placement, PlacementError};
 pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 pub use runtime::{DeviceRuntime, DeviceStep, RuntimeError};
-pub use state::{SequenceSnapshot, SequenceState, StateError};
+pub use state::{SequenceSnapshot, SequenceState, SnapshotSlots, StateError};
 pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
 pub use worker::{Worker, WorkerExecutionError, WorkerId};

@@ -22,7 +22,7 @@ use xabe_sched::ngram::{NgramConfig, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
-use crate::state::{SequenceSnapshot, SnapshotArena};
+use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots};
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
 
 /// Pinned snapshot capacity per worker. One default-retention slot is
@@ -223,6 +223,7 @@ enum RuntimeCommand {
 pub struct DeviceRuntimeHandle {
     commands: SyncSender<RuntimeCommand>,
     thread: Option<JoinHandle<()>>,
+    slots: SnapshotSlots,
 }
 
 impl DeviceRuntimeHandle {
@@ -238,7 +239,7 @@ impl DeviceRuntimeHandle {
         stop_on_eos: bool,
     ) -> Result<Self, RuntimeError> {
         let (commands, receiver) = sync_channel::<RuntimeCommand>(1);
-        let (ready_tx, ready_rx) = sync_channel(0);
+        let (ready_tx, ready_rx) = sync_channel::<Result<SnapshotSlots, RuntimeError>>(0);
         let thread = std::thread::Builder::new()
             .name(format!("xabe-gpu-{device_ordinal}"))
             .spawn(move || {
@@ -254,7 +255,7 @@ impl DeviceRuntimeHandle {
                 );
                 match runtime {
                     Ok(mut runtime) => {
-                        if ready_tx.send(Ok(())).is_err() {
+                        if ready_tx.send(Ok(runtime.snapshot_arena.slots())).is_err() {
                             return;
                         }
                         while let Ok(command) = receiver.recv() {
@@ -292,13 +293,19 @@ impl DeviceRuntimeHandle {
                 }
             })
             .map_err(|_| RuntimeError::RuntimeStopped)?;
-        ready_rx
+        let slots = ready_rx
             .recv()
             .map_err(|_| RuntimeError::RuntimeStopped)??;
         Ok(Self {
             commands,
             thread: Some(thread),
+            slots,
         })
+    }
+
+    /// How much room this device's pinned snapshot arena has left.
+    pub fn snapshot_slots(&self) -> &SnapshotSlots {
+        &self.slots
     }
 
     fn request<T>(

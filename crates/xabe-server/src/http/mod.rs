@@ -54,7 +54,6 @@ struct AppState {
     tokenizer: Arc<Tokenizer>,
     clients: ClientMap,
     next_id: Arc<AtomicU64>,
-    block_size: usize,
     /// `None` leaves the server open, which is what it was before an API key
     /// could be configured.
     api_key: Option<Arc<str>>,
@@ -199,7 +198,6 @@ fn scheduler_loop(state: AppState) {
 pub async fn serve(
     engine: Engine,
     tokenizer: Tokenizer,
-    block_size: usize,
     address: &str,
     api_key: Option<String>,
 ) -> Result<(), String> {
@@ -219,7 +217,6 @@ pub async fn serve(
         tokenizer: Arc::new(tokenizer),
         clients: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
-        block_size,
         api_key: api_key.map(Arc::from),
         think_close_token,
         model: Arc::from(DEFAULT_MODEL),

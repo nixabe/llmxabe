@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use axum::http::StatusCode;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
-use xabe_cache::radix::{BlockHash, ROOT_HASH, hash_block};
+use tracing::debug;
 use xabe_engine::Engine;
 use xabe_sched::request::{NewRequest, RequestId};
 
@@ -63,18 +63,6 @@ pub(crate) struct GenerationSpec {
     /// answer. A chat reply should not begin with the newlines that separate
     /// it from the markup; a raw completion should be returned untouched.
     pub(crate) trim_spans: bool,
-}
-
-/// Chain the prompt's block hashes so the shared prefix tree can match them.
-fn prompt_hashes(tokens: &[u32], block_size: usize) -> Vec<BlockHash> {
-    let mut parent = ROOT_HASH;
-    tokens
-        .chunks(block_size)
-        .map(|block| {
-            parent = hash_block(parent, block);
-            parent
-        })
-        .collect()
 }
 
 /// Cancels its request unless generation reached a terminal state first.
@@ -252,8 +240,6 @@ impl Generation {
             )
         })?;
         let tokens = spec.prompt.iter().map(|&token| token as i32).collect();
-        let hashes = prompt_hashes(&spec.prompt, state.block_size);
-
         let id = RequestId(state.next_id.fetch_add(1, Ordering::Relaxed));
         let (sender, receiver) = mpsc::unbounded_channel();
         state
@@ -268,16 +254,28 @@ impl Generation {
                 max_output_tokens: spec.max_tokens,
             },
             tokens,
-            &hashes,
         );
-        if let Err(failure) = placement {
-            state
-                .clients
-                .lock()
-                .expect("client map poisoned")
-                .remove(&id);
-            return Err(ApiError::unavailable(dialect, failure.to_string()));
-        }
+        let placement = match placement {
+            Ok(placement) => placement,
+            Err(failure) => {
+                state
+                    .clients
+                    .lock()
+                    .expect("client map poisoned")
+                    .remove(&id);
+                return Err(ApiError::unavailable(dialect, failure.to_string()));
+            }
+        };
+        // How much of this prompt the shared prefix cache already held is the
+        // one number that says whether the cache is earning its keep, and it
+        // is invisible from the response.
+        debug!(
+            request = id.0,
+            worker = %placement.worker,
+            prompt_tokens,
+            reused_prefix_tokens = placement.reusable_prefix_tokens,
+            "admitted"
+        );
 
         Ok(Self {
             id,
@@ -437,17 +435,6 @@ impl Generation {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hashes_are_chained_at_natural_attention_blocks() {
-        let tokens = (0..10).collect::<Vec<_>>();
-        let hashes = prompt_hashes(&tokens, 4);
-        assert_eq!(hashes.len(), 3);
-        let first = hash_block(ROOT_HASH, &tokens[..4]);
-        assert_eq!(hashes[0], first);
-        assert_eq!(hashes[1], hash_block(first, &tokens[4..8]));
-        assert_eq!(hashes[2], hash_block(hashes[1], &tokens[8..]));
-    }
 
     #[test]
     fn a_partial_stop_sequence_is_held_back() {

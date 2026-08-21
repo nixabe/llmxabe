@@ -144,6 +144,35 @@ struct LeasePool<T> {
     capacity: usize,
 }
 
+/// How much room a worker's pinned snapshot arena has left.
+///
+/// The arena is the scarce resource behind prefix sharing: a live sequence
+/// that cannot check out a slot stops retaining for the rest of its life, so
+/// anything holding snapshots for later has to be able to see how close it is
+/// to causing that.
+#[derive(Clone)]
+pub struct SnapshotSlots(Arc<LeasePool<SnapshotBuffers>>);
+
+impl SnapshotSlots {
+    /// Slots a live sequence could take a snapshot into right now.
+    pub fn available(&self) -> usize {
+        self.0.available()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.0.capacity
+    }
+}
+
+impl core::fmt::Debug for SnapshotSlots {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SnapshotSlots")
+            .field("available", &self.available())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
 impl<T> LeasePool<T> {
     fn new(free: Vec<T>) -> Arc<Self> {
         let capacity = free.len();
@@ -151,6 +180,11 @@ impl<T> LeasePool<T> {
             free: Mutex::new(free),
             capacity,
         })
+    }
+
+    /// Slots not currently leased out.
+    fn available(&self) -> usize {
+        self.free.lock().expect("snapshot arena poisoned").len()
     }
 
     fn checkout(self: &Arc<Self>) -> Option<Lease<T>> {
@@ -280,6 +314,16 @@ impl SnapshotArena {
 
     pub(crate) fn bytes_per_slot(&self) -> usize {
         self.layout.attention_bytes() + self.layout.gdn_bytes()
+    }
+
+    /// A view of this arena's free-slot count, shareable with the engine
+    /// thread.
+    ///
+    /// Handed out rather than answered over the runtime's command channel so
+    /// the engine can ask without waiting on the GPU thread, which is the
+    /// thread it would be asking on behalf of.
+    pub(crate) fn slots(&self) -> SnapshotSlots {
+        SnapshotSlots(Arc::clone(&self.slots))
     }
 }
 
