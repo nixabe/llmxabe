@@ -156,9 +156,15 @@ engine below it needs a GPU and a 30 GiB model and so cannot be stood up in a
   `/v1/messages/count_tokens`.
 - API-key authentication: accepted via both header spellings, refused with
   each dialect's own `401` envelope, and open when no key is set.
-- Every refusal in [API.md](API.md): tools, `n > 1`, a `tool` role, a late
-  system message, an image content part, `previous_response_id`, malformed
-  JSON.
+- Every refusal in [API.md](API.md): `n > 1`, a forcing `tool_choice`, a
+  late system message, an image content part, `previous_response_id`,
+  malformed JSON.
+- Sampling: `temperature: 0` still greedy and exact; equal seeds replaying
+  byte-identical completions on chat and raw completions; different seeds
+  diverging; out-of-range `temperature` refused.
+- Tool calling in all three chat dialects, streaming and not: calls parsed
+  with schema-typed arguments, `tool_calls` / `tool_use` / `function_call`
+  wire shapes, and tool-result round-trips answered from the result.
 - Three concurrent streams on one worker, each returning its own correct
   answer.
 - Disconnect cancellation: a prompt that runs 42 s to `max_tokens` leaves the
