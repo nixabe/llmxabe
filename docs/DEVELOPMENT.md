@@ -26,14 +26,21 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The host-side crates — `xabe-gguf`, `xabe-model`, `xabe-cache`, `xabe-sched`,
-`xabe-kernels` — need no GPU and no CUDA toolkit. This is deliberate: the
-correctness work that matters most (kernel references, cache geometry,
-scheduler invariants) must not be gated on device access.
+No crate needs a GPU or a CUDA toolkit to build and test, including
+`xabe-cuda`. This is deliberate: the correctness work that matters most
+(kernel references, cache geometry, scheduler invariants) must not be gated on
+device access.
 
-`xabe-cuda` needs CUDA 12.x. It builds against `cudarc` with the `cuda-12040`
-feature and `fallback-dynamic-loading`, so it links against whatever driver is
-present at runtime.
+`xabe-cuda` has no build script, and builds against `cudarc` with the
+`cuda-12040` feature, `fallback-dynamic-loading` and `nvrtc` — so it needs no
+headers and no `nvcc` at build time, resolving the driver and compiling
+kernels at runtime instead. Nothing is needed on `PATH` to compile it.
+
+That property is load-bearing rather than incidental, and it is easy to break
+by accident. Everything device-gated funnels through
+`xabe_cuda::device::driver_available`, which has to answer `false` — not
+abort — on a machine with no driver, because `cudarc` panics rather than
+erroring when it cannot find `libcuda` at all.
 
 ## Reference checkouts
 

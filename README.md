@@ -118,13 +118,13 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The host-side crates build and test without a GPU or CUDA toolkit. Tests that
-need a device detect its absence and skip, reporting that they skipped. Tests
-that read the real model file look for it at `$LLMXABE_MODEL`, falling back to
-the path in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and skip if it is
-absent.
+The whole workspace builds and tests without a GPU or CUDA toolkit — that is
+what CI runs. Tests that need a device detect its absence and skip, reporting
+that they skipped. Tests that read the real model file look for it at
+`$LLMXABE_MODEL`, falling back to the path in
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), and skip if it is absent.
 
-CUDA work additionally needs the CUDA 12.x toolkit on `PATH`:
+Running device work needs a Turing-or-later GPU and its driver at runtime:
 
 ```sh
 cargo run -p xabe-cuda --bin probe     # device inventory and sm_75 gate

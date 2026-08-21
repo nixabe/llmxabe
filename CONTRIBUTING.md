@@ -8,12 +8,13 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The host-side crates need no GPU and no CUDA toolkit. Everything under
-`xabe-gguf`, `xabe-model`, `xabe-cache`, `xabe-sched`, and `xabe-kernels`
-builds and tests on any machine.
+No part of the workspace needs a GPU or a CUDA toolkit to build and test.
+`xabe-cuda` has no build script and reaches the driver and NVRTC by dynamic
+loading, so every crate compiles on any machine and the whole suite runs
+there — which is what CI does.
 
-For device work you additionally need CUDA 12.x on `PATH` and a Turing-or-later
-GPU. Check what the host offers:
+*Running* device work needs a Turing-or-later GPU with its driver, at runtime.
+Check what the host offers:
 
 ```sh
 cargo run -p xabe-cuda --bin probe

@@ -7,23 +7,35 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # The release profile carries `debug = 1` so local profiling has symbols.
+  # CI never opens a profiler and pays for them in disk and cache size, so
+  # drop them. Optimization settings are untouched: this is the same build,
+  # without the symbols.
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
-  # The host-side crates are the ones that must stay buildable and testable
-  # without a GPU or the CUDA toolkit. That is a design property worth
-  # enforcing, not just a convenience: the correctness work that matters most
-  # (kernel references, cache geometry, scheduler invariants) must never be
-  # gated on device access.
-  host:
-    name: host-side crates (no GPU)
+  # The whole workspace must stay buildable and testable without a GPU or the
+  # CUDA toolkit. That is a design property worth enforcing, not just a
+  # convenience: the correctness work that matters most (kernel references,
+  # cache geometry, scheduler invariants) must never be gated on device
+  # access, and every test that does need a device skips and says so.
+  #
+  # No CUDA toolkit is installed because none is needed. `xabe-cuda` has no
+  # build script, and cudarc is built with `fallback-dynamic-loading` and
+  # `nvrtc`, so it resolves the driver at runtime and compiles kernels at
+  # runtime. Nothing wants a header or nvcc at build time.
+  workspace:
+    name: workspace (no GPU)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # Every component rust-toolchain.toml pins, so the action picks a
+      # nightly that actually has all of them — nightlies routinely ship
+      # without one, and cargo would then fail on the pin rather than here.
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-src
 
       - uses: Swatinem/rust-cache@v2
 
@@ -31,55 +43,21 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: |
-          cargo clippy \
-            -p xabe-gguf -p xabe-model -p xabe-cache \
-            -p xabe-sched -p xabe-kernels -p xabe-engine \
-            --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Release, matching AGENTS.md: a debug-build test run is not a signal.
+      #
+      # Tests that need a device, the 32 GB model file, or a golden capture
+      # skip themselves and print why. A skip is not a pass (CONTRIBUTING.md),
+      # so a green run here means the host-side contracts hold — not that the
+      # kernels were verified.
       - name: Tests
-        run: |
-          cargo test \
-            -p xabe-gguf -p xabe-model -p xabe-cache \
-            -p xabe-sched -p xabe-kernels -p xabe-engine
-        # Tests that need the 32 GB model file skip themselves and say so.
-        # A skip is not a pass; see CONTRIBUTING.md.
+        run: cargo test --workspace --release
 
       - name: Docs build without warnings
-        run: |
-          cargo doc --no-deps \
-            -p xabe-gguf -p xabe-model -p xabe-cache \
-            -p xabe-sched -p xabe-kernels -p xabe-engine
+        run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-
-  # xabe-cuda needs the CUDA toolkit to build, but not a device: cudarc is
-  # built with fallback-dynamic-loading, so it links against whatever driver
-  # exists at runtime. The milestone-00 spike inside it skips without a GPU.
-  cuda:
-    name: xabe-cuda + xabe-server (build only)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: Jimver/cuda-toolkit@v0.2.19
-        id: cuda
-        with:
-          cuda: "12.4.0"
-          method: network
-          sub-packages: '["nvcc", "cudart", "nvrtc", "nvrtc_dev", "cublas", "cublas_dev"]'
-
-      - name: Clippy
-        run: cargo clippy -p xabe-cuda -p xabe-server --all-targets -- -D warnings
-
-      - name: Build
-        run: cargo build -p xabe-cuda -p xabe-server
 
   # The design plan is a local draft and must never enter the tree; likewise
   # model weights, which are 32 GB.
@@ -87,7 +65,7 @@ jobs:
     name: repository hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: No design plan committed
         run: |
