@@ -22,8 +22,13 @@ use xabe_sched::ngram::{NgramConfig, NgramConfigError, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
+use crate::image::{
+    ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
+    validate_placements,
+};
 use crate::sampling::{Sampler, SamplingParams};
 use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots};
+use crate::vision::VisionForward;
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
 
 /// Pinned snapshot capacity per worker when no budget is given. One
@@ -34,12 +39,18 @@ use crate::{DeviceWeights, LoadError, SequenceState, StateError};
 /// `--cache-ram` overrides it; see `docs/CLI.md`.
 pub const DEFAULT_SNAPSHOT_SLOTS_PER_WORKER: usize = 24;
 
+/// Default patch budget for the vision tower: 4096 patches = 1024
+/// language-model tokens ≈ a one-megapixel image. Bounds the score
+/// workspace at 4 heads × 4096² f16 = 128 MiB; `--image-max-tokens`
+/// raises it.
+pub const DEFAULT_MAX_IMAGE_PATCHES: usize = 4096;
+
 /// Everything a device runtime needs beyond the model itself.
 ///
 /// A struct rather than eight positional arguments because two of these are
 /// `usize` counts that mean entirely different things, and swapping them
 /// would compile.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Tokens per chunked-prefill step.
     pub prefill_chunk: usize,
@@ -57,6 +68,13 @@ pub struct RuntimeConfig {
     /// throughput benchmark sets this false so its measurement cannot
     /// silently shrink.
     pub stop_on_eos: bool,
+    /// Vision tower (mmproj) GGUF to load, or `None` for text-only serving —
+    /// in which case nothing vision-related is allocated and every request
+    /// carrying images is refused.
+    pub mmproj: Option<PathBuf>,
+    /// Patch budget the vision tower is pre-allocated for (4 patches per
+    /// language-model token). Ignored without `mmproj`.
+    pub max_image_patches: usize,
 }
 
 #[derive(Debug)]
@@ -71,18 +89,41 @@ pub enum RuntimeError {
     ZeroBatchWidth,
     DuplicateRequest(RequestId),
     UnknownRequest(RequestId),
-    PromptLength { declared: u32, actual: usize },
-    TokenOutOfRange { token: i32, vocab: u32 },
-    BatchTooWide { requested: usize, maximum: usize },
-    SnapshotPrefix { snapshot: usize, prompt: usize },
+    PromptLength {
+        declared: u32,
+        actual: usize,
+    },
+    TokenOutOfRange {
+        token: i32,
+        vocab: u32,
+    },
+    BatchTooWide {
+        requested: usize,
+        maximum: usize,
+    },
+    SnapshotPrefix {
+        snapshot: usize,
+        prompt: usize,
+    },
     Speculation(NgramConfigError),
     RuntimeStopped,
+    /// The request carries images but this runtime loaded no mmproj.
+    VisionNotEnabled,
+    /// The vision tower failed to load or encode.
+    Vision(String),
+    /// A request's image placements are inconsistent with its prompt.
+    ImagePlacement(String),
 }
 
 impl core::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
+            Self::VisionNotEnabled => {
+                write!(f, "request carries images but no --mmproj was loaded")
+            }
+            Self::Vision(e) => write!(f, "vision tower: {e}"),
+            Self::ImagePlacement(e) => write!(f, "image placement: {e}"),
             Self::Gguf(e) => write!(f, "GGUF error: {e}"),
             Self::Schema(e) => write!(f, "model schema mismatch: {e}"),
             Self::Load(e) => write!(f, "weight load failed: {e}"),
@@ -160,6 +201,11 @@ struct RuntimeSequence {
     /// `None` is greedy argmax, decided entirely on the device. `Some` pays a
     /// host round-trip per emitted token, only for this sequence.
     sampler: Option<Sampler>,
+    /// The prompt's image spans, sorted. Empty for text-only requests.
+    images: Vec<ImagePlacement>,
+    /// Projected image embeddings, all images concatenated in placement
+    /// order, `sum(tokens) * hidden` f32. Encoded once at admission.
+    image_embeds: Option<cudarc::driver::CudaSlice<f32>>,
 }
 
 fn choose_prefill_width(
@@ -232,12 +278,18 @@ pub struct DeviceRuntime {
     host_logits: Vec<f32>,
     sample_scratch: Vec<(f32, u32)>,
     eos_token: Option<i32>,
+    /// The vision tower, present iff an mmproj was configured.
+    vision: Option<VisionForward>,
+    /// Reused host buffer for per-chunk `(t, h, w)` rotary triples
+    /// (AGENTS.md rule 6: no per-chunk allocation).
+    mrope_host: Vec<i32>,
 }
 
 enum RuntimeCommand {
     Admit {
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         snapshot: Option<Arc<SequenceSnapshot>>,
         sampling: SamplingParams,
         reply: SyncSender<Result<(), RuntimeError>>,
@@ -287,15 +339,16 @@ impl DeviceRuntimeHandle {
                                 RuntimeCommand::Admit {
                                     req,
                                     prompt,
+                                    images,
                                     snapshot,
                                     sampling,
                                     reply,
                                 } => {
                                     let result = match snapshot {
-                                        Some(snapshot) => {
-                                            runtime.admit_restored(req, prompt, snapshot, sampling)
-                                        }
-                                        None => runtime.admit(req, prompt, sampling),
+                                        Some(snapshot) => runtime.admit_restored(
+                                            req, prompt, images, snapshot, sampling,
+                                        ),
+                                        None => runtime.admit(req, prompt, images, sampling),
                                     };
                                     let _ = reply.send(result);
                                 }
@@ -348,11 +401,13 @@ impl DeviceRuntimeHandle {
         &self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         sampling: SamplingParams,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
             prompt,
+            images,
             snapshot: None,
             sampling,
             reply,
@@ -363,12 +418,14 @@ impl DeviceRuntimeHandle {
         &self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
             prompt,
+            images,
             snapshot: Some(snapshot),
             sampling,
             reply,
@@ -411,6 +468,8 @@ impl DeviceRuntime {
             retention_interval,
             snapshot_slots,
             stop_on_eos,
+            mmproj,
+            max_image_patches,
         } = runtime;
         let load_started = Instant::now();
         if prefill_chunk == 0 {
@@ -514,7 +573,36 @@ impl DeviceRuntime {
         );
         let graphs = (0..=max_batch).map(|_| None).collect();
 
-        Ok(Self {
+        // Vision tower: opt-in via --mmproj. Loading enables image-row
+        // staging on every prefill-capable shape; text-only serving skips
+        // all of it, which is what keeps the baseline untouched by
+        // construction.
+        let vision = match &mmproj {
+            Some(path) => {
+                let vision_file = GgufFile::open(path)?;
+                let vision_cfg = xabe_model::VisionConfig::qwen3_6_35b_a3b();
+                let vision_weights = crate::vision::load_vision_weights(&vision_file, &vision_cfg)
+                    .map_err(RuntimeError::Vision)?;
+                let tower = VisionForward::new(
+                    &ctx,
+                    Arc::clone(&stream),
+                    &vision_cfg,
+                    &vision_weights,
+                    max_image_patches.max(4),
+                )
+                .map_err(|e| RuntimeError::Vision(e.to_string()))?;
+                debug!(
+                    device = device_ordinal,
+                    elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+                    max_image_patches,
+                    "vision tower resident"
+                );
+                Some(tower)
+            }
+            None => None,
+        };
+
+        let mut this = Self {
             ctx,
             stream,
             prefill,
@@ -534,7 +622,23 @@ impl DeviceRuntime {
             host_logits: Vec::with_capacity(config.vocab_size as usize),
             sample_scratch: Vec::with_capacity(config.vocab_size as usize),
             eos_token,
-        })
+            vision,
+            mrope_host: Vec::new(),
+        };
+        if this.vision.is_some() {
+            let stream = Arc::clone(&this.stream);
+            this.prefill.enable_image_injection(&stream)?;
+            if let Some(fwd) = this.retention_prefill.as_mut() {
+                fwd.enable_image_injection(&stream)?;
+            }
+            for (_, fwd) in this.prefill_tails.iter_mut() {
+                fwd.enable_image_injection(&stream)?;
+            }
+            for fwd in this.decode.iter_mut().flatten() {
+                fwd.enable_image_injection(&stream)?;
+            }
+        }
+        Ok(this)
     }
 
     pub fn device_ordinal(&self) -> usize {
@@ -549,6 +653,7 @@ impl DeviceRuntime {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         sampling: SamplingParams,
     ) -> Result<(), RuntimeError> {
         if self.sequences.contains_key(&req.id) {
@@ -569,6 +674,9 @@ impl DeviceRuntime {
                 vocab: self.vocab,
             });
         }
+        let placements: Vec<ImagePlacement> = images.iter().map(|i| i.placement).collect();
+        validate_placements(&placements, prompt.len()).map_err(RuntimeError::ImagePlacement)?;
+        let image_embeds = self.encode_images(&images)?;
         let state = self
             .prefill
             .new_state(&self.stream, req.full_seq_len() as usize)?;
@@ -589,9 +697,57 @@ impl DeviceRuntime {
                 last_snapshot: None,
                 retention_disabled: false,
                 sampler: (!sampling.is_greedy()).then(|| Sampler::new(sampling)),
+                images: placements,
+                image_embeds,
             },
         );
         Ok(())
+    }
+
+    /// Encode a request's images through the vision tower into one device
+    /// buffer, embeddings concatenated in placement order.
+    ///
+    /// This is the only per-request device allocation in the engine, and it
+    /// happens at admission — never on the per-step path rule 6 governs.
+    fn encode_images(
+        &mut self,
+        images: &[SequenceImage],
+    ) -> Result<Option<cudarc::driver::CudaSlice<f32>>, RuntimeError> {
+        if images.is_empty() {
+            return Ok(None);
+        }
+        let vision = self.vision.as_mut().ok_or(RuntimeError::VisionNotEnabled)?;
+        let merge = vision.config().spatial_merge;
+        let hidden = vision.config().projection_dim as usize;
+        let total: usize = images.iter().map(|i| i.placement.tokens()).sum();
+        let embeds = self
+            .stream
+            .alloc_zeros::<f32>(total * hidden)
+            .map_err(RuntimeError::Driver)?;
+        let mut row = 0usize;
+        for img in images {
+            let (mh, mw) = (img.image.grid_h / merge, img.image.grid_w / merge);
+            if (img.placement.grid_h, img.placement.grid_w) != (mh, mw) {
+                return Err(RuntimeError::ImagePlacement(format!(
+                    "placement grid {}x{} does not match the preprocessed {}x{}",
+                    img.placement.grid_h, img.placement.grid_w, mh, mw
+                )));
+            }
+            let out = vision
+                .encode(&img.image)
+                .map_err(|e| RuntimeError::Vision(e.to_string()))?;
+            let n = img.placement.tokens() * hidden;
+            // SAFETY: `out` holds at least `n` floats (the tower checked the
+            // patch budget) and `embeds` was sized to the placement total.
+            let src = unsafe { crate::viewslice::subslice(&self.stream, out, 0, n) };
+            let mut dst =
+                unsafe { crate::viewslice::subslice(&self.stream, &embeds, row * hidden, n) };
+            self.stream
+                .memcpy_dtod(&*src, &mut *dst)
+                .map_err(RuntimeError::Driver)?;
+            row += img.placement.tokens();
+        }
+        Ok(Some(embeds))
     }
 
     /// Admit with a prefix restored from pinned host memory.
@@ -605,6 +761,7 @@ impl DeviceRuntime {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
     ) -> Result<(), RuntimeError> {
@@ -615,7 +772,7 @@ impl DeviceRuntime {
                 prompt: prompt.len(),
             });
         }
-        self.admit(req, prompt, sampling)?;
+        self.admit(req, prompt, images, sampling)?;
         let seq = self
             .sequences
             .get_mut(&req.id)
@@ -625,6 +782,15 @@ impl DeviceRuntime {
             .expect("resident request has state")
             .restore(&self.stream, &snapshot)?;
         seq.prefilled = prefix;
+        // The restored prefix may cover image spans; the rotary base for
+        // whatever runs next lags the slot position by their accumulated
+        // delta. (The prefill loop re-derives this per chunk; this covers
+        // the full-restore case that goes straight to decode.)
+        let delta = rope_delta_at(&seq.images, prefix);
+        seq.state
+            .as_mut()
+            .expect("resident request has state")
+            .set_rope_delta(delta);
         seq.last_snapshot_position = prefix;
         seq.last_snapshot = Some(Arc::clone(&snapshot));
         seq.retention_disabled = false;
@@ -971,45 +1137,56 @@ impl DeviceRuntime {
                 self.max_batch,
             );
             let piece = &work[offset..offset + width];
-            if width == self.prefill_chunk {
-                self.prefill.run(
-                    &self.stream,
-                    seq.state.as_mut().expect("resident sequence has state"),
-                    piece,
-                    |_, _| {},
-                )?;
-            } else if width == self.retention_interval && width != 1 {
-                self.retention_prefill
-                    .as_mut()
-                    .expect("distinct retention shape was prebuilt")
-                    .run(
-                        &self.stream,
-                        seq.state.as_mut().expect("resident sequence has state"),
-                        piece,
-                        |_, _| {},
-                    )?;
-            } else if let Some((_, tail)) = self
-                .prefill_tails
-                .iter_mut()
-                .find(|(tail_width, _)| *tail_width == width)
-            {
-                tail.run(
-                    &self.stream,
-                    seq.state.as_mut().expect("resident sequence has state"),
-                    piece,
-                    |_, _| {},
-                )?;
-            } else {
-                self.decode[width]
-                    .as_mut()
-                    .expect("narrow prefill width was prebuilt")
-                    .run(
-                        &self.stream,
-                        seq.state.as_mut().expect("resident sequence has state"),
-                        piece,
-                        |_, _| {},
-                    )?;
+
+            // Image-bearing sequences: fix the rotary base for this chunk,
+            // and when the chunk overlaps a span, switch that one pass to
+            // per-token rotary positions and stage the projector rows that
+            // replace the placeholder embeddings. Text-only sequences set a
+            // delta of 0 — the value the rotary scalar always carried — and
+            // take neither branch.
+            let stream = Arc::clone(&self.stream);
+            seq.state
+                .as_mut()
+                .expect("resident sequence has state")
+                .set_rope_delta(rope_delta_at(&seq.images, position));
+            if chunk_overlaps_images(&seq.images, position, width) {
+                let mut triples = std::mem::take(&mut self.mrope_host);
+                fill_mrope_triples(&seq.images, position, width, &mut triples);
+                let embeds = seq
+                    .image_embeds
+                    .as_ref()
+                    .expect("overlapping spans imply encoded images");
+                let fwd = self.prefill_pass(width);
+                fwd.publish_mrope(&stream, &triples)?;
+                let mut row_base = 0usize;
+                for img in &seq.images {
+                    let begin = img.start.max(position);
+                    let end = img.end().min(position + width);
+                    if begin < end {
+                        fwd.stage_image_rows(
+                            &stream,
+                            embeds,
+                            row_base + (begin - img.start),
+                            begin - position,
+                            end - begin,
+                        )?;
+                    }
+                    row_base += img.tokens();
+                }
+                self.mrope_host = triples;
             }
+            let run_result = self.prefill_pass(width).run(
+                &stream,
+                seq.state.as_mut().expect("resident sequence has state"),
+                piece,
+                |_, _| {},
+            );
+            {
+                let fwd = self.prefill_pass(width);
+                fwd.clear_mrope();
+                fwd.clear_staged_image_rows();
+            }
+            run_result?;
             offset += width;
             last_shape = width;
             let position = seq
@@ -1066,6 +1243,13 @@ impl DeviceRuntime {
             }
         }
         seq.prefilled = end;
+        // The delta that decode inherits is the one past the last span; a
+        // final chunk that *contained* a span set the base for that chunk's
+        // start, which is stale now.
+        seq.state
+            .as_mut()
+            .expect("resident sequence has state")
+            .set_rope_delta(rope_delta_at(&seq.images, seq.prefilled));
         if let Some(ngram) = &mut seq.ngram {
             ngram.observe_all(work);
         }

@@ -458,6 +458,10 @@ fn main() -> std::process::ExitCode {
         prefill_chunk: args.prefill_chunk,
         snapshot_slots: slots_per_worker,
         speculation,
+        // Wired to --mmproj / --image-max-tokens by the vision serving
+        // surface; text-only until then.
+        mmproj: None,
+        max_image_patches: xabe_engine::runtime::DEFAULT_MAX_IMAGE_PATCHES,
     };
     if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");

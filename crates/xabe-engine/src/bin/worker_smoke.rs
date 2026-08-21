@@ -59,7 +59,7 @@ fn main() -> ExitCode {
             prompt_tokens: PROMPT as u32,
             max_output_tokens: OUTPUT,
         };
-        if let Err(error) = worker.admit_tokens(req, prompt, SamplingParams::GREEDY) {
+        if let Err(error) = worker.admit_tokens(req, prompt, Vec::new(), SamplingParams::GREEDY) {
             error!("admission failed: {error}");
             return ExitCode::FAILURE;
         }

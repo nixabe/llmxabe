@@ -256,7 +256,7 @@ impl Engine {
         serving: ServingConfig,
     ) -> Result<(), (WorkerId, RuntimeError)> {
         for worker in &mut self.workers {
-            if let Err(error) = worker.bind_device(model_path, model.clone(), serving) {
+            if let Err(error) = worker.bind_device(model_path, model.clone(), serving.clone()) {
                 return Err((worker.id(), error));
             }
         }
@@ -274,14 +274,21 @@ impl Engine {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<crate::image::SequenceImage>,
         sampling: SamplingParams,
     ) -> Result<Placement, EngineExecutionError> {
+        let placements: Vec<crate::image::ImagePlacement> =
+            images.iter().map(|i| i.placement).collect();
+        debug_assert!(
+            crate::image::validate_placements(&placements, prompt.len()).is_ok(),
+            "image placements must be validated at the server boundary"
+        );
         let budget = self
             .workers
             .first()
             .map(|worker| worker.scheduler().config().token_budget())
             .unwrap_or(0);
-        let chain = SequenceChain::new(self.block_size, &prompt);
+        let chain = SequenceChain::new(self.block_size, &prompt, &placements);
         let matched = self.prefix_tree.match_prefix(chain.hashes());
         let snapshot = matched
             .gdn_snapshot_hash
@@ -306,11 +313,11 @@ impl Engine {
         let request = if let Some(snapshot) = snapshot {
             self.worker_mut(worker)
                 .expect("router returned an existing worker")
-                .admit_tokens_restored(req, prompt, snapshot, sampling)
+                .admit_tokens_restored(req, prompt, images, snapshot, sampling)
         } else {
             self.worker_mut(worker)
                 .expect("router returned an existing worker")
-                .admit_tokens(req, prompt, sampling)
+                .admit_tokens(req, prompt, images, sampling)
         }
         .map_err(|source| EngineExecutionError::Worker { worker, source })?;
         let referenced = matched_tokens as usize / self.block_size as usize;
@@ -626,7 +633,7 @@ mod tests {
         let block = cache.attention_block_size();
         let interval = cache.gdn_retention_interval() as usize;
 
-        let mut chain = SequenceChain::new(block, &[7; 20]);
+        let mut chain = SequenceChain::new(block, &[7; 20], &[]);
         assert_eq!(chain.hashes_for(interval), None, "the prompt is 20 tokens");
 
         chain.extend((0..interval as i32).map(|token| token % 1000));

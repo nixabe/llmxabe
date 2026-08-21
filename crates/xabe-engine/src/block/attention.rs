@@ -751,6 +751,23 @@ impl AttnInt8 {
     }
 }
 
+/// Where the rotary angle for one chunk comes from.
+///
+/// The cache-slot / causal position stays a scalar in every case — only the
+/// *rotary* position ever needs three components, and only on prefill
+/// chunks that overlap an image span. Text sequences and every decode step
+/// use `Scalar`, whose value equals the slot position plus the sequence's
+/// rope delta (0 for text-only — the byte-identical path).
+#[derive(Clone, Copy)]
+pub enum RopeSource<'a> {
+    /// One device scalar; token `i` rotates by `*base + i`.
+    Scalar(&'a CudaSlice<i32>),
+    /// `(t, h, w)` i32 triples, one per token of the chunk — interleaved
+    /// M-RoPE per `xabe_kernels::mrope::apply_imrope`, sections
+    /// [`xabe_kernels::mrope::QWEN3_6_SECTIONS`].
+    PerToken(&'a CudaSlice<i32>),
+}
+
 impl GatedAttentionBlock {
     /// Whether a batch of `tokens` is wide enough to be worth the integer
     /// tensor-core path. Shared with [`crate::block::gdn::GdnBlock`] so the
@@ -1008,6 +1025,7 @@ impl GatedAttentionBlock {
         cache: &mut KvCache,
         pos_offset: usize,
         positions: &CudaSlice<i32>,
+        rope: RopeSource<'_>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), AttentionBlockError> {
         let t = self.tokens;
@@ -1151,26 +1169,34 @@ impl GatedAttentionBlock {
 
         // 7. Partial rotary, on the query and the key only, before the GQA
         //    broadcast — hence two head counts.
-        k.mixer.rope(
-            stream,
-            &sc.query_normed,
-            &mut sc.query_roped,
-            t,
-            self.q_heads,
-            self.rope_dim,
-            positions,
-            self.rope_theta,
-        )?;
-        k.mixer.rope(
-            stream,
-            &sc.key_normed,
-            &mut sc.key_roped,
-            t,
-            self.kv_heads,
-            self.rope_dim,
-            positions,
-            self.rope_theta,
-        )?;
+        for (src, dst, heads) in [
+            (&sc.query_normed, &mut sc.query_roped, self.q_heads),
+            (&sc.key_normed, &mut sc.key_roped, self.kv_heads),
+        ] {
+            match rope {
+                RopeSource::Scalar(base) => k.mixer.rope(
+                    stream,
+                    src,
+                    dst,
+                    t,
+                    heads,
+                    self.rope_dim,
+                    base,
+                    self.rope_theta,
+                )?,
+                RopeSource::PerToken(mrope) => k.mixer.rope_imrope(
+                    stream,
+                    src,
+                    dst,
+                    t,
+                    heads,
+                    self.rope_dim,
+                    mrope,
+                    xabe_kernels::mrope::QWEN3_6_SECTIONS,
+                    self.rope_theta,
+                )?,
+            }
+        }
 
         // 8. Append this batch's keys and values to the cache, at the absolute
         //    positions they belong to. One kernel for both halves, reading the
@@ -1305,6 +1331,7 @@ impl GatedAttentionBlock {
         caches: &mut [&mut KvCache],
         pos_offsets: &[usize],
         positions: &[&CudaSlice<i32>],
+        rope_positions: &[&CudaSlice<i32>],
         out: &mut CudaSlice<f32>,
     ) -> Result<(), AttentionBlockError> {
         let n = caches.len();
@@ -1494,7 +1521,7 @@ impl GatedAttentionBlock {
                 1,
                 self.q_heads,
                 self.rope_dim,
-                positions[i],
+                rope_positions[i],
                 self.rope_theta,
             )?;
 
@@ -1511,7 +1538,7 @@ impl GatedAttentionBlock {
                 1,
                 self.kv_heads,
                 self.rope_dim,
-                positions[i],
+                rope_positions[i],
                 self.rope_theta,
             )?;
 
@@ -1614,6 +1641,7 @@ impl GatedAttentionBlock {
         chunk_tokens: usize,
         pos_offsets: &[usize],
         positions: &[&CudaSlice<i32>],
+        rope_positions: &[&CudaSlice<i32>],
         out: &mut CudaSlice<f32>,
     ) -> Result<(), AttentionBlockError> {
         let n = caches.len();
@@ -1818,7 +1846,7 @@ impl GatedAttentionBlock {
                 chunk_tokens,
                 self.q_heads,
                 self.rope_dim,
-                positions[i],
+                rope_positions[i],
                 self.rope_theta,
             )?;
             k.mixer.rope(
@@ -1828,7 +1856,7 @@ impl GatedAttentionBlock {
                 chunk_tokens,
                 self.kv_heads,
                 self.rope_dim,
-                positions[i],
+                rope_positions[i],
                 self.rope_theta,
             )?;
             let val = unsafe {

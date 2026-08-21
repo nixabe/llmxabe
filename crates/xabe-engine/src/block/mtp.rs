@@ -559,6 +559,11 @@ impl MtpBlock {
         )?;
 
         // 5. block 40's dense-attention mixer, over its own KV cache.
+        // The draft head rotates by the slot scalar. For image-bearing
+        // sequences this ignores the M-RoPE delta, which can only cost
+        // draft acceptance rate — the target pass re-scores every draft
+        // token with the correct rotary positions, so exactness is
+        // unaffected. Text-only sequences have delta 0 and are identical.
         self.attn.forward(
             stream,
             &mut self.attn_scratch,
@@ -566,6 +571,7 @@ impl MtpBlock {
             cache,
             pos_offset,
             positions,
+            crate::block::attention::RopeSource::Scalar(positions),
             &mut self.attn_out,
         )?;
 

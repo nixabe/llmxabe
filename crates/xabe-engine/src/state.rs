@@ -47,6 +47,7 @@
 //! its last three convolution taps, which is finite, plausible, and a
 //! different sequence.
 
+use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, PinnedHostSlice};
@@ -125,7 +126,27 @@ pub struct SequenceState {
     /// keeps the two in step, and it is called on the forward path rather
     /// than by [`Self::advance`] so that a failed pass cannot leave the device
     /// claiming a position no cache was written for.
+    ///
+    /// Two elements since M-RoPE: `[0]` is the cache-slot / causal position,
+    /// `[1]` the rotary base (`position + rope_delta`). For a text-only
+    /// sequence `rope_delta` is 0 and the two are equal, which is what keeps
+    /// that path byte-identical; after an image the rotary base lags the
+    /// slot position because an image advances rope "time" by its longest
+    /// grid edge, not its token count (see `xabe_kernels::mrope`). One
+    /// buffer, one publish — the same four... eight bytes per step.
     d_position: CudaSlice<i32>,
+    /// Aliased one-element views of `d_position[0]` / `d_position[1]`,
+    /// created once at construction. Kernel wrappers demand exactly-one-
+    /// element position buffers, and a captured decode graph binds whichever
+    /// pointer it saw at capture — persistent views keep those pointers
+    /// stable for the state's whole life (same technique as
+    /// `weights::ResidentTensor`).
+    slot_position_view: ManuallyDrop<CudaSlice<i32>>,
+    rope_position_view: ManuallyDrop<CudaSlice<i32>>,
+    /// Rotary-base offset relative to `position`. 0 for text-only; set by
+    /// the runtime while prefilling image-bearing sequences and constant
+    /// from the end of the prompt onward.
+    rope_delta: i32,
     max_seq: usize,
 }
 
@@ -409,11 +430,19 @@ impl SequenceState {
                 }
             }
         }
+        let d_position = stream.alloc_zeros::<i32>(2)?;
+        // SAFETY: both views are inside the two-element buffer just
+        // allocated, and live exactly as long as the struct that owns it.
+        let slot_position_view = unsafe { crate::viewslice::subslice(stream, &d_position, 0, 1) };
+        let rope_position_view = unsafe { crate::viewslice::subslice(stream, &d_position, 1, 1) };
         Ok(Self {
             gdn: gdn_states,
             kv,
             position: 0,
-            d_position: stream.alloc_zeros::<i32>(1)?,
+            d_position,
+            slot_position_view,
+            rope_position_view,
+            rope_delta: 0,
             max_seq,
         })
     }
@@ -454,6 +483,7 @@ impl SequenceState {
             stream.memset_zeros(&mut state.recurrent)?;
         }
         self.position = 0;
+        self.rope_delta = 0;
         stream.memset_zeros(&mut self.d_position)?;
         Ok(())
     }
@@ -525,7 +555,7 @@ impl SequenceState {
             stream.memcpy_htod(&host.recurrent, &mut state.recurrent)?;
         }
         self.position = snapshot.position;
-        stream.memcpy_htod(&[self.position as i32], &mut self.d_position)?;
+        self.publish_position(stream)?;
         stream.synchronize()?;
         Ok(())
     }
@@ -565,14 +595,42 @@ impl SequenceState {
     /// one expression. They are disjoint fields, so one call that splits them
     /// is the borrow checker's answer rather than a workaround.
     pub(crate) fn kv_and_position_mut(&mut self, slot: usize) -> (&mut KvCache, &CudaSlice<i32>) {
-        (&mut self.kv[slot], &self.d_position)
+        (&mut self.kv[slot], &self.slot_position_view)
     }
 
-    /// Copy the host position to the device.
+    /// As [`Self::kv_and_position_mut`], plus the rotary-base scalar.
     ///
-    /// Four bytes, once per pass, before anything reads it.
+    /// The slot scalar drives the cache append and the causal bound; the
+    /// rotary scalar drives RoPE. They differ only for image-bearing
+    /// sequences (`rope_delta != 0`).
+    pub(crate) fn kv_and_positions_mut(
+        &mut self,
+        slot: usize,
+    ) -> (&mut KvCache, &CudaSlice<i32>, &CudaSlice<i32>) {
+        (
+            &mut self.kv[slot],
+            &self.slot_position_view,
+            &self.rope_position_view,
+        )
+    }
+
+    /// The rotary-base offset relative to [`Self::position`].
+    pub fn rope_delta(&self) -> i32 {
+        self.rope_delta
+    }
+
+    /// Set the rotary-base offset. Takes effect at the next
+    /// [`Self::publish_position`].
+    pub(crate) fn set_rope_delta(&mut self, delta: i32) {
+        self.rope_delta = delta;
+    }
+
+    /// Copy the host position — slot and rotary base — to the device.
+    ///
+    /// Eight bytes, once per pass, before anything reads them.
     pub(crate) fn publish_position(&mut self, stream: &Arc<CudaStream>) -> Result<(), StateError> {
-        stream.memcpy_htod(&[self.position as i32], &mut self.d_position)?;
+        let pos = self.position as i32;
+        stream.memcpy_htod(&[pos, pos + self.rope_delta], &mut self.d_position)?;
         Ok(())
     }
 

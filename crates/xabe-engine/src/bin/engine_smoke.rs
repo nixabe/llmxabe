@@ -35,6 +35,7 @@ fn admit(
                 max_output_tokens: OUTPUT,
             },
             prompt(id, tokens, model.vocab_size),
+            Vec::new(),
             SamplingParams::GREEDY,
         )
         .map(|placement| placement.worker)

@@ -256,6 +256,9 @@ pub enum ForwardError {
     /// Every block validates its buffer lengths exactly rather than accepting
     /// a prefix, so the token count is fixed at construction.
     WrongTokenCount { expected: usize, got: usize },
+    /// `stage_image_rows` without `enable_image_injection` — vision serving
+    /// must pre-allocate at load, never lazily (AGENTS.md rule 6).
+    ImageInjectionNotEnabled,
     /// Sequence state could not be allocated or reset.
     State(StateError),
     /// [`Forward::capture_step`] was called on a pass with stage profiling on.
@@ -354,6 +357,10 @@ impl std::fmt::Display for ForwardError {
             Self::WrongTokenCount { expected, got } => write!(
                 f,
                 "this pass was built for {expected} tokens and was given {got}",
+            ),
+            Self::ImageInjectionNotEnabled => write!(
+                f,
+                "image rows staged on a pass without enable_image_injection"
             ),
             Self::State(e) => write!(f, "{e}"),
             Self::CaptureWhileProfiling => {
@@ -712,6 +719,28 @@ pub struct Forward {
     /// Host staging for the copy above, pre-sized once so publishing a step
     /// never allocates (`AGENTS.md` rule 6).
     batch_positions_host: Vec<i32>,
+    /// `(t, h, w)` rotary triples for one image-overlapping prefill chunk,
+    /// `3 * tokens` i32. Published by [`Self::publish_mrope`] and consumed
+    /// by [`Self::body`]'s attention layers when [`Self::mrope_active`];
+    /// 12 KiB at the deepest chunk shape, so it is allocated
+    /// unconditionally rather than gated on vision being enabled.
+    d_mrope: CudaSlice<i32>,
+    /// Whether the *next* pass rotates by [`Self::d_mrope`] instead of the
+    /// per-sequence scalar. Never true on a captured pass — asserted at
+    /// capture — so decode graphs always bind the scalar path.
+    mrope_active: bool,
+    /// Device staging for image embedding rows, `tokens * hidden` f32,
+    /// allocated by [`Self::enable_image_injection`] when the server loads
+    /// an mmproj — text-only serving never allocates it. Rows are copied
+    /// here at chunk-preparation time and replayed over the freshly
+    /// embedded `hidden_state` inside [`Self::body`], right after the
+    /// token-id gather whose placeholder rows they replace.
+    image_stage: Option<CudaSlice<f32>>,
+    /// `(dst_token, stage_row, n_rows)` copies pending for the next pass.
+    /// Always empty on a captured pass — asserted at capture.
+    staged_rows: SmallVec<[(usize, usize, usize); 4]>,
+    /// Rows of [`Self::image_stage`] already claimed by `staged_rows`.
+    stage_used: usize,
     /// Stable pageable source used only while capturing the batch graph.
     batch_zero_tokens: Vec<i32>,
     /// Fixed fork/join resources for the sequence-local part of batched
@@ -1074,6 +1103,11 @@ impl Forward {
             batch_argmax_out: None,
             batch_positions: None,
             batch_positions_host: Vec::new(),
+            d_mrope: stream.alloc_zeros::<i32>(3 * tokens)?,
+            mrope_active: false,
+            image_stage: None,
+            staged_rows: SmallVec::new(),
+            stage_used: 0,
             batch_zero_tokens: Vec::new(),
             batch_attention: None,
             verify_scratch: None,
@@ -1289,6 +1323,17 @@ impl Forward {
         if self.profile.is_some() {
             return Err(ForwardError::CaptureWhileProfiling);
         }
+        // A captured pass must bind the scalar rotary path: the graph
+        // replays whatever kernel and buffer it recorded, and decode never
+        // uses per-token rotary positions.
+        assert!(
+            !self.mrope_active,
+            "capture with mrope active would bake the per-token rotary path into a decode graph"
+        );
+        assert!(
+            self.staged_rows.is_empty(),
+            "capture with staged image rows would bake an injection into a decode graph"
+        );
         // The capture must be told about the position and the token count
         // before it starts, or the calls that publish them are recorded --
         // and a copy from pageable host memory is not something a graph may
@@ -1445,8 +1490,8 @@ impl Forward {
         self.batch_argmax_values = Some(stream.alloc_zeros::<f32>(tokens * ARGMAX_BLOCKS)?);
         self.batch_argmax_indices = Some(stream.alloc_zeros::<i32>(tokens * ARGMAX_BLOCKS)?);
         self.batch_argmax_out = Some(stream.alloc_zeros::<i32>(tokens)?);
-        self.batch_positions = Some(stream.alloc_zeros::<i32>(tokens)?);
-        self.batch_positions_host = vec![0i32; tokens];
+        self.batch_positions = Some(stream.alloc_zeros::<i32>(2 * tokens)?);
+        self.batch_positions_host = vec![0i32; 2 * tokens];
         self.batch_zero_tokens = vec![0i32; tokens];
         let concurrent_attention = std::env::var_os("LLMXABE_SERIAL_BATCH_ATTENTION").is_none();
         let lanes = if concurrent_attention {
@@ -1511,8 +1556,8 @@ impl Forward {
         self.batch_argmax_values = Some(stream.alloc_zeros::<f32>(sequences * ARGMAX_BLOCKS)?);
         self.batch_argmax_indices = Some(stream.alloc_zeros::<i32>(sequences * ARGMAX_BLOCKS)?);
         self.batch_argmax_out = Some(stream.alloc_zeros::<i32>(sequences)?);
-        self.batch_positions = Some(stream.alloc_zeros::<i32>(sequences)?);
-        self.batch_positions_host = vec![0i32; sequences];
+        self.batch_positions = Some(stream.alloc_zeros::<i32>(2 * sequences)?);
+        self.batch_positions_host = vec![0i32; 2 * sequences];
         self.batch_zero_tokens = vec![0i32; self.tokens];
         Ok(())
     }
@@ -1657,11 +1702,13 @@ impl Forward {
                     let mut caches: SmallVec<[&mut KvCache; 3]> = SmallVec::new();
                     let mut offsets: SmallVec<[usize; 3]> = SmallVec::new();
                     let mut positions: SmallVec<[&CudaSlice<i32>; 3]> = SmallVec::new();
+                    let mut rope_positions: SmallVec<[&CudaSlice<i32>; 3]> = SmallVec::new();
                     for state in states.iter_mut() {
                         offsets.push(state.position());
-                        let (cache, position) = state.kv_and_position_mut(attn_slot);
+                        let (cache, position, rope) = state.kv_and_positions_mut(attn_slot);
                         caches.push(cache);
                         positions.push(position);
+                        rope_positions.push(rope);
                     }
                     self.attention[attn_slot].forward_batch_prefill(
                         stream,
@@ -1671,6 +1718,7 @@ impl Forward {
                         chunk_tokens,
                         &offsets,
                         &positions,
+                        &rope_positions,
                         &mut self.mixer_out,
                     )?;
                     attn_slot += 1;
@@ -1809,6 +1857,17 @@ impl Forward {
         if self.profile.is_some() {
             return Err(ForwardError::CaptureWhileProfiling);
         }
+        // A captured pass must bind the scalar rotary path: the graph
+        // replays whatever kernel and buffer it recorded, and decode never
+        // uses per-token rotary positions.
+        assert!(
+            !self.mrope_active,
+            "capture with mrope active would bake the per-token rotary path into a decode graph"
+        );
+        assert!(
+            self.staged_rows.is_empty(),
+            "capture with staged image rows would bake an injection into a decode graph"
+        );
         let n = self.tokens;
         self.check_batch_shape(states, &self.batch_zero_tokens)?;
         // As `capture_step`: the capture must already know about the token
@@ -1817,8 +1876,16 @@ impl Forward {
         // from pageable host memory cannot be.
         stream.memcpy_htod(&self.batch_zero_tokens, &mut self.d_tokens)?;
         self.moe.publish_tokens(stream, n)?;
-        for (dst, state) in self.batch_positions_host.iter_mut().zip(states.iter()) {
-            *dst = state.position() as i32;
+        for (dst, state) in self
+            .batch_positions_host
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(states.iter())
+        {
+            let pos = state.position() as i32;
+            dst[0] = pos;
+            dst[1] = pos + state.rope_delta();
         }
         stream.memcpy_htod(
             &self.batch_positions_host,
@@ -1989,8 +2056,16 @@ impl Forward {
         let n = self.tokens;
         stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
         self.moe.publish_tokens(stream, n)?;
-        for (dst, state) in self.batch_positions_host.iter_mut().zip(states) {
-            *dst = state.position() as i32;
+        for (dst, state) in self
+            .batch_positions_host
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(states)
+        {
+            let pos = state.position() as i32;
+            dst[0] = pos;
+            dst[1] = pos + state.rope_delta();
         }
         let positions = self
             .batch_positions
@@ -2057,19 +2132,26 @@ impl Forward {
                     let mut caches: SmallVec<[&mut KvCache; 3]> = SmallVec::new();
                     let mut pos_offsets: SmallVec<[usize; 3]> = SmallVec::new();
                     let mut position_views: SmallVec<[_; 3]> = SmallVec::new();
+                    let mut rope_views: SmallVec<[_; 3]> = SmallVec::new();
                     for (i, state) in states.iter_mut().enumerate() {
                         pos_offsets.push(state.position());
                         let (cache, _) = state.kv_and_position_mut(attn_slot);
                         caches.push(cache);
                         // SAFETY: `i < n` and `batch_positions` holds
-                        // exactly `n` elements, allocated by
+                        // exactly `2 * n` elements — interleaved
+                        // [slot, rope] pairs — allocated by
                         // `enable_batch_decode`.
                         position_views.push(unsafe {
-                            crate::viewslice::subslice(stream, batch_positions, i, 1)
+                            crate::viewslice::subslice(stream, batch_positions, 2 * i, 1)
+                        });
+                        rope_views.push(unsafe {
+                            crate::viewslice::subslice(stream, batch_positions, 2 * i + 1, 1)
                         });
                     }
                     let positions: SmallVec<[&CudaSlice<i32>; 3]> =
                         position_views.iter().map(|v| &**v).collect();
+                    let rope_positions: SmallVec<[&CudaSlice<i32>; 3]> =
+                        rope_views.iter().map(|v| &**v).collect();
                     self.attention[attn_slot]
                         .forward_batch_decode(
                             stream,
@@ -2093,6 +2175,7 @@ impl Forward {
                             &mut caches,
                             &pos_offsets,
                             &positions,
+                            &rope_positions,
                             &mut self.mixer_out,
                         )
                         .map_err(ForwardError::Attention)?;
@@ -2392,7 +2475,12 @@ impl Forward {
                 }
                 LayerKind::GatedAttention => {
                     let pos_offset = state.position();
-                    let (cache, positions) = state.kv_and_position_mut(attn_slot);
+                    let (cache, positions, rope_scalar) = state.kv_and_positions_mut(attn_slot);
+                    let rope = if self.mrope_active {
+                        crate::block::attention::RopeSource::PerToken(&self.d_mrope)
+                    } else {
+                        crate::block::attention::RopeSource::Scalar(rope_scalar)
+                    };
                     let r = self.attention[attn_slot]
                         .forward(
                             stream,
@@ -2401,6 +2489,7 @@ impl Forward {
                             cache,
                             pos_offset,
                             positions,
+                            rope,
                             &mut self.mixer_out,
                         )
                         .map_err(ForwardError::from);
@@ -2619,6 +2708,90 @@ impl Forward {
         self.run_tagged(stream, state, token_ids, &mut on_waypoint)
     }
 
+    /// Publish `(t, h, w)` rotary triples for the next (single-sequence,
+    /// uncaptured) pass, which will rotate by them instead of the scalar.
+    ///
+    /// `triples` holds exactly `3 * tokens` values in token order. The flag
+    /// sticks until [`Self::clear_mrope`], so a caller that publishes for an
+    /// image chunk must clear before the next text chunk.
+    pub fn publish_mrope(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        triples: &[i32],
+    ) -> Result<(), ForwardError> {
+        if triples.len() != 3 * self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: 3 * self.tokens,
+                got: triples.len(),
+            });
+        }
+        stream.memcpy_htod(triples, &mut self.d_mrope)?;
+        self.mrope_active = true;
+        Ok(())
+    }
+
+    /// Return the next pass to scalar rotary positions.
+    pub fn clear_mrope(&mut self) {
+        self.mrope_active = false;
+    }
+
+    /// Pre-allocate the image-row staging buffer (`tokens * hidden` f32).
+    ///
+    /// Called once at load when vision serving is enabled, per AGENTS.md
+    /// rule 6 — [`Self::stage_image_rows`] on a pass without this is an
+    /// error, never a lazy allocation.
+    pub fn enable_image_injection(&mut self, stream: &Arc<CudaStream>) -> Result<(), ForwardError> {
+        if self.image_stage.is_none() {
+            self.image_stage = Some(stream.alloc_zeros::<f32>(self.tokens * self.hidden)?);
+        }
+        Ok(())
+    }
+
+    /// Queue `n_rows` embedding rows for injection at chunk token
+    /// `dst_token` on the next pass, copying them device-to-device from
+    /// `src` starting at its row `src_row` (rows are `hidden` floats).
+    ///
+    /// The copy into staging happens now; the copy into the residual
+    /// stream happens inside [`Self::body`], after the embedding gather
+    /// has written the placeholder rows this replaces.
+    pub fn stage_image_rows(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        src: &CudaSlice<f32>,
+        src_row: usize,
+        dst_token: usize,
+        n_rows: usize,
+    ) -> Result<(), ForwardError> {
+        let stage = self
+            .image_stage
+            .as_mut()
+            .ok_or(ForwardError::ImageInjectionNotEnabled)?;
+        if dst_token + n_rows > self.tokens
+            || self.stage_used + n_rows > self.tokens
+            || (src_row + n_rows) * self.hidden > src.len()
+        {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: dst_token + n_rows,
+            });
+        }
+        let h = self.hidden;
+        // SAFETY: both views are inside their buffers by the checks above.
+        let src_view = unsafe { crate::viewslice::subslice(stream, src, src_row * h, n_rows * h) };
+        let mut dst_view =
+            unsafe { crate::viewslice::subslice(stream, stage, self.stage_used * h, n_rows * h) };
+        stream.memcpy_dtod(&*src_view, &mut *dst_view)?;
+        self.staged_rows.push((dst_token, self.stage_used, n_rows));
+        self.stage_used += n_rows;
+        Ok(())
+    }
+
+    /// Drop any queued image rows without running them.
+    pub fn clear_staged_image_rows(&mut self) {
+        self.staged_rows.clear();
+        self.stage_used = 0;
+    }
+
     /// The two per-step host inputs: the token ids and the position.
     ///
     /// Split out of `Self::body` because these are the only two operations
@@ -2658,6 +2831,31 @@ impl Forward {
     ) -> Result<(), ForwardError> {
         self.mark(stream, Stage::Reset)?;
         self.embed(stream)?;
+        // Image spans: overwrite the placeholder rows the gather just wrote
+        // with the projector's embeddings. Empty on every decode step and on
+        // every captured pass (asserted at capture), so the text path takes
+        // no branch and records no copy.
+        if !self.staged_rows.is_empty() {
+            let stage = self
+                .image_stage
+                .as_ref()
+                .expect("staged rows imply an enabled stage");
+            let h = self.hidden;
+            for &(dst_token, stage_row, n_rows) in &self.staged_rows {
+                // SAFETY: bounds were checked when the rows were staged.
+                let src =
+                    unsafe { crate::viewslice::subslice(stream, stage, stage_row * h, n_rows * h) };
+                let mut dst = unsafe {
+                    crate::viewslice::subslice(
+                        stream,
+                        &self.hidden_state,
+                        dst_token * h,
+                        n_rows * h,
+                    )
+                };
+                stream.memcpy_dtod(&*src, &mut *dst)?;
+            }
+        }
         self.mark(stream, Stage::Embed)?;
         on_waypoint(None, WaypointStage::Embed, &self.hidden_state);
 
@@ -2679,7 +2877,12 @@ impl Forward {
                 }
                 LayerKind::GatedAttention => {
                     let pos_offset = state.position();
-                    let (cache, positions) = state.kv_and_position_mut(attn_slot);
+                    let (cache, positions, rope_scalar) = state.kv_and_positions_mut(attn_slot);
+                    let rope = if self.mrope_active {
+                        crate::block::attention::RopeSource::PerToken(&self.d_mrope)
+                    } else {
+                        crate::block::attention::RopeSource::Scalar(rope_scalar)
+                    };
                     self.attention[attn_slot].forward(
                         stream,
                         &mut self.attn_scratch,
@@ -2687,6 +2890,7 @@ impl Forward {
                         cache,
                         pos_offset,
                         positions,
+                        rope,
                         &mut self.mixer_out,
                     )?;
                     attn_slot += 1;

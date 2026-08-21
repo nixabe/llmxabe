@@ -61,7 +61,9 @@ fn main() -> ExitCode {
         prompt_tokens: PROMPT as u32,
         max_output_tokens: OUTPUT,
     };
-    if let Err(failure) = cold.admit_tokens(request, prompt.clone(), SamplingParams::GREEDY) {
+    if let Err(failure) =
+        cold.admit_tokens(request, prompt.clone(), Vec::new(), SamplingParams::GREEDY)
+    {
         error!("cold admission failed: {failure}");
         return ExitCode::FAILURE;
     }
@@ -76,9 +78,13 @@ fn main() -> ExitCode {
         error!("cold worker did not retain the 2048-token boundary");
         return ExitCode::FAILURE;
     };
-    if let Err(failure) =
-        restored.admit_tokens_restored(request, prompt, snapshot, SamplingParams::GREEDY)
-    {
+    if let Err(failure) = restored.admit_tokens_restored(
+        request,
+        prompt,
+        Vec::new(),
+        snapshot,
+        SamplingParams::GREEDY,
+    ) {
         error!("restored admission failed: {failure}");
         return ExitCode::FAILURE;
     }

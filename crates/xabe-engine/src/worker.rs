@@ -61,7 +61,7 @@ pub enum Speculation {
 /// Everything else the runtime needs — batch width, draft count, retention
 /// interval — the worker reads off its own scheduler and cache
 /// configuration, so those are not repeated here where they could disagree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServingConfig {
     /// Tokens per chunked-prefill step.
     pub prefill_chunk: usize,
@@ -70,6 +70,10 @@ pub struct ServingConfig {
     pub snapshot_slots: usize,
     /// Which speculative decoder to run.
     pub speculation: Speculation,
+    /// Vision tower (mmproj) GGUF, or `None` for text-only serving.
+    pub mmproj: Option<std::path::PathBuf>,
+    /// Patch budget the vision tower is pre-allocated for.
+    pub max_image_patches: usize,
 }
 
 impl ServingConfig {
@@ -79,6 +83,8 @@ impl ServingConfig {
             prefill_chunk,
             snapshot_slots: crate::runtime::DEFAULT_SNAPSHOT_SLOTS_PER_WORKER,
             speculation: Speculation::None,
+            mmproj: None,
+            max_image_patches: crate::runtime::DEFAULT_MAX_IMAGE_PATCHES,
         }
     }
 }
@@ -151,6 +157,7 @@ struct CacheReservation {
 struct PendingSequence {
     request: NewRequest,
     prompt: Vec<i32>,
+    images: Vec<crate::image::SequenceImage>,
     snapshot: Option<Arc<SequenceSnapshot>>,
     sampling: SamplingParams,
 }
@@ -325,6 +332,8 @@ impl Worker {
                 retention_interval: self.cache.gdn_retention_interval() as usize,
                 snapshot_slots: serving.snapshot_slots,
                 stop_on_eos,
+                mmproj: serving.mmproj.clone(),
+                max_image_patches: serving.max_image_patches,
             },
         )?);
         self.vocab = Some(vocab);
@@ -351,6 +360,7 @@ impl Worker {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<crate::image::SequenceImage>,
         sampling: SamplingParams,
     ) -> Result<RequestId, WorkerExecutionError> {
         self.validate_pending(req, &prompt, None)?;
@@ -363,6 +373,7 @@ impl Worker {
             PendingSequence {
                 request: req,
                 prompt,
+                images,
                 snapshot: None,
                 sampling,
             },
@@ -374,6 +385,7 @@ impl Worker {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        images: Vec<crate::image::SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
     ) -> Result<RequestId, WorkerExecutionError> {
@@ -388,6 +400,7 @@ impl Worker {
             PendingSequence {
                 request: req,
                 prompt,
+                images,
                 snapshot: Some(snapshot),
                 sampling,
             },
@@ -427,10 +440,16 @@ impl Worker {
                     Some(snapshot) => runtime.admit_restored(
                         pending.request,
                         pending.prompt,
+                        pending.images,
                         snapshot,
                         pending.sampling,
                     )?,
-                    None => runtime.admit(pending.request, pending.prompt, pending.sampling)?,
+                    None => runtime.admit(
+                        pending.request,
+                        pending.prompt,
+                        pending.images,
+                        pending.sampling,
+                    )?,
                 }
             }
         }

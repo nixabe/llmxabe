@@ -317,6 +317,11 @@ impl VisionForward {
         self.max_patches
     }
 
+    /// The tower's structural config.
+    pub fn config(&self) -> &VisionConfig {
+        &self.cfg
+    }
+
     /// Encode one preprocessed image; the embeddings land in the returned
     /// device buffer's first `output_tokens * projection_dim` floats.
     ///

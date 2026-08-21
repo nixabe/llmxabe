@@ -18,6 +18,7 @@
 pub mod block;
 pub mod engine;
 pub mod forward;
+pub mod image;
 pub(crate) mod prefix;
 pub mod router;
 pub mod runtime;

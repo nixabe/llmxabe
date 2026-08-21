@@ -349,6 +349,7 @@ impl Generation {
                 max_output_tokens: spec.max_tokens,
             },
             tokens,
+            Vec::new(),
             spec.sampling,
         );
         let placement = match placement {

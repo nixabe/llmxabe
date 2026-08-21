@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use xabe_cache::radix::{BlockHash, ROOT_HASH, hash_block};
 
+use crate::image::ImagePlacement;
 use crate::state::SequenceSnapshot;
 use crate::worker::WorkerId;
 
@@ -37,6 +38,18 @@ use crate::worker::WorkerId;
 /// [`xabe_cache::radix::RadixTree::insert`] charges every entry a full
 /// `block_size` of positions, so one partial entry would misplace every
 /// block after it.
+///
+/// # Images
+///
+/// Every token of an image span is the same `<|image_pad|>` id, so two
+/// prompts differing only in their image *bytes* would hash identically —
+/// and one request would silently resume from the other's image, the exact
+/// wrong-prompt failure described above. So blocks are named over a
+/// substituted stream: an image slot contributes its
+/// [`ImagePlacement::lane`] — a per-slot digest of the image's content
+/// hash — instead of the token id. Same content, same name (cross-request
+/// prefix sharing keeps working); different content, a different name in
+/// every overlapping block.
 pub(crate) struct SequenceChain {
     block_size: usize,
     hashes: Vec<BlockHash>,
@@ -44,25 +57,42 @@ pub(crate) struct SequenceChain {
     pending: Vec<u32>,
     /// Where the prompt ended and generation began.
     prompt_len: usize,
+    /// The prompt's image spans, sorted and validated by the engine.
+    /// Generated tokens are always past `prompt_len` and never in a span.
+    images: Vec<ImagePlacement>,
+    /// Absolute index of the next token [`Self::push`] will see.
+    next_index: usize,
 }
 
 impl SequenceChain {
-    /// Start a chain over a request's prompt.
-    pub(crate) fn new(block_size: u32, prompt: &[i32]) -> Self {
+    /// Start a chain over a request's prompt and its image placements.
+    pub(crate) fn new(block_size: u32, prompt: &[i32], images: &[ImagePlacement]) -> Self {
         let block_size = block_size.max(1) as usize;
         let mut chain = Self {
             block_size,
             hashes: Vec::with_capacity(prompt.len() / block_size + 1),
             pending: Vec::with_capacity(block_size),
             prompt_len: prompt.len(),
+            images: images.to_vec(),
+            next_index: 0,
         };
         chain.extend(prompt.iter().copied());
         chain
     }
 
     /// Append one token, closing a block if that filled it.
+    ///
+    /// Image slots contribute their content lane instead of the token id —
+    /// see the type docs.
     pub(crate) fn push(&mut self, token: i32) {
-        self.pending.push(token as u32);
+        let index = self.next_index;
+        self.next_index += 1;
+        let value = self
+            .images
+            .iter()
+            .find(|img| index >= img.start && index < img.end())
+            .map_or(token as u32, |img| img.lane(index - img.start));
+        self.pending.push(value);
         if self.pending.len() == self.block_size {
             let parent = self.hashes.last().copied().unwrap_or(ROOT_HASH);
             self.hashes.push(hash_block(parent, &self.pending));
@@ -245,7 +275,7 @@ mod tests {
     #[test]
     fn a_chain_hashes_complete_blocks_and_holds_the_rest() {
         let tokens: Vec<i32> = (0..10).collect();
-        let chain = SequenceChain::new(4, &tokens);
+        let chain = SequenceChain::new(4, &tokens, &[]);
         assert_eq!(chain.position(), 10);
         assert_eq!(
             chain.hashes().len(),
@@ -267,11 +297,11 @@ mod tests {
         let prompt: Vec<i32> = (0..6).collect();
         let generated: Vec<i32> = (6..12).collect();
 
-        let mut live = SequenceChain::new(4, &prompt);
+        let mut live = SequenceChain::new(4, &prompt, &[]);
         live.extend(generated.iter().copied());
 
         let whole: Vec<i32> = prompt.iter().chain(&generated).copied().collect();
-        let replayed = SequenceChain::new(4, &whole);
+        let replayed = SequenceChain::new(4, &whole, &[]);
 
         assert_eq!(live.hashes(), replayed.hashes());
         assert_eq!(live.position(), replayed.position());
@@ -279,7 +309,7 @@ mod tests {
 
     #[test]
     fn a_chain_names_only_positions_it_has_reached_and_lands_on() {
-        let chain = SequenceChain::new(4, &(0..10).collect::<Vec<i32>>());
+        let chain = SequenceChain::new(4, &(0..10).collect::<Vec<i32>>(), &[]);
         assert_eq!(chain.hashes_for(8).map(<[u64]>::len), Some(2));
         assert_eq!(chain.hashes_for(4).map(<[u64]>::len), Some(1));
         // Past the complete blocks, even though the chain has seen 10 tokens.
@@ -292,7 +322,7 @@ mod tests {
 
     #[test]
     fn a_chain_answers_only_for_generated_positions_it_still_holds() {
-        let mut chain = SequenceChain::new(4, &(0..6).collect::<Vec<i32>>());
+        let mut chain = SequenceChain::new(4, &(0..6).collect::<Vec<i32>>(), &[]);
         chain.extend(6..10);
         // Two blocks hashed, so positions 8 and 9 are still pending.
         assert_eq!(chain.generated_token_at(8), Some(8));
@@ -308,16 +338,59 @@ mod tests {
         // said next, which is not the prompt's next token. Answering here
         // would report drift on every prefill snapshot and decline to share
         // a perfectly good one.
-        let chain = SequenceChain::new(4, &(0..10).collect::<Vec<i32>>());
+        let chain = SequenceChain::new(4, &(0..10).collect::<Vec<i32>>(), &[]);
         assert_eq!(chain.generated_token_at(8), None);
         assert_eq!(chain.generated_token_at(9), None);
     }
 
     #[test]
     fn a_short_prompt_names_nothing() {
-        let chain = SequenceChain::new(256, &[1, 2, 3]);
+        let chain = SequenceChain::new(256, &[1, 2, 3], &[]);
         assert!(chain.hashes().is_empty());
         assert_eq!(chain.hashes_for(256), None);
+    }
+
+    #[test]
+    fn identical_image_pads_with_different_content_hash_differently() {
+        use crate::image::ImagePlacement;
+        // Two prompts, byte-identical token streams (the pad id repeated),
+        // different image content. Their chains must diverge in the first
+        // block the image touches — this is the silent-wrong-answer case.
+        let pad = 248_056i32;
+        let prompt: Vec<i32> = vec![100, 101, pad, pad, pad, pad, pad, pad, 102, 103];
+        let img = |hash| ImagePlacement {
+            start: 2,
+            grid_h: 2,
+            grid_w: 3,
+            content_hash: hash,
+        };
+        let a = SequenceChain::new(4, &prompt, &[img(1)]);
+        let b = SequenceChain::new(4, &prompt, &[img(2)]);
+        assert_eq!(a.hashes().len(), 2);
+        assert_ne!(a.hashes()[0], b.hashes()[0], "first overlapping block");
+        assert_ne!(a.hashes()[1], b.hashes()[1]);
+
+        // Same content: identical names, so cross-request sharing works.
+        let c = SequenceChain::new(4, &prompt, &[img(1)]);
+        assert_eq!(a.hashes(), c.hashes());
+    }
+
+    #[test]
+    fn image_lanes_do_not_disturb_text_only_blocks() {
+        use crate::image::ImagePlacement;
+        // A block entirely before the image span hashes exactly as a
+        // text-only chain would — prefix sharing up to the image survives.
+        let pad = 248_056i32;
+        let prompt: Vec<i32> = vec![1, 2, 3, 4, pad, pad, pad, pad];
+        let img = ImagePlacement {
+            start: 4,
+            grid_h: 2,
+            grid_w: 2,
+            content_hash: 7,
+        };
+        let with_image = SequenceChain::new(4, &prompt, &[img]);
+        let text_only = SequenceChain::new(4, &[1, 2, 3, 4], &[]);
+        assert_eq!(with_image.hashes()[0], text_only.hashes()[0]);
     }
 
     fn shared_with_three() -> SharedSnapshots<u32> {

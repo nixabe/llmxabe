@@ -18,6 +18,7 @@ xabe-cache.workspace = true
 xabe-sched.workspace = true
 xabe-kernels.workspace = true
 parking_lot.workspace = true
+rustc-hash.workspace = true
 half.workspace = true
 smallvec = "1"
 

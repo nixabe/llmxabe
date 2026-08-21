@@ -123,6 +123,7 @@ fn run_width(
             .admit_tokens(
                 request,
                 synthetic_prompt(sequence, context, model.vocab_size as usize),
+                Vec::new(),
                 SamplingParams::GREEDY,
             )
             .map_err(|error| error.to_string())?;

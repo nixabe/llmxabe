@@ -1037,6 +1037,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 &mut cache,
                 0,
                 &positions,
+                xabe_engine::block::attention::RopeSource::Scalar(&positions),
                 &mut d_out,
             )
             .expect("block forward launches");
