@@ -398,6 +398,70 @@ __global__ void attn_rope_partial_neox(
     }
 }
 
+// Interleaved multimodal rotary (IMROPE), the three-component sibling of
+// attn_rope_partial_neox for prefill chunks that overlap an image span.
+//
+// Each token carries (t, h, w) in `mrope_pos[3*token ..]`. Pair d reads
+// component d%3 — h iff d%3==1 and d < h_bound (3*sections[1]), w iff
+// d%3==2 and d < w_bound (3*sections[2]), else t — with the frequency on
+// the *global* pair index, exactly `ggml_mrope_cache_init`'s
+// GGML_ROPE_TYPE_IMROPE branch (reference:
+// `xabe_kernels::mrope::apply_imrope`). With all three components equal
+// this computes bit-for-bit what attn_rope_partial_neox computes — the
+// double conversions and the operation order are copied from it — which is
+// asserted by differential test rather than assumed.
+//
+// No ROPE_TT banding: the frequency hoist is per pair as before, but the
+// position is per token anyway and this kernel only ever runs on
+// image-bearing prefill chunks, off the decode path the banding was
+// measured for.
+__global__ void attn_rope_partial_imrope(
+    const float* __restrict__ in,
+    float* __restrict__ out,
+    int n_heads,
+    int head_dim,
+    int rope_dim,
+    const int* __restrict__ mrope_pos,
+    int h_bound,
+    int w_bound,
+    float theta_base,
+    int n_tokens
+) {
+    long long t = blockIdx.x;
+    int h = blockIdx.y;
+    int d = threadIdx.x;
+    if (t >= n_tokens) return;
+
+    int half = rope_dim >> 1;
+    long long base = (t * (long long)n_heads + h) * (long long)head_dim;
+
+    if (d >= rope_dim) {
+        out[base + d] = in[base + d];
+        return;
+    }
+    if (d >= half) return;
+
+    int c = d % 3;
+    int component;
+    if (c == 1 && d < h_bound) {
+        component = mrope_pos[3 * t + 1];
+    } else if (c == 2 && d < w_bound) {
+        component = mrope_pos[3 * t + 2];
+    } else {
+        component = mrope_pos[3 * t];
+    }
+
+    double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
+    double angle = (double)component * freq;
+    float sin_a = (float)sin(angle);
+    float cos_a = (float)cos(angle);
+
+    float x0 = in[base + d];
+    float x1 = in[base + d + half];
+    out[base + d]        = x0 * cos_a - x1 * sin_a;
+    out[base + d + half] = x0 * sin_a + x1 * cos_a;
+}
+
 // Causal GQA attention, online-softmax streaming form.
 //
 // grid: (n_query, q_heads) — one block per (query row, query head).
@@ -2508,6 +2572,7 @@ impl AttnDecodeScratch {
 pub struct AttentionKernels {
     split: CudaFunction,
     rope: CudaFunction,
+    rope_imrope: CudaFunction,
     flash: CudaFunction,
     flash_gqa: CudaFunction,
     flash_mma: CudaFunction,
@@ -2589,6 +2654,7 @@ impl AttentionKernels {
         Ok(Self {
             split: module.load_function("attn_split_query_gate")?,
             rope: module.load_function("attn_rope_partial_neox")?,
+            rope_imrope: module.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
             flash_mma: {
@@ -3060,6 +3126,82 @@ impl AttentionKernels {
         // stops at the last real token; both buffers were checked to hold
         // exactly that many floats, and every thread touches only its own
         // head's slice.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// Interleaved multimodal rotary over `[n_tokens][n_heads][head_dim]` —
+    /// the three-component sibling of [`Self::rope`] for prefill chunks
+    /// overlapping an image span.
+    ///
+    /// `mrope_positions` holds `(t, h, w)` i32 triples, one per token, in
+    /// token order. Pair `d` reads component `d % 3` bounded by
+    /// `3 * sections[1]` / `3 * sections[2]` (`h_bound` / `w_bound`), with
+    /// the frequency on the global pair index — `ggml_mrope_cache_init`'s
+    /// `GGML_ROPE_TYPE_IMROPE` branch; reference
+    /// `xabe_kernels::mrope::apply_imrope`. With `t == h == w` per token
+    /// this is bit-identical to [`Self::rope`], asserted by differential
+    /// test. Dimensions `[rope_dim, head_dim)` are copied through.
+    ///
+    /// Only ever launched on uncaptured prefill passes; decode keeps the
+    /// scalar kernel with a delta-adjusted base.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_imrope(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        rope_dim: usize,
+        mrope_positions: &CudaSlice<i32>,
+        sections: [u32; 3],
+        theta_base: f32,
+    ) -> Result<(), AttentionError> {
+        if mrope_positions.len() < 3 * n_tokens {
+            return Err(AttentionError::BufferShape {
+                what: "imrope positions",
+                expected: 3 * n_tokens,
+                actual: mrope_positions.len(),
+            });
+        }
+        if !rope_dim.is_multiple_of(2) || rope_dim > self.head_dim {
+            return Err(AttentionError::UnsupportedRopeDim {
+                rope_dim,
+                head_dim: self.head_dim,
+            });
+        }
+        let n = n_tokens * n_heads * self.head_dim;
+        Self::expect_len("imrope input", input.len(), n)?;
+        Self::expect_len("imrope output", out.len(), n)?;
+
+        let cfg = LaunchConfig {
+            grid_dim: (n_tokens as u32, n_heads as u32, 1),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_heads_i = n_heads as i32;
+        let head_dim = self.head_dim as i32;
+        let rope_dim_i = rope_dim as i32;
+        let h_bound = (3 * sections[1]) as i32;
+        let w_bound = (3 * sections[2]) as i32;
+        let n_tokens_i = n_tokens as i32;
+        let mut builder = stream.launch_builder(&self.rope_imrope);
+        builder
+            .arg(input)
+            .arg(out)
+            .arg(&n_heads_i)
+            .arg(&head_dim)
+            .arg(&rope_dim_i)
+            .arg(mrope_positions)
+            .arg(&h_bound)
+            .arg(&w_bound)
+            .arg(&theta_base)
+            .arg(&n_tokens_i);
+        // SAFETY: grid is (n_tokens, n_heads) with one thread per head
+        // dimension; both buffers hold exactly n floats and positions holds
+        // at least 3*n_tokens ints (checked above); each thread touches only
+        // its own head's slice.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
