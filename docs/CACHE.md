@@ -141,6 +141,51 @@ which worker inserted them.
 boot into an eviction-exempt slot. Three prefills at startup, zero at steady
 state.
 
+### What names a sequence's blocks
+
+`xabe-engine`'s `SequenceChain` owns the hashing, and it hashes nothing but the
+sequence's own tokens in order: the prompt the request was admitted with, then
+every token the runtime reports generating, appended as it is reported. No
+caller supplies hashes, because a chain that disagreed with the tokens would
+file a snapshot under a prefix it does not describe, and the next request to
+match that hash would resume from a prompt it never sent — fluently, with
+nothing in the output to say so.
+
+Two rules fall out of that:
+
+- **Only complete blocks are hashed.** A partial trailing block has no stable
+  name, since the same tokens hash differently once the block fills, and
+  `RadixTree::insert` charges every entry a full `block_size` of positions —
+  one partial entry would misplace every block after it. A prompt shorter than
+  one block names nothing, and cannot.
+- **Generated tokens are folded in before that step's snapshots are
+  published.** Within a step the runtime interleaves the two — a speculative
+  round retains at position `p`, then emits the token at `p` — so taking the
+  generated tokens first is what guarantees every chain has reached the
+  deepest position its step retained.
+
+The engine also cross-checks the two records it has of the same fact: the
+snapshot's `next_token`, recorded by the runtime, against the chain's own
+record of the token that followed that position. They are built independently,
+so a disagreement means the chain has drifted, and a drifted chain declines to
+publish rather than share a prefix it cannot vouch for.
+
+### Why the shared snapshot cache yields
+
+A published snapshot pins at least one of its worker's 24 arena slots — often
+several, since a snapshot holds an `Arc` to its parent for everything before
+its own interval. Those are the same slots live sequences snapshot into, and
+running out is not a soft failure: the runtime answers `SnapshotArenaExhausted`
+by switching that sequence's retention off *permanently*. Holding a snapshot
+against a future hit therefore costs a present one.
+
+So before a worker publishes, the cache drops that worker's least recently used
+entries until its arena has one free slot per concurrent sequence — enough that
+every live sequence can still take its next snapshot — and declines to publish
+if it cannot get there. Recency counts actual reuse rather than insertion,
+because a shared system prompt is old by construction and is exactly the entry
+worth keeping.
+
 ### Why one process wins
 
 The alternative was `--slot-save-path` on tmpfs as an L2 tier behind each
@@ -186,20 +231,21 @@ Stated rather than discovered later:
 - `xabe-cache` itself does not touch device memory. `xabe-engine` accounts the
   per-worker device pools during admission and owns the pinned migration arena.
   The cache crate's tests remain host-side logic.
-- **Only the prompt is shared.** A request is admitted with the block hashes
-  of its prompt, and nothing extends that chain as the sequence generates. So
-  a snapshot taken at a retention boundary the prompt does not reach has no
-  name to be filed under, and `Engine::install_snapshot` declines to share it
-  — the sequence keeps using it locally, but no other request can find it.
+- **A chat turn's reply is not on the next turn's path**, and no amount of
+  prefix caching changes that. It is a property of this model's chat template,
+  not of this cache. Turn one's sequence runs
+  `…<|im_start|>assistant\n<think>\n` and then its reply; turn two re-renders
+  that same assistant turn as `…<|im_start|>assistant\n{content}<|im_end|>\n`,
+  dropping the `<think>` block the generation prompt opened. The two token
+  sequences diverge immediately after the assistant marker, so turn two's
+  longest shared prefix ends at the end of turn one's *prompt* — which turn
+  one's own prefill already published.
 
-  The cost is cross-turn reuse: the second turn of a conversation matches only
-  as far as the first turn's *prompt*, not through the reply the model
-  generated. Closing this means hashing generated tokens into the chain as
-  they are produced, which must agree exactly with the runtime's own idea of
-  the sequence position — a chain that disagrees files a snapshot under a
-  prefix it does not describe, and the next request to match that hash resumes
-  from the wrong state. That is worth building deliberately, with a test that
-  pins the agreement, rather than as a side effect.
-
-  Until then, note that this is *not* free: declining is the safe branch, and
-  it silently gives up the reuse rather than misreporting it.
+  Measured on one RTX 8000: a three-turn conversation over a ~3850-token
+  system prompt reused 2048 tokens on turns two and three, and reused the same
+  2048 before generated tokens were ever hashed. Do not expect this cache to
+  earn its keep on chat beyond the shared prompt prefix; where it earns it is
+  a prompt that genuinely continues an earlier reply — a raw completion picking
+  up where it left off, or an agent replaying its own output verbatim. There,
+  reuse went from 0 to 2048 tokens, worth 2.1× on time to first token over
+  four interleaved pairs.

@@ -165,6 +165,16 @@ engine below it needs a GPU and a 30 GiB model and so cannot be stood up in a
   card idle within 3 s of the client vanishing.
 - A 4000-token generation, which crosses a GDN retention boundary — the case
   that used to fail the whole scheduler step.
+- **Prefix reuse through generated tokens, against a cold control.** A
+  14-token prompt generated 2,600 tokens; a second request whose prompt was
+  that prompt plus that output reused 2,048 tokens, none of which the first
+  request's prompt could have named. The resumed continuation was compared
+  against the identical request on a freshly started server that had never
+  seen the text — byte-identical, which is the check that matters, because a
+  chain naming the wrong prefix produces fluent output rather than an error.
+  Four interleaved pairs on unique prompts put the saving at 2.1× on time to
+  first token for a 2,621-token prompt, and every pair's resumed answer
+  matched its cold arm.
 
 Everything below the wire format is covered by the unit tests in
 `crates/xabe-server/src/http/`: the ChatML rendering is pinned string by
