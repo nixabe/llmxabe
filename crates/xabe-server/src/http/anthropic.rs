@@ -46,12 +46,13 @@ struct MessagesRequest {
 }
 
 impl MessagesRequest {
-    /// Extended thinking is on unless the caller turned it off, which matches
-    /// the model's own template default.
-    fn thinking_enabled(&self) -> bool {
+    /// Extended thinking follows the server default unless the caller says
+    /// otherwise. The shipped default is on, matching the model's own
+    /// template.
+    fn thinking_enabled(&self, default: bool) -> bool {
         self.thinking
             .as_ref()
-            .is_none_or(|thinking| thinking.kind != "disabled")
+            .map_or(default, |thinking| thinking.kind != "disabled")
     }
 
     fn conversation(&self) -> Result<Conversation, ApiError> {
@@ -109,7 +110,7 @@ fn start(state: &AppState, request: &MessagesRequest) -> Result<Generation, ApiE
     if request.tools.is_some() {
         return Err(unsupported_tools(DIALECT));
     }
-    let thinking = request.thinking_enabled();
+    let thinking = request.thinking_enabled(state.default_reasoning);
     let prompt = request.conversation()?.render(thinking);
     let encoding = state
         .tokenizer
@@ -263,7 +264,9 @@ pub(crate) async fn count_tokens(
     if request.tools.is_some() {
         return Err(unsupported_tools(DIALECT));
     }
-    let prompt = request.conversation()?.render(request.thinking_enabled());
+    let prompt = request
+        .conversation()?
+        .render(request.thinking_enabled(state.default_reasoning));
     let encoding = state
         .tokenizer
         .encode(prompt, false)
@@ -283,6 +286,7 @@ mod tests {
 
     #[test]
     fn a_system_string_and_a_system_block_list_are_the_same_thing() {
+        // `render` takes the resolved flag, so pass it explicitly here.
         let plain = request(
             r#"{"max_tokens":16,"system":"Be terse.","messages":[{"role":"user","content":"Hi"}]}"#,
         );
@@ -297,16 +301,20 @@ mod tests {
     }
 
     #[test]
-    fn thinking_is_on_unless_it_is_turned_off() {
-        assert!(request(r#"{"max_tokens":1,"messages":[]}"#).thinking_enabled());
-        assert!(
-            request(r#"{"max_tokens":1,"messages":[],"thinking":{"type":"enabled"}}"#)
-                .thinking_enabled()
-        );
-        assert!(
-            !request(r#"{"max_tokens":1,"messages":[],"thinking":{"type":"disabled"}}"#)
-                .thinking_enabled()
-        );
+    fn a_silent_request_follows_the_server_default() {
+        let silent = request(r#"{"max_tokens":1,"messages":[]}"#);
+        assert!(silent.thinking_enabled(true));
+        assert!(!silent.thinking_enabled(false));
+    }
+
+    #[test]
+    fn a_request_that_names_a_mode_overrides_the_server_default() {
+        // Either way round: `--no-reasoning` must not silently ignore a
+        // caller that asked for thinking, and neither must the reverse.
+        let on = request(r#"{"max_tokens":1,"messages":[],"thinking":{"type":"enabled"}}"#);
+        let off = request(r#"{"max_tokens":1,"messages":[],"thinking":{"type":"disabled"}}"#);
+        assert!(on.thinking_enabled(false));
+        assert!(!off.thinking_enabled(true));
     }
 
     #[test]

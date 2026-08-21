@@ -25,7 +25,7 @@ use crate::prefix::{SequenceChain, SharedSnapshots};
 use crate::router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 use crate::runtime::{DeviceStep, RuntimeError};
 use crate::state::SequenceSnapshot;
-use crate::worker::{Worker, WorkerExecutionError, WorkerId};
+use crate::worker::{ServingConfig, Worker, WorkerExecutionError, WorkerId};
 
 #[derive(Debug)]
 pub enum EngineExecutionError {
@@ -252,10 +252,10 @@ impl Engine {
         &mut self,
         model_path: &Path,
         model: ModelConfig,
-        prefill_chunk: usize,
+        serving: ServingConfig,
     ) -> Result<(), (WorkerId, RuntimeError)> {
         for worker in &mut self.workers {
-            if let Err(error) = worker.bind_device(model_path, model.clone(), prefill_chunk) {
+            if let Err(error) = worker.bind_device(model_path, model.clone(), serving) {
                 return Err((worker.id(), error));
             }
         }

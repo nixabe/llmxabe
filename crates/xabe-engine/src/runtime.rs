@@ -25,12 +25,38 @@ use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
 use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots};
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
 
-/// Pinned snapshot capacity per worker. One default-retention slot is
-/// 102.8125 MiB, so 24 slots consume 2.41 GiB per worker and 7.23 GiB
-/// process-wide.
+/// Pinned snapshot capacity per worker when no budget is given. One
+/// default-retention slot is 102.8125 MiB, so 24 slots consume 2.41 GiB per
+/// worker and 7.23 GiB process-wide.
 /// This stays below the host's locked-memory limit while covering eight
 /// simultaneous retention points for each of the three serving sequences.
-const SNAPSHOT_SLOTS_PER_WORKER: usize = 24;
+/// `--cache-ram` overrides it; see `docs/CLI.md`.
+pub const DEFAULT_SNAPSHOT_SLOTS_PER_WORKER: usize = 24;
+
+/// Everything a device runtime needs beyond the model itself.
+///
+/// A struct rather than eight positional arguments because two of these are
+/// `usize` counts that mean entirely different things, and swapping them
+/// would compile.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeConfig {
+    /// Tokens per chunked-prefill step.
+    pub prefill_chunk: usize,
+    /// Widest decode batch this worker will be asked to run.
+    pub max_batch: usize,
+    /// Speculative drafting, or `None` for no drafting at all.
+    pub ngram: Option<NgramConfig>,
+    /// Tokens between retained GDN snapshots.
+    pub retention_interval: usize,
+    /// Pinned host snapshot slots. Zero disables retention, and with it
+    /// prefix sharing: a sequence that cannot check one out simply stops
+    /// snapshotting and serves normally.
+    pub snapshot_slots: usize,
+    /// Whether the end-of-turn token ends a sequence. A fixed-width
+    /// throughput benchmark sets this false so its measurement cannot
+    /// silently shrink.
+    pub stop_on_eos: bool,
+}
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -227,32 +253,18 @@ pub struct DeviceRuntimeHandle {
 }
 
 impl DeviceRuntimeHandle {
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         device_ordinal: usize,
         model_path: PathBuf,
         config: ModelConfig,
-        prefill_chunk: usize,
-        max_batch: usize,
-        ngram: Option<NgramConfig>,
-        retention_interval: usize,
-        stop_on_eos: bool,
+        runtime: RuntimeConfig,
     ) -> Result<Self, RuntimeError> {
         let (commands, receiver) = sync_channel::<RuntimeCommand>(1);
         let (ready_tx, ready_rx) = sync_channel::<Result<SnapshotSlots, RuntimeError>>(0);
         let thread = std::thread::Builder::new()
             .name(format!("xabe-gpu-{device_ordinal}"))
             .spawn(move || {
-                let runtime = DeviceRuntime::load(
-                    device_ordinal,
-                    &model_path,
-                    config,
-                    prefill_chunk,
-                    max_batch,
-                    ngram,
-                    retention_interval,
-                    stop_on_eos,
-                );
+                let runtime = DeviceRuntime::load(device_ordinal, &model_path, config, runtime);
                 match runtime {
                     Ok(mut runtime) => {
                         if ready_tx.send(Ok(runtime.snapshot_arena.slots())).is_err() {
@@ -365,17 +377,20 @@ impl Drop for DeviceRuntimeHandle {
 }
 
 impl DeviceRuntime {
-    #[allow(clippy::too_many_arguments)]
     pub fn load(
         device_ordinal: usize,
         model_path: &Path,
         config: ModelConfig,
-        prefill_chunk: usize,
-        max_batch: usize,
-        ngram: Option<NgramConfig>,
-        retention_interval: usize,
-        stop_on_eos: bool,
+        runtime: RuntimeConfig,
     ) -> Result<Self, RuntimeError> {
+        let RuntimeConfig {
+            prefill_chunk,
+            max_batch,
+            ngram,
+            retention_interval,
+            snapshot_slots,
+            stop_on_eos,
+        } = runtime;
         let load_started = Instant::now();
         if prefill_chunk == 0 {
             return Err(RuntimeError::ZeroPrefillChunk);
@@ -390,7 +405,6 @@ impl DeviceRuntime {
         // per-allocation event tracking; disable it before the first upload.
         unsafe { ctx.disable_event_tracking() };
 
-        let snapshot_slots = SNAPSHOT_SLOTS_PER_WORKER.max(max_batch);
         let snapshot_arena =
             SnapshotArena::new(&ctx, &config, retention_interval.max(1), snapshot_slots)?;
         debug!(

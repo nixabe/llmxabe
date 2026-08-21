@@ -13,10 +13,6 @@ use super::{AppState, sse_json, unix_now};
 
 const DIALECT: Dialect = Dialect::OpenAi;
 
-const fn default_max_tokens() -> u32 {
-    16
-}
-
 /// `stop` is a string or a list of strings in both OpenAI shapes.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -106,8 +102,8 @@ enum Prompt {
 #[derive(Debug, Deserialize)]
 struct CompletionRequest {
     prompt: Prompt,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
+    #[serde(default)]
+    max_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -164,7 +160,7 @@ pub(crate) async fn completions(
     // and everything the model emits is answer text.
     let spec = GenerationSpec {
         prompt: encoding.get_ids().to_vec(),
-        max_tokens: request.max_tokens,
+        max_tokens: request.max_tokens.unwrap_or(state.default_max_tokens),
         stop: stop_sequences(request.stop),
         thinking: false,
         trim_spans: false,
@@ -362,7 +358,7 @@ pub(crate) async fn chat_completions(
         .chat_template_kwargs
         .as_ref()
         .and_then(|kwargs| kwargs.enable_thinking)
-        .unwrap_or(true);
+        .unwrap_or(state.default_reasoning);
     let conversation = conversation(request.messages)?;
     let prompt = conversation.render(thinking);
     let encoding = state
@@ -374,7 +370,7 @@ pub(crate) async fn chat_completions(
         max_tokens: request
             .max_completion_tokens
             .or(request.max_tokens)
-            .unwrap_or(default_max_tokens()),
+            .unwrap_or(state.default_max_tokens),
         stop: stop_sequences(request.stop),
         thinking,
         trim_spans: true,

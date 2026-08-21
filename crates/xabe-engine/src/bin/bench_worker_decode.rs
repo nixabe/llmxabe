@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use tracing::{debug, error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{Worker, WorkerId};
+use xabe_engine::{ServingConfig, Worker, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::config::{DEFAULT_WATERMARK_FRACTION, SchedulerConfig};
 use xabe_sched::request::{NewRequest, RequestId};
@@ -98,7 +98,11 @@ fn run_width(
         width as u32,
     );
     worker
-        .bind_device_for_benchmark(path, model.clone(), PREFILL_CHUNK.min(context).max(1))
+        .bind_device_for_benchmark(
+            path,
+            model.clone(),
+            ServingConfig::new(PREFILL_CHUNK.min(context).max(1)),
+        )
         .map_err(|error| error.to_string())?;
 
     for sequence in 0..width {

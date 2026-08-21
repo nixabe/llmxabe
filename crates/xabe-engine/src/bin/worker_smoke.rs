@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{Worker, WorkerId};
+use xabe_engine::{ServingConfig, Worker, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::config::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
     let attention_blocks = 393_216 / cache.attention_block_size();
     let mut worker = Worker::new(WorkerId(0), 0, cache, sched, attention_blocks, width as u32);
     info!("binding worker0 to visible CUDA device 0");
-    if let Err(error) = worker.bind_device(&path, model.clone(), PROMPT) {
+    if let Err(error) = worker.bind_device(&path, model.clone(), ServingConfig::new(PROMPT)) {
         error!("worker binding failed: {error}");
         return ExitCode::FAILURE;
     }

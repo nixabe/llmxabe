@@ -270,6 +270,16 @@ impl SnapshotLayout {
     }
 }
 
+/// Pinned host bytes one retained snapshot occupies.
+///
+/// Pure arithmetic over the model configuration, so a caller can turn a
+/// memory budget into a slot count — and report what that budget bought —
+/// during preflight, before any device is touched.
+pub fn snapshot_bytes_per_slot(config: &ModelConfig, retention_interval: usize) -> usize {
+    let layout = SnapshotLayout::new(config, retention_interval);
+    layout.attention_bytes() + layout.gdn_bytes()
+}
+
 /// Fixed-capacity page-locked storage for retained sequence snapshots.
 pub(crate) struct SnapshotArena {
     slots: Arc<LeasePool<SnapshotBuffers>>,

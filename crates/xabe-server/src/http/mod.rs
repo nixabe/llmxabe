@@ -48,19 +48,34 @@ pub const DEFAULT_MODEL: &str = "Qwen3.6-35B-A3B";
 /// The vocabulary entry that closes the model's reasoning span.
 const THINK_CLOSE: &str = "</think>";
 
+/// The serving defaults a request may override.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// `None` leaves the server open, which is what it was before an API key
+    /// could be configured.
+    pub api_key: Option<String>,
+    /// The model name reported by `/v1/models` and echoed in responses.
+    pub model: String,
+    /// The output token limit for a request that does not set one.
+    pub default_max_tokens: u32,
+    /// Whether a chat request that says nothing about reasoning gets it.
+    /// The model's own template defaults this on.
+    pub default_reasoning: bool,
+}
+
 #[derive(Clone)]
 struct AppState {
     engine: Arc<Mutex<Engine>>,
     tokenizer: Arc<Tokenizer>,
     clients: ClientMap,
     next_id: Arc<AtomicU64>,
-    /// `None` leaves the server open, which is what it was before an API key
-    /// could be configured.
     api_key: Option<Arc<str>>,
     /// The id of `</think>`, looked up once so the generation path can close
     /// the reasoning span on a token comparison.
     think_close_token: Option<i32>,
     model: Arc<str>,
+    default_max_tokens: u32,
+    default_reasoning: bool,
 }
 
 impl AppState {
@@ -199,7 +214,7 @@ pub async fn serve(
     engine: Engine,
     tokenizer: Tokenizer,
     address: &str,
-    api_key: Option<String>,
+    config: ServerConfig,
 ) -> Result<(), String> {
     let think_close_token = tokenizer
         .token_to_id(THINK_CLOSE)
@@ -217,9 +232,11 @@ pub async fn serve(
         tokenizer: Arc::new(tokenizer),
         clients: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
-        api_key: api_key.map(Arc::from),
+        api_key: config.api_key.map(Arc::from),
         think_close_token,
-        model: Arc::from(DEFAULT_MODEL),
+        model: Arc::from(config.model.as_str()),
+        default_max_tokens: config.default_max_tokens,
+        default_reasoning: config.default_reasoning,
     };
     let scheduler_state = state.clone();
     std::thread::Builder::new()

@@ -29,7 +29,11 @@ pub mod worker;
 
 pub use engine::{Engine, EngineExecutionError, Placement, PlacementError};
 pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
-pub use runtime::{DeviceRuntime, DeviceStep, RuntimeError};
-pub use state::{SequenceSnapshot, SequenceState, SnapshotSlots, StateError};
+pub use runtime::{
+    DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, DeviceRuntime, DeviceStep, RuntimeConfig, RuntimeError,
+};
+pub use state::{
+    SequenceSnapshot, SequenceState, SnapshotSlots, StateError, snapshot_bytes_per_slot,
+};
 pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
-pub use worker::{Worker, WorkerExecutionError, WorkerId};
+pub use worker::{ServingConfig, Worker, WorkerExecutionError, WorkerId};

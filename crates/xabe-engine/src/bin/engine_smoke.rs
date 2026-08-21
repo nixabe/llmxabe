@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{Engine, RouterConfig, WorkerId};
+use xabe_engine::{Engine, RouterConfig, ServingConfig, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
@@ -58,7 +58,9 @@ fn main() -> ExitCode {
         3,
         RouterConfig::balanced(),
     );
-    if let Err((worker, failure)) = engine.bind_devices(&path, model.clone(), 128) {
+    if let Err((worker, failure)) =
+        engine.bind_devices(&path, model.clone(), ServingConfig::new(128))
+    {
         error!("{worker} failed to bind: {failure}");
         return ExitCode::FAILURE;
     }

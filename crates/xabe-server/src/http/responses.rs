@@ -24,10 +24,6 @@ use super::{AppState, sse_named, unix_now};
 
 const DIALECT: Dialect = Dialect::OpenAi;
 
-const fn default_max_output_tokens() -> u32 {
-    16
-}
-
 /// One entry of a structured `input` list.
 #[derive(Debug, Deserialize)]
 struct InputItem {
@@ -59,8 +55,8 @@ struct ResponsesRequest {
     input: Input,
     #[serde(default)]
     instructions: Option<String>,
-    #[serde(default = "default_max_output_tokens")]
-    max_output_tokens: u32,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -74,13 +70,16 @@ struct ResponsesRequest {
 }
 
 impl ResponsesRequest {
-    fn thinking_enabled(&self) -> bool {
-        !matches!(
-            self.reasoning
-                .as_ref()
-                .and_then(|reasoning| reasoning.effort.as_deref()),
-            Some("none" | "minimal")
-        )
+    fn thinking_enabled(&self, default: bool) -> bool {
+        match self
+            .reasoning
+            .as_ref()
+            .and_then(|reasoning| reasoning.effort.as_deref())
+        {
+            Some("none" | "minimal") => false,
+            Some(_) => true,
+            None => default,
+        }
     }
 
     fn conversation(&self) -> Result<Conversation, ApiError> {
@@ -230,7 +229,7 @@ pub(crate) async fn create(
              so send the whole conversation in `input`",
         ));
     }
-    let thinking = request.thinking_enabled();
+    let thinking = request.thinking_enabled(state.default_reasoning);
     let prompt = request.conversation()?.render(thinking);
     let encoding = state
         .tokenizer
@@ -238,7 +237,9 @@ pub(crate) async fn create(
         .map_err(|error| ApiError::bad_request(DIALECT, error.to_string()))?;
     let spec = GenerationSpec {
         prompt: encoding.get_ids().to_vec(),
-        max_tokens: request.max_output_tokens,
+        max_tokens: request
+            .max_output_tokens
+            .unwrap_or(state.default_max_tokens),
         stop: Vec::new(),
         thinking,
         trim_spans: true,
@@ -458,10 +459,22 @@ mod tests {
 
     #[test]
     fn minimal_reasoning_effort_turns_thinking_off() {
-        assert!(request(r#"{"input":"Hi"}"#).thinking_enabled());
-        assert!(request(r#"{"input":"Hi","reasoning":{"effort":"high"}}"#).thinking_enabled());
-        assert!(!request(r#"{"input":"Hi","reasoning":{"effort":"none"}}"#).thinking_enabled());
-        assert!(!request(r#"{"input":"Hi","reasoning":{"effort":"minimal"}}"#).thinking_enabled());
+        assert!(!request(r#"{"input":"Hi","reasoning":{"effort":"none"}}"#).thinking_enabled(true));
+        assert!(
+            !request(r#"{"input":"Hi","reasoning":{"effort":"minimal"}}"#).thinking_enabled(true)
+        );
+    }
+
+    #[test]
+    fn a_named_effort_overrides_the_server_default_either_way() {
+        assert!(request(r#"{"input":"Hi","reasoning":{"effort":"high"}}"#).thinking_enabled(false));
+        assert!(!request(r#"{"input":"Hi","reasoning":{"effort":"none"}}"#).thinking_enabled(true));
+    }
+
+    #[test]
+    fn a_silent_request_follows_the_server_default() {
+        assert!(request(r#"{"input":"Hi"}"#).thinking_enabled(true));
+        assert!(!request(r#"{"input":"Hi"}"#).thinking_enabled(false));
     }
 
     #[test]

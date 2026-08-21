@@ -28,8 +28,32 @@ use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 use xabe_sched::scheduler::Scheduler;
 
 use crate::router::WorkerLoad;
-use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeError};
+use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeConfig, RuntimeError};
 use crate::state::{SequenceSnapshot, SnapshotSlots};
+
+/// The bind-time knobs a worker cannot derive for itself.
+///
+/// Everything else the runtime needs — batch width, draft count, retention
+/// interval — the worker reads off its own scheduler and cache
+/// configuration, so those are not repeated here where they could disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServingConfig {
+    /// Tokens per chunked-prefill step.
+    pub prefill_chunk: usize,
+    /// Pinned host snapshot slots for this worker. Zero disables retention,
+    /// and with it prefix sharing.
+    pub snapshot_slots: usize,
+}
+
+impl ServingConfig {
+    /// A configuration with the shipped snapshot budget.
+    pub fn new(prefill_chunk: usize) -> Self {
+        Self {
+            prefill_chunk,
+            snapshot_slots: crate::runtime::DEFAULT_SNAPSHOT_SLOTS_PER_WORKER,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum WorkerExecutionError {
@@ -226,9 +250,9 @@ impl Worker {
         &mut self,
         model_path: &Path,
         model: ModelConfig,
-        prefill_chunk: usize,
+        serving: ServingConfig,
     ) -> Result<(), RuntimeError> {
-        self.bind_device_inner(model_path, model, prefill_chunk, true)
+        self.bind_device_inner(model_path, model, serving, true)
     }
 
     /// Bind the real scheduler/runtime path while leaving EOS as an ordinary
@@ -237,16 +261,16 @@ impl Worker {
         &mut self,
         model_path: &Path,
         model: ModelConfig,
-        prefill_chunk: usize,
+        serving: ServingConfig,
     ) -> Result<(), RuntimeError> {
-        self.bind_device_inner(model_path, model, prefill_chunk, false)
+        self.bind_device_inner(model_path, model, serving, false)
     }
 
     fn bind_device_inner(
         &mut self,
         model_path: &Path,
         model: ModelConfig,
-        prefill_chunk: usize,
+        serving: ServingConfig,
         stop_on_eos: bool,
     ) -> Result<(), RuntimeError> {
         let max_batch = self.scheduler.config().max_concurrent_decodes() as usize;
@@ -262,11 +286,14 @@ impl Worker {
             self.device_ordinal,
             model_path.to_path_buf(),
             model,
-            prefill_chunk,
-            max_batch,
-            ngram,
-            self.cache.gdn_retention_interval() as usize,
-            stop_on_eos,
+            RuntimeConfig {
+                prefill_chunk: serving.prefill_chunk,
+                max_batch,
+                ngram,
+                retention_interval: self.cache.gdn_retention_interval() as usize,
+                snapshot_slots: serving.snapshot_slots,
+                stop_on_eos,
+            },
         )?);
         self.vocab = Some(vocab);
         Ok(())

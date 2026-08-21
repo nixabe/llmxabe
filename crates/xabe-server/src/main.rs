@@ -19,6 +19,7 @@
 //! `docs/CLI.md`.
 
 mod http;
+mod size;
 mod tokenizer;
 
 use clap::Parser;
@@ -26,7 +27,9 @@ use std::path::PathBuf;
 use tracing::{error, info, warn};
 use xabe_cache::config::CacheConfig;
 use xabe_cuda::{check_gate, device};
-use xabe_engine::{Engine, RouterConfig};
+use xabe_engine::{
+    DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, Engine, RouterConfig, ServingConfig, snapshot_bytes_per_slot,
+};
 use xabe_model::budget;
 use xabe_model::{ModelConfig, verify};
 use xabe_sched::config::SchedulerConfig;
@@ -84,9 +87,30 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     prefill_chunk: usize,
 
+    /// Host RAM for the prefix cache's pinned snapshots, across all workers
+    /// (e.g. 8GiB); 0 disables snapshot retention and prefix sharing
+    #[arg(long, env = "LLMXABE_CACHE_RAM", value_parser = size::parse_bytes)]
+    cache_ram: Option<u64>,
+
+    /// Fraction of the KV pool held back as admission headroom, in [0, 1)
+    #[arg(long, default_value_t = xabe_sched::config::DEFAULT_WATERMARK_FRACTION)]
+    watermark: f64,
+
     /// API key callers must present; with none set, every caller is accepted
     #[arg(long, env = "LLMXABE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+
+    /// Model name reported by /v1/models and echoed in responses
+    #[arg(long, env = "LLMXABE_SERVED_MODEL_NAME", default_value = http::DEFAULT_MODEL)]
+    served_model_name: String,
+
+    /// Output token limit for requests that do not set one
+    #[arg(long, default_value_t = 16)]
+    default_max_tokens: u32,
+
+    /// Answer without extended thinking unless a request asks for it
+    #[arg(long)]
+    no_reasoning: bool,
 }
 
 /// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
@@ -107,11 +131,6 @@ fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
             arg
         })
         .collect()
-}
-
-/// Bytes as GiB, for display.
-fn gib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
 }
 
 fn main() -> std::process::ExitCode {
@@ -164,10 +183,12 @@ fn main() -> std::process::ExitCode {
     info!("                 (capacity is reported per group and never summed)");
 
     // 3. Scheduler. Construction rejects the budget-versus-block trap.
-    let sched = match SchedulerConfig::with_defaults(
+    let sched = match SchedulerConfig::new(
         args.token_budget,
         cache.attention_block_size(),
         args.slots_per_worker,
+        args.watermark,
+        xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -182,7 +203,7 @@ fn main() -> std::process::ExitCode {
         sched.max_concurrent_decodes()
     );
     info!(
-        "                 {} tokens charged per decode step ({} MTP drafts)",
+        "                 {} tokens charged per decode step ({} n-gram drafts)",
         sched.tokens_per_decode_step(),
         sched.draft_tokens_per_step()
     );
@@ -229,8 +250,8 @@ fn main() -> std::process::ExitCode {
     let headroom = vram.headroom_bytes(usable);
     info!(
         "\nvram             {:.2} GiB of {:.2} GiB measured — {:.2} GiB headroom",
-        gib(vram.total_bytes()),
-        gib(usable),
+        size::gib(vram.total_bytes()),
+        size::gib(usable),
         headroom as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     info!("                 (text-only; excludes the ~1.5 GiB vision encoder)");
@@ -241,6 +262,7 @@ fn main() -> std::process::ExitCode {
 
     // 6. Engine. One worker per device, sharing one prefix tree.
     let attention_blocks = args.total_context / cache.attention_block_size();
+    let retention_interval = cache.gdn_retention_interval() as usize;
     let ordinals: Vec<usize> = devices.iter().map(|d| d.ordinal).collect();
     let mut engine = Engine::new(
         &ordinals,
@@ -256,9 +278,43 @@ fn main() -> std::process::ExitCode {
         attention_blocks
     );
 
+    // 7. Prefix-cache RAM. Sized here, before anything is allocated, so the
+    //    preflight can say what the budget actually bought — a slot count is
+    //    the quantity that matters and a byte figure is what was asked for.
+    let bytes_per_slot = snapshot_bytes_per_slot(&model, retention_interval) as u64;
+    let slots_per_worker = match args.cache_ram {
+        Some(budget) => budget / engine.worker_count().max(1) as u64 / bytes_per_slot.max(1),
+        None => DEFAULT_SNAPSHOT_SLOTS_PER_WORKER as u64,
+    } as usize;
+    let cache_ram = slots_per_worker as u64 * bytes_per_slot * engine.worker_count() as u64;
+    info!(
+        "\ncache ram        {:.2} GiB pinned — {} snapshots per worker at {:.2} MiB each",
+        size::gib(cache_ram),
+        slots_per_worker,
+        bytes_per_slot as f64 / (1024.0 * 1024.0)
+    );
+    if slots_per_worker == 0 {
+        warn!("                 no snapshots retained — prefix sharing is off");
+    } else if slots_per_worker < args.slots_per_worker as usize {
+        // The engine keeps one slot per concurrent sequence free before it
+        // will publish anything, so below that line it publishes nothing at
+        // all — and whichever sequence loses the race for the remaining slots
+        // stops retaining for the rest of its life.
+        warn!(
+            "                 fewer snapshots than the {} concurrent sequences per worker — \
+             nothing will be shared, and retention will switch off for whichever sequence \
+             loses the race",
+            args.slots_per_worker
+        );
+    }
+
     let model_path = args.model;
     info!("\nloading           {}", model_path.display());
-    if let Err((worker, failure)) = engine.bind_devices(&model_path, model, args.prefill_chunk) {
+    let serving = ServingConfig {
+        prefill_chunk: args.prefill_chunk,
+        snapshot_slots: slots_per_worker,
+    };
+    if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");
         return std::process::ExitCode::FAILURE;
     }
@@ -277,7 +333,13 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(http::serve(engine, tokenizer, &address, args.api_key)) {
+    let server = http::ServerConfig {
+        api_key: args.api_key,
+        model: args.served_model_name,
+        default_max_tokens: args.default_max_tokens,
+        default_reasoning: !args.no_reasoning,
+    };
+    match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(failure) => {
             error!("server           FAIL — {failure}");

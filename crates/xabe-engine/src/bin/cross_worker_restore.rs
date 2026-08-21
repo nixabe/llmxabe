@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{SequenceSnapshot, Worker, WorkerId};
+use xabe_engine::{SequenceSnapshot, ServingConfig, Worker, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
@@ -45,11 +45,11 @@ fn main() -> ExitCode {
     let blocks = 131_072 / cache.attention_block_size();
     let mut cold = Worker::new(WorkerId(0), 0, cache.clone(), sched, blocks, 1);
     let mut restored = Worker::new(WorkerId(1), 1, cache, sched, blocks, 1);
-    if let Err(failure) = cold.bind_device(&path, model.clone(), PROMPT) {
+    if let Err(failure) = cold.bind_device(&path, model.clone(), ServingConfig::new(PROMPT)) {
         error!("cold worker failed to bind: {failure}");
         return ExitCode::FAILURE;
     }
-    if let Err(failure) = restored.bind_device(&path, model.clone(), PROMPT) {
+    if let Err(failure) = restored.bind_device(&path, model.clone(), ServingConfig::new(PROMPT)) {
         error!("restore worker failed to bind: {failure}");
         return ExitCode::FAILURE;
     }
