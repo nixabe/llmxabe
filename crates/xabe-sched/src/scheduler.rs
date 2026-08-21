@@ -128,7 +128,12 @@ impl Scheduler {
     }
 
     fn attention_blocks_needed(&self, full_seq_len: u32) -> u32 {
-        full_seq_len.div_ceil(self.config.block_size())
+        // Speculative decode's verify pass writes its whole fixed window of
+        // K/V rows before acceptance truncates anything, so a drafting
+        // engine's true per-sequence footprint is `full_seq_len` plus one
+        // draft window of scratch. Reserving it here keeps rule 4 honest:
+        // the blocks a sequence will actually touch are the blocks reserved.
+        (full_seq_len + self.config.draft_tokens_per_step()).div_ceil(self.config.block_size())
     }
 
     /// Whether [`Self::admit`] would accept this request, without enqueueing
@@ -679,6 +684,37 @@ mod tests {
             prefill_tokens, 12,
             "exactly the budget left after both decodes"
         );
+    }
+
+    /// The verify pass writes a full draft window of K/V before acceptance
+    /// truncates anything, so a drafting scheduler must reserve that window
+    /// as scratch beyond `full_seq_len` — a sequence one emission short of
+    /// its cap still verifies a full window.
+    #[test]
+    fn draft_scratch_is_reserved_beyond_the_full_sequence_length() {
+        // block_size 256, 4 total blocks. A 1024-token request exactly fills
+        // capacity with drafting off...
+        let plain = SchedulerConfig::new(2048, 256, 1, 0.0, 0).unwrap();
+        let mut s = Scheduler::new(plain, 4);
+        s.admit(req(1, 512, 512)).unwrap();
+        assert!(s.step().prefills.iter().any(|p| p.id == RequestId(1)));
+        assert_eq!(s.free_attention_blocks(), 0);
+
+        // ...but with 3 draft tokens per step, the same request needs a 5th
+        // block for the verify window's scratch rows and must be rejected.
+        let drafting = SchedulerConfig::new(2048, 256, 1, 0.0, 3).unwrap();
+        let mut s = Scheduler::new(drafting, 4);
+        assert!(!s.can_admit(&req(2, 512, 512)));
+        assert!(matches!(
+            s.admit(req(2, 512, 512)),
+            Err(AdmissionError::ExceedsTotalCapacity { .. })
+        ));
+
+        // A request whose scratch fits inside its last block's padding is
+        // unaffected: 1021 + 3 still rounds to 4 blocks.
+        s.admit(req(3, 512, 509)).unwrap();
+        assert!(s.step().prefills.iter().any(|p| p.id == RequestId(3)));
+        assert_eq!(s.free_attention_blocks(), 0);
     }
 
     #[test]

@@ -1031,9 +1031,15 @@ impl DeviceRuntime {
         let placements: Vec<ImagePlacement> = images.iter().map(|i| i.placement).collect();
         validate_placements(&placements, prompt.len()).map_err(RuntimeError::ImagePlacement)?;
         let image_embeds = self.encode_images(&images)?;
+        // The batched verify writes its whole fixed window of K/V rows
+        // before acceptance decides anything, so a drafting engine needs
+        // scratch slots past the last real token: a sequence one emission
+        // short of its output cap still runs a full-window verify. Without
+        // this slack that last verify is a CacheExhausted error.
+        let verify_slack = self.window.saturating_sub(1);
         let state = self
             .prefill
-            .new_state(&self.stream, req.full_seq_len() as usize)?;
+            .new_state(&self.stream, req.full_seq_len() as usize + verify_slack)?;
         let draft = Vec::with_capacity(self.window.saturating_sub(1));
         let ngram = self.ngram.map(NgramSpeculator::new);
         // The draft head's per-sequence state: its own KV cache and seed

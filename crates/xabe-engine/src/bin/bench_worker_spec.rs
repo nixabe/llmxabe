@@ -143,11 +143,16 @@ fn run_width(
         .map_err(|error| error.to_string())?;
 
     let quota = WARMUP_TOKENS + tokens_per_seq;
+    // Speculation lets sequences advance unevenly: while the slowest
+    // sequence works through its quota, the fastest can emit up to a whole
+    // verify window per step. The output budget must cover that divergence,
+    // or a fast sequence retires at its cap before the window closes.
+    let max_output = quota * (drafts + 1) + 8;
     for sequence in 0..width {
         let request = NewRequest {
             id: RequestId(sequence as u64 + 1),
             prompt_tokens: context as u32,
-            max_output_tokens: quota + drafts + 8,
+            max_output_tokens: max_output,
         };
         worker
             .admit_tokens(

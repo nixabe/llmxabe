@@ -664,10 +664,12 @@ mod tests {
         assert_eq!(batch.prefills[0].id, id);
         worker.reserve_cache(id).unwrap();
 
+        // 512 + 256 tokens plus the default 3-token draft window's verify
+        // scratch: 771 tokens -> 4 blocks of 256.
         let live = worker.capacity();
-        assert_eq!(live.attention_free_blocks, 29);
+        assert_eq!(live.attention_free_blocks, 28);
         assert_eq!(live.gdn_free_slots, 2);
-        assert_eq!(worker.kv_utilization(), 3.0 / 32.0);
+        assert_eq!(worker.kv_utilization(), 4.0 / 32.0);
 
         assert!(worker.cancel(id));
         let released = worker.capacity();
