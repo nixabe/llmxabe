@@ -934,6 +934,14 @@ impl MoeBlock {
         self.moe.disable_tensor_cores();
     }
 
+    /// Pin the routed-expert kernels to the flat decode regime regardless of
+    /// this pass's token width — see
+    /// [`MoeKernels::set_exact_decode_regime`]. Verify passes set this so a
+    /// window row's floats land exactly where plain decode's would.
+    pub fn set_exact_decode_regime(&mut self, on: bool) {
+        self.moe.set_exact_decode_regime(on);
+    }
+
     /// Whether the MoE GEMMs will take the integer tensor-core path.
     pub fn tensor_cores_enabled(&self) -> bool {
         self.moe.tensor_cores_enabled()
