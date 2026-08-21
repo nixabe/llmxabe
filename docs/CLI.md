@@ -155,10 +155,11 @@ the count too far is refused rather than allowed to starve prefill.
 
 ### `ngram`
 
-Suffix lookup, needing no second model: the sequence's own history is searched
-for the longest recent suffix that occurred before, and what followed it last
-time is proposed. It costs nothing to run and pays off on repetitive output —
-code, tables, quoted text — and very little on prose.
+Suffix lookup, needing no second model: the sequence's own history is indexed
+by n-gram (a hash lookup, not a scan — the history is the whole context), the
+longest recent suffix that occurred before is found, and what followed it
+last time is proposed. It costs almost nothing to run and pays off on
+repetitive output — code, tables, quoted text — and very little on prose.
 
 ```sh
 llmxabe --spec-type ngram --spec-ngram-n-max 4 --spec-ngram-min 2 --spec-ngram-max 6
@@ -166,6 +167,19 @@ llmxabe --spec-type ngram --spec-ngram-n-max 4 --spec-ngram-min 2 --spec-ngram-m
 
 `--spec-ngram-min` and `--spec-ngram-max` bound the suffix length tried;
 `--spec-ngram-n-max` bounds how many tokens one match may propose.
+
+Drafted tokens are fed through one **batched verify pass**: every scheduled
+sequence's window (`1 + n` positions) runs through the target in a single
+weight-read pass, and each sequence keeps its accepted prefix plus the
+target's own token at the first mismatch. That is where the weight-read
+saving comes from, and it is what
+`crates/xabe-engine/tests/serving_speculative_identity.rs` gates: identical
+output to `--spec-type none`, fewer steps. The verify machinery costs VRAM —
+one snapshot ring set per decode slot (~300 MiB each at `n = 3`) plus the
+per-width verify passes — allocated only when `--spec-type ngram` is on.
+`LLMXABE_NGRAM_GATED=1` falls back to the older round-gated loop (drafts
+gate extra one-token rounds and are never model inputs), kept as the A/B
+lever for measuring the verify path against.
 
 ### `draft-mtp` is accepted by the parser and refused by preflight
 
@@ -185,11 +199,13 @@ speculation      FAIL — --spec-type draft-mtp is not wired into the serving
 ```
 
 `SpeculativeSession` owns one sequence's state and verifies a window for it,
-while the serving loop verifies a whole batch in one pass. Adopting it means
-building a batched verify path first — and then re-measuring, because ~7%
-unbatched is not what it would be worth batched. Refusing is the honest
-answer; quietly running `ngram` under the name that was not asked for would
-look like success and measure like a disappointment.
+while the serving loop verifies a whole batch in one pass. The batched verify
+path that adoption was blocked on now exists (`Forward::run_batch_verify`,
+serving the `ngram` type); wiring the MTP head's drafts into it and
+re-measuring — because ~7% unbatched is not what it would be worth batched —
+is what stands between this flag and acceptance. Refusing until then is the
+honest answer; quietly running `ngram` under the name that was not asked for
+would look like success and measure like a disappointment.
 
 ## Validation happens at preflight, not at first request
 

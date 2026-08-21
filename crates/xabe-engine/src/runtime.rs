@@ -21,6 +21,7 @@ use xabe_model::weights::WeightSchema;
 use xabe_sched::ngram::{NgramConfig, NgramConfigError, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
+use crate::block::gdn_verify::GdnSnapshotRing;
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
@@ -263,6 +264,17 @@ pub struct DeviceRuntime {
     prefill_tails: Vec<(usize, Forward)>,
     decode: Vec<Option<Forward>>,
     graphs: Vec<Option<(SmallVec<[RequestId; 3]>, BatchStepGraph)>>,
+    /// Speculative verify passes, indexed by decode width like `decode`.
+    /// Empty `None`s when drafting is off (or `LLMXABE_NGRAM_GATED` forces
+    /// the round-gated fallback), so the non-speculative baseline allocates
+    /// and runs nothing new.
+    verify: Vec<Option<Forward>>,
+    /// One reusable set of per-layer GDN snapshot rings per decode slot.
+    /// Rings are step-scratch, not sequence state: a verify step borrows
+    /// `[..width]` and every ring is dead again once the step commits.
+    verify_rings: Vec<Vec<GdnSnapshotRing>>,
+    /// Verify window width: `1 + draft_tokens`. Zero when drafting is off.
+    window: usize,
     weights: DeviceWeights,
     sequences: HashMap<RequestId, RuntimeSequence>,
     prefill_chunk: usize,
@@ -573,6 +585,42 @@ impl DeviceRuntime {
         );
         let graphs = (0..=max_batch).map(|_| None).collect();
 
+        // Speculative verify shapes: one pass per decode width at
+        // `width * (1 + draft_tokens)` tokens, plus one reusable ring set
+        // per decode slot. Only when drafting is configured — the
+        // non-speculative baseline must not pay a byte or a branch for
+        // this — and `LLMXABE_NGRAM_GATED` keeps the old round-gated
+        // behavior for A/B measurement.
+        let window = ngram.map_or(0, |config| config.max_draft_tokens + 1);
+        let gated = std::env::var_os("LLMXABE_NGRAM_GATED").is_some();
+        let mut verify: Vec<Option<Forward>> = Vec::with_capacity(max_batch + 1);
+        verify.push(None);
+        let mut verify_rings = Vec::new();
+        if window >= 2 && !gated {
+            for width in 1..=max_batch {
+                let mut pass =
+                    prefill.reshape(&ctx, &stream, &file, &directory, &weights, width * window)?;
+                pass.enable_batch_decode(&ctx, &stream)?;
+                pass.enable_verify(&stream)?;
+                verify.push(Some(pass));
+            }
+            for _ in 0..max_batch {
+                verify_rings.push(prefill.new_verify_rings(&stream, window)?);
+            }
+            debug!(
+                device = device_ordinal,
+                window,
+                ring_bytes = verify_rings
+                    .iter()
+                    .flatten()
+                    .map(GdnSnapshotRing::bytes)
+                    .sum::<u64>(),
+                "speculative verify shapes ready"
+            );
+        } else {
+            verify.extend((1..=max_batch).map(|_| None));
+        }
+
         // Vision tower: opt-in via --mmproj. Loading enables image-row
         // staging on every prefill-capable shape; text-only serving skips
         // all of it, which is what keeps the baseline untouched by
@@ -610,6 +658,9 @@ impl DeviceRuntime {
             prefill_tails,
             decode,
             graphs,
+            verify,
+            verify_rings,
+            window,
             weights,
             sequences: HashMap::with_capacity(max_batch),
             prefill_chunk,
@@ -905,6 +956,32 @@ impl DeviceRuntime {
             }
             let remaining_after_plain = seq.max_output.saturating_sub(seq.emitted + 1) as usize;
             seq.draft.truncate(remaining_after_plain);
+            // A verify step advances up to `draft + 1` positions at once;
+            // capping the draft at the next retention boundary means the
+            // step can land exactly on it but never skip it, so retained
+            // snapshots keep their every-`retention_interval` cadence.
+            if self.retention_interval > 0 && !seq.retention_disabled {
+                let position = seq
+                    .state
+                    .as_ref()
+                    .expect("resident sequence has state")
+                    .position();
+                let to_boundary = self.retention_interval - position % self.retention_interval;
+                seq.draft.truncate(to_boundary.saturating_sub(1));
+            }
+        }
+
+        // Drafted tokens are fed through a single batched verify pass when
+        // one was built: every sequence's whole window shares one weight
+        // read, which is the speculative saving the round-gated loop below
+        // never had. Empty drafts (or no verify pass) fall through to the
+        // plain captured batch-decode round.
+        if self.verify[width].is_some() && owned.iter().any(|(_, seq)| !seq.draft.is_empty()) {
+            let result = self.verify_decode_step(&mut owned, generated, retained, stopped);
+            for (id, seq) in owned {
+                self.sequences.insert(id, seq);
+            }
+            return result;
         }
 
         // Round zero is the normal N-wide decode. Sequences whose draft token
@@ -1061,6 +1138,195 @@ impl DeviceRuntime {
             self.sequences.insert(id, seq);
         }
         Ok(())
+    }
+
+    /// One true speculative decode step: every scheduled sequence's window
+    /// (`[id_last, draft...]`, padded with `id_last` where a draft came up
+    /// short) through one batched verify pass, then per-sequence
+    /// acceptance, rollback and bookkeeping.
+    ///
+    /// Emitted tokens are exactly the target model's own choices at every
+    /// position — a draft is accepted only by equaling the target's
+    /// argmax (or, for a sampling sequence, its own draw from the same
+    /// logits row the plain path would have produced), and a rejected
+    /// position emits the target's token in its place. What changes is the
+    /// number of weight-read passes per emitted token, never the tokens.
+    fn verify_decode_step(
+        &mut self,
+        owned: &mut SmallVec<[(RequestId, RuntimeSequence); 3]>,
+        generated: &mut SmallVec<[(RequestId, i32); 16]>,
+        retained: &mut SmallVec<[(RequestId, Arc<SequenceSnapshot>); 8]>,
+        stopped: &mut SmallVec<[RequestId; 3]>,
+    ) -> Result<(), RuntimeError> {
+        let width = owned.len();
+        let window = self.window;
+
+        let mut ids: SmallVec<[i32; 16]> = SmallVec::new();
+        let mut states: SmallVec<[SequenceState; 3]> = SmallVec::new();
+        for (id, seq) in owned.iter_mut() {
+            let last = seq.next_token.ok_or(RuntimeError::UnknownRequest(*id))?;
+            ids.push(last);
+            for j in 0..window - 1 {
+                // Padding a short draft with `id_last` keeps the pass shape
+                // fixed; the padded rows are never compared, never emitted,
+                // and their state is rolled back by the commit below.
+                ids.push(seq.draft.get(j).copied().unwrap_or(last));
+            }
+            states.push(seq.state.take().ok_or(RuntimeError::UnknownRequest(*id))?);
+        }
+
+        let pass = self.verify[width]
+            .as_mut()
+            .expect("caller checked the verify pass exists");
+        let rows = match pass.run_batch_verify(
+            &self.stream,
+            &mut states,
+            &mut self.verify_rings[..width],
+            &ids,
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                for ((_, seq), state) in owned.iter_mut().zip(states) {
+                    seq.state = Some(state);
+                }
+                return Err(error.into());
+            }
+        };
+
+        let stream = Arc::clone(&self.stream);
+        let mut host = std::mem::take(&mut self.host_logits);
+        let mut scratch = std::mem::take(&mut self.sample_scratch);
+        let mut result = Ok(());
+        for (s, mut state) in states.into_iter().enumerate() {
+            let (id, seq) = &mut owned[s];
+            if result.is_err() {
+                // A failure on an earlier sequence: restore and skip, so
+                // every sequence keeps its state even on the error path.
+                seq.state = Some(state);
+                continue;
+            }
+            let seq_rows = &rows[s * window..(s + 1) * window];
+            let d_real = seq.draft.len();
+
+            // The emissions, in order: accepted drafts then the bonus (or
+            // the first mismatch's target token). For a sampling sequence
+            // each row is drawn with its own sampler — the acceptance rule
+            // is the same equality the round-gated path used, so sampling
+            // stays exact: row `j`'s logits are conditioned on the drafted
+            // prefix, which the loop has already proven equal to the
+            // emitted prefix.
+            let mut emit: SmallVec<[i32; 8]> = SmallVec::new();
+            if let Some(sampler) = seq.sampler.as_mut() {
+                let pass = self.verify[width].as_ref().expect("checked above");
+                for j in 0..=d_real {
+                    if let Err(error) =
+                        pass.read_batch_logits_row_into(&stream, s * window + j, &mut host)
+                    {
+                        result = Err(error.into());
+                        break;
+                    }
+                    let token = sampler.sample(&host, &mut scratch);
+                    emit.push(token);
+                    if j >= d_real || token != seq.draft[j] {
+                        break;
+                    }
+                }
+                if result.is_err() {
+                    seq.state = Some(state);
+                    continue;
+                }
+            } else {
+                let mut accepted = 0usize;
+                while accepted < d_real && seq_rows[accepted] == seq.draft[accepted] {
+                    accepted += 1;
+                }
+                emit.extend_from_slice(&seq.draft[..accepted]);
+                emit.push(seq_rows[accepted]);
+            }
+
+            // A mid-window end-of-turn truncates the step at the eos: the
+            // tokens before it are real inputs, the eos itself ends the
+            // sequence exactly as it does on the plain decode path.
+            let mut hit_eos = false;
+            if let Some(eos) = self.eos_token
+                && let Some(at) = emit.iter().position(|&token| token == eos)
+            {
+                emit.truncate(at + 1);
+                hit_eos = true;
+            }
+
+            // Inputs folded for real: `id_last` plus every emitted token
+            // except the last (which has not been fed back yet).
+            let commit_positions = emit.len();
+            {
+                let pass = self.verify[width].as_ref().expect("checked above");
+                if let Err(error) = pass.commit_verify_window(
+                    &stream,
+                    &mut state,
+                    &self.verify_rings[s],
+                    commit_positions,
+                ) {
+                    result = Err(error.into());
+                    seq.state = Some(state);
+                    continue;
+                }
+            }
+
+            let last = *emit.last().expect("a verify step always emits");
+            seq.next_token = Some(last);
+
+            // Retention: the draft cap in `execute_decodes` means the step
+            // can land exactly on a boundary but never cross it, so the
+            // every-interval cadence holds. Same rules as the plain path:
+            // sampled sequences record no next token on the snapshot.
+            let position = state.position();
+            if self.retention_interval > 0
+                && !seq.retention_disabled
+                && position > seq.last_snapshot_position
+                && position.is_multiple_of(self.retention_interval)
+            {
+                match state.snapshot(&stream, &self.snapshot_arena, seq.last_snapshot.clone()) {
+                    Ok(mut snapshot) => {
+                        if seq.sampler.is_none() {
+                            snapshot.set_next_token(last);
+                        }
+                        let snapshot = Arc::new(snapshot);
+                        seq.last_snapshot = Some(Arc::clone(&snapshot));
+                        retained.push((*id, snapshot));
+                        seq.last_snapshot_position = position;
+                    }
+                    Err(StateError::SnapshotArenaExhausted) => {
+                        seq.retention_disabled = true;
+                    }
+                    Err(error) => {
+                        result = Err(error.into());
+                        seq.state = Some(state);
+                        continue;
+                    }
+                }
+            }
+
+            let real = if hit_eos {
+                &emit[..emit.len() - 1]
+            } else {
+                &emit[..]
+            };
+            for &token in real {
+                if let Some(ngram) = &mut seq.ngram {
+                    ngram.observe(token);
+                }
+                generated.push((*id, token));
+                seq.emitted += 1;
+            }
+            if hit_eos {
+                seq.emitted = seq.max_output;
+                stopped.push(*id);
+            }
+            seq.state = Some(state);
+        }
+        self.host_logits = host;
+        self.sample_scratch = scratch;
+        result
     }
 
     /// The prebuilt pass that just ran a prefill piece of `width` tokens —
