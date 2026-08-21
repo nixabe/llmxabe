@@ -1580,6 +1580,7 @@ dependencies = [
  "half",
  "thiserror",
  "tracing",
+ "xabe-gguf",
  "xabe-log",
  "xabe-model",
 ]

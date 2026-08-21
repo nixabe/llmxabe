@@ -135,6 +135,31 @@ Q6_K/Q8_0 *dequantization* is transcribed from `ggml-quants.c`; the
 explicitly **not** llama.cpp's least-squares quantizer. RoPE's NEOX pairing was
 confirmed from `ggml_compute_forward_rope_flt`.
 
+**Vision tower: ported and validated against upstream execution.** The
+`vision` reference (patch conv, position-grid interpolation, 27 SigLIP
+blocks, `qwen3vl_merger` projector) is ported from
+`tools/mtmd/models/qwen3vl.cpp` and `tools/mtmd/clip.cpp`, and — unusually
+for this crate — validated not just by construction but against llama.cpp
+*running the same mmproj file*: `tests/vision_golden.rs` replays
+`llama-mtmd-debug`'s synthetic images through the reference and compares the
+final embeddings value-for-value against that tool's tensor dumps. Captured
+logs are never committed; the test reads them from
+`LLMXABE_MTMD_GOLDEN_DIR` and skips without it. Generate with, for `IMG` in
+`gray`/`red`/`cb` and `N` in `64`/`96`:
+
+```sh
+llama-mtmd-debug -m <model.gguf> --mmproj <mmproj-F16.gguf> \
+  -p encode --image $IMG -n $N --no-mmproj-offload -ngl 0 --no-warmup \
+  > $LLMXABE_MTMD_GOLDEN_DIR/golden-$IMG-$N.log 2>&1
+```
+
+Agreement at last check: ≤ 3.2e-4 on output mass, ≤ 5e-3 per printed value —
+the budget covers llama.cpp's f16 GELU table (`GGML_GELU_FP16`) against the
+reference's exact tanh form. Text-side M-RoPE (`mrope`) is ported from
+`ggml_mrope_cache_init`'s `IMROPE` branch and carries a bit-exactness test
+that scalar positions collapse to `rope::apply_rope` — the same reduction
+`xabe-engine`'s text path depends on.
+
 ## Serving acceptance status
 
 Stated plainly, because a gap you know about is manageable and one you assume
