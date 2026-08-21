@@ -25,6 +25,7 @@ pub mod sampling;
 pub mod speculative;
 pub mod state;
 pub(crate) mod viewslice;
+pub mod vision;
 pub mod weights;
 pub mod worker;
 
