@@ -21,6 +21,7 @@ pub mod forward;
 pub(crate) mod prefix;
 pub mod router;
 pub mod runtime;
+pub mod sampling;
 pub mod speculative;
 pub mod state;
 pub(crate) mod viewslice;
@@ -32,6 +33,7 @@ pub use router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 pub use runtime::{
     DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, DeviceRuntime, DeviceStep, RuntimeConfig, RuntimeError,
 };
+pub use sampling::{Sampler, SamplingParams};
 pub use state::{
     SequenceSnapshot, SequenceState, SnapshotSlots, StateError, snapshot_bytes_per_slot,
 };

@@ -22,6 +22,7 @@ use xabe_sched::ngram::{NgramConfig, NgramConfigError, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
+use crate::sampling::{Sampler, SamplingParams};
 use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots};
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
 
@@ -156,6 +157,9 @@ struct RuntimeSequence {
     last_snapshot_position: usize,
     last_snapshot: Option<Arc<SequenceSnapshot>>,
     retention_disabled: bool,
+    /// `None` is greedy argmax, decided entirely on the device. `Some` pays a
+    /// host round-trip per emitted token, only for this sequence.
+    sampler: Option<Sampler>,
 }
 
 fn choose_prefill_width(
@@ -222,6 +226,11 @@ pub struct DeviceRuntime {
     retention_interval: usize,
     snapshot_arena: SnapshotArena,
     sampled: Vec<i32>,
+    /// One logits row copied back for host-side sampling, and the candidate
+    /// scratch the sampler filters in. Both are pre-sized at load so the
+    /// sampling path allocates nothing per token (AGENTS.md rule 6).
+    host_logits: Vec<f32>,
+    sample_scratch: Vec<(f32, u32)>,
     eos_token: Option<i32>,
 }
 
@@ -230,6 +239,7 @@ enum RuntimeCommand {
         req: NewRequest,
         prompt: Vec<i32>,
         snapshot: Option<Arc<SequenceSnapshot>>,
+        sampling: SamplingParams,
         reply: SyncSender<Result<(), RuntimeError>>,
     },
     Remove {
@@ -278,13 +288,14 @@ impl DeviceRuntimeHandle {
                                     req,
                                     prompt,
                                     snapshot,
+                                    sampling,
                                     reply,
                                 } => {
                                     let result = match snapshot {
                                         Some(snapshot) => {
-                                            runtime.admit_restored(req, prompt, snapshot)
+                                            runtime.admit_restored(req, prompt, snapshot, sampling)
                                         }
-                                        None => runtime.admit(req, prompt),
+                                        None => runtime.admit(req, prompt, sampling),
                                     };
                                     let _ = reply.send(result);
                                 }
@@ -333,11 +344,17 @@ impl DeviceRuntimeHandle {
         receive.recv().map_err(|_| RuntimeError::RuntimeStopped)
     }
 
-    pub fn admit(&self, req: NewRequest, prompt: Vec<i32>) -> Result<(), RuntimeError> {
+    pub fn admit(
+        &self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        sampling: SamplingParams,
+    ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
             prompt,
             snapshot: None,
+            sampling,
             reply,
         })?
     }
@@ -347,11 +364,13 @@ impl DeviceRuntimeHandle {
         req: NewRequest,
         prompt: Vec<i32>,
         snapshot: Arc<SequenceSnapshot>,
+        sampling: SamplingParams,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
             prompt,
             snapshot: Some(snapshot),
+            sampling,
             reply,
         })?
     }
@@ -512,6 +531,8 @@ impl DeviceRuntime {
             retention_interval,
             snapshot_arena,
             sampled: Vec::with_capacity(max_batch),
+            host_logits: Vec::with_capacity(config.vocab_size as usize),
+            sample_scratch: Vec::with_capacity(config.vocab_size as usize),
             eos_token,
         })
     }
@@ -524,7 +545,12 @@ impl DeviceRuntime {
         self.weights.arena().used()
     }
 
-    pub fn admit(&mut self, req: NewRequest, prompt: Vec<i32>) -> Result<(), RuntimeError> {
+    pub fn admit(
+        &mut self,
+        req: NewRequest,
+        prompt: Vec<i32>,
+        sampling: SamplingParams,
+    ) -> Result<(), RuntimeError> {
         if self.sequences.contains_key(&req.id) {
             return Err(RuntimeError::DuplicateRequest(req.id));
         }
@@ -562,17 +588,25 @@ impl DeviceRuntime {
                 last_snapshot_position: 0,
                 last_snapshot: None,
                 retention_disabled: false,
+                sampler: (!sampling.is_greedy()).then(|| Sampler::new(sampling)),
             },
         );
         Ok(())
     }
 
     /// Admit with a prefix restored from pinned host memory.
+    ///
+    /// A snapshot covering the *entire* prompt hands the sequence its first
+    /// output token via [`SequenceSnapshot::next_token`], which is only valid
+    /// for a greedy consumer inheriting from a greedy producer; the engine's
+    /// placement path is what guarantees a sampling request never gets here
+    /// with such a snapshot.
     pub fn admit_restored(
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
         snapshot: Arc<SequenceSnapshot>,
+        sampling: SamplingParams,
     ) -> Result<(), RuntimeError> {
         let prefix = snapshot.position();
         if prefix > prompt.len() {
@@ -581,7 +615,7 @@ impl DeviceRuntime {
                 prompt: prompt.len(),
             });
         }
-        self.admit(req, prompt)?;
+        self.admit(req, prompt, sampling)?;
         let seq = self
             .sequences
             .get_mut(&req.id)
@@ -618,7 +652,13 @@ impl DeviceRuntime {
                 &self.snapshot_arena,
                 seq.last_snapshot.clone(),
             )?;
-        if let Some(token) = seq.next_token {
+        // A sampled sequence's pending token was drawn from *its* RNG; naming
+        // it on the snapshot would hand that draw to whichever request resumes
+        // here. Leave it unset — a consumer whose prompt ends exactly at this
+        // snapshot is then refused the restore instead of inheriting it.
+        if seq.sampler.is_none()
+            && let Some(token) = seq.next_token
+        {
             snapshot.set_next_token(token);
         }
         Ok(Arc::new(snapshot))
@@ -746,6 +786,37 @@ impl DeviceRuntime {
                 return Err(error.into());
             }
 
+            // Host sampling overrides the device argmax verdict, per sequence
+            // that asked for it, before anything downstream reads `outputs`.
+            // The replayed step has already synchronized for the argmax
+            // read-back, so the logits rows are final. Draft acceptance below
+            // stays exact under sampling: the emitted token *is* the target
+            // model's draw, and a draft is accepted only by equaling it.
+            if active.iter().any(|&index| owned[index].1.sampler.is_some()) {
+                let stream = Arc::clone(&self.stream);
+                let mut host = std::mem::take(&mut self.host_logits);
+                let mut scratch = std::mem::take(&mut self.sample_scratch);
+                for (row, &index) in active.iter().enumerate() {
+                    if owned[index].1.sampler.is_none() {
+                        continue;
+                    }
+                    let pass = self.decode[width]
+                        .as_ref()
+                        .expect("every serving width was prebuilt");
+                    if let Err(error) = pass.read_batch_logits_row_into(&stream, row, &mut host) {
+                        outputs.clear();
+                        self.sampled = outputs;
+                        self.host_logits = host;
+                        self.sample_scratch = scratch;
+                        return Err(error.into());
+                    }
+                    let sampler = owned[index].1.sampler.as_mut().expect("checked above");
+                    outputs[row] = sampler.sample(&host, &mut scratch);
+                }
+                self.host_logits = host;
+                self.sample_scratch = scratch;
+            }
+
             let mut next_active: SmallVec<[usize; 3]> = SmallVec::new();
             for (((index, state), output), _) in active
                 .into_iter()
@@ -776,7 +847,12 @@ impl DeviceRuntime {
                         );
                     match snapshot {
                         Ok(mut snapshot) => {
-                            snapshot.set_next_token(output);
+                            // A sampled token is this sequence's own draw;
+                            // recording it would let another request inherit
+                            // it as a first output token. See `snapshot()`.
+                            if seq.sampler.is_none() {
+                                snapshot.set_next_token(output);
+                            }
                             let snapshot = Arc::new(snapshot);
                             seq.last_snapshot = Some(Arc::clone(&snapshot));
                             retained.push((*id, snapshot));
@@ -819,6 +895,48 @@ impl DeviceRuntime {
             self.sequences.insert(id, seq);
         }
         Ok(())
+    }
+
+    /// The prebuilt pass that just ran a prefill piece of `width` tokens —
+    /// the same four-way choice the launch site makes, so the logits being
+    /// read are the ones that pass produced.
+    fn prefill_pass(&mut self, width: usize) -> &mut Forward {
+        if width == self.prefill_chunk {
+            &mut self.prefill
+        } else if width == self.retention_interval && width != 1 {
+            self.retention_prefill
+                .as_mut()
+                .expect("distinct retention shape was prebuilt")
+        } else if let Some(index) = self
+            .prefill_tails
+            .iter()
+            .position(|(tail_width, _)| *tail_width == width)
+        {
+            &mut self.prefill_tails[index].1
+        } else {
+            self.decode[width]
+                .as_mut()
+                .expect("narrow prefill width was prebuilt")
+        }
+    }
+
+    /// Draw the next token from the logits `prefill_pass(width)` just
+    /// produced, with `sampler`.
+    fn sample_prefill_output(
+        &mut self,
+        sampler: &mut Sampler,
+        width: usize,
+    ) -> Result<i32, RuntimeError> {
+        let stream = Arc::clone(&self.stream);
+        let mut host = std::mem::take(&mut self.host_logits);
+        let mut scratch = std::mem::take(&mut self.sample_scratch);
+        let drawn = self
+            .prefill_pass(width)
+            .read_logits_into(&stream, &mut host)
+            .map(|()| sampler.sample(&host, &mut scratch));
+        self.host_logits = host;
+        self.sample_scratch = scratch;
+        Ok(drawn?)
     }
 
     fn execute_prefill(
@@ -904,24 +1022,21 @@ impl DeviceRuntime {
                 && position > seq.last_snapshot_position
                 && position.is_multiple_of(self.retention_interval)
             {
-                let next = if width == self.prefill_chunk {
-                    self.prefill.sample_argmax(&self.stream)?
-                } else if width == self.retention_interval && width != 1 {
-                    self.retention_prefill
-                        .as_mut()
-                        .expect("distinct retention shape was prebuilt")
-                        .sample_argmax(&self.stream)?
-                } else if let Some((_, tail)) = self
-                    .prefill_tails
-                    .iter_mut()
-                    .find(|(tail_width, _)| *tail_width == width)
-                {
-                    tail.sample_argmax(&self.stream)?
+                // Inside the prompt this token is a greedy *prediction*,
+                // recorded so a full-prefix resume knows what followed. At a
+                // boundary that is also the end of the prompt it is the first
+                // emitted token, so a sampling sequence draws it instead —
+                // and then it must not be recorded, for the same reason
+                // decode-time snapshots of sampled sequences record nothing.
+                let sample_here = position == seq.prompt.len() && seq.sampler.is_some();
+                let next = if sample_here {
+                    let mut sampler = seq.sampler.take().expect("sample_here checked it");
+                    let drawn = self.sample_prefill_output(&mut sampler, width);
+                    seq.sampler = Some(sampler);
+                    drawn?
                 } else {
-                    self.decode[width]
-                        .as_mut()
-                        .expect("narrow prefill width was prebuilt")
-                        .sample_argmax(&self.stream)?
+                    let stream = Arc::clone(&self.stream);
+                    self.prefill_pass(width).sample_argmax(&stream)?
                 };
                 let snapshot = seq
                     .state
@@ -935,7 +1050,9 @@ impl DeviceRuntime {
                 seq.next_token = Some(next);
                 match snapshot {
                     Ok(mut snapshot) => {
-                        snapshot.set_next_token(next);
+                        if !sample_here {
+                            snapshot.set_next_token(next);
+                        }
                         let snapshot = Arc::new(snapshot);
                         seq.last_snapshot = Some(Arc::clone(&snapshot));
                         retained.push((id, snapshot));
@@ -958,28 +1075,22 @@ impl DeviceRuntime {
                 .as_ref()
                 .is_some_and(|state| state.position() == seq.last_snapshot_position);
             let next = if work.is_empty() || at_retained_boundary {
+                // For a sampled sequence this token was drawn at the boundary
+                // above; the work-is-empty case cannot be a sampled sequence,
+                // because placement refuses it a snapshot covering the whole
+                // prompt.
                 seq.next_token.ok_or(RuntimeError::SnapshotPrefix {
                     snapshot: seq.prefilled,
                     prompt: seq.prompt.len(),
                 })?
-            } else if last_shape == self.prefill_chunk {
-                self.prefill.sample_argmax(&self.stream)?
-            } else if last_shape == self.retention_interval && last_shape != 1 {
-                self.retention_prefill
-                    .as_mut()
-                    .expect("distinct retention shape was prebuilt")
-                    .sample_argmax(&self.stream)?
-            } else if let Some((_, tail)) = self
-                .prefill_tails
-                .iter_mut()
-                .find(|(tail_width, _)| *tail_width == last_shape)
-            {
-                tail.sample_argmax(&self.stream)?
+            } else if seq.sampler.is_some() {
+                let mut sampler = seq.sampler.take().expect("checked just above");
+                let drawn = self.sample_prefill_output(&mut sampler, last_shape);
+                seq.sampler = Some(sampler);
+                drawn?
             } else {
-                self.decode[last_shape]
-                    .as_mut()
-                    .expect("narrow prefill width was prebuilt")
-                    .sample_argmax(&self.stream)?
+                let stream = Arc::clone(&self.stream);
+                self.prefill_pass(last_shape).sample_argmax(&stream)?
             };
             seq.next_token = Some(next);
             if self.eos_token == Some(next) {

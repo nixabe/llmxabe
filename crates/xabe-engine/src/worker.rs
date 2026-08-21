@@ -29,6 +29,7 @@ use xabe_sched::scheduler::Scheduler;
 
 use crate::router::WorkerLoad;
 use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeConfig, RuntimeError};
+use crate::sampling::SamplingParams;
 use crate::state::{SequenceSnapshot, SnapshotSlots};
 
 /// Which speculative decoder a worker runs.
@@ -151,6 +152,7 @@ struct PendingSequence {
     request: NewRequest,
     prompt: Vec<i32>,
     snapshot: Option<Arc<SequenceSnapshot>>,
+    sampling: SamplingParams,
 }
 
 impl Worker {
@@ -342,10 +344,14 @@ impl Worker {
     }
 
     /// Admit both scheduler metadata and the actual prompt token ids.
+    ///
+    /// `sampling` is how this request's tokens are chosen;
+    /// [`SamplingParams::GREEDY`] keeps the on-device argmax path.
     pub fn admit_tokens(
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        sampling: SamplingParams,
     ) -> Result<RequestId, WorkerExecutionError> {
         self.validate_pending(req, &prompt, None)?;
         let id = self
@@ -358,6 +364,7 @@ impl Worker {
                 request: req,
                 prompt,
                 snapshot: None,
+                sampling,
             },
         );
         Ok(id)
@@ -368,6 +375,7 @@ impl Worker {
         req: NewRequest,
         prompt: Vec<i32>,
         snapshot: Arc<SequenceSnapshot>,
+        sampling: SamplingParams,
     ) -> Result<RequestId, WorkerExecutionError> {
         self.validate_pending(req, &prompt, Some(&snapshot))?;
         let prefix = snapshot.position() as u32;
@@ -381,6 +389,7 @@ impl Worker {
                 request: req,
                 prompt,
                 snapshot: Some(snapshot),
+                sampling,
             },
         );
         Ok(id)
@@ -415,10 +424,13 @@ impl Worker {
                     .expect("pending request was checked above");
                 let runtime = self.runtime.as_ref().expect("runtime was checked above");
                 match pending.snapshot {
-                    Some(snapshot) => {
-                        runtime.admit_restored(pending.request, pending.prompt, snapshot)?
-                    }
-                    None => runtime.admit(pending.request, pending.prompt)?,
+                    Some(snapshot) => runtime.admit_restored(
+                        pending.request,
+                        pending.prompt,
+                        snapshot,
+                        pending.sampling,
+                    )?,
+                    None => runtime.admit(pending.request, pending.prompt, pending.sampling)?,
                 }
             }
         }

@@ -24,6 +24,7 @@ use xabe_sched::request::{NewRequest, RequestId};
 use crate::prefix::{SequenceChain, SharedSnapshots};
 use crate::router::{Routed, RouterConfig, RoutingError, WorkerLoad, route};
 use crate::runtime::{DeviceStep, RuntimeError};
+use crate::sampling::SamplingParams;
 use crate::state::SequenceSnapshot;
 use crate::worker::{ServingConfig, Worker, WorkerExecutionError, WorkerId};
 
@@ -273,6 +274,7 @@ impl Engine {
         &mut self,
         req: NewRequest,
         prompt: Vec<i32>,
+        sampling: SamplingParams,
     ) -> Result<Placement, EngineExecutionError> {
         let budget = self
             .workers
@@ -283,7 +285,17 @@ impl Engine {
         let matched = self.prefix_tree.match_prefix(chain.hashes());
         let snapshot = matched
             .gdn_snapshot_hash
-            .and_then(|hash| self.snapshots.write().take_for_reuse(hash));
+            .and_then(|hash| self.snapshots.write().take_for_reuse(hash))
+            // A snapshot covering the *whole* prompt supplies the first
+            // output token through its recorded `next_token`. That inherited
+            // token is only right when this request is greedy and the
+            // recording sequence was too (a sampled producer records none) —
+            // otherwise fall back to prefilling, which recomputes the final
+            // logits so the token can be chosen properly.
+            .filter(|snapshot| {
+                snapshot.position() < prompt.len()
+                    || (sampling.is_greedy() && snapshot.next_token().is_some())
+            });
         let loads = self.score_workers(&req, chain.hashes());
         let Routed {
             worker,
@@ -294,11 +306,11 @@ impl Engine {
         let request = if let Some(snapshot) = snapshot {
             self.worker_mut(worker)
                 .expect("router returned an existing worker")
-                .admit_tokens_restored(req, prompt, snapshot)
+                .admit_tokens_restored(req, prompt, snapshot, sampling)
         } else {
             self.worker_mut(worker)
                 .expect("router returned an existing worker")
-                .admit_tokens(req, prompt)
+                .admit_tokens(req, prompt, sampling)
         }
         .map_err(|source| EngineExecutionError::Worker { worker, source })?;
         let referenced = matched_tokens as usize / self.block_size as usize;

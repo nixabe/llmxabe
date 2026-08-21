@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{SequenceSnapshot, ServingConfig, Worker, WorkerId};
+use xabe_engine::{SamplingParams, SequenceSnapshot, ServingConfig, Worker, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
         prompt_tokens: PROMPT as u32,
         max_output_tokens: OUTPUT,
     };
-    if let Err(failure) = cold.admit_tokens(request, prompt.clone()) {
+    if let Err(failure) = cold.admit_tokens(request, prompt.clone(), SamplingParams::GREEDY) {
         error!("cold admission failed: {failure}");
         return ExitCode::FAILURE;
     }
@@ -76,7 +76,9 @@ fn main() -> ExitCode {
         error!("cold worker did not retain the 2048-token boundary");
         return ExitCode::FAILURE;
     };
-    if let Err(failure) = restored.admit_tokens_restored(request, prompt, snapshot) {
+    if let Err(failure) =
+        restored.admit_tokens_restored(request, prompt, snapshot, SamplingParams::GREEDY)
+    {
         error!("restored admission failed: {failure}");
         return ExitCode::FAILURE;
     }

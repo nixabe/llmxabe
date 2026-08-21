@@ -1204,6 +1204,58 @@ impl Forward {
         Ok(host[0])
     }
 
+    /// Copy the last position's logits to `host`, for host-side sampling.
+    ///
+    /// Synchronizes, exactly as [`Self::sample_argmax`] does and for the same
+    /// reason: the caller is about to choose the next token from these
+    /// values. `host` is caller-owned and resized here so a serving runtime
+    /// can pre-allocate it once and reuse it (AGENTS.md rule 6).
+    pub fn read_logits_into(
+        &self,
+        stream: &Arc<CudaStream>,
+        host: &mut Vec<f32>,
+    ) -> Result<(), ForwardError> {
+        host.resize(self.vocab, 0.0);
+        stream.memcpy_dtoh(&self.logits, host.as_mut_slice())?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Copy one sequence's logits row from the last batched decode step to
+    /// `host`, for host-side sampling.
+    ///
+    /// `row` indexes the `states` order of that step. The batched step's
+    /// argmax has already run on the device by the time a caller wants this,
+    /// so reading the row is purely additive: the greedy path is untouched
+    /// and pays nothing.
+    pub fn read_batch_logits_row_into(
+        &self,
+        stream: &Arc<CudaStream>,
+        row: usize,
+        host: &mut Vec<f32>,
+    ) -> Result<(), ForwardError> {
+        let logits = self
+            .batch_logits
+            .as_ref()
+            .ok_or(ForwardError::BatchDecodeNotEnabled)?;
+        if row >= self.tokens {
+            return Err(ForwardError::BatchWidth {
+                expected: self.tokens,
+                got: row,
+                what: "logits row",
+            });
+        }
+        let vocab = self.vocab;
+        // SAFETY: `row < self.tokens` and `batch_logits` is
+        // `self.tokens * vocab` elements, allocated by `enable_batch_decode`,
+        // so the view is in bounds and outlived by the buffer.
+        let view = unsafe { crate::viewslice::subslice(stream, logits, row * vocab, vocab) };
+        host.resize(vocab, 0.0);
+        stream.memcpy_dtoh(&*view, host.as_mut_slice())?;
+        stream.synchronize()?;
+        Ok(())
+    }
+
     /// Record one whole step — embedding, forty blocks, LM head, argmax — as a
     /// CUDA graph, for [`Self::replay_step`] to launch at every later position.
     ///

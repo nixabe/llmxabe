@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tracing::debug;
-use xabe_engine::Engine;
+use xabe_engine::{Engine, SamplingParams};
 use xabe_sched::request::{NewRequest, RequestId};
 
 use super::AppState;
@@ -254,6 +254,9 @@ impl Generation {
                 max_output_tokens: spec.max_tokens,
             },
             tokens,
+            // The HTTP surface does not parse sampling parameters yet; every
+            // request stays on the greedy path it always took.
+            SamplingParams::GREEDY,
         );
         let placement = match placement {
             Ok(placement) => placement,

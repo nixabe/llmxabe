@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{ServingConfig, Worker, WorkerId};
+use xabe_engine::{SamplingParams, ServingConfig, Worker, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::config::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
@@ -59,7 +59,7 @@ fn main() -> ExitCode {
             prompt_tokens: PROMPT as u32,
             max_output_tokens: OUTPUT,
         };
-        if let Err(error) = worker.admit_tokens(req, prompt) {
+        if let Err(error) = worker.admit_tokens(req, prompt, SamplingParams::GREEDY) {
             error!("admission failed: {error}");
             return ExitCode::FAILURE;
         }

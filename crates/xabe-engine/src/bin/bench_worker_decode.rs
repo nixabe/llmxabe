@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use tracing::{debug, error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{ServingConfig, Worker, WorkerId};
+use xabe_engine::{SamplingParams, ServingConfig, Worker, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::config::{DEFAULT_WATERMARK_FRACTION, SchedulerConfig};
 use xabe_sched::request::{NewRequest, RequestId};
@@ -123,6 +123,7 @@ fn run_width(
             .admit_tokens(
                 request,
                 synthetic_prompt(sequence, context, model.vocab_size as usize),
+                SamplingParams::GREEDY,
             )
             .map_err(|error| error.to_string())?;
     }

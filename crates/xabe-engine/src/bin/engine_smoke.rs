@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use tracing::{error, info};
 use xabe_cache::CacheConfig;
-use xabe_engine::{Engine, RouterConfig, ServingConfig, WorkerId};
+use xabe_engine::{Engine, RouterConfig, SamplingParams, ServingConfig, WorkerId};
 use xabe_model::ModelConfig;
 use xabe_sched::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
@@ -35,6 +35,7 @@ fn admit(
                 max_output_tokens: OUTPUT,
             },
             prompt(id, tokens, model.vocab_size),
+            SamplingParams::GREEDY,
         )
         .map(|placement| placement.worker)
         .map_err(|failure| failure.to_string())
