@@ -150,8 +150,21 @@ pub fn probe_all() -> Result<Vec<DeviceInfo>, DriverError> {
 ///
 /// Used by tests to decide between skipping and failing. A test that cannot
 /// find a GPU has not passed — it has not run, and it must say so.
+///
+/// The `catch_unwind` is load-bearing, not defensive. `cudarc`'s
+/// `fallback-dynamic-loading` resolves `libcuda` on first use and *panics*
+/// from `panic_no_lib_found` when it finds none, so `device_count().is_ok()`
+/// never gets to answer `false` on a machine with no driver installed — the
+/// one machine this function exists to recognize. Every GPU-gated test in the
+/// workspace calls through here, so without this they all abort instead of
+/// skipping, which is how CI on a GPU-less runner failed.
+///
+/// A driver that is present but unhappy still returns `Err` normally; only
+/// the library-not-found case unwinds. The panic message is written to
+/// stderr, which the test harness captures and discards for a test that goes
+/// on to pass.
 pub fn driver_available() -> bool {
-    CudaContext::device_count().is_ok()
+    std::panic::catch_unwind(|| CudaContext::device_count().is_ok()).unwrap_or(false)
 }
 
 /// Reasons a set of devices is unsuitable for this engine.

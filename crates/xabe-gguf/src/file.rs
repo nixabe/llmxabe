@@ -142,7 +142,7 @@ impl GgufFile {
         })
     }
 
-    /// GGUF format version. Always `3` — see [`GGUF_VERSION`].
+    /// GGUF format version. Always `3` — see `GGUF_VERSION`.
     pub fn version(&self) -> u32 {
         self.version
     }
@@ -176,7 +176,7 @@ impl GgufFile {
     ///
     /// The returned slice borrows directly from the memory map (or owned
     /// buffer); no data is copied. Bounds were already validated at load
-    /// time in [`Self::from_backing`], so this indexing cannot panic.
+    /// time in `Self::from_backing`, so this indexing cannot panic.
     pub fn tensor_bytes(&self, name: &str) -> Option<&[u8]> {
         let info = self.tensor(name)?;
         let start = (self.data_offset + info.offset) as usize;

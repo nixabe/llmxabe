@@ -2522,7 +2522,7 @@ pub struct AttentionKernels {
     kv_heads: usize,
     head_dim: usize,
     /// Which decode path `decode()` takes: `0` for `Auto` (the default --
-    /// depth-aware dispatch against [`DECODE_MMA_DEPTH_THRESHOLD`], see
+    /// depth-aware dispatch against `DECODE_MMA_DEPTH_THRESHOLD`, see
     /// [`Self::active_decode_mma`]), `1` to force `attn_flash_decode_warp`'s
     /// per-key online softmax at every depth, or `2`/`4` to force the
     /// tensor-core kernel at that occupancy width at every depth. For the
@@ -2715,14 +2715,14 @@ impl AttentionKernels {
             .store(blocks, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether [`Self::decode`] will take the tensor-core kernel this call,
+    /// Whether `Self::decode` will take the tensor-core kernel this call,
     /// and if so at which occupancy width.
     ///
     /// `depth` is the number of keys the call will actually read (the
     /// caller's `pos_offset + n_query`, host-side and known before launch --
     /// not `max_keys`, which is only the cache's allocated capacity). It
     /// drives the `Auto` lever's choice against
-    /// [`DECODE_MMA_DEPTH_THRESHOLD`]; a forced lever ignores it.
+    /// `DECODE_MMA_DEPTH_THRESHOLD`; a forced lever ignores it.
     ///
     /// Exposed so a differential test can pick the tolerance the arithmetic
     /// actually warrants without hardcoding the dispatch rule. Unlike
@@ -3097,8 +3097,8 @@ impl AttentionKernels {
     /// *capacity*. It plays no part in correctness (the launch geometry and
     /// the device-side `positions` already cover that, per the note above on
     /// why the bound check itself cannot live here) and is used only to pick
-    /// among decode's kernels by depth; see [`Self::decode`] and
-    /// [`DECODE_MMA_DEPTH_THRESHOLD`].
+    /// among decode's kernels by depth; see `Self::decode` and
+    /// `DECODE_MMA_DEPTH_THRESHOLD`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,

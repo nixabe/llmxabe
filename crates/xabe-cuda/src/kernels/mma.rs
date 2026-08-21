@@ -32,7 +32,7 @@
 //! tolerance separates it from arithmetic noise.
 //!
 //! So this kernel is gated on **bit-exact equality** with
-//! [`xabe_kernels::mma::int8_gemm`] — possible only because integer addition
+//! `xabe_kernels::mma::int8_gemm` — possible only because integer addition
 //! is associative, so the device and the reference may sum the same products
 //! in different orders and must still agree to the last bit. Every fp32 kernel
 //! in this workspace accepts a tolerance for exactly the reason this one does
@@ -898,7 +898,7 @@ impl MmaKernels {
     ///
     /// `a` is `[m][k]` and `b` is `[n][k]`, both row-major and both int8.
     /// `d` is `[m][n]` int32. The result is **bit-exact** against
-    /// [`xabe_kernels::mma::int8_gemm`] — integer addition is associative, so
+    /// `xabe_kernels::mma::int8_gemm` — integer addition is associative, so
     /// summation order cannot excuse a disagreement.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm(

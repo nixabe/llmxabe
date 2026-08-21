@@ -29,7 +29,7 @@
 //! either.
 //!
 //! That only works if the output still *looks* like a table, which is what
-//! [`ToolFormat`] is for: at `info` an event is written as its message and
+//! `ToolFormat` is for: at `info` an event is written as its message and
 //! nothing else, so the rendering is byte-for-byte what `println!` produced
 //! before. `WARN` and `ERROR` keep a level tag, because a warning that looks
 //! like ordinary output is a warning nobody reads. At `debug` and `trace` the

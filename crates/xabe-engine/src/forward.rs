@@ -692,7 +692,7 @@ pub struct Forward {
     /// Sized for `self.tokens` rows rather than the fixed one [`Self::lm_head`]
     /// reads: batched decode's every row is a distinct sequence's last (and
     /// only) position, so there is no "select the last row" step to narrow
-    /// `self.tokens` rows down to one the way [`Self::body`] does for every
+    /// `self.tokens` rows down to one the way `Self::body` does for every
     /// other shape this type builds.
     batch_lm_head: Option<LmHeadKernels>,
     /// `[tokens][vocab]`, one row per sequence in the batch.
@@ -1167,7 +1167,7 @@ impl Forward {
     /// 248,320-entry logit vector occupies, and it moves the scan itself off
     /// a single CPU core. That was worth about 4% of a decode step.
     ///
-    /// The tie-break matches [`xabe_kernels::gemv::argmax`] exactly, which is
+    /// The tie-break matches `xabe_kernels::gemv::argmax` exactly, which is
     /// what `tests/lm_head_differential.rs` asserts. A near-tie between two
     /// logits is the one place a kernel can be well inside every tolerance
     /// and still emit a different token.
@@ -1214,12 +1214,12 @@ impl Forward {
     /// turnaround at the step boundary. A graph is the same sequence submitted
     /// as one object.
     ///
-    /// **What made it possible.** Nothing in [`Self::body`] may take a value
+    /// **What made it possible.** Nothing in `Self::body` may take a value
     /// that changes between steps as a host argument, because a recorded
     /// launch keeps the arguments it was recorded with. The sequence position
     /// was the last one: the rotary embedding, the causal bound and the
     /// key/value append all read it from
-    /// [`SequenceState::publish_position`]'s device scalar now.
+    /// `SequenceState::publish_position`'s device scalar now.
     ///
     /// Capture executes nothing, so the state is not advanced and the caches
     /// are not written. It does have to run on a stream of its own — capture
@@ -1708,7 +1708,7 @@ impl Forward {
     ///
     /// Built for the batch-vs-single-stream divergence audit, which needs the
     /// first layer and family at which the two disagree. It drives the same
-    /// [`Self::body_batch_decode`] the ordinary path and the graph capture do,
+    /// `Self::body_batch_decode` the ordinary path and the graph capture do,
     /// so what it measures is what the engine runs.
     pub fn run_batch_decode_with_stage_waypoints(
         &mut self,
@@ -1743,7 +1743,7 @@ impl Forward {
     /// operation count.
     ///
     /// The same constraints apply, for the same reasons: nothing in
-    /// [`Self::body_batch_decode`] may take a value that changes between
+    /// `Self::body_batch_decode` may take a value that changes between
     /// steps as a host argument, which is why every sequence's position lives
     /// in that [`SequenceState`]'s own device scalar and is read from there,
     /// not passed in. `self` and `states` must be the exact objects passed to
@@ -1919,7 +1919,7 @@ impl Forward {
     /// before every replay.
     ///
     /// Every sequence's position is copied in **one** call rather than
-    /// `states.len()` — [`SequenceState::publish_position`] writes each
+    /// `states.len()` — `SequenceState::publish_position` writes each
     /// state's own single-element device scalar, and looping that per state
     /// was `states.len()` separate host-to-device copies where one array
     /// does the same job, which measurably mattered at small batch widths
@@ -2142,7 +2142,7 @@ impl Forward {
         Ok(())
     }
 
-    /// Read back the last [`Self::body_batch_decode`]'s sampled ids.
+    /// Read back the last `Self::body_batch_decode`'s sampled ids.
     ///
     /// Synchronizes, for the reason [`Self::read_sampled`] does: a step is
     /// not finished until the host knows what to feed back in for every
@@ -2555,7 +2555,7 @@ impl Forward {
     /// Built for the batch-vs-single-stream divergence audit: telling "the
     /// mixer already disagreed" from "the mixer agreed and MoE introduced the
     /// disagreement" needs the buffer `run`'s callback never exposes. It runs
-    /// the same [`Self::body`] the golden test and `capture_step` do, so an
+    /// the same `Self::body` the golden test and `capture_step` do, so an
     /// audit cannot measure a path the engine does not take.
     pub fn run_with_stage_waypoints(
         &mut self,
@@ -2569,7 +2569,7 @@ impl Forward {
 
     /// The two per-step host inputs: the token ids and the position.
     ///
-    /// Split out of [`Self::body`] because these are the only two operations
+    /// Split out of `Self::body` because these are the only two operations
     /// in a pass that read host memory, and a CUDA graph capture cannot
     /// contain a copy from a pageable host pointer. They run before the graph
     /// launches instead, on the same stream, which orders them ahead of

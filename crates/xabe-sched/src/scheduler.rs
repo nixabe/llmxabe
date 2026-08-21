@@ -138,7 +138,7 @@ impl Scheduler {
     /// it, and it must not be a reimplementation of the rule: admission
     /// feasibility is AGENTS.md rule 4, and rule 4 lives here. Both this and
     /// [`Self::admit`] derive from
-    /// [`Self::attention_blocks_needed`] against total capacity, so they
+    /// `Self::attention_blocks_needed` against total capacity, so they
     /// cannot disagree.
     pub fn can_admit(&self, req: &NewRequest) -> bool {
         (self.waiting.len() as u32) < self.config.max_waiting_requests()

@@ -29,7 +29,7 @@
 //!   target's hidden state from position `p - 1`, zero for `p = 0`) — this
 //!   is what makes an untouched draft cache a silent quality bug rather than
 //!   an error.
-//! - **The draft chain** ([`Self::draft`]): every position after the first
+//! - **The draft chain** (`SpeculativeSession::draft`): every position after the first
 //!   in a window feeds back the draft head's *own* previous emitted hidden
 //!   state, because the target has not run that position yet.
 //!

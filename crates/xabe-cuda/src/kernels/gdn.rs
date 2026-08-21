@@ -425,7 +425,7 @@ impl GdnKernels {
     }
 
     /// Allocate the per-step scratch buffers, sized for the widest batch
-    /// [`Self::step_batch`] accepts so a batch of any admissible width never
+    /// [`Self::step_batch_raw`] accepts so a batch of any admissible width never
     /// reallocates.
     pub fn scratch(&self, stream: &Arc<CudaStream>) -> Result<GdnScratch, GdnError> {
         let n = STEP_MAX_BATCH * self.qk_heads * self.head_dim;
@@ -442,7 +442,7 @@ impl GdnKernels {
 
     /// Advance one sequence's `state` by one token and write its output.
     ///
-    /// [`Self::step_batch`] at a batch of one — the arithmetic is the same
+    /// [`Self::step_batch_raw`] at a batch of one — the arithmetic is the same
     /// kernel, so a sequence decodes identically here and in a batch.
     ///
     /// `q` and `k` are `[qk_heads][head_dim]` raw — not normalized, not

@@ -73,7 +73,7 @@
 //! order 1. Measured on the real rates over 197 tokens at
 //! `head_dim = 128`, `chunk_len = 64`: **25082 of 25216 outputs and 16384 of
 //! 16384 state elements non-finite** — see
-//! [`tests::chunked_forward_stays_finite_at_this_models_real_decay_rates`],
+//! `tests::chunked_forward_stays_finite_at_this_models_real_decay_rates`,
 //! which carries those numbers as the regression it guards. The recurrent
 //! form is immune, because it decays the state one token at a time and never
 //! accumulates; the differential test in `xabe-engine` therefore had to

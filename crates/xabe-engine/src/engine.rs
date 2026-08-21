@@ -268,7 +268,7 @@ impl Engine {
     /// supplied: they are what the engine will later file this sequence's
     /// snapshots under, and a caller-supplied chain that disagreed with the
     /// tokens would publish a snapshot under a prefix it does not describe.
-    /// See [`SequenceChain`].
+    /// See `SequenceChain`.
     pub fn place_tokens(
         &mut self,
         req: NewRequest,

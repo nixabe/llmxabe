@@ -24,7 +24,7 @@
 //! aligned addresses**, into a per-warp shared staging buffer; the 34-byte
 //! granular unpack then runs against shared memory, where alignment is free. A
 //! Q8_0 block is 34 bytes, so a warp reading its 32 contiguous quants is never
-//! sector-aligned and nearly every request straddles two sectors. [`STAGE_BLOCKS`]
+//! sector-aligned and nearly every request straddles two sectors. `STAGE_BLOCKS`
 //! is 16 blocks = 544 bytes, a multiple of 32, which is what makes every
 //! staged segment start on a sector boundary. Worth 1.35x.
 //!
@@ -54,7 +54,7 @@
 //! # Why the result is not bit-identical to the CPU reference
 //!
 //! The dequantized weights are — multiplication only. The 2,048-term dot
-//! product is not: [`xabe_kernels::gemv::gemv`] sums sequentially, each lane
+//! product is not: `xabe_kernels::gemv::gemv` sums sequentially, each lane
 //! here sums 64 terms in four-element groups and the 32 lane totals combine in
 //! a shuffle tree. The kernel also lets nvcc contract `acc += w * x` into an
 //! FMA, which rounds once where the reference rounds twice; there is no
@@ -611,7 +611,7 @@ pub enum LmHeadError {
     ///
     /// Only Q8_0 is implemented, because `output.weight` in
     /// `Qwen3.6-35B-A3B-UD-Q6_K_XL` is Q8_0 — verified against the file's
-    /// tensor directory. [`docs/KERNELS.md`] proposes re-quantizing the head
+    /// tensor directory. `docs/KERNELS.md` proposes re-quantizing the head
     /// to Q6_K to cut its 540 MB/token; that would slot [`super::moe`]'s
     /// `q6k_element` into the prologue unchanged, but shipping an untested
     /// second path ahead of that decision would be worse than rejecting it

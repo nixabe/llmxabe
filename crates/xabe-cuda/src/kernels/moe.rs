@@ -46,7 +46,7 @@
 //! runs a different expert.
 //!
 //! **The padding sentinel is `num_tokens * top_k` and inactive blocks are
-//! `-1`**, matching [`xabe_kernels::moe::dispatch::padding_sentinel`] and
+//! `-1`**, matching `xabe_kernels::moe::dispatch::padding_sentinel` and
 //! `INACTIVE_EXPERT`. Get it wrong and a consumer either indexes past the
 //! token array or silently drops tokens.
 //!
@@ -4028,7 +4028,7 @@ impl MoeKernels {
     /// geometry. The first counts each expert's selections and lays down the
     /// sentinel / INACTIVE fill; the second recomputes the shared prefix sum
     /// and scatters. The intermediate counts live in
-    /// [`MoeBuffers::expert_counts`] on the device, so the pair is still one
+    /// `MoeBuffers::expert_counts` on the device, so the pair is still one
     /// capturable sequence with no host round trip between the passes.
     pub fn build_dispatch(
         &self,

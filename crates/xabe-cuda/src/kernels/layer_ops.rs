@@ -11,11 +11,11 @@
 //! pass — but the standalone op has to exist and be the thing a fused variant
 //! is checked against.
 //!
-//! References: [`xabe_kernels::norm::rms_norm`],
-//! [`xabe_kernels::rope::apply_rope`], [`xabe_kernels::norm::swiglu`],
-//! [`xabe_kernels::norm::sigmoid_gate`], [`xabe_kernels::norm::residual_add`],
-//! [`xabe_kernels::norm::softplus`],
-//! [`xabe_kernels::conv::causal_depthwise_conv1d`].
+//! References: `xabe_kernels::norm::rms_norm`,
+//! `xabe_kernels::rope::apply_rope`, `xabe_kernels::norm::swiglu`,
+//! `xabe_kernels::norm::sigmoid_gate`, `xabe_kernels::norm::residual_add`,
+//! `xabe_kernels::norm::softplus`,
+//! `xabe_kernels::conv::causal_depthwise_conv1d`.
 //!
 //! # Geometry is per launch, not per instance
 //!
@@ -957,7 +957,7 @@ impl LayerOpsKernels {
 
     /// `out = a + b` over `n` elements — the residual add.
     ///
-    /// Bit-identical to [`xabe_kernels::norm::residual_add`], not merely
+    /// Bit-identical to `xabe_kernels::norm::residual_add`, not merely
     /// close: one rounding per element, in the operand order given.
     ///
     /// `out` may alias either input; each thread touches one index of each.
@@ -990,7 +990,7 @@ impl LayerOpsKernels {
     ///
     /// The GDN alpha gate's nonlinearity. The passthrough is not optional:
     /// without it `expf` overflows above `x ≈ 88.7` and the result is `inf`
-    /// where the answer is `x`. See [`xabe_kernels::norm::softplus`].
+    /// where the answer is `x`. See `xabe_kernels::norm::softplus`.
     ///
     /// `out` may alias `x`.
     pub fn softplus(
