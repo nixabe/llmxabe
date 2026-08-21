@@ -16,8 +16,14 @@ RTX 8000, written in Rust.
 > best settings: **ahead on every cell, prefill 512–128K and decode 2K/32K**.
 > The current numbers live in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 >
-> What it cannot do: streaming responses, tokenization, and multimodal input.
-> See [docs/MILESTONES.md](docs/MILESTONES.md) for the itemized state.
+> It serves OpenAI's completions, chat completions and responses dialects and
+> Anthropic's messages, streaming or not, behind an optional API key, and
+> tokenizes from the vocabulary embedded in the GGUF.
+>
+> What it does not do: multimodal input, tool calls, and sampling — decoding is
+> greedy argmax, so sampling parameters are accepted and ignored. See
+> [docs/API.md](docs/API.md) for what the endpoints refuse, and
+> [docs/MILESTONES.md](docs/MILESTONES.md) for the engine milestones.
 
 ## Why this exists
 
