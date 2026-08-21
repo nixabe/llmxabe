@@ -18,7 +18,7 @@ use tracing::debug;
 use xabe_gguf::{GgufError, GgufFile};
 use xabe_model::ModelConfig;
 use xabe_model::weights::WeightSchema;
-use xabe_sched::ngram::{NgramConfig, NgramSpeculator};
+use xabe_sched::ngram::{NgramConfig, NgramConfigError, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
@@ -74,6 +74,7 @@ pub enum RuntimeError {
     TokenOutOfRange { token: i32, vocab: u32 },
     BatchTooWide { requested: usize, maximum: usize },
     SnapshotPrefix { snapshot: usize, prompt: usize },
+    Speculation(NgramConfigError),
     RuntimeStopped,
 }
 
@@ -86,6 +87,7 @@ impl core::fmt::Display for RuntimeError {
             Self::Load(e) => write!(f, "weight load failed: {e}"),
             Self::Forward(e) => write!(f, "forward pass failed: {e}"),
             Self::State(e) => write!(f, "sequence state failed: {e}"),
+            Self::Speculation(e) => write!(f, "speculative decoding: {e}"),
             Self::ZeroPrefillChunk => write!(f, "prefill chunk must be non-zero"),
             Self::ZeroBatchWidth => write!(f, "maximum decode batch must be non-zero"),
             Self::DuplicateRequest(id) => write!(f, "request {} is already resident", id.0),

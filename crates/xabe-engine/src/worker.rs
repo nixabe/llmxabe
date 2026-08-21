@@ -31,6 +31,30 @@ use crate::router::WorkerLoad;
 use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeConfig, RuntimeError};
 use crate::state::{SequenceSnapshot, SnapshotSlots};
 
+/// Which speculative decoder a worker runs.
+///
+/// The draft *count* is deliberately absent: it comes from the scheduler,
+/// which has to charge those tokens against its step budget whether or not
+/// they are later accepted. Carrying it here too would let the two disagree.
+///
+/// There is no MTP variant. `crate::speculative::SpeculativeSession` is a
+/// complete, output-identity-tested MTP driver, but it owns one sequence's
+/// state and the serving loop verifies a batch in one pass — connecting them
+/// means a batched verify path, not an extra enum arm. A variant that
+/// silently ran n-gram instead would be worse than its absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speculation {
+    /// One token per decode step, drafted by nothing.
+    None,
+    /// Suffix lookup over the sequence's own prompt and output.
+    Ngram {
+        /// Shortest suffix worth matching on.
+        min: usize,
+        /// Longest suffix matched before giving up.
+        max: usize,
+    },
+}
+
 /// The bind-time knobs a worker cannot derive for itself.
 ///
 /// Everything else the runtime needs — batch width, draft count, retention
@@ -43,14 +67,17 @@ pub struct ServingConfig {
     /// Pinned host snapshot slots for this worker. Zero disables retention,
     /// and with it prefix sharing.
     pub snapshot_slots: usize,
+    /// Which speculative decoder to run.
+    pub speculation: Speculation,
 }
 
 impl ServingConfig {
-    /// A configuration with the shipped snapshot budget.
+    /// A configuration with the shipped snapshot budget and no drafting.
     pub fn new(prefill_chunk: usize) -> Self {
         Self {
             prefill_chunk,
             snapshot_slots: crate::runtime::DEFAULT_SNAPSHOT_SLOTS_PER_WORKER,
+            speculation: Speculation::None,
         }
     }
 }
@@ -277,10 +304,13 @@ impl Worker {
         let drafts = self.scheduler.config().draft_tokens_per_step() as usize;
         let history_capacity =
             (self.attention_pool.total() * self.cache.attention_block_size()) as usize;
-        let ngram = (drafts > 0).then(|| {
-            NgramConfig::new(2, 4, drafts, history_capacity)
-                .expect("worker cache capacity exceeds the n-gram window")
-        });
+        let ngram = match serving.speculation {
+            Speculation::Ngram { min, max } if drafts > 0 => Some(
+                NgramConfig::new(min, max, drafts, history_capacity)
+                    .map_err(RuntimeError::Speculation)?,
+            ),
+            Speculation::Ngram { .. } | Speculation::None => None,
+        };
         let vocab = model.vocab_size;
         self.runtime = Some(DeviceRuntimeHandle::spawn(
             self.device_ordinal,

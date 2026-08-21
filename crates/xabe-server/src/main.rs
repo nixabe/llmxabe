@@ -22,13 +22,14 @@ mod http;
 mod size;
 mod tokenizer;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 use xabe_cache::config::CacheConfig;
 use xabe_cuda::{check_gate, device};
 use xabe_engine::{
-    DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, Engine, RouterConfig, ServingConfig, snapshot_bytes_per_slot,
+    DEFAULT_SNAPSHOT_SLOTS_PER_WORKER, Engine, RouterConfig, ServingConfig, Speculation,
+    snapshot_bytes_per_slot,
 };
 use xabe_model::budget;
 use xabe_model::{ModelConfig, verify};
@@ -40,6 +41,17 @@ const KV_ELEM_BYTES_F16: u64 = 2;
 const WEIGHTS_BYTES: u64 = (296 * (1024 * 1024 * 1024)) / 10;
 const DEFAULT_MODEL_PATH: &str =
     "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+
+/// Which speculative decoder to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SpecType {
+    /// One token per decode step.
+    None,
+    /// Suffix lookup over the sequence's own prompt and output.
+    Ngram,
+    /// The model's own multi-token-prediction head.
+    DraftMtp,
+}
 
 /// `--help` addendum for the flag clap never sees (see [`Args`] docs).
 fn log_flag_help() -> String {
@@ -92,6 +104,26 @@ struct Args {
     #[arg(long, env = "LLMXABE_CACHE_RAM", value_parser = size::parse_bytes)]
     cache_ram: Option<u64>,
 
+    /// Speculative decoder to run
+    #[arg(long, value_enum, default_value_t = SpecType::None)]
+    spec_type: SpecType,
+
+    /// draft-mtp: maximum tokens the draft head proposes per step
+    #[arg(long, default_value_t = xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP)]
+    spec_draft_n_max: u32,
+
+    /// ngram: maximum tokens proposed from a suffix match per step
+    #[arg(long, default_value_t = xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP)]
+    spec_ngram_n_max: u32,
+
+    /// ngram: shortest suffix worth matching on
+    #[arg(long, default_value_t = 2)]
+    spec_ngram_min: usize,
+
+    /// ngram: longest suffix matched before giving up
+    #[arg(long, default_value_t = 4)]
+    spec_ngram_max: usize,
+
     /// Fraction of the KV pool held back as admission headroom, in [0, 1)
     #[arg(long, default_value_t = xabe_sched::config::DEFAULT_WATERMARK_FRACTION)]
     watermark: f64,
@@ -133,11 +165,65 @@ fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Resolve `--spec-type` and its family into the draft count the scheduler
+/// must budget for and the decoder a worker will run.
+///
+/// `draft-mtp` is refused rather than quietly downgraded. The MTP driver in
+/// `xabe_engine::speculative` is real and output-identity tested, but it was
+/// measured and deliberately not adopted — 65.2% acceptance for ~7%, and
+/// unbatched across sequences (milestone 09 in `docs/MILESTONES.md`). Running
+/// n-gram under the name the caller did not ask for would be worse than
+/// saying so.
+fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
+    match args.spec_type {
+        SpecType::None => Ok((0, Speculation::None)),
+        SpecType::Ngram => {
+            if args.spec_ngram_min == 0 || args.spec_ngram_min > args.spec_ngram_max {
+                return Err(format!(
+                    "--spec-ngram-min {} and --spec-ngram-max {} must satisfy 0 < min <= max",
+                    args.spec_ngram_min, args.spec_ngram_max
+                ));
+            }
+            if args.spec_ngram_max >= args.total_context as usize {
+                return Err(format!(
+                    "--spec-ngram-max {} must be shorter than the {} token context it \
+                     matches within",
+                    args.spec_ngram_max, args.total_context
+                ));
+            }
+            Ok((
+                args.spec_ngram_n_max,
+                Speculation::Ngram {
+                    min: args.spec_ngram_min,
+                    max: args.spec_ngram_max,
+                },
+            ))
+        }
+        SpecType::DraftMtp => Err(
+            "--spec-type draft-mtp is not wired into the serving path, and that was a \
+             decision rather than an omission: the driver exists and is output-identity \
+             tested (crates/xabe-engine/src/speculative.rs), but it measured 65.2% \
+             acceptance for ~7% and drafts one sequence at a time while the serving loop \
+             verifies a batch in one pass — milestone 09 in docs/MILESTONES.md. \
+             Use --spec-type ngram, or none."
+                .to_owned(),
+        ),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let rest = xabe_log::init_from_args();
     let args = Args::parse_from(expand_two_letter_shorts(rest));
 
     info!("llmxabe preflight\n");
+
+    let (draft_tokens, speculation) = match resolve_speculation(&args) {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            error!("speculation      FAIL — {failure}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     // 1. Model configuration.
     let model = ModelConfig::qwen3_6_35b_a3b();
@@ -188,7 +274,7 @@ fn main() -> std::process::ExitCode {
         cache.attention_block_size(),
         args.slots_per_worker,
         args.watermark,
-        xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP,
+        draft_tokens,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -203,10 +289,41 @@ fn main() -> std::process::ExitCode {
         sched.max_concurrent_decodes()
     );
     info!(
-        "                 {} tokens charged per decode step ({} n-gram drafts)",
+        "                 {} tokens charged per decode step ({})",
         sched.tokens_per_decode_step(),
-        sched.draft_tokens_per_step()
+        match args.spec_type {
+            SpecType::None => "no drafting".to_owned(),
+            SpecType::Ngram => format!(
+                "{} n-gram drafts from {}..={} token suffixes",
+                sched.draft_tokens_per_step(),
+                args.spec_ngram_min,
+                args.spec_ngram_max
+            ),
+            SpecType::DraftMtp => unreachable!("draft-mtp is refused above"),
+        }
     );
+
+    // Design rule 3 again, this time against the draft count actually asked
+    // for. `SchedulerConfig` charges one token per decode, which is only true
+    // with drafting off; with a draft count raised, a full house of decodes
+    // can consume the whole step budget and starve prefill exactly as the rule
+    // describes, while passing the constructor's check.
+    let decode_tokens = sched
+        .tokens_per_decode_step()
+        .saturating_mul(sched.max_concurrent_decodes());
+    if decode_tokens.saturating_add(sched.block_size()) >= sched.token_budget() {
+        error!(
+            "\nscheduler        FAIL — {} decodes drafting {} tokens each consume {} of a {} \
+             token budget, leaving less than one {}-token block for prefill",
+            sched.max_concurrent_decodes(),
+            sched.draft_tokens_per_step(),
+            decode_tokens,
+            sched.token_budget(),
+            sched.block_size()
+        );
+        error!("                 raise --token-budget, or lower the draft count for --spec-type");
+        return std::process::ExitCode::FAILURE;
+    }
 
     // 4. Devices. The only part that can be skipped — and it must be checked
     //    before the VRAM budget, so headroom is computed against this card's
@@ -313,6 +430,7 @@ fn main() -> std::process::ExitCode {
     let serving = ServingConfig {
         prefill_chunk: args.prefill_chunk,
         snapshot_slots: slots_per_worker,
+        speculation,
     };
     if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");
@@ -345,5 +463,70 @@ fn main() -> std::process::ExitCode {
             error!("server           FAIL — {failure}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(spec: SpecType) -> Args {
+        Args::parse_from([
+            "--spec-type",
+            match spec {
+                SpecType::None => "none",
+                SpecType::Ngram => "ngram",
+                SpecType::DraftMtp => "draft-mtp",
+            },
+        ])
+    }
+
+    #[test]
+    fn no_speculation_charges_one_token_per_decode() {
+        assert_eq!(
+            resolve_speculation(&args(SpecType::None)),
+            Ok((0, Speculation::None))
+        );
+    }
+
+    #[test]
+    fn ngram_carries_its_window_and_its_draft_count() {
+        assert_eq!(
+            resolve_speculation(&args(SpecType::Ngram)),
+            Ok((3, Speculation::Ngram { min: 2, max: 4 }))
+        );
+    }
+
+    #[test]
+    fn an_inverted_ngram_window_is_refused() {
+        let mut inverted = args(SpecType::Ngram);
+        inverted.spec_ngram_min = 5;
+        inverted.spec_ngram_max = 3;
+        assert!(resolve_speculation(&inverted).is_err());
+
+        inverted.spec_ngram_min = 0;
+        inverted.spec_ngram_max = 4;
+        assert!(resolve_speculation(&inverted).is_err());
+    }
+
+    #[test]
+    fn an_ngram_window_longer_than_the_context_is_refused() {
+        // It could never match, and `NgramConfig` would reject it further
+        // down with a message that does not name the flag.
+        let mut wide = args(SpecType::Ngram);
+        wide.spec_ngram_max = wide.total_context as usize;
+        assert!(resolve_speculation(&wide).is_err());
+    }
+
+    #[test]
+    fn draft_mtp_is_refused_rather_than_downgraded_to_ngram() {
+        // Serving n-gram under the name the caller did not ask for would look
+        // like success and measure like a disappointment.
+        let failure = resolve_speculation(&args(SpecType::DraftMtp))
+            .expect_err("draft-mtp has no serving path yet");
+        assert!(
+            failure.contains("not wired into the serving path"),
+            "{failure}"
+        );
     }
 }

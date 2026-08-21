@@ -36,4 +36,4 @@ pub use state::{
     SequenceSnapshot, SequenceState, SnapshotSlots, StateError, snapshot_bytes_per_slot,
 };
 pub use weights::{DeviceWeights, LoadError, LoadReport, TensorPlacement};
-pub use worker::{ServingConfig, Worker, WorkerExecutionError, WorkerId};
+pub use worker::{ServingConfig, Speculation, Worker, WorkerExecutionError, WorkerId};
