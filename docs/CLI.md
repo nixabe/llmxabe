@@ -64,12 +64,12 @@ can set its own without every client having to.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--served-model-name <NAME>` | `LLMXABE_SERVED_MODEL_NAME` | `Qwen3.6-35B-A3B` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. |
-| `--default-max-tokens <N>` | — | `16` | Output limit for a request that sets none. OpenAI's historical 16 truncates most chat replies, so raise it if your clients rely on the default. |
+| `-a, --alias <NAME>` | `LLMXABE_SERVED_MODEL_NAME` | `Qwen3.6-35B-A3B` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. |
+| `--max-tokens <N>` | — | `16` | Output limit for a request that sets none. OpenAI's historical 16 truncates most chat replies, so raise it if your clients rely on the default. |
 | `--no-reasoning` | — | off | Answer without extended thinking unless a request asks for it. A request that names a mode still wins, either way. See [API.md](API.md#reasoning). |
-| `--default-temperature <T>` | — | `1.0` | Sampling temperature for a request that sets none; `0` makes silent requests greedy, which is what this server always did before it had a sampler. See [API.md](API.md#sampling). |
+| `--temperature <T>` (also `-temp`) | — | `1.0` | Sampling temperature for a request that sets none; `0` makes silent requests greedy, which is what this server always did before it had a sampler. See [API.md](API.md#sampling). |
 
-The two-letter shorts `-pc` and `-tb` are rewritten to their long forms before
+The multi-letter shorts `-pc`, `-tb`, and `-temp` are rewritten to their long forms before
 clap parses (clap itself only supports single-character shorts), so they accept
 a space-separated or `=`-joined value (`-pc 2048`, `-pc=2048`) but not the
 attached form single-character shorts allow (`-c393216` works, `-pc2048` does

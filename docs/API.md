@@ -155,7 +155,7 @@ send); `seed` is honoured on the OpenAI shapes that carry it.
 
 - `temperature: 0` is **greedy argmax**, decided on the device — the path
   every request took before the server had a sampler, at the same cost.
-- A request that says nothing gets `--default-temperature`, which ships as
+- A request that says nothing gets `--temperature`, which ships as
   `1.0` — the default both dialects document. An operator who wants the old
   always-greedy behaviour sets it to `0`.
 - Filters chain the way llama.cpp's sampler chain does: temperature scales
@@ -279,7 +279,7 @@ and nothing else.
 ## Model name
 
 `GET /v1/models` reports one model, `Qwen3.6-35B-A3B` unless
-`--served-model-name` says otherwise. Responses echo back whatever `model` the
+`--alias` says otherwise. Responses echo back whatever `model` the
 request named, or that name if the request named none. The engine serves one
 model per process; the field is not a selector.
 
@@ -291,10 +291,10 @@ overridable per request.
 
 | Default | Flag | Ships as |
 | --- | --- | --- |
-| Output limit when a request sets none | `--default-max-tokens` | `16` |
+| Output limit when a request sets none | `--max-tokens` | `16` |
 | Extended thinking when a request says nothing | `--no-reasoning` | on |
-| Sampling temperature when a request sets none | `--default-temperature` | `1.0` |
-| Model name reported and echoed | `--served-model-name` | `Qwen3.6-35B-A3B` |
+| Sampling temperature when a request sets none | `--temperature` | `1.0` |
+| Model name reported and echoed | `--alias` | `Qwen3.6-35B-A3B` |
 
 `16` is OpenAI's historical default and truncates most chat replies; raise it
 if your clients lean on it. See [CLI.md](CLI.md#serving-defaults).

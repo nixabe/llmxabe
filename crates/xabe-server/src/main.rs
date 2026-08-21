@@ -133,28 +133,34 @@ struct Args {
     api_key: Option<String>,
 
     /// Model name reported by /v1/models and echoed in responses
-    #[arg(long, env = "LLMXABE_SERVED_MODEL_NAME", default_value = http::DEFAULT_MODEL)]
-    served_model_name: String,
+    #[arg(short, long, env = "LLMXABE_SERVED_MODEL_NAME", default_value = http::DEFAULT_MODEL)]
+    alias: String,
 
     /// Output token limit for requests that do not set one
     #[arg(long, default_value_t = 16)]
-    default_max_tokens: u32,
+    max_tokens: u32,
 
     /// Answer without extended thinking unless a request asks for it
     #[arg(long)]
     no_reasoning: bool,
 
     /// Sampling temperature for requests that do not set one; 0 is greedy
+    /// (also -temp)
     #[arg(long, default_value_t = 1.0)]
-    default_temperature: f32,
+    temperature: f32,
 }
 
-/// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
-/// their long forms before parsing. Both bare and `=value` forms are handled.
-fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
+/// Rewrite the multi-letter shorts clap cannot express (`-pc`, `-tb`,
+/// `-temp`) into their long forms before parsing. Both bare and `=value`
+/// forms are handled.
+fn expand_multi_letter_shorts(args: Vec<String>) -> Vec<String> {
     args.into_iter()
         .map(|arg| {
-            for (short, long) in [("-pc", "--prefill-chunk"), ("-tb", "--token-budget")] {
+            for (short, long) in [
+                ("-pc", "--prefill-chunk"),
+                ("-tb", "--token-budget"),
+                ("-temp", "--temperature"),
+            ] {
                 if arg == short {
                     return long.to_owned();
                 }
@@ -217,7 +223,7 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
 
 fn main() -> std::process::ExitCode {
     let rest = xabe_log::init_from_args();
-    let args = Args::parse_from(expand_two_letter_shorts(rest));
+    let args = Args::parse_from(expand_multi_letter_shorts(rest));
 
     info!("llmxabe preflight\n");
 
@@ -457,10 +463,10 @@ fn main() -> std::process::ExitCode {
     };
     let server = http::ServerConfig {
         api_key: args.api_key,
-        model: args.served_model_name,
-        default_max_tokens: args.default_max_tokens,
+        model: args.alias,
+        default_max_tokens: args.max_tokens,
         default_reasoning: !args.no_reasoning,
-        default_temperature: args.default_temperature,
+        default_temperature: args.temperature,
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -484,6 +490,25 @@ mod tests {
                 SpecType::DraftMtp => "draft-mtp",
             },
         ])
+    }
+
+    #[test]
+    fn the_renamed_serving_flags_parse_in_both_spellings() {
+        // `-temp` goes through the multi-letter rewrite, `-a` is a real clap
+        // short; both must land on the same fields as the long forms.
+        let long = Args::parse_from(["--temperature", "0.5", "--alias", "m", "--max-tokens", "64"]);
+        assert_eq!(long.temperature, 0.5);
+        assert_eq!(long.alias, "m");
+        assert_eq!(long.max_tokens, 64);
+
+        let short = Args::parse_from(expand_multi_letter_shorts(
+            ["-temp", "0.5", "-a", "m"].map(String::from).to_vec(),
+        ));
+        assert_eq!(short.temperature, 0.5);
+        assert_eq!(short.alias, "m");
+
+        let joined = Args::parse_from(expand_multi_letter_shorts(vec!["-temp=0".to_owned()]));
+        assert_eq!(joined.temperature, 0.0);
     }
 
     #[test]
