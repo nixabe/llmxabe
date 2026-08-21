@@ -17,6 +17,7 @@ pub mod layer_ops;
 pub mod lm_head;
 pub mod mma;
 pub mod moe;
+pub mod vision;
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};

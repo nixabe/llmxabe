@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+half.workspace = true
 tracing.workspace = true
 xabe-log.workspace = true
-cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "cublaslt", "fallback-dynamic-loading", "cuda-12040"] }
+cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "cublaslt", "f16", "fallback-dynamic-loading", "cuda-12040"] }
