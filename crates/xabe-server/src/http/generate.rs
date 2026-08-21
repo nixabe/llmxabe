@@ -5,6 +5,8 @@
 //! becomes text: incremental detokenization, stop sequences, and the split
 //! between the model's reasoning span and its answer.
 
+use std::collections::VecDeque;
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +19,7 @@ use xabe_sched::request::{NewRequest, RequestId};
 
 use super::AppState;
 use super::error::{ApiError, Dialect};
+use super::tools::{ParsedToolCall, ToolCallParser, ToolEvent};
 
 /// What the scheduler thread sends to a waiting client.
 pub(crate) enum ClientEvent {
@@ -45,10 +48,11 @@ pub(crate) enum Finish {
 }
 
 /// A piece of decoded output, routed to the span it belongs to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Chunk {
     Reasoning(String),
     Text(String),
+    ToolCall(ParsedToolCall),
 }
 
 /// A prompt that has already been templated and tokenized.
@@ -63,6 +67,61 @@ pub(crate) struct GenerationSpec {
     /// answer. A chat reply should not begin with the newlines that separate
     /// it from the markup; a raw completion should be returned untouched.
     pub(crate) trim_spans: bool,
+    /// How output tokens are chosen. [`SamplingParams::GREEDY`] is the
+    /// on-device argmax path.
+    pub(crate) sampling: SamplingParams,
+    /// `Some` scans the answer span for `<tool_call>` blocks and reports
+    /// them as [`Chunk::ToolCall`] instead of text.
+    pub(crate) tool_parser: Option<ToolCallParser>,
+}
+
+/// Resolve a request's sampling fields against the server default,
+/// refusing values that cannot mean what the caller intended.
+///
+/// `top_p == 0` degenerates to argmax by the nucleus definition (the
+/// smallest set reaching zero mass is the single most likely token), which is
+/// what some clients mean by it, so it is accepted rather than refused.
+pub(crate) fn resolve_sampling(
+    dialect: Dialect,
+    default_temperature: f32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    seed: Option<i64>,
+) -> Result<SamplingParams, ApiError> {
+    let temperature = temperature.unwrap_or(default_temperature);
+    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        return Err(ApiError::bad_request(
+            dialect,
+            format!("`temperature` must be between 0 and 2, got {temperature}"),
+        ));
+    }
+    let top_p = top_p.unwrap_or(1.0);
+    if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) {
+        return Err(ApiError::bad_request(
+            dialect,
+            format!("`top_p` must be between 0 and 1, got {top_p}"),
+        ));
+    }
+    let params = SamplingParams {
+        temperature,
+        top_k: top_k.unwrap_or(0),
+        top_p,
+        // An unpinned seed still needs to differ between requests, or two
+        // identical prompts would stream identical "random" answers.
+        seed: seed.map(|seed| seed as u64).unwrap_or_else(|| {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u64(0);
+            hasher.finish()
+        }),
+    };
+    // Normalize every greedy spelling to the one the engine's fast path
+    // matches on.
+    Ok(if params.is_greedy() || params.top_p == 0.0 {
+        SamplingParams::GREEDY
+    } else {
+        params
+    })
 }
 
 /// Cancels its request unless generation reached a terminal state first.
@@ -184,6 +243,14 @@ fn earliest_stop<'a>(text: &str, stop: &'a [String]) -> Option<(usize, &'a str)>
         .min_by_key(|&(at, _)| at)
 }
 
+/// Everything a completed, non-streaming response carries.
+#[derive(Debug, Default)]
+pub(crate) struct Collected {
+    pub(crate) reasoning: String,
+    pub(crate) text: String,
+    pub(crate) tool_calls: Vec<ParsedToolCall>,
+}
+
 /// One in-flight response.
 pub(crate) struct Generation {
     id: RequestId,
@@ -207,6 +274,12 @@ pub(crate) struct Generation {
     completion_tokens: usize,
     finish: Option<Finish>,
     drained: bool,
+    /// `Some` scans answer text for `<tool_call>` blocks; taken (and flushed)
+    /// exactly once, when the token stream ends.
+    tool_parser: Option<ToolCallParser>,
+    /// Chunks the tool parser produced beyond the one being returned now.
+    queued: VecDeque<Chunk>,
+    tool_calls: usize,
 }
 
 impl Generation {
@@ -254,9 +327,7 @@ impl Generation {
                 max_output_tokens: spec.max_tokens,
             },
             tokens,
-            // The HTTP surface does not parse sampling parameters yet; every
-            // request stays on the greedy path it always took.
-            SamplingParams::GREEDY,
+            spec.sampling,
         );
         let placement = match placement {
             Ok(placement) => placement,
@@ -299,6 +370,9 @@ impl Generation {
             completion_tokens: 0,
             finish: None,
             drained: false,
+            tool_parser: spec.tool_parser,
+            queued: VecDeque::new(),
+            tool_calls: 0,
         })
     }
 
@@ -345,8 +419,61 @@ impl Generation {
         })
     }
 
+    /// How many tool calls have been parsed out of the output so far. What
+    /// the dialects' `finish_reason` / `stop_reason` decisions read.
+    pub(crate) fn tool_call_count(&self) -> usize {
+        self.tool_calls
+    }
+
     /// The next piece of output, or `None` once the response is complete.
+    ///
+    /// When a tool parser is attached, answer text flows through it: text
+    /// that turns out to be a `<tool_call>` block arrives as
+    /// [`Chunk::ToolCall`], and text that could still become one is held
+    /// back until it is decided.
     pub(crate) async fn next(&mut self) -> Result<Option<Chunk>, ApiError> {
+        loop {
+            if let Some(chunk) = self.queued.pop_front() {
+                return Ok(Some(chunk));
+            }
+            match self.raw_next().await? {
+                Some(Chunk::Text(text)) if self.tool_parser.is_some() => {
+                    let parser = self.tool_parser.as_mut().expect("matched above");
+                    let mut events = Vec::new();
+                    parser.push(&text, &mut events);
+                    self.enqueue(events);
+                }
+                Some(chunk) => return Ok(Some(chunk)),
+                None => {
+                    // The stream is over; flush what the parser was still
+                    // holding, exactly once.
+                    if let Some(mut parser) = self.tool_parser.take() {
+                        let mut events = Vec::new();
+                        parser.finish(&mut events);
+                        self.enqueue(events);
+                    }
+                    if self.queued.is_empty() {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+
+    fn enqueue(&mut self, events: Vec<ToolEvent>) {
+        for event in events {
+            self.queued.push_back(match event {
+                ToolEvent::Text(text) => Chunk::Text(text),
+                ToolEvent::Call(call) => {
+                    self.tool_calls += 1;
+                    Chunk::ToolCall(call)
+                }
+            });
+        }
+    }
+
+    /// The undecoded pipeline: engine events to span-routed text.
+    async fn raw_next(&mut self) -> Result<Option<Chunk>, ApiError> {
         if self.drained {
             return Ok(None);
         }
@@ -422,16 +549,18 @@ impl Generation {
         }
     }
 
-    /// Run to completion, accumulating the reasoning span and the answer.
-    pub(crate) async fn collect(&mut self) -> Result<(String, String), ApiError> {
-        let (mut reasoning, mut text) = (String::new(), String::new());
+    /// Run to completion, accumulating the reasoning span, the answer, and
+    /// any tool calls.
+    pub(crate) async fn collect(&mut self) -> Result<Collected, ApiError> {
+        let mut collected = Collected::default();
         while let Some(chunk) = self.next().await? {
             match chunk {
-                Chunk::Reasoning(part) => reasoning.push_str(&part),
-                Chunk::Text(part) => text.push_str(&part),
+                Chunk::Reasoning(part) => collected.reasoning.push_str(&part),
+                Chunk::Text(part) => collected.text.push_str(&part),
+                Chunk::ToolCall(call) => collected.tool_calls.push(call),
             }
         }
-        Ok((reasoning, text))
+        Ok(collected)
     }
 }
 
@@ -458,6 +587,50 @@ mod tests {
         let stop = vec!["世界".to_owned()];
         assert_eq!(held_back_len("你好世", &stop), 3);
         assert_eq!(held_back_len("你好", &stop), 0);
+    }
+
+    #[test]
+    fn greedy_spellings_normalize_to_the_device_argmax_path() {
+        // temperature 0, top_k 1, and top_p 0 are all argmax in disguise;
+        // the engine's fast path matches on SamplingParams::GREEDY exactly.
+        for (temperature, top_k, top_p) in [
+            (Some(0.0), None, None),
+            (None, Some(1), None),
+            (None, None, Some(0.0)),
+        ] {
+            let params = resolve_sampling(Dialect::OpenAi, 1.0, temperature, top_p, top_k, None)
+                .expect("greedy spellings resolve");
+            assert_eq!(params, SamplingParams::GREEDY);
+        }
+    }
+
+    #[test]
+    fn a_silent_request_gets_the_server_default_temperature() {
+        let sampled = resolve_sampling(Dialect::OpenAi, 1.0, None, None, None, Some(7))
+            .expect("defaults resolve");
+        assert_eq!(sampled.temperature, 1.0);
+        assert_eq!(sampled.seed, 7);
+        let greedy_default = resolve_sampling(Dialect::OpenAi, 0.0, None, None, None, None)
+            .expect("defaults resolve");
+        assert_eq!(greedy_default, SamplingParams::GREEDY);
+    }
+
+    #[test]
+    fn out_of_range_sampling_parameters_are_refused() {
+        assert!(resolve_sampling(Dialect::OpenAi, 1.0, Some(2.5), None, None, None).is_err());
+        assert!(resolve_sampling(Dialect::OpenAi, 1.0, Some(-0.1), None, None, None).is_err());
+        assert!(resolve_sampling(Dialect::OpenAi, 1.0, Some(f32::NAN), None, None, None).is_err());
+        assert!(resolve_sampling(Dialect::OpenAi, 1.0, None, Some(1.5), None, None).is_err());
+        assert!(resolve_sampling(Dialect::OpenAi, 1.0, None, Some(-0.5), None, None).is_err());
+    }
+
+    #[test]
+    fn unpinned_seeds_differ_between_requests() {
+        let a =
+            resolve_sampling(Dialect::OpenAi, 1.0, Some(0.8), None, None, None).expect("resolves");
+        let b =
+            resolve_sampling(Dialect::OpenAi, 1.0, Some(0.8), None, None, None).expect("resolves");
+        assert_ne!(a.seed, b.seed, "two unpinned requests drew the same seed");
     }
 
     #[test]

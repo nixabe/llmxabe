@@ -6,13 +6,14 @@
 //! all four funnel through [`generate::Generation`], which owns admission,
 //! detokenization, stop sequences, and cancellation.
 //!
-//! What the engine below does *not* offer is worth stating here, because the
-//! wire formats imply it: decoding is greedy argmax, so `temperature`,
-//! `top_p`, `top_k` and `seed` are accepted for client compatibility and have
-//! no effect. Anything that would change the *shape* of a response rather
-//! than its content — `n > 1`, tool definitions — is refused instead, so a
-//! caller is never handed a reply that silently answers a different question
-//! than the one it asked. See `docs/API.md`.
+//! `temperature`, `top_p`, `top_k` and `seed` are honoured — decoding
+//! samples through the engine's host sampler, and `temperature: 0` is greedy
+//! argmax on the device. Tool calling is honoured too: definitions render
+//! into the model's own template section and `<tool_call>` blocks are parsed
+//! back out of the output. What is still refused, loudly, is anything that
+//! would need machinery this server does not have — `n > 1`, a forced
+//! `tool_choice` — so a caller is never handed a reply that silently answers
+//! a different question than the one it asked. See `docs/API.md`.
 
 mod anthropic;
 mod auth;
@@ -21,6 +22,7 @@ mod error;
 mod generate;
 mod openai;
 mod responses;
+mod tools;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -61,6 +63,10 @@ pub struct ServerConfig {
     /// Whether a chat request that says nothing about reasoning gets it.
     /// The model's own template defaults this on.
     pub default_reasoning: bool,
+    /// The sampling temperature for a request that does not set one. Both
+    /// dialects document 1.0; `0` makes silent requests greedy, which is what
+    /// this server always did before it had a sampler.
+    pub default_temperature: f32,
 }
 
 #[derive(Clone)]
@@ -76,6 +82,7 @@ struct AppState {
     model: Arc<str>,
     default_max_tokens: u32,
     default_reasoning: bool,
+    default_temperature: f32,
 }
 
 impl AppState {
@@ -237,6 +244,7 @@ pub async fn serve(
         model: Arc::from(config.model.as_str()),
         default_max_tokens: config.default_max_tokens,
         default_reasoning: config.default_reasoning,
+        default_temperature: config.default_temperature,
     };
     let scheduler_state = state.clone();
     std::thread::Builder::new()

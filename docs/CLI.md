@@ -67,6 +67,7 @@ can set its own without every client having to.
 | `--served-model-name <NAME>` | `LLMXABE_SERVED_MODEL_NAME` | `Qwen3.6-35B-A3B` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. |
 | `--default-max-tokens <N>` | — | `16` | Output limit for a request that sets none. OpenAI's historical 16 truncates most chat replies, so raise it if your clients rely on the default. |
 | `--no-reasoning` | — | off | Answer without extended thinking unless a request asks for it. A request that names a mode still wins, either way. See [API.md](API.md#reasoning). |
+| `--default-temperature <T>` | — | `1.0` | Sampling temperature for a request that sets none; `0` makes silent requests greedy, which is what this server always did before it had a sampler. See [API.md](API.md#sampling). |
 
 The two-letter shorts `-pc` and `-tb` are rewritten to their long forms before
 clap parses (clap itself only supports single-character shorts), so they accept
@@ -133,10 +134,12 @@ weight-read pass. It ships as `none`.
 | `ngram` | a suffix match against the sequence's own prompt and output | works |
 | `draft-mtp` | the model's own multi-token-prediction head | **refused at startup**; see below |
 
-Whatever the type, **the output is the same**. Under greedy decoding a drafted
-token is accepted only if it equals the target model's own argmax there, and a
-rejected draft is replaced by that argmax rather than dropped, so speculation
-changes how many weight reads a token costs and never what the token is. That
+Whatever the type, **the output is the same**. A drafted token is accepted
+only if it equals the token the target model itself chose there — its argmax
+under greedy decoding, its sample under sampling — and a rejected draft is
+replaced by that token rather than dropped, so speculation changes how many
+weight reads a token costs and never what the token is (under sampling it just
+accepts fewer drafts). That
 is a contract, not a hope: `crates/xabe-engine/tests/speculative_identity.rs`
 holds the MTP driver to it, and `--spec-type ngram` was checked against
 `--spec-type none` on the same prompt and came back byte-identical.

@@ -17,14 +17,16 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::chat::{Content, Conversation, Turn, unsupported_role, unsupported_tools};
+use super::chat::{Content, Conversation, Turn, unsupported_role, unsupported_tool_choice};
 use super::error::{ApiError, Dialect, parse_body};
-use super::generate::{Chunk, Finish, Generation, GenerationSpec};
+use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
+use super::tools::{ParsedToolCall, ToolCallParser, ToolDefinition};
 use super::{AppState, sse_named, unix_now};
 
 const DIALECT: Dialect = Dialect::OpenAi;
 
-/// One entry of a structured `input` list.
+/// One entry of a structured `input` list: a `message`, or a replayed
+/// `function_call` / `function_call_output` pair.
 #[derive(Debug, Deserialize)]
 struct InputItem {
     #[serde(default, rename = "type")]
@@ -33,6 +35,12 @@ struct InputItem {
     role: Option<String>,
     #[serde(default)]
     content: Option<Content>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    output: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,12 +72,39 @@ struct ResponsesRequest {
     #[serde(default)]
     reasoning: Option<ReasoningOptions>,
     #[serde(default)]
-    tools: Option<Value>,
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
     #[serde(default)]
     previous_response_id: Option<String>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
 }
 
 impl ResponsesRequest {
+    /// Whether the caller's `tool_choice` lets the tools be offered at all.
+    fn tools_offered(&self) -> Result<bool, ApiError> {
+        match &self.tool_choice {
+            None => Ok(true),
+            Some(Value::String(choice)) if choice == "auto" => Ok(true),
+            Some(Value::String(choice)) if choice == "none" => Ok(false),
+            Some(Value::String(choice)) => Err(unsupported_tool_choice(DIALECT, choice)),
+            Some(_) => Err(unsupported_tool_choice(DIALECT, "a named function")),
+        }
+    }
+
+    fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, ApiError> {
+        self.tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(ToolDefinition::from_responses)
+            .collect::<Result<_, _>>()
+            .map_err(|failure| ApiError::bad_request(DIALECT, failure))
+    }
+
     fn thinking_enabled(&self, default: bool) -> bool {
         match self
             .reasoning
@@ -86,19 +121,77 @@ impl ResponsesRequest {
         let mut conversation = Conversation {
             system: self.instructions.clone(),
             turns: Vec::new(),
+            tools: Vec::new(),
         };
         match &self.input {
             Input::Text(text) => conversation.turns.push(Turn::User(text.clone())),
             Input::Items(items) => {
                 for item in items {
-                    if item.kind.as_deref().is_some_and(|kind| kind != "message") {
-                        return Err(ApiError::bad_request(
-                            DIALECT,
-                            format!(
-                                "input items of type `{}` are not supported; send `message` items",
-                                item.kind.as_deref().unwrap_or_default()
-                            ),
-                        ));
+                    match item.kind.as_deref() {
+                        None | Some("message") => {}
+                        // A call this server made on a previous turn, being
+                        // replayed. It belongs to the assistant turn before
+                        // it, which is also where the template renders it.
+                        Some("function_call") => {
+                            let name = item
+                                .name
+                                .clone()
+                                .filter(|name| !name.is_empty())
+                                .ok_or_else(|| {
+                                    ApiError::bad_request(
+                                        DIALECT,
+                                        "a `function_call` item needs a `name`",
+                                    )
+                                })?;
+                            let arguments = match item.arguments.as_deref() {
+                                None | Some("") => serde_json::Map::new(),
+                                Some(text) => serde_json::from_str::<Value>(text)
+                                    .ok()
+                                    .and_then(|parsed| parsed.as_object().cloned())
+                                    .ok_or_else(|| {
+                                        ApiError::bad_request(
+                                            DIALECT,
+                                            format!(
+                                                "function_call `{name}` has `arguments` that \
+                                                 are not a JSON object"
+                                            ),
+                                        )
+                                    })?,
+                            };
+                            let call = ParsedToolCall { name, arguments };
+                            if let Some(Turn::Assistant { tool_calls, .. }) =
+                                conversation.turns.last_mut()
+                            {
+                                tool_calls.push(call);
+                            } else {
+                                conversation.turns.push(Turn::Assistant {
+                                    reasoning: String::new(),
+                                    content: String::new(),
+                                    tool_calls: vec![call],
+                                });
+                            }
+                            continue;
+                        }
+                        Some("function_call_output") => {
+                            let output = match &item.output {
+                                None => String::new(),
+                                Some(Value::String(text)) => text.clone(),
+                                Some(other) => {
+                                    serde_json::to_string(other).expect("JSON values serialize")
+                                }
+                            };
+                            conversation.push_tool_result(output);
+                            continue;
+                        }
+                        Some(kind) => {
+                            return Err(ApiError::bad_request(
+                                DIALECT,
+                                format!(
+                                    "input items of type `{kind}` are not supported; send \
+                                     `message`, `function_call`, or `function_call_output` items"
+                                ),
+                            ));
+                        }
                     }
                     let (text, thinking) = item
                         .content
@@ -122,10 +215,9 @@ impl ResponsesRequest {
                             system.push_str(&text);
                         }
                         Some("user") => conversation.turns.push(Turn::User(text)),
-                        Some("assistant") => conversation.turns.push(Turn::Assistant {
-                            reasoning: thinking,
-                            content: text,
-                        }),
+                        Some("assistant") => conversation
+                            .turns
+                            .push(Turn::assistant_text(thinking, text)),
                         Some(role) => return Err(unsupported_role(DIALECT, role)),
                         None => {
                             return Err(ApiError::bad_request(
@@ -190,6 +282,29 @@ impl Envelope {
         })
     }
 
+    fn function_call_item_id(&self, index: usize) -> String {
+        format!("fc_{}_{index}", self.id.trim_start_matches("resp_"))
+    }
+
+    fn function_call_id(&self, index: usize) -> String {
+        format!("call_{}_{index}", self.id.trim_start_matches("resp_"))
+    }
+
+    fn function_call_item(&self, index: usize, call: &ParsedToolCall, status: &str) -> Value {
+        json!({
+            "id": self.function_call_item_id(index),
+            "type": "function_call",
+            "status": status,
+            "call_id": self.function_call_id(index),
+            "name": call.name,
+            "arguments": if status == "in_progress" {
+                String::new()
+            } else {
+                call.arguments_json()
+            },
+        })
+    }
+
     fn object(&self, status: &str, incomplete: Value, output: Vec<Value>, usage: Value) -> Value {
         json!({
             "id": self.id,
@@ -219,9 +334,6 @@ pub(crate) async fn create(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let request: ResponsesRequest = parse_body(&body, DIALECT)?;
-    if request.tools.is_some() {
-        return Err(unsupported_tools(DIALECT));
-    }
     if request.previous_response_id.is_some() {
         return Err(ApiError::bad_request(
             DIALECT,
@@ -230,7 +342,13 @@ pub(crate) async fn create(
         ));
     }
     let thinking = request.thinking_enabled(state.default_reasoning);
-    let prompt = request.conversation()?.render(thinking);
+    let mut conversation = request.conversation()?;
+    if request.tools_offered()? {
+        conversation.tools = request.tool_definitions()?;
+    }
+    let tool_parser =
+        (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
+    let prompt = conversation.render(thinking);
     let encoding = state
         .tokenizer
         .encode(prompt, false)
@@ -243,6 +361,15 @@ pub(crate) async fn create(
         stop: Vec::new(),
         thinking,
         trim_spans: true,
+        sampling: resolve_sampling(
+            DIALECT,
+            state.default_temperature,
+            request.temperature,
+            request.top_p,
+            None,
+            None,
+        )?,
+        tool_parser,
     };
     let mut generation = Generation::start(&state, spec, DIALECT)?;
     let envelope = Envelope {
@@ -252,13 +379,18 @@ pub(crate) async fn create(
     };
 
     if !request.stream {
-        let (reasoning, text) = generation.collect().await?;
+        let collected = generation.collect().await?;
         let (status, incomplete) = status_of(&generation.finish());
-        let mut output = Vec::with_capacity(2);
-        if !reasoning.is_empty() {
-            output.push(envelope.reasoning_item(&reasoning));
+        let mut output = Vec::with_capacity(2 + collected.tool_calls.len());
+        if !collected.reasoning.is_empty() {
+            output.push(envelope.reasoning_item(&collected.reasoning));
         }
-        output.push(envelope.message_item(&text));
+        if !collected.text.is_empty() || collected.tool_calls.is_empty() {
+            output.push(envelope.message_item(&collected.text));
+        }
+        for (index, call) in collected.tool_calls.iter().enumerate() {
+            output.push(envelope.function_call_item(index, call, "completed"));
+        }
         return Ok(
             axum::Json(envelope.object(status, incomplete, output, usage_of(&generation)))
                 .into_response(),
@@ -287,6 +419,7 @@ pub(crate) async fn create(
         }));
 
         let (mut reasoning, mut text) = (String::new(), String::new());
+        let mut calls: Vec<super::tools::ParsedToolCall> = Vec::new();
         // Output items open on their first delta, so a response with no
         // reasoning carries no reasoning item.
         let mut output_index = 0usize;
@@ -301,10 +434,12 @@ pub(crate) async fn create(
                     return;
                 }
             };
+            // A tool call closes whatever item is open and emits a complete
+            // item of its own, so it maps to "nothing open" here.
             let kind = match &chunk {
                 Some(Chunk::Reasoning(_)) => Some("reasoning"),
                 Some(Chunk::Text(_)) => Some("message"),
-                None => None,
+                Some(Chunk::ToolCall(_)) | None => None,
             };
             if open != kind {
                 // Close whatever is open before opening the next item.
@@ -406,16 +541,51 @@ pub(crate) async fn create(
                         "delta": delta,
                     }));
                 }
+                Some(Chunk::ToolCall(call)) => {
+                    // A call parses only once its block is complete, so its
+                    // item streams as one added/delta/done/done group.
+                    let index = calls.len();
+                    let item_id = envelope.function_call_item_id(index);
+                    yield Ok(emit!("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": envelope.function_call_item(index, &call, "in_progress"),
+                    }));
+                    yield Ok(emit!("response.function_call_arguments.delta", {
+                        "type": "response.function_call_arguments.delta",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": call.arguments_json(),
+                    }));
+                    yield Ok(emit!("response.function_call_arguments.done", {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": call.arguments_json(),
+                    }));
+                    yield Ok(emit!("response.output_item.done", {
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": envelope.function_call_item(index, &call, "completed"),
+                    }));
+                    output_index += 1;
+                    calls.push(call);
+                }
                 None => break,
             }
         }
 
         let (status, incomplete) = status_of(&generation.finish());
-        let mut output = Vec::with_capacity(2);
+        let mut output = Vec::with_capacity(2 + calls.len());
         if !reasoning.is_empty() {
             output.push(envelope.reasoning_item(&reasoning));
         }
-        output.push(envelope.message_item(&text));
+        if !text.is_empty() || calls.is_empty() {
+            output.push(envelope.message_item(&text));
+        }
+        for (index, call) in calls.iter().enumerate() {
+            output.push(envelope.function_call_item(index, call, "completed"));
+        }
         yield Ok(emit!("response.completed", {
             "type": "response.completed",
             "response": envelope.object(status, incomplete, output, usage_of(&generation)),

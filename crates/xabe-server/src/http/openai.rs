@@ -5,10 +5,12 @@ use axum::extract::State;
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 
-use super::chat::{Content, Conversation, Turn, unsupported_role, unsupported_tools};
+use super::chat::{Content, Conversation, Turn, unsupported_role, unsupported_tool_choice};
 use super::error::{ApiError, Dialect, parse_body};
-use super::generate::{Chunk, Finish, Generation, GenerationSpec};
+use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
+use super::tools::{ParsedToolCall, ToolCallParser, ToolDefinition};
 use super::{AppState, sse_json, unix_now};
 
 const DIALECT: Dialect = Dialect::OpenAi;
@@ -53,6 +55,78 @@ fn finish_reason(finish: &Finish) -> &'static str {
     }
 }
 
+/// As [`finish_reason`], for a chat response that may have called tools: a
+/// turn the model ended after calling tools is `"tool_calls"`, while a
+/// truncated one stays `"length"` — the caller must know the call list may
+/// be incomplete.
+fn chat_finish_reason(finish: &Finish, tool_calls: usize) -> &'static str {
+    match finish {
+        Finish::EndOfTurn if tool_calls > 0 => "tool_calls",
+        _ => finish_reason(finish),
+    }
+}
+
+/// The wire shape of one emitted call, shared by the message and the delta.
+fn tool_call_value(request_id: u64, index: usize, call: &ParsedToolCall) -> Value {
+    json!({
+        "id": format!("call_{request_id}_{index}"),
+        "type": "function",
+        "function": { "name": call.name, "arguments": call.arguments_json() },
+    })
+}
+
+/// Fold a replayed `tool_calls` array back into parsed calls for the
+/// template. OpenAI carries `arguments` as a JSON-encoded string.
+fn replayed_tool_calls(raw: Option<Vec<Value>>) -> Result<Vec<ParsedToolCall>, ApiError> {
+    let mut calls = Vec::new();
+    for value in raw.unwrap_or_default() {
+        let function = value.get("function").unwrap_or(&value);
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(DIALECT, "every replayed tool call needs a function `name`")
+            })?;
+        let arguments = match function.get("arguments") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::String(text)) if text.trim().is_empty() => Map::new(),
+            Some(Value::String(text)) => serde_json::from_str::<Value>(text)
+                .ok()
+                .and_then(|parsed| parsed.as_object().cloned())
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        DIALECT,
+                        format!("tool call `{name}` has `arguments` that are not a JSON object"),
+                    )
+                })?,
+            Some(Value::Object(object)) => object.clone(),
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    DIALECT,
+                    format!("tool call `{name}` has `arguments` that are not a JSON object"),
+                ));
+            }
+        };
+        calls.push(ParsedToolCall {
+            name: name.to_owned(),
+            arguments,
+        });
+    }
+    Ok(calls)
+}
+
+/// Whether to offer the tools to the model at all.
+fn tools_offered(choice: Option<&Value>) -> Result<bool, ApiError> {
+    match choice {
+        None => Ok(true),
+        Some(Value::String(choice)) if choice == "auto" => Ok(true),
+        Some(Value::String(choice)) if choice == "none" => Ok(false),
+        Some(Value::String(choice)) => Err(unsupported_tool_choice(DIALECT, choice)),
+        Some(_) => Err(unsupported_tool_choice(DIALECT, "a named function")),
+    }
+}
+
 #[derive(Serialize)]
 struct Usage {
     prompt_tokens: usize,
@@ -72,22 +146,49 @@ impl Usage {
 
 /// Refuse the parameters that would change the response's shape.
 ///
-/// Parameters that only change sampling are accepted and ignored — decoding
-/// is greedy argmax — but a caller that asked for four completions and got one
-/// has been answered wrongly, not approximately.
+/// A caller that asked for four completions and got one has been answered
+/// wrongly, not approximately.
 fn reject_shape_changing(n: Option<u32>, best_of: Option<u32>) -> Result<(), ApiError> {
     for (name, value) in [("n", n), ("best_of", best_of)] {
         if value.is_some_and(|value| value > 1) {
             return Err(ApiError::bad_request(
                 DIALECT,
                 format!(
-                    "`{name}` above 1 is not supported: decoding is greedy, so every completion \
-                     would be identical"
+                    "`{name}` above 1 is not supported: this server generates one completion \
+                     per request"
                 ),
             ));
         }
     }
     Ok(())
+}
+
+/// The sampling fields both OpenAI request shapes carry. `top_k` is not
+/// OpenAI's, but clients aimed at llama.cpp and vLLM send it and both honour
+/// it, so refusing it would break them for no gain.
+#[derive(Debug, Default, Deserialize)]
+struct SamplingFields {
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    seed: Option<i64>,
+}
+
+impl SamplingFields {
+    fn resolve(&self, state: &AppState) -> Result<xabe_engine::SamplingParams, ApiError> {
+        resolve_sampling(
+            DIALECT,
+            state.default_temperature,
+            self.temperature,
+            self.top_p,
+            self.top_k,
+            self.seed,
+        )
+    }
 }
 
 // ---------------------------------------------------------------- completions
@@ -116,6 +217,8 @@ struct CompletionRequest {
     n: Option<u32>,
     #[serde(default)]
     best_of: Option<u32>,
+    #[serde(flatten)]
+    sampling: SamplingFields,
 }
 
 #[derive(Serialize)]
@@ -164,6 +267,8 @@ pub(crate) async fn completions(
         stop: stop_sequences(request.stop),
         thinking: false,
         trim_spans: false,
+        sampling: request.sampling.resolve(&state)?,
+        tool_parser: None,
     };
     let mut generation = Generation::start(&state, spec, DIALECT)?;
     let id = format!("cmpl-{}", generation.request_id());
@@ -171,7 +276,7 @@ pub(crate) async fn completions(
     let created = unix_now();
 
     if !request.stream {
-        let (_, text) = generation.collect().await?;
+        let text = generation.collect().await?.text;
         return Ok(axum::Json(CompletionResponse {
             id,
             object: "text_completion",
@@ -191,6 +296,9 @@ pub(crate) async fn completions(
     let stream = async_stream::stream! {
         loop {
             match generation.next().await {
+                // No tool parser is attached to a raw completion, so a
+                // `ToolCall` chunk cannot arrive here.
+                Ok(Some(Chunk::ToolCall(_))) => unreachable!("completions attach no tool parser"),
                 Ok(Some(Chunk::Reasoning(text) | Chunk::Text(text))) => {
                     yield Ok::<_, std::convert::Infallible>(sse_json(&CompletionResponse {
                         id: id.clone(),
@@ -239,6 +347,9 @@ struct ChatMessage {
     /// Reasoning replayed from a previous turn, as this server emits it.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Calls replayed from a previous assistant turn.
+    #[serde(default)]
+    tool_calls: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,9 +378,13 @@ struct ChatRequest {
     #[serde(default)]
     n: Option<u32>,
     #[serde(default)]
-    tools: Option<serde_json::Value>,
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    #[serde(flatten)]
+    sampling: SamplingFields,
 }
 
 /// Fold OpenAI chat messages into a conversation.
@@ -298,7 +413,9 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
             "assistant" => conversation.turns.push(Turn::Assistant {
                 reasoning: message.reasoning_content.unwrap_or(thinking),
                 content: text,
+                tool_calls: replayed_tool_calls(message.tool_calls)?,
             }),
+            "tool" => conversation.push_tool_result(text),
             role => return Err(unsupported_role(DIALECT, role)),
         }
     }
@@ -322,6 +439,8 @@ struct ChatDelta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<Value>>,
 }
 
 #[derive(Serialize)]
@@ -350,16 +469,25 @@ pub(crate) async fn chat_completions(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let request: ChatRequest = parse_body(&body, DIALECT)?;
-    if request.tools.is_some() {
-        return Err(unsupported_tools(DIALECT));
-    }
     reject_shape_changing(request.n, None)?;
     let thinking = request
         .chat_template_kwargs
         .as_ref()
         .and_then(|kwargs| kwargs.enable_thinking)
         .unwrap_or(state.default_reasoning);
-    let conversation = conversation(request.messages)?;
+    let mut conversation = conversation(request.messages)?;
+    if tools_offered(request.tool_choice.as_ref())? {
+        conversation.tools = request
+            .tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(ToolDefinition::from_openai)
+            .collect::<Result<_, _>>()
+            .map_err(|failure| ApiError::bad_request(DIALECT, failure))?;
+    }
+    let tool_parser =
+        (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
     let prompt = conversation.render(thinking);
     let encoding = state
         .tokenizer
@@ -374,6 +502,8 @@ pub(crate) async fn chat_completions(
         stop: stop_sequences(request.stop),
         thinking,
         trim_spans: true,
+        sampling: request.sampling.resolve(&state)?,
+        tool_parser,
     };
     let mut generation = Generation::start(&state, spec, DIALECT)?;
     let id = format!("chatcmpl-{}", generation.request_id());
@@ -381,7 +511,16 @@ pub(crate) async fn chat_completions(
     let created = unix_now();
 
     if !request.stream {
-        let (reasoning, content) = generation.collect().await?;
+        let collected = generation.collect().await?;
+        let request_id = generation.request_id();
+        let tool_calls = (!collected.tool_calls.is_empty()).then(|| {
+            collected
+                .tool_calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| tool_call_value(request_id, index, call))
+                .collect()
+        });
         return Ok(axum::Json(ChatResponse {
             id,
             object: "chat.completion",
@@ -391,11 +530,19 @@ pub(crate) async fn chat_completions(
                 index: 0,
                 message: Some(ChatDelta {
                     role: Some("assistant"),
-                    content: Some(content),
-                    reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                    // `null` content alongside tool calls is OpenAI's shape
+                    // for a turn that only called tools.
+                    content: (tool_calls.is_none() || !collected.text.is_empty())
+                        .then_some(collected.text),
+                    reasoning_content: (!collected.reasoning.is_empty())
+                        .then_some(collected.reasoning),
+                    tool_calls,
                 }),
                 delta: None,
-                finish_reason: Some(finish_reason(&generation.finish())),
+                finish_reason: Some(chat_finish_reason(
+                    &generation.finish(),
+                    generation.tool_call_count(),
+                )),
             }],
             usage: Some(Usage::of(&generation)),
         })
@@ -416,10 +563,12 @@ pub(crate) async fn chat_completions(
         };
         // OpenAI's first chunk announces the role and carries no content.
         yield Ok::<_, std::convert::Infallible>(chunk(
-            ChatDelta { role: Some("assistant"), content: Some(String::new()), reasoning_content: None },
+            ChatDelta { role: Some("assistant"), content: Some(String::new()), ..ChatDelta::default() },
             None,
             None,
         ));
+        let request_id = generation.request_id();
+        let mut emitted_calls = 0usize;
         loop {
             match generation.next().await {
                 Ok(Some(Chunk::Text(text))) => {
@@ -432,10 +581,23 @@ pub(crate) async fn chat_completions(
                         None,
                     ));
                 }
+                Ok(Some(Chunk::ToolCall(call))) => {
+                    // A call parses only once its block is complete, so it
+                    // streams as one delta: the entry, name and arguments
+                    // together, at the index clients accumulate by.
+                    let mut entry = tool_call_value(request_id, emitted_calls, &call);
+                    entry["index"] = json!(emitted_calls);
+                    emitted_calls += 1;
+                    yield Ok(chunk(
+                        ChatDelta { tool_calls: Some(vec![entry]), ..ChatDelta::default() },
+                        None,
+                        None,
+                    ));
+                }
                 Ok(None) => {
                     yield Ok(chunk(
                         ChatDelta::default(),
-                        Some(finish_reason(&generation.finish())),
+                        Some(chat_finish_reason(&generation.finish(), generation.tool_call_count())),
                         include_usage.then(|| Usage::of(&generation)),
                     ));
                     break;
@@ -462,6 +624,7 @@ mod tests {
             role: role.to_owned(),
             content: Some(Content::Text(content.to_owned())),
             reasoning_content: None,
+            tool_calls: None,
         }
     }
 
@@ -495,8 +658,63 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_message_is_refused() {
-        assert!(conversation(vec![message("tool", "{}")]).is_err());
+    fn a_tool_message_becomes_a_tool_response_turn() {
+        let folded = conversation(vec![
+            message("user", "Weather?"),
+            message("assistant", "checking"),
+            message("tool", "Sunny"),
+            message("tool", "Windy"),
+        ])
+        .expect("tool messages fold");
+        // Consecutive tool messages share one turn, as the template merges
+        // them into one user turn of <tool_response> blocks.
+        assert_eq!(folded.turns.len(), 3);
+        assert!(matches!(
+            &folded.turns[2],
+            Turn::ToolResults(results) if results == &["Sunny".to_owned(), "Windy".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn replayed_tool_calls_parse_string_and_object_arguments() {
+        let calls = replayed_tool_calls(Some(vec![
+            json!({ "id": "call_1", "type": "function",
+                    "function": { "name": "f", "arguments": r#"{"city":"Paris"}"# } }),
+            json!({ "function": { "name": "g", "arguments": { "days": 3 } } }),
+        ]))
+        .expect("well-formed replays parse");
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[0].arguments.get("city"), Some(&json!("Paris")));
+        assert_eq!(calls[1].arguments.get("days"), Some(&json!(3)));
+
+        assert!(replayed_tool_calls(Some(vec![json!({ "function": {} })])).is_err());
+        assert!(
+            replayed_tool_calls(Some(vec![
+                json!({ "function": { "name": "f", "arguments": "not json" } })
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tool_choice_auto_and_none_work_and_forcing_is_refused() {
+        assert!(tools_offered(None).expect("default is auto"));
+        assert!(tools_offered(Some(&json!("auto"))).expect("auto offers"));
+        assert!(!tools_offered(Some(&json!("none"))).expect("none withholds"));
+        assert!(tools_offered(Some(&json!("required"))).is_err());
+        assert!(
+            tools_offered(Some(
+                &json!({ "type": "function", "function": { "name": "f" } })
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_with_calls_reports_tool_calls_but_a_truncated_one_length() {
+        assert_eq!(chat_finish_reason(&Finish::EndOfTurn, 2), "tool_calls");
+        assert_eq!(chat_finish_reason(&Finish::EndOfTurn, 0), "stop");
+        assert_eq!(chat_finish_reason(&Finish::Length, 2), "length");
     }
 
     #[test]

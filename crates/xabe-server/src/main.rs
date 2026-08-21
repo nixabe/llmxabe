@@ -143,6 +143,10 @@ struct Args {
     /// Answer without extended thinking unless a request asks for it
     #[arg(long)]
     no_reasoning: bool,
+
+    /// Sampling temperature for requests that do not set one; 0 is greedy
+    #[arg(long, default_value_t = 1.0)]
+    default_temperature: f32,
 }
 
 /// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
@@ -456,6 +460,7 @@ fn main() -> std::process::ExitCode {
         model: args.served_model_name,
         default_max_tokens: args.default_max_tokens,
         default_reasoning: !args.no_reasoning,
+        default_temperature: args.default_temperature,
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,

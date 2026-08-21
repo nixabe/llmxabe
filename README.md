@@ -20,10 +20,11 @@ RTX 8000, written in Rust.
 > Anthropic's messages, streaming or not, behind an optional API key, and
 > tokenizes from the vocabulary embedded in the GGUF.
 >
-> What it does not do: multimodal input, tool calls, and sampling — decoding is
-> greedy argmax, so sampling parameters are accepted and ignored. See
-> [docs/API.md](docs/API.md) for what the endpoints refuse, and
-> [docs/MILESTONES.md](docs/MILESTONES.md) for the engine milestones.
+> It samples — `temperature`, `top_p`, `top_k`, `seed`, with `temperature: 0`
+> as greedy argmax — and it speaks tool calls in all three chat dialects.
+> What it does not do: multimodal input. See [docs/API.md](docs/API.md) for
+> what the endpoints refuse, and [docs/MILESTONES.md](docs/MILESTONES.md) for
+> the engine milestones.
 
 ## Why this exists
 
@@ -143,8 +144,8 @@ memory, and engine assembly.
 
 The HTTP surface serves OpenAI's `/v1/completions`, `/v1/chat/completions` and
 `/v1/responses`, and Anthropic's `/v1/messages`, across all three cards —
-streaming or not, with optional API-key authentication. Decoding is greedy
-argmax; sampling parameters are accepted and ignored. See
+streaming or not, with optional API-key authentication, with sampling and
+tool calling in every chat dialect. See
 [docs/API.md](docs/API.md) for the endpoints and what they refuse, and
 [docs/TESTING.md](docs/TESTING.md) for what the serving checks do and do not
 cover.

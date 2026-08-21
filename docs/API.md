@@ -146,22 +146,77 @@ OpenAI reports this as `finish_reason: "stop"`, which is also what an
 end-of-turn token reports. Anthropic distinguishes them: `stop_reason:
 "stop_sequence"` plus the `stop_sequence` that matched.
 
-## What is accepted and ignored, and what is refused
+## Sampling
 
-Decoding is **greedy argmax**. There is no sampler.
+Every generation endpoint honours `temperature` and `top_p`; `top_k` is
+honoured on `/v1/messages` (where it is Anthropic's own) and on both OpenAI
+completions shapes (where it is the llama.cpp/vLLM extension clients already
+send); `seed` is honoured on the OpenAI shapes that carry it.
 
-*Accepted and ignored*, because refusing them would break every standard
-client and they change only which of several plausible answers you get:
-`temperature`, `top_p`, `top_k`, `seed`, `presence_penalty`,
-`frequency_penalty`, `logit_bias`.
+- `temperature: 0` is **greedy argmax**, decided on the device — the path
+  every request took before the server had a sampler, at the same cost.
+- A request that says nothing gets `--default-temperature`, which ships as
+  `1.0` — the default both dialects document. An operator who wants the old
+  always-greedy behaviour sets it to `0`.
+- Filters chain the way llama.cpp's sampler chain does: temperature scales
+  the logits, `top_k` keeps the k most likely, `top_p` keeps the smallest
+  set of the survivors whose cumulative probability reaches `p`, and the
+  draw renormalizes over what is left. `top_k: 1` and `top_p: 0` both
+  degenerate to greedy and are served as such.
+- Equal `seed`s with equal parameters replay equal outputs. Without a seed,
+  each request draws fresh entropy.
+- `temperature` outside `[0, 2]` and `top_p` outside `[0, 1]` are refused
+  with `400`.
+
+A sampling request pays one logits-row copy to the host (~1 MB) plus an
+`O(vocab)` host pass per generated token; greedy requests are untouched.
+Speculative decoding stays exact under sampling — a draft is accepted only
+when it equals the token the target model drew — it just accepts fewer
+drafts as temperature rises.
+
+Still *accepted and ignored*, because refusing them would break standard
+clients and they only nudge which plausible answer you get:
+`presence_penalty`, `frequency_penalty`, `logit_bias`.
+
+## Tool calling
+
+All three chat dialects take tool definitions and return structured calls:
+
+| Dialect | Definitions | Calls come back as |
+| --- | --- | --- |
+| `/v1/chat/completions` | `tools: [{type:"function", function:{name, description, parameters}}]` | `message.tool_calls`, finish reason `tool_calls`; streamed as one `delta.tool_calls` entry per call |
+| `/v1/messages` | `tools: [{name, description, input_schema}]` | `tool_use` content blocks, stop reason `tool_use`; streamed as a `tool_use` block with one `input_json_delta` |
+| `/v1/responses` | `tools: [{type:"function", name, description, parameters}]` | `function_call` output items; streamed with `response.function_call_arguments.delta` / `.done` |
+
+Results go back in the dialect's own shape — the `tool` role with
+`tool_call_id`, a `tool_result` content block, a `function_call_output`
+item — and render into the model's template as `<tool_response>` blocks.
+`POST /v1/messages/count_tokens` accepts tools and prices the same prompt the
+request itself would render.
+
+The model emits calls in its template's XML form
+(`<tool_call><function=name><parameter=key>…`); the server parses that back
+out, typing each argument by its declared schema — a `string` parameter takes
+the text verbatim, everything else parses as JSON — the same rules llama.cpp
+applies to this format. A block that does not parse is returned as plain
+text rather than dropped. Because a call only parses once its closing tag
+arrives, streamed calls arrive as one complete delta each, not
+token-by-token.
+
+`tool_choice` `"auto"` and `"none"` are honoured (`none` withholds the tools
+from the prompt while still rendering tool history). Forcing a call —
+`required`, `any`, or a named function — is refused with `400`: it is a
+guarantee about the output, and nothing here constrains decoding to keep it.
+
+## What is refused
 
 *Refused with `400`*, because honouring them halfway would answer a different
 question than the one asked:
 
 | Parameter | Why |
 | --- | --- |
-| `n`, `best_of` above 1 | Greedy decoding makes every completion identical; returning one where four were asked for is a wrong answer, not an approximate one. |
-| `tools`, and the `tool` role | The model is trained for tool calls and its template has a tool section, but nothing here parses a `<tool_call>` block back out of the output. A caller would get prose describing a call it cannot execute. |
+| `n`, `best_of` above 1 | One completion per request; returning one where four were asked for is a wrong answer, not an approximate one. |
+| A forcing `tool_choice` | See above. |
 | `previous_response_id` | Responses are not stored, so the reference cannot be resolved; the model would answer without context the caller believed it had sent. |
 | A system message after the first turn | The model's own template silently discards it. Discarding an instruction the caller wrote is worse than refusing it. |
 | A batch of prompts in `/v1/completions` | One prompt per request. |
@@ -194,6 +249,15 @@ Details that follow the model's own template:
   conversation's prompt from growing with every past reasoning span.
 - The generation prompt ends with an open `<think>` block, or with a closed
   empty one when reasoning is off.
+- With tools, the system turn opens with the template's `# Tools` section —
+  the definitions inside `<tools>` tags and the call-format instructions —
+  and the caller's own system text follows it. Replayed assistant calls
+  render as `<tool_call><function=…><parameter=…>` blocks; tool results
+  render as `<tool_response>` blocks inside user turns, consecutive results
+  sharing one turn. A user turn that is only a tool response does not count
+  as "the last user message" for reasoning replay, so reasoning survives
+  across an agentic loop's intermediate steps — all exactly as the Jinja
+  template does it.
 
 The template that ships in the GGUF is Jinja, and rendering it would mean
 carrying a Jinja engine plus shims for the Python string methods it calls.
@@ -221,14 +285,15 @@ model per process; the field is not a selector.
 
 ## Defaults an operator can move
 
-Three request defaults are set at startup rather than compiled in, so a
-deployment can suit its clients without changing every one of them. All three
-are overridable per request.
+Four request defaults are set at startup rather than compiled in, so a
+deployment can suit its clients without changing every one of them. All are
+overridable per request.
 
 | Default | Flag | Ships as |
 | --- | --- | --- |
 | Output limit when a request sets none | `--default-max-tokens` | `16` |
 | Extended thinking when a request says nothing | `--no-reasoning` | on |
+| Sampling temperature when a request sets none | `--default-temperature` | `1.0` |
 | Model name reported and echoed | `--served-model-name` | `Qwen3.6-35B-A3B` |
 
 `16` is OpenAI's historical default and truncates most chat replies; raise it
