@@ -112,8 +112,13 @@ zero.
 
 ## Speculative decoding
 
-MTP produces 2–3 draft tokens per step. Every draft token consumes token budget
-and KV blocks that may be discarded on rejection.
+A draft source produces 2–3 draft tokens per step. Every draft token consumes
+token budget and KV blocks that may be discarded on rejection.
+
+Which source, and whether any, is `--spec-type` (see [CLI.md](CLI.md#speculative-decoding)).
+It ships as `none`. The only source wired into serving is n-gram suffix
+lookup; the trained MTP head has a driver but was measured and not adopted
+(milestone 09).
 
 `tokens_per_decode_step()` charges `1 + draft_tokens_per_step` against the
 budget, so the budget is **sized for the drafted case, not the accepted case**.
@@ -121,7 +126,8 @@ Sizing for the accepted case makes admission oscillate: the scheduler admits
 based on optimistic capacity, drafts overshoot it, and requests preempt.
 
 `DEFAULT_DRAFT_TOKENS_PER_STEP` is 3, matching the vLLM and SGLang recipes for
-this model's trained MTP head.
+this model's trained MTP head. It is the default draft count for whichever
+source `--spec-type` selects, not a claim that MTP is the one running.
 
 ## Async scheduling
 

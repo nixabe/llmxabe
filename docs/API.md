@@ -109,6 +109,10 @@ concatenated into it:
 | `/v1/responses` | a `reasoning` output item, streamed as `response.reasoning_text.delta` |
 | `/v1/completions` | nowhere — a raw completion is not a chat turn and opens no think block |
 
+Reasoning is on by default, matching the model's own template. A deployment
+that never wants it can flip the default with `--no-reasoning`; a request that
+names a mode still wins, either way.
+
 Turn it off per request:
 
 ```jsonc
@@ -210,6 +214,22 @@ and nothing else.
 
 ## Model name
 
-`GET /v1/models` reports one model, `Qwen3.6-35B-A3B`. Responses echo back
-whatever `model` the request named, or that name if the request named none.
-The engine serves one model per process; the field is not a selector.
+`GET /v1/models` reports one model, `Qwen3.6-35B-A3B` unless
+`--served-model-name` says otherwise. Responses echo back whatever `model` the
+request named, or that name if the request named none. The engine serves one
+model per process; the field is not a selector.
+
+## Defaults an operator can move
+
+Three request defaults are set at startup rather than compiled in, so a
+deployment can suit its clients without changing every one of them. All three
+are overridable per request.
+
+| Default | Flag | Ships as |
+| --- | --- | --- |
+| Output limit when a request sets none | `--default-max-tokens` | `16` |
+| Extended thinking when a request says nothing | `--no-reasoning` | on |
+| Model name reported and echoed | `--served-model-name` | `Qwen3.6-35B-A3B` |
+
+`16` is OpenAI's historical default and truncates most chat replies; raise it
+if your clients lean on it. See [CLI.md](CLI.md#serving-defaults).

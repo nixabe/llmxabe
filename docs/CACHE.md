@@ -207,14 +207,23 @@ host-to-device transfers roughly halve effective bandwidth. Each slot keeps
 the two natural geometries separate: 40 MiB of attention KV for one 2,048-token
 interval and 62.8125 MiB of GDN state, or 102.8125 MiB in total.
 
-Each worker owns 24 slots (2.41 GiB); the three-worker process reserves 7.23
-GiB of pinned host memory at startup. A snapshot holds its slot for as long as
-it or any child snapshot remains reachable. If all slots are retained, the
-request that reaches the next boundary stops publishing further snapshots but
-continues inference. It does not later publish a delta spanning the missed
-boundary. One chain can therefore retain at most 49,152 tokens at the default
-interval when it owns every slot; this is bounded storage, not full 128K
-retention coverage.
+Each worker owns 24 slots by default (2.41 GiB), so the three-worker process
+reserves 7.23 GiB of pinned host memory at startup. `--cache-ram` sets that
+budget across all workers, and preflight prints the slot count it bought; see
+[CLI.md](CLI.md#--cache-ram).
+
+A snapshot holds its slot for as long as it or any child snapshot remains
+reachable. If all slots are retained, the request that reaches the next
+boundary stops publishing further snapshots but continues inference. It does
+not later publish a delta spanning the missed boundary. One chain can
+therefore retain at most 49,152 tokens at the default interval and slot count
+when it owns every slot; this is bounded storage, not full 128K retention
+coverage.
+
+Note what `--cache-ram` does *not* buy. It sets how many snapshots are kept,
+never how far apart they are taken: retention granularity is `R`, so a match
+is always truncated down to a multiple of it no matter how much memory is
+available. Rule 2 above is why `R` is not a knob.
 
 Snapshot copies currently run on and synchronize the serving stream at each
 retention boundary. Moving them to a dedicated copy stream remains future
