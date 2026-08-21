@@ -244,6 +244,14 @@ impl GgufFile {
             _ => None,
         }
     }
+
+    /// Fetch a `bool[]`-typed metadata value.
+    pub fn get_bool_array(&self, key: &str) -> Option<&[bool]> {
+        match self.metadata.get(key)? {
+            GgufValue::Array(GgufArray::Bool(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 struct Parsed {
