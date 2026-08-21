@@ -38,11 +38,6 @@ use crate::state::{SequenceSnapshot, SnapshotSlots};
 /// which has to charge those tokens against its step budget whether or not
 /// they are later accepted. Carrying it here too would let the two disagree.
 ///
-/// There is no MTP variant. `crate::speculative::SpeculativeSession` is a
-/// complete, output-identity-tested MTP driver, but it owns one sequence's
-/// state and the serving loop verifies a batch in one pass — connecting them
-/// means a batched verify path, not an extra enum arm. A variant that
-/// silently ran n-gram instead would be worse than its absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Speculation {
     /// One token per decode step, drafted by nothing.
@@ -54,6 +49,11 @@ pub enum Speculation {
         /// Longest suffix matched before giving up.
         max: usize,
     },
+    /// The model's own trained next-token-prediction head (GGUF block 40)
+    /// drafts; the same batched verify pass the n-gram path uses accepts.
+    /// Costs one extra layer's weights on the device and one draft-head
+    /// KV cache per resident sequence.
+    Mtp,
 }
 
 /// The bind-time knobs a worker cannot derive for itself.
@@ -318,7 +318,14 @@ impl Worker {
                 NgramConfig::new(min, max, drafts, history_capacity)
                     .map_err(RuntimeError::Speculation)?,
             ),
-            Speculation::Ngram { .. } | Speculation::None => None,
+            Speculation::Ngram { .. } | Speculation::None | Speculation::Mtp => None,
+        };
+        // The draft count comes from the scheduler for the same reason the
+        // enum carries none: the scheduler charges those tokens against its
+        // step budget, and a second copy here could disagree.
+        let mtp_drafts = match serving.speculation {
+            Speculation::Mtp => drafts,
+            Speculation::None | Speculation::Ngram { .. } => 0,
         };
         let vocab = model.vocab_size;
         self.runtime = Some(DeviceRuntimeHandle::spawn(
@@ -329,6 +336,7 @@ impl Worker {
                 prefill_chunk: serving.prefill_chunk,
                 max_batch,
                 ngram,
+                mtp_drafts,
                 retention_interval: self.cache.gdn_retention_interval() as usize,
                 snapshot_slots: serving.snapshot_slots,
                 stop_on_eos,

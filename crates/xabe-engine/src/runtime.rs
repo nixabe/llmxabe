@@ -21,7 +21,9 @@ use xabe_model::weights::WeightSchema;
 use xabe_sched::ngram::{NgramConfig, NgramConfigError, NgramSpeculator};
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
 
+use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
+use crate::block::mtp::{MtpBlock, MtpBlockError};
 use crate::forward::{BatchStepGraph, Forward, ForwardError, arena_holds};
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
@@ -59,6 +61,10 @@ pub struct RuntimeConfig {
     pub max_batch: usize,
     /// Speculative drafting, or `None` for no drafting at all.
     pub ngram: Option<NgramConfig>,
+    /// Tokens the trained MTP head drafts per step, or zero for no MTP.
+    /// Mutually exclusive with `ngram`; `crate::worker` enforces that by
+    /// construction from the single `Speculation` enum.
+    pub mtp_drafts: usize,
     /// Tokens between retained GDN snapshots.
     pub retention_interval: usize,
     /// Pinned host snapshot slots. Zero disables retention, and with it
@@ -107,6 +113,8 @@ pub enum RuntimeError {
         prompt: usize,
     },
     Speculation(NgramConfigError),
+    /// Building or running the MTP draft head failed.
+    Mtp(MtpBlockError),
     RuntimeStopped,
     /// The request carries images but this runtime loaded no mmproj.
     VisionNotEnabled,
@@ -131,6 +139,7 @@ impl core::fmt::Display for RuntimeError {
             Self::Forward(e) => write!(f, "forward pass failed: {e}"),
             Self::State(e) => write!(f, "sequence state failed: {e}"),
             Self::Speculation(e) => write!(f, "speculative decoding: {e}"),
+            Self::Mtp(e) => write!(f, "MTP draft head: {e}"),
             Self::ZeroPrefillChunk => write!(f, "prefill chunk must be non-zero"),
             Self::ZeroBatchWidth => write!(f, "maximum decode batch must be non-zero"),
             Self::DuplicateRequest(id) => write!(f, "request {} is already resident", id.0),
@@ -163,6 +172,12 @@ impl From<DriverError> for RuntimeError {
     }
 }
 
+impl From<MtpBlockError> for RuntimeError {
+    fn from(value: MtpBlockError) -> Self {
+        Self::Mtp(value)
+    }
+}
+
 impl From<GgufError> for RuntimeError {
     fn from(value: GgufError) -> Self {
         Self::Gguf(value)
@@ -187,12 +202,58 @@ impl From<StateError> for RuntimeError {
     }
 }
 
+/// One sequence's half of the MTP draft head: its own key/value cache and
+/// the seed hidden state for the next draft chain.
+struct MtpSequence {
+    /// The draft head's own KV cache — entirely separate from the target's.
+    /// Sized `full_seq_len + drafts` so a chain drafted right at the output
+    /// cap still has slots to write into (its tail is truncated, not run).
+    cache: KvCache,
+    /// The target's `final_norm` row at the last computed position — the
+    /// producer of `next_token`. During prefill this doubles as the
+    /// cross-chunk carry for the shifted-right catch-up input; after a
+    /// verify step it is refreshed from the row that produced the last
+    /// emitted token. Zero before any position is computed, which is the
+    /// defined seed for position 0.
+    pending_h: cudarc::driver::CudaSlice<f32>,
+}
+
+/// The runtime's half of the MTP draft head: one set of weights, one block
+/// per prefill/draft shape, and the step scratch the drafting chain reuses
+/// (AGENTS.md rule 6: nothing here allocates per step).
+struct MtpRuntime {
+    /// `(tokens, block)` per shape. Prefill shapes (chunk, retention
+    /// interval, tails) are built without the LM head; widths
+    /// `1..=max_batch` carry it, because they both draft and serve as the
+    /// narrow catch-up remainder shapes. All share one upload of the
+    /// block-40 MoE expert weights.
+    shapes: Vec<(usize, MtpBlock)>,
+    /// Shifted-`h` staging for catch-up and the chained draft `h`:
+    /// `[largest shape][hidden]`.
+    h: cudarc::driver::CudaSlice<f32>,
+    /// Per-sequence absolute-position scalars, `[max_batch]`; catch-up
+    /// borrows element 0.
+    positions: cudarc::driver::CudaSlice<i32>,
+    /// Host staging for `positions`.
+    pos_host: Vec<i32>,
+    /// Tokens drafted per step (the verify window is this plus one).
+    drafts: usize,
+    hidden: usize,
+    /// For sizing per-sequence draft caches at admission.
+    config: ModelConfig,
+}
+
 struct RuntimeSequence {
     state: Option<SequenceState>,
     prompt: Vec<i32>,
     prefilled: usize,
     next_token: Option<i32>,
     ngram: Option<NgramSpeculator>,
+    /// The MTP draft head's per-sequence state, when MTP serving is on and
+    /// the sequence is eligible (text-only, not restored from a snapshot —
+    /// a restored prefix was never caught up in the draft cache, and
+    /// drafting over a hole would propose from garbage attention).
+    mtp: Option<MtpSequence>,
     draft: Vec<i32>,
     emitted: u32,
     max_output: u32,
@@ -237,6 +298,37 @@ fn choose_prefill_width(
         .unwrap_or_else(|| remaining.min(to_boundary).min(max_batch).max(1))
 }
 
+/// The prebuilt pass for a `width`-token prefill piece — over split borrows
+/// so a caller can hold other runtime fields (the MTP scratch, a sequence's
+/// draft cache) at the same time. [`DeviceRuntime::prefill_pass`] is the
+/// whole-`self` convenience over this.
+fn prefill_pass_in<'a>(
+    prefill: &'a mut Forward,
+    retention_prefill: &'a mut Option<Forward>,
+    prefill_tails: &'a mut [(usize, Forward)],
+    decode: &'a mut [Option<Forward>],
+    prefill_chunk: usize,
+    retention_interval: usize,
+    width: usize,
+) -> &'a mut Forward {
+    if width == prefill_chunk {
+        prefill
+    } else if width == retention_interval && width != 1 {
+        retention_prefill
+            .as_mut()
+            .expect("distinct retention shape was prebuilt")
+    } else if let Some(index) = prefill_tails
+        .iter()
+        .position(|(tail_width, _)| *tail_width == width)
+    {
+        &mut prefill_tails[index].1
+    } else {
+        decode[width]
+            .as_mut()
+            .expect("narrow prefill width was prebuilt")
+    }
+}
+
 /// Tokens emitted by one scheduler/device step.
 pub struct DeviceStep {
     pub decode_items: usize,
@@ -275,6 +367,9 @@ pub struct DeviceRuntime {
     verify_rings: Vec<Vec<GdnSnapshotRing>>,
     /// Verify window width: `1 + draft_tokens`. Zero when drafting is off.
     window: usize,
+    /// The MTP draft head, present iff `mtp_drafts > 0` was configured — the
+    /// non-speculative baseline allocates and runs none of this.
+    mtp: Option<MtpRuntime>,
     weights: DeviceWeights,
     sequences: HashMap<RequestId, RuntimeSequence>,
     prefill_chunk: usize,
@@ -477,6 +572,7 @@ impl DeviceRuntime {
             prefill_chunk,
             max_batch,
             ngram,
+            mtp_drafts,
             retention_interval,
             snapshot_slots,
             stop_on_eos,
@@ -511,7 +607,14 @@ impl DeviceRuntime {
             .then(|| file.get_u32("tokenizer.ggml.eos_token_id"))
             .flatten()
             .map(|token| token as i32);
-        let schema = WeightSchema::new(&config);
+        // MTP serving needs block 40's tensors in the directory; its expert
+        // weights stay out of the arena either way (`arena_holds`) and are
+        // uploaded exactly once by the first `MtpBlock` below.
+        let schema = if mtp_drafts > 0 {
+            WeightSchema::with_mtp(&config)
+        } else {
+            WeightSchema::new(&config)
+        };
         let directory = schema
             .resolve(&file)
             .map_err(|errors| RuntimeError::Schema(format!("{errors:?}")))?;
@@ -591,8 +694,14 @@ impl DeviceRuntime {
         // non-speculative baseline must not pay a byte or a branch for
         // this — and `LLMXABE_NGRAM_GATED` keeps the old round-gated
         // behavior for A/B measurement.
-        let window = ngram.map_or(0, |config| config.max_draft_tokens + 1);
-        let gated = std::env::var_os("LLMXABE_NGRAM_GATED").is_some();
+        let window = if mtp_drafts > 0 {
+            mtp_drafts + 1
+        } else {
+            ngram.map_or(0, |config| config.max_draft_tokens + 1)
+        };
+        // The gating env is the n-gram A/B lever only: MTP has no
+        // round-gated fallback drafter, so it always verifies batched.
+        let gated = mtp_drafts == 0 && std::env::var_os("LLMXABE_NGRAM_GATED").is_some();
         let mut verify: Vec<Option<Forward>> = Vec::with_capacity(max_batch + 1);
         verify.push(None);
         let mut verify_rings = Vec::new();
@@ -620,6 +729,81 @@ impl DeviceRuntime {
         } else {
             verify.extend((1..=max_batch).map(|_| None));
         }
+
+        // The MTP draft head: one block per shape the serving loop can ask
+        // for. Prefill shapes catch the draft cache up chunk by chunk;
+        // widths `1..=max_batch` run the chained batch draft (and the
+        // narrow catch-up remainders, which is why they exist even though
+        // drafting itself only ever uses the scheduled decode width).
+        let mtp = if mtp_drafts > 0 {
+            let rms_eps = file
+                .get_f32(crate::forward::RMS_EPS_KEY)
+                .ok_or_else(|| RuntimeError::Schema(crate::forward::RMS_EPS_KEY.into()))?;
+            let rope_theta = file
+                .get_f32(crate::forward::ROPE_FREQ_BASE_KEY)
+                .ok_or_else(|| RuntimeError::Schema(crate::forward::ROPE_FREQ_BASE_KEY.into()))?;
+            // Width shapes first, with the LM head — drafting needs it.
+            // Prefill shapes follow without one; a duplicate token count
+            // (e.g. a prefill remainder equal to a draft width) keeps the
+            // LM-head variant, whose extra argmax on a catch-up call is
+            // harmless. All reshapes share the first block's one upload of
+            // the block-40 expert weights.
+            let first = MtpBlock::new(
+                &ctx, &stream, &file, &directory, &weights, &config, 1, rms_eps, rope_theta, true,
+            )?;
+            let mut shapes = vec![(1usize, first)];
+            let want = |tokens: usize,
+                        lm_head: bool,
+                        shapes: &mut Vec<(usize, MtpBlock)>|
+             -> Result<(), RuntimeError> {
+                if shapes.iter().all(|(t, _)| *t != tokens) {
+                    let block = shapes[0].1.reshape(
+                        &ctx, &stream, &weights, &config, tokens, rms_eps, rope_theta, lm_head,
+                    )?;
+                    shapes.push((tokens, block));
+                }
+                Ok(())
+            };
+            for width in 2..=max_batch {
+                want(width, true, &mut shapes)?;
+            }
+            want(prefill_chunk, false, &mut shapes)?;
+            if retention_interval > 0 {
+                want(retention_interval, false, &mut shapes)?;
+            }
+            let tail_ceiling = prefill_chunk.min(retention_interval.max(1)).min(256);
+            let mut tail = 2usize;
+            while tail <= tail_ceiling {
+                if tail > max_batch {
+                    want(tail, false, &mut shapes)?;
+                }
+                tail *= 2;
+            }
+            let hidden = config.hidden_size as usize;
+            let max_shape = shapes
+                .iter()
+                .map(|(t, _)| *t)
+                .max()
+                .expect("at least the chunk shape exists");
+            debug!(
+                device = device_ordinal,
+                elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
+                shapes = shapes.len(),
+                drafts = mtp_drafts,
+                "MTP draft head resident"
+            );
+            Some(MtpRuntime {
+                shapes,
+                h: stream.alloc_zeros::<f32>(max_shape * hidden)?,
+                positions: stream.alloc_zeros::<i32>(max_batch)?,
+                pos_host: vec![0; max_batch],
+                drafts: mtp_drafts,
+                hidden,
+                config: config.clone(),
+            })
+        } else {
+            None
+        };
 
         // Vision tower: opt-in via --mmproj. Loading enables image-row
         // staging on every prefill-capable shape; text-only serving skips
@@ -661,6 +845,7 @@ impl DeviceRuntime {
             verify,
             verify_rings,
             window,
+            mtp,
             weights,
             sequences: HashMap::with_capacity(max_batch),
             prefill_chunk,
@@ -731,8 +916,25 @@ impl DeviceRuntime {
         let state = self
             .prefill
             .new_state(&self.stream, req.full_seq_len() as usize)?;
-        let draft = Vec::with_capacity(self.ngram.map_or(0, |config| config.max_draft_tokens));
+        let draft = Vec::with_capacity(self.window.saturating_sub(1));
         let ngram = self.ngram.map(NgramSpeculator::new);
+        // The draft head's per-sequence state: its own KV cache and seed
+        // hidden state. Admission-time allocation, like image embeddings —
+        // never on the per-step path rule 6 governs. Image-bearing
+        // sequences are excluded: the draft head embeds prompt token ids,
+        // and image spans have no token ids to embed, only injected rows.
+        let mtp = match &self.mtp {
+            Some(rt) if images.is_empty() => Some(MtpSequence {
+                cache: KvCache::new(
+                    &self.stream,
+                    &rt.config,
+                    req.full_seq_len() as usize + rt.drafts,
+                )
+                .map_err(|e| RuntimeError::Mtp(MtpBlockError::Attention(e)))?,
+                pending_h: self.stream.alloc_zeros::<f32>(rt.hidden)?,
+            }),
+            _ => None,
+        };
         self.sequences.insert(
             req.id,
             RuntimeSequence {
@@ -741,6 +943,7 @@ impl DeviceRuntime {
                 prefilled: 0,
                 next_token: None,
                 ngram,
+                mtp,
                 draft,
                 emitted: 0,
                 max_output: req.max_output_tokens,
@@ -845,6 +1048,11 @@ impl DeviceRuntime {
         seq.last_snapshot_position = prefix;
         seq.last_snapshot = Some(Arc::clone(&snapshot));
         seq.retention_disabled = false;
+        // Snapshots restore the target's state only; the draft head's cache
+        // over the restored prefix was computed by whoever produced the
+        // snapshot and is gone. Drafting over that hole would propose from
+        // zeroed attention slots, so this sequence decodes plain instead.
+        seq.mtp = None;
         if prefix == seq.prompt.len() {
             seq.next_token = snapshot.next_token();
         }
@@ -951,6 +1159,14 @@ impl DeviceRuntime {
 
         for (_, seq) in &mut owned {
             seq.draft.clear();
+        }
+        // The MTP head drafts for every eligible sequence in one chained
+        // batch; the n-gram speculator proposes per sequence. The two are
+        // mutually exclusive by configuration, so exactly one fills drafts.
+        if self.mtp.is_some() {
+            self.mtp_draft_chain(&mut owned)?;
+        }
+        for (_, seq) in &mut owned {
             if let Some(ngram) = &seq.ngram {
                 ngram.propose_into(&mut seq.draft);
             }
@@ -975,8 +1191,15 @@ impl DeviceRuntime {
         // one was built: every sequence's whole window shares one weight
         // read, which is the speculative saving the round-gated loop below
         // never had. Empty drafts (or no verify pass) fall through to the
-        // plain captured batch-decode round.
-        if self.verify[width].is_some() && owned.iter().any(|(_, seq)| !seq.draft.is_empty()) {
+        // plain captured batch-decode round — except under MTP, where a
+        // sequence with a draft head always takes the verify step even with
+        // an empty (boundary-truncated) draft, because only the verify
+        // pass's `final_norm` can refresh its seed hidden state exactly.
+        if self.verify[width].is_some()
+            && owned
+                .iter()
+                .any(|(_, seq)| !seq.draft.is_empty() || seq.mtp.is_some())
+        {
             let result = self.verify_decode_step(&mut owned, generated, retained, stopped);
             for (id, seq) in owned {
                 self.sequences.insert(id, seq);
@@ -1140,6 +1363,122 @@ impl DeviceRuntime {
         Ok(())
     }
 
+    /// Draft up to `drafts` tokens for every MTP-eligible scheduled
+    /// sequence, greedily, in one chained batch: each round runs the draft
+    /// head once at the participant width (weight-bound projections batch
+    /// across sequences) and feeds its own `h_nextn` back as the next
+    /// round's hidden input — the draft chain, never the target's `h`,
+    /// which has not run these positions yet.
+    ///
+    /// Drafted ids only *propose*; the verify pass recomputes everything,
+    /// so nothing here can change what is emitted — only how often drafts
+    /// are accepted.
+    fn mtp_draft_chain(
+        &mut self,
+        owned: &mut SmallVec<[(RequestId, RuntimeSequence); 3]>,
+    ) -> Result<(), RuntimeError> {
+        let stream = Arc::clone(&self.stream);
+        let rt = self.mtp.as_mut().expect("caller checked MTP is on");
+        let MtpRuntime {
+            shapes,
+            h,
+            positions,
+            pos_host,
+            drafts,
+            hidden,
+            ..
+        } = rt;
+        let (drafts, hidden) = (*drafts, *hidden);
+        let parts: SmallVec<[usize; 3]> = owned
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, seq))| seq.mtp.is_some() && seq.next_token.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        let w = parts.len();
+        if w == 0 || drafts == 0 {
+            return Ok(());
+        }
+        let block_index = shapes
+            .iter()
+            .position(|(t, _)| *t == w)
+            .expect("every draft width was prebuilt");
+        let block = &mut shapes[block_index].1;
+
+        // Seed the chain with each participant's pending target hidden row.
+        for (r, &i) in parts.iter().enumerate() {
+            let sm = owned[i].1.mtp.as_ref().expect("participant has a head");
+            let mut dst = h.slice_mut(r * hidden..(r + 1) * hidden);
+            stream.memcpy_dtod(&sm.pending_h, &mut dst)?;
+        }
+        let mut toks: SmallVec<[i32; 3]> = parts
+            .iter()
+            .map(|&i| owned[i].1.next_token.expect("participant has a token"))
+            .collect();
+        let base: SmallVec<[usize; 3]> = parts
+            .iter()
+            .map(|&i| {
+                owned[i]
+                    .1
+                    .state
+                    .as_ref()
+                    .expect("resident sequence has state")
+                    .position()
+            })
+            .collect();
+
+        for j in 0..drafts {
+            for (r, &b) in base.iter().enumerate() {
+                pos_host[r] = (b + j) as i32;
+            }
+            {
+                let mut dst = positions.slice_mut(0..w);
+                stream.memcpy_htod(&pos_host[..w], &mut dst)?;
+            }
+            let pos_offsets: SmallVec<[usize; 3]> = base.iter().map(|&b| b + j).collect();
+            // SAFETY: `r < w <= max_batch`, the length `positions` was
+            // allocated with; `w * hidden` is within `h`'s largest-shape
+            // allocation.
+            let pos_views: SmallVec<[_; 3]> = (0..w)
+                .map(|r| unsafe { crate::viewslice::subslice(&stream, positions, r, 1) })
+                .collect();
+            let pos_refs: SmallVec<[&cudarc::driver::CudaSlice<i32>; 3]> =
+                pos_views.iter().map(|view| &**view).collect();
+            let mut caches: SmallVec<[&mut KvCache; 3]> = owned
+                .iter_mut()
+                .filter_map(|(_, seq)| {
+                    if seq.next_token.is_some() {
+                        seq.mtp.as_mut().map(|sm| &mut sm.cache)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let sampled = {
+                let h_view = unsafe { crate::viewslice::subslice(&stream, h, 0, w * hidden) };
+                block.forward_batch_decode(
+                    &stream,
+                    &toks,
+                    &h_view,
+                    &mut caches,
+                    &pos_offsets,
+                    &pos_refs,
+                )?
+            }
+            .expect("draft width shapes are built with the LM head");
+            drop(caches);
+            for (r, &i) in parts.iter().enumerate() {
+                owned[i].1.draft.push(sampled[r]);
+                toks[r] = sampled[r];
+            }
+            if j + 1 < drafts {
+                let mut dst = h.slice_mut(0..w * hidden);
+                stream.memcpy_dtod(block.h_nextn(), &mut dst)?;
+            }
+        }
+        Ok(())
+    }
+
     /// One true speculative decode step: every scheduled sequence's window
     /// (`[id_last, draft...]`, padded with `id_last` where a draft came up
     /// short) through one batched verify pass, then per-sequence
@@ -1275,6 +1614,27 @@ impl DeviceRuntime {
             let last = *emit.last().expect("a verify step always emits");
             seq.next_token = Some(last);
 
+            // The next draft chain's seed: the target's own hidden state at
+            // the window row that produced `last`. Exactness never depends
+            // on this — a stale seed can only cost acceptance rate — but
+            // this row is exact, which is the point of always routing MTP
+            // sequences through the verify step.
+            if let Some(sm) = seq.mtp.as_mut() {
+                let hidden = self
+                    .mtp
+                    .as_ref()
+                    .expect("a sequence has a draft head only when MTP is on")
+                    .hidden;
+                let pass = self.verify[width].as_ref().expect("checked above");
+                let row = (s * window + emit.len() - 1) * hidden;
+                let src = pass.final_norm().slice(row..row + hidden);
+                if let Err(error) = stream.memcpy_dtod(&src, &mut sm.pending_h) {
+                    result = Err(error.into());
+                    seq.state = Some(state);
+                    continue;
+                }
+            }
+
             // Retention: the draft cap in `execute_decodes` means the step
             // can land exactly on a boundary but never cross it, so the
             // every-interval cadence holds. Same rules as the plain path:
@@ -1333,23 +1693,88 @@ impl DeviceRuntime {
     /// the same four-way choice the launch site makes, so the logits being
     /// read are the ones that pass produced.
     fn prefill_pass(&mut self, width: usize) -> &mut Forward {
-        if width == self.prefill_chunk {
-            &mut self.prefill
-        } else if width == self.retention_interval && width != 1 {
-            self.retention_prefill
-                .as_mut()
-                .expect("distinct retention shape was prebuilt")
-        } else if let Some(index) = self
-            .prefill_tails
-            .iter()
-            .position(|(tail_width, _)| *tail_width == width)
+        prefill_pass_in(
+            &mut self.prefill,
+            &mut self.retention_prefill,
+            &mut self.prefill_tails,
+            &mut self.decode,
+            self.prefill_chunk,
+            self.retention_interval,
+            width,
+        )
+    }
+
+    /// Catch the draft head's own KV cache up over the prefill piece that
+    /// just ran: pair token `p` with the target's `final_norm` row at
+    /// `p - 1` (`pending_h` carries the last row across chunk boundaries,
+    /// and is zero before position 0), run the same-shaped MTP block into
+    /// the sequence's draft cache, and advance the carry.
+    fn mtp_catchup(
+        &mut self,
+        width: usize,
+        piece: &[i32],
+        start: usize,
+        sm: &mut MtpSequence,
+    ) -> Result<(), RuntimeError> {
+        let Self {
+            prefill,
+            retention_prefill,
+            prefill_tails,
+            decode,
+            prefill_chunk,
+            retention_interval,
+            mtp,
+            stream,
+            ..
+        } = self;
+        let Some(rt) = mtp.as_mut() else {
+            return Ok(());
+        };
+        let MtpRuntime {
+            shapes,
+            h,
+            positions,
+            hidden,
+            ..
+        } = rt;
+        let hidden = *hidden;
+        let pass = prefill_pass_in(
+            prefill,
+            retention_prefill,
+            prefill_tails,
+            decode,
+            *prefill_chunk,
+            *retention_interval,
+            width,
+        );
+        let fnorm = pass.final_norm();
         {
-            &mut self.prefill_tails[index].1
-        } else {
-            self.decode[width]
-                .as_mut()
-                .expect("narrow prefill width was prebuilt")
+            let mut dst = h.slice_mut(0..hidden);
+            stream.memcpy_dtod(&sm.pending_h, &mut dst)?;
         }
+        if width > 1 {
+            let src = fnorm.slice(0..(width - 1) * hidden);
+            let mut dst = h.slice_mut(hidden..width * hidden);
+            stream.memcpy_dtod(&src, &mut dst)?;
+        }
+        {
+            let src = fnorm.slice((width - 1) * hidden..width * hidden);
+            stream.memcpy_dtod(&src, &mut sm.pending_h)?;
+        }
+        // SAFETY: element 0 of `positions` (len `max_batch >= 1`) and the
+        // first `width * hidden` elements of `h` (sized for the largest
+        // shape) — both in bounds by construction.
+        let mut pos0 = unsafe { crate::viewslice::subslice(stream, positions, 0, 1) };
+        stream.memcpy_htod(&[start as i32], &mut *pos0)?;
+        let h_view = unsafe { crate::viewslice::subslice(stream, h, 0, width * hidden) };
+        let index = shapes
+            .iter()
+            .position(|(t, _)| *t == width)
+            .expect("every prefill shape was prebuilt for the draft head");
+        shapes[index]
+            .1
+            .forward(stream, piece, &h_view, &mut sm.cache, start, &pos0)?;
+        Ok(())
     }
 
     /// Draw the next token from the logits `prefill_pass(width)` just
@@ -1453,6 +1878,14 @@ impl DeviceRuntime {
                 fwd.clear_staged_image_rows();
             }
             run_result?;
+            // Draft-head catch-up rides each chunk: the target's hidden
+            // states for exactly these positions are sitting in the pass's
+            // `final_norm` right now, and they are gone once the next chunk
+            // overwrites it. `piece` borrows `seq.prompt` and the catch-up
+            // state is `seq.mtp` — disjoint fields.
+            if let Some(sm) = seq.mtp.as_mut() {
+                self.mtp_catchup(width, piece, position, sm)?;
+            }
             offset += width;
             last_shape = width;
             let position = seq

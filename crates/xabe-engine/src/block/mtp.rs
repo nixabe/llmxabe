@@ -38,7 +38,8 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 
 use xabe_cuda::kernels::compile;
@@ -216,6 +217,11 @@ pub struct MtpBlock {
     layer_ops: LayerOpsKernels,
     attn: GatedAttentionBlock,
     attn_scratch: AttnScratch,
+    /// A fork marker [`Self::forward_batch_decode`] hands the attention
+    /// block. Drafting batches are 1-3 tokens, so the per-sequence chains
+    /// run serially on the main stream (no side lanes) — the event is
+    /// required by the signature, recorded and never waited on.
+    batch_fork: CudaEvent,
     moe: MoeBlock,
     moe_weights: Arc<MoeLayerWeights>,
     eh_proj: LmHeadKernels,
@@ -344,6 +350,7 @@ impl MtpBlock {
         let concat_fn = module.load_function("mtp_concat_eh")?;
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
+        let batch_fork = ctx.new_event(None)?;
         let attn_kernels = Arc::new(AttentionKernelSet::new(ctx, config, tokens)?);
         let attn = GatedAttentionBlock::new(
             attn_kernels,
@@ -407,6 +414,7 @@ impl MtpBlock {
             layer_ops,
             attn,
             attn_scratch,
+            batch_fork,
             moe,
             moe_weights,
             eh_proj,
@@ -464,6 +472,70 @@ impl MtpBlock {
         pos_offset: usize,
         positions: &CudaSlice<i32>,
     ) -> Result<Option<Vec<i32>>, MtpBlockError> {
+        self.embed_tokens(stream, token_ids)?;
+        self.finish_forward(stream, h, cache, pos_offset, positions)
+    }
+
+    /// One MTP step for `caches.len()` independent decoding sequences at
+    /// once — one drafted token per sequence, each against its own draft
+    /// KV cache and position scalar. The row layout matches the target's
+    /// batch decode: row `i` belongs to sequence `i` everywhere.
+    ///
+    /// The weight-bound projections (`eh_proj`, the attention projections,
+    /// the MoE, the LM head) batch across sequences; only rope, the cache
+    /// append and the attention mix loop per sequence — the same split
+    /// [`GatedAttentionBlock::forward_batch_decode`] makes for the target.
+    /// `positions` serves as both the cache-slot scalar and the rope
+    /// position, matching the single-sequence path's `RopeSource::Scalar`
+    /// (the draft head never applies an M-RoPE delta; see
+    /// [`Self::finish_forward`] on why that cannot affect exactness).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_batch_decode(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_ids: &[i32],
+        h: &CudaSlice<f32>,
+        caches: &mut [&mut KvCache],
+        pos_offsets: &[usize],
+        positions: &[&CudaSlice<i32>],
+    ) -> Result<Option<Vec<i32>>, MtpBlockError> {
+        self.embed_tokens(stream, token_ids)?;
+        self.mix_input(stream, h)?;
+
+        // No side lanes: at draft widths (≤ the worker's max batch) the
+        // per-sequence loop is a handful of tiny launches, and a fork/join
+        // would cost more than it hides. `batch_fork` satisfies the
+        // signature and is never recorded when the lane list is empty.
+        let (attn, attn_scratch, eh_out, attn_out) = (
+            &mut self.attn,
+            &mut self.attn_scratch,
+            &self.eh_out,
+            &mut self.attn_out,
+        );
+        attn.forward_batch_decode(
+            stream,
+            &[],
+            &self.batch_fork,
+            &[],
+            attn_scratch,
+            eh_out,
+            caches,
+            pos_offsets,
+            positions,
+            positions,
+            attn_out,
+        )?;
+
+        self.finish_output(stream)
+    }
+
+    /// Steps 1-2: upload `token_ids`, embed, `enorm` — filling
+    /// `self.e_norm` for [`Self::mix_input`].
+    fn embed_tokens(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        token_ids: &[i32],
+    ) -> Result<(), MtpBlockError> {
         let t = self.tokens;
         if token_ids.len() != t {
             return Err(MtpBlockError::WrongTokenCount {
@@ -503,7 +575,7 @@ impl MtpBlock {
             self.hidden,
             self.rms_eps,
         )?;
-        self.finish_forward(stream, h, cache, pos_offset, positions)
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -515,6 +587,42 @@ impl MtpBlock {
         pos_offset: usize,
         positions: &CudaSlice<i32>,
     ) -> Result<Option<Vec<i32>>, MtpBlockError> {
+        self.mix_input(stream, h)?;
+
+        // 5. block 40's dense-attention mixer, over its own KV cache.
+        // The draft head rotates by the slot scalar. For image-bearing
+        // sequences this ignores the M-RoPE delta, which can only cost
+        // draft acceptance rate — the target pass re-scores every draft
+        // token with the correct rotary positions, so exactness is
+        // unaffected. Text-only sequences have delta 0 and are identical.
+        let (attn, attn_scratch, eh_out, attn_out) = (
+            &mut self.attn,
+            &mut self.attn_scratch,
+            &self.eh_out,
+            &mut self.attn_out,
+        );
+        attn.forward(
+            stream,
+            attn_scratch,
+            eh_out,
+            cache,
+            pos_offset,
+            positions,
+            crate::block::attention::RopeSource::Scalar(positions),
+            attn_out,
+        )?;
+
+        self.finish_output(stream)
+    }
+
+    /// Steps 2h-4 of the head: `hnorm(h)`, the e/h concat and `eh_proj`,
+    /// leaving the attention input in `self.eh_out`. `self.e_norm` must
+    /// already hold the embedded, normalized token rows.
+    fn mix_input(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        h: &CudaSlice<f32>,
+    ) -> Result<(), MtpBlockError> {
         let t = self.tokens;
         let eps = self.rms_eps;
         self.layer_ops.rms_norm(
@@ -557,24 +665,17 @@ impl MtpBlock {
             t,
             &mut self.eh_out,
         )?;
+        Ok(())
+    }
 
-        // 5. block 40's dense-attention mixer, over its own KV cache.
-        // The draft head rotates by the slot scalar. For image-bearing
-        // sequences this ignores the M-RoPE delta, which can only cost
-        // draft acceptance rate — the target pass re-scores every draft
-        // token with the correct rotary positions, so exactness is
-        // unaffected. Text-only sequences have delta 0 and are identical.
-        self.attn.forward(
-            stream,
-            &mut self.attn_scratch,
-            &self.eh_out,
-            cache,
-            pos_offset,
-            positions,
-            crate::block::attention::RopeSource::Scalar(positions),
-            &mut self.attn_out,
-        )?;
-
+    /// Steps 6-7 and the LM head: everything after the attention mixer.
+    /// `self.attn_out` must hold the mixer's output for all `tokens` rows.
+    fn finish_output(
+        &mut self,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Option<Vec<i32>>, MtpBlockError> {
+        let t = self.tokens;
+        let eps = self.rms_eps;
         // 6. block 40's MoE, residual against the attention output.
         self.moe.forward(
             stream,

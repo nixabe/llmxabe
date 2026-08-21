@@ -157,6 +157,49 @@ fn run_serving(
     })
 }
 
+/// Same contract for the trained MTP head: `Speculation::Mtp` through the
+/// real serving loop — chunked prefill catch-up, chained batch drafting,
+/// batched verify — must emit exactly what `Speculation::None` emits.
+#[test]
+fn serving_with_mtp_speculation_matches_serving_without() {
+    let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
+    if !gpu_available() {
+        return;
+    }
+    let vocab = ModelConfig::qwen3_6_35b_a3b().vocab_size as i64;
+
+    // 96 tokens: longer than `PREFILL_CHUNK`, so the draft-head catch-up
+    // must cross a chunk boundary and carry `pending_h` between chunks —
+    // the path a one-chunk prompt would leave untested.
+    let cycle = [791i32, 1131, 1721, 2217];
+    let periodic: Vec<i32> = cycle.iter().copied().cycle().take(96).collect();
+    let random = xorshift_prompt(0x5EED_CAFE, 16, vocab);
+    let prompts = vec![periodic, random];
+
+    let plain = run_serving(Speculation::None, 0, &prompts).expect("plain serving runs");
+    let spec = run_serving(Speculation::Mtp, DRAFTS, &prompts).expect("mtp serving runs");
+
+    println!(
+        "plain: {} steps; mtp: {} steps, {} multi-token steps",
+        plain.steps, spec.steps, spec.multi_token_steps,
+    );
+    for (i, (a, b)) in plain.outputs.iter().zip(&spec.outputs).enumerate() {
+        let n = MIN_TOKENS.min(a.len()).min(b.len());
+        assert_eq!(
+            a[..n],
+            b[..n],
+            "request {i}: MTP serving diverged from plain serving",
+        );
+        println!("request {i}: {n} tokens identical");
+    }
+    // The trained head must actually get drafts accepted — a run where every
+    // draft was rejected would make this test a no-op on the accept path.
+    assert!(
+        spec.multi_token_steps > 0,
+        "no step emitted more than one token; the MTP head never had a draft accepted",
+    );
+}
+
 #[test]
 fn serving_with_ngram_speculation_matches_serving_without() {
     let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");

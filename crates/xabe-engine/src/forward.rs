@@ -150,8 +150,8 @@ pub fn moe_block_size(tokens: usize) -> usize {
 }
 
 /// The GGUF keys that are not in [`ModelConfig`] and must not be guessed.
-const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
-const ROPE_FREQ_BASE_KEY: &str = "qwen35moe.rope.freq_base";
+pub(crate) const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
+pub(crate) const ROPE_FREQ_BASE_KEY: &str = "qwen35moe.rope.freq_base";
 
 const EMBED_SRC: &str = r#"
 extern "C" {

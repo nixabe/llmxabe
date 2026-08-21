@@ -136,7 +136,7 @@ weight-read pass. It ships as `none`.
 | --- | --- | --- |
 | `none` | nothing — one token per step | the default |
 | `ngram` | a suffix match against the sequence's own prompt and output | works |
-| `draft-mtp` | the model's own multi-token-prediction head | **refused at startup**; see below |
+| `draft-mtp` | the model's own multi-token-prediction head | works; see below |
 
 Whatever the type, **the output is the same**. A drafted token is accepted
 only if it equals the token the target model itself chose there — its argmax
@@ -181,31 +181,39 @@ per-width verify passes — allocated only when `--spec-type ngram` is on.
 gate extra one-token rounds and are never model inputs), kept as the A/B
 lever for measuring the verify path against.
 
-### `draft-mtp` is accepted by the parser and refused by preflight
+### `draft-mtp`
 
-Qwen3.6 ships an MTP head, and this repository has a complete driver for it —
-`crates/xabe-engine/src/speculative.rs`, held to the identity contract above
-by `tests/speculative_identity.rs`. It is still not reachable from the server,
-and that is a decision rather than an omission: milestone 09 measured **65.2%
-acceptance for about 7%**, unbatched across sequences, and did not adopt it.
-See [MILESTONES.md](MILESTONES.md).
+Qwen3.6 ships a trained multi-token-prediction head (GGUF block 40), and
+`--spec-type draft-mtp` serves it: the head drafts
+`--spec-draft-n-max` tokens per step for every scheduled sequence in one
+chained batch, and the same batched verify pass the `ngram` type uses
+accepts them. Unlike `ngram` it drafts *every* step, on any content — the
+trade is what it costs:
 
-The flag exists so that answer is given once, out loud, instead of being
-rediscovered:
-
-```
-speculation      FAIL — --spec-type draft-mtp is not wired into the serving
-                 path. …Use --spec-type ngram, or none.
+```sh
+llmxabe --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
-`SpeculativeSession` owns one sequence's state and verifies a window for it,
-while the serving loop verifies a whole batch in one pass. The batched verify
-path that adoption was blocked on now exists (`Forward::run_batch_verify`,
-serving the `ngram` type); wiring the MTP head's drafts into it and
-re-measuring — because ~7% unbatched is not what it would be worth batched —
-is what stands between this flag and acceptance. Refusing until then is the
-honest answer; quietly running `ngram` under the name that was not asked for
-would look like success and measure like a disappointment.
+- **One extra layer resident.** Block 40's expert weights are loaded once
+  (they are not part of text serving otherwise).
+- **One draft KV cache per resident sequence**, sized to that request's
+  `prompt + max_output`, allocated at admission.
+- **Catch-up rides prefill.** The draft head's own cache must be filled over
+  the whole prompt, pairing each token with the target's hidden state one
+  position back; this runs as one extra block-40 pass per prefill chunk.
+- The verify machinery is the same as `ngram`'s (ring sets, per-width verify
+  passes) and is allocated only when a speculative type is on.
+
+Two classes of request decode plain under this type, by design: sequences
+restored from a prefix snapshot (the snapshot carries no draft-head cache,
+and drafting over the hole would propose from zeroed state) and image-bearing
+sequences (the draft head embeds token ids; image spans have none).
+
+An earlier milestone measured the single-sequence, unbatched driver at 65.2%
+acceptance for about +7% and did not adopt it; the serving path above is the
+batched re-attempt that measurement asked for. Numbers for the batched path
+belong in [BENCHMARKS.md](BENCHMARKS.md) once measured — do not trust this
+paragraph to have kept up with them.
 
 ## Validation happens at preflight, not at first request
 
@@ -233,8 +241,8 @@ server never comes up. In particular:
   ```
 - `--spec-ngram-min`/`--spec-ngram-max` that do not satisfy `0 < min <= max`,
   or a `max` at least as long as `--total-context`, are rejected by name.
-- `--spec-type draft-mtp` is rejected outright; see
-  [above](#draft-mtp-is-accepted-by-the-parser-and-refused-by-preflight).
+- `--spec-type draft-mtp` with `--spec-draft-n-max 0` is rejected by name
+  (drafting nothing is `--spec-type none`).
 - `--cache-ram` with an unrecognised unit is rejected by clap, before
   anything starts.
 

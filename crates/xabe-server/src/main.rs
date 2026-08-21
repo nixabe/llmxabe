@@ -190,13 +190,6 @@ fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
 
 /// Resolve `--spec-type` and its family into the draft count the scheduler
 /// must budget for and the decoder a worker will run.
-///
-/// `draft-mtp` is refused rather than quietly downgraded. The MTP driver in
-/// `xabe_engine::speculative` is real and output-identity tested, but it was
-/// measured and deliberately not adopted — 65.2% acceptance for ~7%, and
-/// unbatched across sequences (milestone 09 in `docs/MILESTONES.md`). Running
-/// n-gram under the name the caller did not ask for would be worse than
-/// saying so.
 fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
     match args.spec_type {
         SpecType::None => Ok((0, Speculation::None)),
@@ -222,15 +215,16 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
                 },
             ))
         }
-        SpecType::DraftMtp => Err(
-            "--spec-type draft-mtp is not wired into the serving path, and that was a \
-             decision rather than an omission: the driver exists and is output-identity \
-             tested (crates/xabe-engine/src/speculative.rs), but it measured 65.2% \
-             acceptance for ~7% and drafts one sequence at a time while the serving loop \
-             verifies a batch in one pass — milestone 09 in docs/MILESTONES.md. \
-             Use --spec-type ngram, or none."
-                .to_owned(),
-        ),
+        SpecType::DraftMtp => {
+            if args.spec_draft_n_max == 0 {
+                return Err(
+                    "--spec-draft-n-max 0 asks the draft head to draft nothing; \
+                     use --spec-type none instead"
+                        .to_owned(),
+                );
+            }
+            Ok((args.spec_draft_n_max, Speculation::Mtp))
+        }
     }
 }
 
@@ -360,7 +354,10 @@ fn main() -> std::process::ExitCode {
                 args.spec_ngram_min,
                 args.spec_ngram_max
             ),
-            SpecType::DraftMtp => unreachable!("draft-mtp is refused above"),
+            SpecType::DraftMtp => format!(
+                "{} tokens per step from the trained MTP head",
+                sched.draft_tokens_per_step(),
+            ),
         }
     );
 
@@ -625,14 +622,18 @@ mod tests {
     }
 
     #[test]
-    fn draft_mtp_is_refused_rather_than_downgraded_to_ngram() {
-        // Serving n-gram under the name the caller did not ask for would look
-        // like success and measure like a disappointment.
-        let failure = resolve_speculation(&args(SpecType::DraftMtp))
-            .expect_err("draft-mtp has no serving path yet");
-        assert!(
-            failure.contains("not wired into the serving path"),
-            "{failure}"
+    fn draft_mtp_resolves_to_the_mtp_speculation() {
+        let (drafts, speculation) =
+            resolve_speculation(&args(SpecType::DraftMtp)).expect("draft-mtp serves");
+        assert_eq!(speculation, Speculation::Mtp);
+        assert_eq!(
+            drafts,
+            xabe_sched::config::DEFAULT_DRAFT_TOKENS_PER_STEP,
+            "the draft count must come from --spec-draft-n-max's default",
         );
+
+        let mut zero = args(SpecType::DraftMtp);
+        zero.spec_draft_n_max = 0;
+        assert!(resolve_speculation(&zero).is_err());
     }
 }
