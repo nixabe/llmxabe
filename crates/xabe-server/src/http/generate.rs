@@ -75,38 +75,58 @@ pub(crate) struct GenerationSpec {
     pub(crate) tool_parser: Option<ToolCallParser>,
 }
 
-/// Resolve a request's sampling fields against the server default,
+/// The serving defaults a silent request samples with, set at startup by
+/// `--temperature`, `--top-p`, and `--min-p`.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingDefaults {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub min_p: f32,
+}
+
+/// Resolve a request's sampling fields against the server defaults,
 /// refusing values that cannot mean what the caller intended.
 ///
 /// `top_p == 0` degenerates to argmax by the nucleus definition (the
-/// smallest set reaching zero mass is the single most likely token), which is
-/// what some clients mean by it, so it is accepted rather than refused.
+/// smallest set reaching zero mass is the single most likely token), and
+/// `min_p == 1` keeps only tokens as likely as the most likely one; both are
+/// what some clients mean by them, so they are accepted rather than refused
+/// and served on the greedy path.
 pub(crate) fn resolve_sampling(
     dialect: Dialect,
-    default_temperature: f32,
+    defaults: SamplingDefaults,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<u32>,
+    min_p: Option<f32>,
     seed: Option<i64>,
 ) -> Result<SamplingParams, ApiError> {
-    let temperature = temperature.unwrap_or(default_temperature);
+    let temperature = temperature.unwrap_or(defaults.temperature);
     if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
         return Err(ApiError::bad_request(
             dialect,
             format!("`temperature` must be between 0 and 2, got {temperature}"),
         ));
     }
-    let top_p = top_p.unwrap_or(1.0);
+    let top_p = top_p.unwrap_or(defaults.top_p);
     if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) {
         return Err(ApiError::bad_request(
             dialect,
             format!("`top_p` must be between 0 and 1, got {top_p}"),
         ));
     }
+    let min_p = min_p.unwrap_or(defaults.min_p);
+    if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+        return Err(ApiError::bad_request(
+            dialect,
+            format!("`min_p` must be between 0 and 1, got {min_p}"),
+        ));
+    }
     let params = SamplingParams {
         temperature,
         top_k: top_k.unwrap_or(0),
         top_p,
+        min_p,
         // An unpinned seed still needs to differ between requests, or two
         // identical prompts would stream identical "random" answers.
         seed: seed.map(|seed| seed as u64).unwrap_or_else(|| {
@@ -117,11 +137,13 @@ pub(crate) fn resolve_sampling(
     };
     // Normalize every greedy spelling to the one the engine's fast path
     // matches on.
-    Ok(if params.is_greedy() || params.top_p == 0.0 {
-        SamplingParams::GREEDY
-    } else {
-        params
-    })
+    Ok(
+        if params.is_greedy() || params.top_p == 0.0 || params.min_p >= 1.0 {
+            SamplingParams::GREEDY
+        } else {
+            params
+        },
+    )
 }
 
 /// Cancels its request unless generation reached a terminal state first.
@@ -589,47 +611,118 @@ mod tests {
         assert_eq!(held_back_len("你好", &stop), 0);
     }
 
+    fn neutral() -> SamplingDefaults {
+        SamplingDefaults {
+            temperature: 1.0,
+            top_p: 1.0,
+            min_p: 0.0,
+        }
+    }
+
     #[test]
     fn greedy_spellings_normalize_to_the_device_argmax_path() {
-        // temperature 0, top_k 1, and top_p 0 are all argmax in disguise;
-        // the engine's fast path matches on SamplingParams::GREEDY exactly.
-        for (temperature, top_k, top_p) in [
-            (Some(0.0), None, None),
-            (None, Some(1), None),
-            (None, None, Some(0.0)),
+        // temperature 0, top_k 1, top_p 0, and min_p 1 are all argmax in
+        // disguise; the engine's fast path matches on SamplingParams::GREEDY
+        // exactly.
+        for (temperature, top_k, top_p, min_p) in [
+            (Some(0.0), None, None, None),
+            (None, Some(1), None, None),
+            (None, None, Some(0.0), None),
+            (None, None, None, Some(1.0)),
         ] {
-            let params = resolve_sampling(Dialect::OpenAi, 1.0, temperature, top_p, top_k, None)
-                .expect("greedy spellings resolve");
+            let params = resolve_sampling(
+                Dialect::OpenAi,
+                neutral(),
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                None,
+            )
+            .expect("greedy spellings resolve");
             assert_eq!(params, SamplingParams::GREEDY);
         }
     }
 
     #[test]
-    fn a_silent_request_gets_the_server_default_temperature() {
-        let sampled = resolve_sampling(Dialect::OpenAi, 1.0, None, None, None, Some(7))
+    fn a_silent_request_gets_the_server_defaults() {
+        let defaults = SamplingDefaults {
+            temperature: 0.8,
+            top_p: 0.95,
+            min_p: 0.05,
+        };
+        let sampled = resolve_sampling(Dialect::OpenAi, defaults, None, None, None, None, Some(7))
             .expect("defaults resolve");
-        assert_eq!(sampled.temperature, 1.0);
+        assert_eq!(sampled.temperature, 0.8);
+        assert_eq!(sampled.top_p, 0.95);
+        assert_eq!(sampled.min_p, 0.05);
         assert_eq!(sampled.seed, 7);
-        let greedy_default = resolve_sampling(Dialect::OpenAi, 0.0, None, None, None, None)
-            .expect("defaults resolve");
+        let greedy_default = resolve_sampling(
+            Dialect::OpenAi,
+            SamplingDefaults {
+                temperature: 0.0,
+                ..neutral()
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("defaults resolve");
         assert_eq!(greedy_default, SamplingParams::GREEDY);
     }
 
     #[test]
     fn out_of_range_sampling_parameters_are_refused() {
-        assert!(resolve_sampling(Dialect::OpenAi, 1.0, Some(2.5), None, None, None).is_err());
-        assert!(resolve_sampling(Dialect::OpenAi, 1.0, Some(-0.1), None, None, None).is_err());
-        assert!(resolve_sampling(Dialect::OpenAi, 1.0, Some(f32::NAN), None, None, None).is_err());
-        assert!(resolve_sampling(Dialect::OpenAi, 1.0, None, Some(1.5), None, None).is_err());
-        assert!(resolve_sampling(Dialect::OpenAi, 1.0, None, Some(-0.5), None, None).is_err());
+        let bad = [
+            (Some(2.5), None, None),
+            (Some(-0.1), None, None),
+            (Some(f32::NAN), None, None),
+            (None, Some(1.5), None),
+            (None, Some(-0.5), None),
+            (None, None, Some(1.5)),
+            (None, None, Some(-0.5)),
+        ];
+        for (temperature, top_p, min_p) in bad {
+            assert!(
+                resolve_sampling(
+                    Dialect::OpenAi,
+                    neutral(),
+                    temperature,
+                    top_p,
+                    None,
+                    min_p,
+                    None
+                )
+                .is_err(),
+                "{temperature:?} {top_p:?} {min_p:?} should be refused"
+            );
+        }
     }
 
     #[test]
     fn unpinned_seeds_differ_between_requests() {
-        let a =
-            resolve_sampling(Dialect::OpenAi, 1.0, Some(0.8), None, None, None).expect("resolves");
-        let b =
-            resolve_sampling(Dialect::OpenAi, 1.0, Some(0.8), None, None, None).expect("resolves");
+        let a = resolve_sampling(
+            Dialect::OpenAi,
+            neutral(),
+            Some(0.8),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolves");
+        let b = resolve_sampling(
+            Dialect::OpenAi,
+            neutral(),
+            Some(0.8),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("resolves");
         assert_ne!(a.seed, b.seed, "two unpinned requests drew the same seed");
     }
 

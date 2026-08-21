@@ -163,9 +163,10 @@ fn reject_shape_changing(n: Option<u32>, best_of: Option<u32>) -> Result<(), Api
     Ok(())
 }
 
-/// The sampling fields both OpenAI request shapes carry. `top_k` is not
-/// OpenAI's, but clients aimed at llama.cpp and vLLM send it and both honour
-/// it, so refusing it would break them for no gain.
+/// The sampling fields both OpenAI request shapes carry. `top_k` and
+/// `min_p` are not OpenAI's, but clients aimed at llama.cpp and vLLM send
+/// them and both honour them, so refusing them would break those clients for
+/// no gain.
 #[derive(Debug, Default, Deserialize)]
 struct SamplingFields {
     #[serde(default)]
@@ -175,6 +176,8 @@ struct SamplingFields {
     #[serde(default)]
     top_k: Option<u32>,
     #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
     seed: Option<i64>,
 }
 
@@ -182,10 +185,11 @@ impl SamplingFields {
     fn resolve(&self, state: &AppState) -> Result<xabe_engine::SamplingParams, ApiError> {
         resolve_sampling(
             DIALECT,
-            state.default_temperature,
+            state.sampling_defaults,
             self.temperature,
             self.top_p,
             self.top_k,
+            self.min_p,
             self.seed,
         )
     }

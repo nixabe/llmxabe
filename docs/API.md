@@ -148,25 +148,31 @@ end-of-turn token reports. Anthropic distinguishes them: `stop_reason:
 
 ## Sampling
 
-Every generation endpoint honours `temperature` and `top_p`; `top_k` is
-honoured on `/v1/messages` (where it is Anthropic's own) and on both OpenAI
-completions shapes (where it is the llama.cpp/vLLM extension clients already
-send); `seed` is honoured on the OpenAI shapes that carry it.
+Every generation endpoint honours `temperature`, `top_p`, and `min_p` (the
+llama.cpp/vLLM extension: keep only tokens at least `min_p` times as likely
+as the most likely one); `top_k` is honoured on `/v1/messages` (where it is
+Anthropic's own) and on both OpenAI completions shapes (where it is the same
+kind of extension); `seed` is honoured on the OpenAI shapes that carry it.
 
 - `temperature: 0` is **greedy argmax**, decided on the device — the path
   every request took before the server had a sampler, at the same cost.
-- A request that says nothing gets `--temperature`, which ships as
-  `1.0` — the default both dialects document. An operator who wants the old
-  always-greedy behaviour sets it to `0`.
-- Filters chain the way llama.cpp's sampler chain does: temperature scales
-  the logits, `top_k` keeps the k most likely, `top_p` keeps the smallest
-  set of the survivors whose cumulative probability reaches `p`, and the
-  draw renormalizes over what is left. `top_k: 1` and `top_p: 0` both
-  degenerate to greedy and are served as such.
+- A request that says nothing gets `--temperature` (alias `--temp`),
+  `--top-p`, and `--min-p`, which ship as `1.0`, `1.0`, and `0` — the
+  dialect-documented defaults, i.e. plain temperature-1 sampling. An
+  operator who wants the old always-greedy behaviour sets the temperature
+  default to `0`; one who wants llama-server's flavour sets, say,
+  `--temp 0.8 --top-p 0.95 --min-p 0.05`.
+- Filters run in the sequence llama.cpp's chain uses: temperature scales
+  the logits first, `top_k` keeps the k most likely, `top_p` keeps the
+  smallest set of the survivors whose cumulative probability reaches `p`,
+  `min_p` drops survivors below `min_p` times the most likely token's
+  probability, and the draw renormalizes over what is left. `top_k: 1`,
+  `top_p: 0`, and `min_p: 1` all degenerate to greedy and are served as
+  such.
 - Equal `seed`s with equal parameters replay equal outputs. Without a seed,
   each request draws fresh entropy.
-- `temperature` outside `[0, 2]` and `top_p` outside `[0, 1]` are refused
-  with `400`.
+- `temperature` outside `[0, 2]`, and `top_p` or `min_p` outside `[0, 1]`,
+  are refused with `400`.
 
 A sampling request pays one logits-row copy to the host (~1 MB) plus an
 `O(vocab)` host pass per generated token; greedy requests are untouched.
@@ -285,7 +291,7 @@ model per process; the field is not a selector.
 
 ## Defaults an operator can move
 
-Four request defaults are set at startup rather than compiled in, so a
+These request defaults are set at startup rather than compiled in, so a
 deployment can suit its clients without changing every one of them. All are
 overridable per request.
 
@@ -293,7 +299,9 @@ overridable per request.
 | --- | --- | --- |
 | Output limit when a request sets none | `--max-tokens` | `16` |
 | Extended thinking when a request says nothing | `--no-reasoning` | on |
-| Sampling temperature when a request sets none | `--temperature` | `1.0` |
+| Sampling temperature when a request sets none | `--temperature` (alias `--temp`) | `1.0` |
+| Nucleus cutoff when a request sets none | `--top-p` | `1.0` |
+| Relative-probability floor when a request sets none | `--min-p` | `0` |
 | Model name reported and echoed | `--alias` | `Qwen3.6-35B-A3B` |
 
 `16` is OpenAI's historical default and truncates most chat replies; raise it

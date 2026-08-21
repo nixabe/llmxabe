@@ -145,22 +145,25 @@ struct Args {
     no_reasoning: bool,
 
     /// Sampling temperature for requests that do not set one; 0 is greedy
-    /// (also -temp)
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, visible_alias = "temp", default_value_t = 1.0)]
     temperature: f32,
+
+    /// Nucleus cutoff for requests that do not set one; 1 disables it
+    #[arg(long, default_value_t = 1.0)]
+    top_p: f32,
+
+    /// Keep only tokens at least this likely relative to the most likely
+    /// token, for requests that do not set it; 0 disables it
+    #[arg(long, default_value_t = 0.0)]
+    min_p: f32,
 }
 
-/// Rewrite the multi-letter shorts clap cannot express (`-pc`, `-tb`,
-/// `-temp`) into their long forms before parsing. Both bare and `=value`
-/// forms are handled.
-fn expand_multi_letter_shorts(args: Vec<String>) -> Vec<String> {
+/// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
+/// their long forms before parsing. Both bare and `=value` forms are handled.
+fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
     args.into_iter()
         .map(|arg| {
-            for (short, long) in [
-                ("-pc", "--prefill-chunk"),
-                ("-tb", "--token-budget"),
-                ("-temp", "--temperature"),
-            ] {
+            for (short, long) in [("-pc", "--prefill-chunk"), ("-tb", "--token-budget")] {
                 if arg == short {
                     return long.to_owned();
                 }
@@ -223,7 +226,7 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
 
 fn main() -> std::process::ExitCode {
     let rest = xabe_log::init_from_args();
-    let args = Args::parse_from(expand_multi_letter_shorts(rest));
+    let args = Args::parse_from(expand_two_letter_shorts(rest));
 
     info!("llmxabe preflight\n");
 
@@ -234,6 +237,20 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    // The sampling defaults stand in for per-request values, which are
+    // range-checked at request time; a default outside that range would turn
+    // every silent request into a 400 at serve time. Fail preflight instead.
+    for (flag, value, high) in [
+        ("--temperature", args.temperature, 2.0f32),
+        ("--top-p", args.top_p, 1.0),
+        ("--min-p", args.min_p, 1.0),
+    ] {
+        if !value.is_finite() || !(0.0..=high).contains(&value) {
+            error!("sampling         FAIL — {flag} {value} must be between 0 and {high}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
 
     // 1. Model configuration.
     let model = ModelConfig::qwen3_6_35b_a3b();
@@ -466,7 +483,11 @@ fn main() -> std::process::ExitCode {
         model: args.alias,
         default_max_tokens: args.max_tokens,
         default_reasoning: !args.no_reasoning,
-        default_temperature: args.temperature,
+        sampling_defaults: http::SamplingDefaults {
+            temperature: args.temperature,
+            top_p: args.top_p,
+            min_p: args.min_p,
+        },
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -494,21 +515,30 @@ mod tests {
 
     #[test]
     fn the_renamed_serving_flags_parse_in_both_spellings() {
-        // `-temp` goes through the multi-letter rewrite, `-a` is a real clap
-        // short; both must land on the same fields as the long forms.
+        // `--temp` is a clap alias of `--temperature`, `-a` a real short;
+        // both must land on the same fields as the long forms.
         let long = Args::parse_from(["--temperature", "0.5", "--alias", "m", "--max-tokens", "64"]);
         assert_eq!(long.temperature, 0.5);
         assert_eq!(long.alias, "m");
         assert_eq!(long.max_tokens, 64);
 
-        let short = Args::parse_from(expand_multi_letter_shorts(
-            ["-temp", "0.5", "-a", "m"].map(String::from).to_vec(),
-        ));
-        assert_eq!(short.temperature, 0.5);
-        assert_eq!(short.alias, "m");
+        let aliased = Args::parse_from(["--temp", "0.5", "-a", "m"]);
+        assert_eq!(aliased.temperature, 0.5);
+        assert_eq!(aliased.alias, "m");
 
-        let joined = Args::parse_from(expand_multi_letter_shorts(vec!["-temp=0".to_owned()]));
+        let joined = Args::parse_from(["--temp=0"]);
         assert_eq!(joined.temperature, 0.0);
+    }
+
+    #[test]
+    fn the_sampling_default_flags_parse() {
+        let sampled = Args::parse_from(["--top-p", "0.95", "--min-p", "0.05"]);
+        assert_eq!(sampled.top_p, 0.95);
+        assert_eq!(sampled.min_p, 0.05);
+        let silent = Args::parse_from([] as [&str; 0]);
+        assert_eq!(silent.top_p, 1.0);
+        assert_eq!(silent.min_p, 0.0);
+        assert_eq!(silent.temperature, 1.0);
     }
 
     #[test]

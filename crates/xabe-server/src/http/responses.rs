@@ -81,6 +81,9 @@ struct ResponsesRequest {
     temperature: Option<f32>,
     #[serde(default)]
     top_p: Option<f32>,
+    /// Not OpenAI's field, but llama.cpp-aimed clients send it here too.
+    #[serde(default)]
+    min_p: Option<f32>,
 }
 
 impl ResponsesRequest {
@@ -363,10 +366,11 @@ pub(crate) async fn create(
         trim_spans: true,
         sampling: resolve_sampling(
             DIALECT,
-            state.default_temperature,
+            state.sampling_defaults,
             request.temperature,
             request.top_p,
             None,
+            request.min_p,
             None,
         )?,
         tool_parser,

@@ -1,5 +1,5 @@
-//! Host-side token sampling: temperature, top-k, and top-p over a logit
-//! vector the device copied back.
+//! Host-side token sampling: temperature, top-k, top-p, and min-p over a
+//! logit vector the device copied back.
 //!
 //! # Why the host, when argmax runs on the device
 //!
@@ -17,13 +17,22 @@
 //!
 //! # Distribution semantics
 //!
-//! The filters chain the way llama.cpp's sampler chain does
+//! The filters run in the sequence llama.cpp's default sampler chain uses
 //! (`src/llama-sampling.cpp`, `llama_sampler_top_k_impl` /
-//! `llama_sampler_top_p_impl`): top-k keeps the k largest logits, then top-p
-//! keeps the smallest prefix of the survivors — sorted by descending
-//! probability, normalized over the survivors — whose cumulative mass reaches
-//! `p`, and the final draw renormalizes over what is left. Temperature scales
-//! log-probabilities before either filter looks at them.
+//! `llama_sampler_top_p_impl` / `llama_sampler_min_p_impl`): top-k keeps the
+//! k largest logits, top-p keeps the smallest prefix of the survivors —
+//! sorted by descending probability, normalized over the survivors — whose
+//! cumulative mass reaches `p`, min-p drops survivors whose probability is
+//! below `min_p` times the most likely token's, and the final draw
+//! renormalizes over what is left.
+//!
+//! Temperature scales log-probabilities *before* any filter looks at them —
+//! vLLM's order. llama.cpp's default chain instead applies temperature after
+//! its truncation filters, so at temperatures far from 1 its filters cut a
+//! differently-shaped distribution; there is no one spec here, and the
+//! temperature-first order is chosen because it makes each filter's
+//! documented meaning ("cumulative probability", "relative probability")
+//! true of the distribution actually being sampled.
 //!
 //! Speculative decoding needs no changes to stay exact under sampling: the
 //! runtime samples the *target* model's token and accepts a draft only when
@@ -46,6 +55,9 @@ pub struct SamplingParams {
     /// Keep the smallest set of tokens whose cumulative probability reaches
     /// `top_p`. One disables the filter.
     pub top_p: f32,
+    /// Keep only tokens whose probability is at least `min_p` times the most
+    /// likely token's. Zero disables the filter.
+    pub min_p: f32,
     /// RNG seed. Equal seeds with equal parameters draw equal token
     /// sequences; the serving layer fills this with entropy when the caller
     /// did not pin it.
@@ -58,6 +70,7 @@ impl SamplingParams {
         temperature: 0.0,
         top_k: 0,
         top_p: 1.0,
+        min_p: 0.0,
         seed: 0,
     };
 
@@ -225,6 +238,15 @@ impl Sampler {
             }
         }
 
+        if self.params.min_p > 0.0 {
+            // The most likely candidate survives every earlier filter and its
+            // weight is exactly 1 — its logit *is* `max` — so the relative cut
+            // `w >= min_p * w_max` is a plain threshold, and it can never
+            // empty the candidate set while `min_p <= 1`.
+            let threshold = f64::from(self.params.min_p);
+            scratch.retain(|&(logit, _)| weight(logit) >= threshold);
+        }
+
         let total: f64 = scratch.iter().map(|&(logit, _)| weight(logit)).sum();
         let mut draw = self.rng.next_f64() * total;
         for &(logit, index) in scratch.iter() {
@@ -248,6 +270,7 @@ mod tests {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             seed,
         })
     }
@@ -267,6 +290,7 @@ mod tests {
                 temperature: 1.0,
                 top_k: 1,
                 top_p: 1.0,
+                min_p: 0.0,
                 seed: 7,
             }
             .is_greedy()
@@ -276,6 +300,7 @@ mod tests {
                 temperature: 0.7,
                 top_k: 40,
                 top_p: 0.9,
+                min_p: 0.05,
                 seed: 7,
             }
             .is_greedy()
@@ -322,6 +347,42 @@ mod tests {
         let drawn = draw_many(&mut sampler(1.0, 0, 0.7, 3), &logits, 500);
         assert!(drawn.iter().all(|&token| token == 0 || token == 1));
         assert!(drawn.contains(&0) && drawn.contains(&1));
+    }
+
+    #[test]
+    fn min_p_drops_tokens_far_below_the_most_likely_one() {
+        // Probabilities 0.5, 0.3, 0.2 at temperature 1: a 0.5 relative cut
+        // keeps tokens at or above 0.25 = 0.5 * 0.5 — the first two.
+        let logits = [0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()];
+        let mut sampler = Sampler::new(SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.5,
+            seed: 29,
+        });
+        let drawn = draw_many(&mut sampler, &logits, 500);
+        assert!(drawn.iter().all(|&token| token == 0 || token == 1));
+        assert!(drawn.contains(&0) && drawn.contains(&1));
+    }
+
+    #[test]
+    fn min_p_zero_is_a_no_op() {
+        let logits = [0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()];
+        let with = Sampler::new(SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            seed: 37,
+        });
+        let drawn_with = draw_many(&mut with.clone(), &logits, 500);
+        let drawn_without = draw_many(&mut sampler(1.0, 0, 1.0, 37), &logits, 500);
+        assert_eq!(drawn_with, drawn_without);
+        assert!(
+            drawn_with.contains(&2),
+            "the tail token must stay reachable"
+        );
     }
 
     #[test]

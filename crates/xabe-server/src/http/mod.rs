@@ -39,6 +39,7 @@ use tracing::{error, info};
 use xabe_engine::Engine;
 use xabe_sched::request::RequestId;
 
+pub use generate::SamplingDefaults;
 use generate::{ClientEvent, EngineFinish};
 
 type ClientSender = mpsc::UnboundedSender<ClientEvent>;
@@ -63,10 +64,11 @@ pub struct ServerConfig {
     /// Whether a chat request that says nothing about reasoning gets it.
     /// The model's own template defaults this on.
     pub default_reasoning: bool,
-    /// The sampling temperature for a request that does not set one. Both
-    /// dialects document 1.0; `0` makes silent requests greedy, which is what
-    /// this server always did before it had a sampler.
-    pub default_temperature: f32,
+    /// What a request that does not set its own sampling fields samples
+    /// with. Both dialects document temperature 1.0; a temperature of `0`
+    /// makes silent requests greedy, which is what this server always did
+    /// before it had a sampler.
+    pub sampling_defaults: SamplingDefaults,
 }
 
 #[derive(Clone)]
@@ -82,7 +84,7 @@ struct AppState {
     model: Arc<str>,
     default_max_tokens: u32,
     default_reasoning: bool,
-    default_temperature: f32,
+    sampling_defaults: SamplingDefaults,
 }
 
 impl AppState {
@@ -244,7 +246,7 @@ pub async fn serve(
         model: Arc::from(config.model.as_str()),
         default_max_tokens: config.default_max_tokens,
         default_reasoning: config.default_reasoning,
-        default_temperature: config.default_temperature,
+        sampling_defaults: config.sampling_defaults,
     };
     let scheduler_state = state.clone();
     std::thread::Builder::new()

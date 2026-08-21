@@ -52,6 +52,9 @@ struct MessagesRequest {
     top_p: Option<f32>,
     #[serde(default)]
     top_k: Option<u32>,
+    /// Not Anthropic's field, but llama.cpp-aimed clients send it here too.
+    #[serde(default)]
+    min_p: Option<f32>,
 }
 
 impl MessagesRequest {
@@ -91,10 +94,11 @@ impl MessagesRequest {
     fn sampling(&self, state: &AppState) -> Result<xabe_engine::SamplingParams, ApiError> {
         resolve_sampling(
             DIALECT,
-            state.default_temperature,
+            state.sampling_defaults,
             self.temperature,
             self.top_p,
             self.top_k,
+            self.min_p,
             None,
         )
     }
