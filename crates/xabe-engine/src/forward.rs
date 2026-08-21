@@ -109,6 +109,7 @@ use crate::block::gdn::{
 };
 use crate::block::gdn_verify::{
     GdnSnapshotRing, GdnVerifyError, GdnVerifyScratch, run_layer_with_snapshots,
+    run_layer_with_snapshots_batch,
 };
 use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
 use crate::state::{SequenceState, StateError};
@@ -2368,6 +2369,13 @@ impl Forward {
         if self.verify_scratch.is_some() {
             return Ok(());
         }
+        // A verify window's rows must land exactly where plain decode's
+        // would, and above `MOE_NARROW_DECODE_MAX` tokens the MoE's default
+        // selection moves to tiled/tensor-core kernels that are not
+        // bit-identical per row (`tests/batch_verify.rs` caught the flip).
+        // Pin this pass's MoE to the flat decode regime for its lifetime —
+        // a Forward with verify enabled is only ever used to verify.
+        self.moe.set_exact_decode_regime(true);
         let geometry = self.gdn.geometry();
         let mut scratch = Vec::with_capacity(self.gdn_weights.len());
         for _ in &self.gdn_weights {
@@ -2586,6 +2594,339 @@ impl Forward {
                 .map_err(ForwardError::LmHead)?;
         }
         self.read_batch_sampled(stream)
+    }
+
+    /// One [`GdnSnapshotRing`] per Gated DeltaNet layer for a verify window
+    /// of `window` positions, in layer order — the per-sequence ring set
+    /// [`Self::run_verify`] and [`Self::run_batch_verify`] take.
+    ///
+    /// Allocates, so this is a cold-path call: serving runtimes build one
+    /// set per concurrent sequence at startup or admission, never per step.
+    pub fn new_verify_rings(
+        &self,
+        stream: &Arc<CudaStream>,
+        window: usize,
+    ) -> Result<Vec<GdnSnapshotRing>, ForwardError> {
+        let geometry = self.gdn.geometry();
+        let mut rings = Vec::with_capacity(self.gdn_weights.len());
+        for _ in &self.gdn_weights {
+            rings.push(GdnSnapshotRing::new(stream, &geometry, window + 1)?);
+        }
+        Ok(rings)
+    }
+
+    /// The batched sibling of [`Self::run_verify`]: `states.len()`
+    /// independent sequences, each contributing a window of `self.tokens /
+    /// states.len()` positions (`[id_last, draft_1, ..., draft_d]`,
+    /// sequence-major in `token_ids`), verified in **one** weight-read pass.
+    ///
+    /// Returns one greedy-argmax id per row, sequence-major: row
+    /// `s * window + i` is the target's own next-token prediction after
+    /// having seen sequence `s`'s `window[0..=i]`. The caller compares each
+    /// sequence's rows `0..d` against its drafts to find that sequence's
+    /// accepted prefix `k`, then commits it with
+    /// [`Self::commit_verify_window`] at `positions = k + 1`. Like
+    /// [`Self::run_verify`], this advances **nothing** itself, and the
+    /// attention key/value caches need no rollback — a rejected tail's
+    /// entries are overwritten in place by a later pass at the same
+    /// positions.
+    ///
+    /// Weight-bound stages — the embedding gather, the Gated DeltaNet
+    /// projections (via [`run_layer_with_snapshots_batch`]), Gated
+    /// Attention's four projections (via
+    /// [`GatedAttentionBlock::forward_batch_prefill`]), the MoE, the final
+    /// norm and the LM head — each run once over all `states.len() *
+    /// window` rows. That is the point: one pass's weight traffic verifies
+    /// every sequence's whole window, where the serving decode loop paid
+    /// one full pass per emitted token.
+    ///
+    /// [`Self::enable_verify`] and [`Self::enable_batch_decode`] must both
+    /// have been called on this pass — the first sizes the per-layer
+    /// snapshot scratch to `self.tokens`, the second the wide LM head and
+    /// the per-row argmax used here unchanged. `rings[s]` must hold one
+    /// ring of depth `window + 1` per Gated DeltaNet layer, in layer order,
+    /// for sequence `s` (see [`Self::new_verify_rings`]).
+    pub fn run_batch_verify(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        rings: &mut [Vec<GdnSnapshotRing>],
+        token_ids: &[i32],
+    ) -> Result<Vec<i32>, ForwardError> {
+        self.run_batch_verify_tagged(stream, states, rings, token_ids, &mut |_, _, _| {})
+    }
+
+    /// Diagnostic-only sibling of [`Self::run_batch_verify`], with
+    /// `on_waypoint` fired after the embedding gather and after each
+    /// layer's mixer and MoE — the same probes the batch-decode and
+    /// batch-prefill siblings expose, for the same reason: a cross-sequence
+    /// divergence needs the first layer and family at which two sequences'
+    /// rows disagree, and no public surface exposes the per-stage buffers.
+    pub fn run_batch_verify_with_stage_waypoints(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        rings: &mut [Vec<GdnSnapshotRing>],
+        token_ids: &[i32],
+        mut on_waypoint: impl FnMut(Option<u32>, WaypointStage, &CudaSlice<f32>),
+    ) -> Result<Vec<i32>, ForwardError> {
+        self.run_batch_verify_tagged(stream, states, rings, token_ids, &mut on_waypoint)
+    }
+
+    fn run_batch_verify_tagged(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        states: &mut [SequenceState],
+        rings: &mut [Vec<GdnSnapshotRing>],
+        token_ids: &[i32],
+        on_waypoint: &mut impl FnMut(Option<u32>, WaypointStage, &CudaSlice<f32>),
+    ) -> Result<Vec<i32>, ForwardError> {
+        let n = states.len();
+        if n == 0 || !self.tokens.is_multiple_of(n) {
+            return Err(ForwardError::BatchWidth {
+                expected: self.tokens,
+                got: n,
+                what: "a divisor number of states",
+            });
+        }
+        let window = self.tokens / n;
+        if token_ids.len() != self.tokens {
+            return Err(ForwardError::WrongTokenCount {
+                expected: self.tokens,
+                got: token_ids.len(),
+            });
+        }
+        let (gdn_layers, attn_layers) = (self.gdn_weights.len(), self.attention.len());
+        for state in states.iter() {
+            if state.gdn_layers() != gdn_layers || state.attention_layers() != attn_layers {
+                return Err(ForwardError::StateShape {
+                    expected_gdn: gdn_layers,
+                    expected_attention: attn_layers,
+                    got_gdn: state.gdn_layers(),
+                    got_attention: state.attention_layers(),
+                });
+            }
+            if state.position() + window > state.max_seq() {
+                return Err(ForwardError::CacheExhausted {
+                    position: state.position(),
+                    tokens: window,
+                    max_seq: state.max_seq(),
+                });
+            }
+        }
+        // The per-row argmax needs `enable_batch_decode`'s sizing (one row
+        // per token), not `enable_batch_prefill`'s (one row per sequence).
+        if self.batch_lm_head.is_none()
+            || self.batch_argmax_out.as_ref().map_or(0, CudaSlice::len) != self.tokens
+        {
+            return Err(ForwardError::BatchDecodeNotEnabled);
+        }
+        let Some(mut scratch) = self.verify_scratch.take() else {
+            return Err(ForwardError::BatchWidth {
+                expected: gdn_layers,
+                got: 0,
+                what: "verify scratch (call enable_verify first)",
+            });
+        };
+        if rings.len() != n
+            || rings.iter().any(|set| set.len() != gdn_layers)
+            || scratch.len() != gdn_layers
+        {
+            self.verify_scratch = Some(scratch);
+            return Err(ForwardError::BatchWidth {
+                expected: gdn_layers,
+                got: rings.iter().map(Vec::len).min().unwrap_or(0),
+                what: "per-sequence gdn snapshot ring sets",
+            });
+        }
+
+        // The publish half, as `run_batch_prefill`: token ids once, every
+        // sequence's position from its own device scalar.
+        stream.memcpy_htod(token_ids, &mut self.d_tokens)?;
+        self.moe.publish_tokens(stream, self.tokens)?;
+        for state in states.iter_mut() {
+            state
+                .publish_position(stream)
+                .map_err(ForwardError::State)?;
+        }
+
+        self.embed(stream)?;
+        on_waypoint(None, WaypointStage::Embed, &self.hidden_state);
+
+        let (mut gdn_slot, mut attn_slot) = (0usize, 0usize);
+        for layer in 0..self.config.num_layers {
+            let result = match self.config.layer_kind(layer) {
+                LayerKind::GatedDeltaNet => {
+                    let mut gdn_states: SmallVec<[&mut GdnState; 3]> =
+                        states.iter_mut().map(|s| s.gdn_mut(gdn_slot)).collect();
+                    let mut layer_rings: SmallVec<[&mut GdnSnapshotRing; 3]> =
+                        rings.iter_mut().map(|set| &mut set[gdn_slot]).collect();
+                    let r = run_layer_with_snapshots_batch(
+                        stream,
+                        &mut self.gdn,
+                        &self.gdn_weights[gdn_slot],
+                        self.gdn_int8.get(gdn_slot),
+                        &mut gdn_states,
+                        &self.hidden_state,
+                        &mut self.mixer_out,
+                        &mut scratch[gdn_slot],
+                        &mut layer_rings,
+                        window,
+                    )
+                    .map_err(ForwardError::from);
+                    gdn_slot += 1;
+                    r
+                }
+                LayerKind::GatedAttention => {
+                    let mut caches: SmallVec<[&mut KvCache; 3]> = SmallVec::new();
+                    let mut offsets: SmallVec<[usize; 3]> = SmallVec::new();
+                    let mut positions: SmallVec<[&CudaSlice<i32>; 3]> = SmallVec::new();
+                    let mut rope_positions: SmallVec<[&CudaSlice<i32>; 3]> = SmallVec::new();
+                    for state in states.iter_mut() {
+                        offsets.push(state.position());
+                        let (cache, position, rope) = state.kv_and_positions_mut(attn_slot);
+                        caches.push(cache);
+                        positions.push(position);
+                        rope_positions.push(rope);
+                    }
+                    let r = self.attention[attn_slot]
+                        .forward_batch_prefill(
+                            stream,
+                            &mut self.attn_scratch,
+                            &self.hidden_state,
+                            &mut caches,
+                            window,
+                            &offsets,
+                            &positions,
+                            &rope_positions,
+                            &mut self.mixer_out,
+                        )
+                        .map_err(ForwardError::from);
+                    attn_slot += 1;
+                    r
+                }
+            };
+            if let Err(e) = result {
+                self.verify_scratch = Some(scratch);
+                return Err(e);
+            }
+            on_waypoint(Some(layer), WaypointStage::Mixer, &self.mixer_out);
+
+            if let Err(e) = self.moe.forward(
+                stream,
+                &self.moe_weights[layer as usize],
+                &self.mixer_out,
+                self.tokens,
+                &mut self.ffn_out,
+                &mut self.hidden_state,
+            ) {
+                self.verify_scratch = Some(scratch);
+                return Err(ForwardError::from(e));
+            }
+            on_waypoint(Some(layer), WaypointStage::Moe, &self.hidden_state);
+        }
+        self.verify_scratch = Some(scratch);
+
+        self.layer_ops.rms_norm(
+            stream,
+            &self.hidden_state,
+            &self.w_output_norm,
+            &mut self.final_norm,
+            self.tokens,
+            self.hidden,
+            self.rms_eps,
+        )?;
+
+        let vocab = self.vocab;
+        let rows = self.tokens;
+        {
+            let lm_head = self.batch_lm_head.as_ref().expect("checked above");
+            let logits = self.batch_logits.as_mut().expect("checked above");
+            lm_head
+                .forward(
+                    stream,
+                    QuantTensor {
+                        bytes: &self.w_lm_head,
+                        quant: ExpertQuant::Q8_0,
+                    },
+                    &self.final_norm,
+                    rows,
+                    logits,
+                )
+                .map_err(ForwardError::LmHead)?;
+        }
+        for i in 0..rows {
+            // SAFETY: as `run_verify`'s identical tail — `i < rows`, and the
+            // batch logits/argmax buffers are all sized by
+            // `enable_batch_decode` to exactly `rows` (times `vocab` or
+            // `ARGMAX_BLOCKS` where relevant).
+            let row = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_logits.as_ref().expect("checked above"),
+                    i * vocab,
+                    vocab,
+                )
+            };
+            let mut values = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_values.as_ref().expect("checked above"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut indices = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_indices.as_ref().expect("checked above"),
+                    i * ARGMAX_BLOCKS,
+                    ARGMAX_BLOCKS,
+                )
+            };
+            let mut out_one = unsafe {
+                crate::viewslice::subslice(
+                    stream,
+                    self.batch_argmax_out.as_ref().expect("checked above"),
+                    i,
+                    1,
+                )
+            };
+            self.lm_head
+                .argmax(stream, &row, vocab, &mut values, &mut indices, &mut out_one)
+                .map_err(ForwardError::LmHead)?;
+        }
+        self.read_batch_sampled(stream)
+    }
+
+    /// Commit a verify step's outcome for one sequence: restore every Gated
+    /// DeltaNet layer's state to the snapshot at `positions` window
+    /// positions folded in, and advance the sequence by the same count.
+    ///
+    /// `positions` is the number of window rows that became real — the
+    /// accepted draft count plus one for the window's leading `id_last`
+    /// (`k + 1` in [`Self::run_verify`]'s and [`Self::run_batch_verify`]'s
+    /// terms). The attention key/value caches need no touch-up; see
+    /// [`Self::run_verify`]'s docs.
+    pub fn commit_verify_window(
+        &self,
+        stream: &Arc<CudaStream>,
+        state: &mut SequenceState,
+        rings: &[GdnSnapshotRing],
+        positions: usize,
+    ) -> Result<(), ForwardError> {
+        if rings.len() != self.gdn_weights.len() {
+            return Err(ForwardError::BatchWidth {
+                expected: self.gdn_weights.len(),
+                got: rings.len(),
+                what: "gdn snapshot rings",
+            });
+        }
+        for (slot, ring) in rings.iter().enumerate() {
+            ring.commit(stream, positions, state.gdn_mut(slot))?;
+        }
+        state.advance(positions);
+        Ok(())
     }
 
     /// Allocate carried state for one sequence of up to `max_seq` positions.

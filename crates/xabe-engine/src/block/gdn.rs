@@ -230,6 +230,18 @@ fn proj_tile_for(tokens: usize) -> (usize, u32) {
 /// trade `PROJ_ROWS` records for the standard layout.
 const SPLIT_TILES: [(u32, u32); 6] = [(1, 4), (2, 4), (3, 4), (4, 4), (8, 2), (16, 1)];
 
+/// The widest token count whose split-layout projection tile still carries
+/// the one-token GEMV's row grouping (row tile 4). The wider tiles trade
+/// the row tile down for token width, which changes the per-output
+/// accumulation order — bit-divergent from one-token decode, which is fine
+/// for prefill but not for a speculative verify window, whose argmax must
+/// match what plain decode would have emitted (`tests/batch_verify.rs`
+/// caught exactly this: a batched verify at 8 tokens took the `(8, 2)`
+/// tile and flipped a near-tie argmax nine steps in). Verify paths chunk
+/// their projections to this width; see
+/// `crate::block::gdn_verify::run_layer_with_snapshots_batch`.
+pub const SPLIT_PROJ_EXACT_TOKENS: usize = 4;
+
 /// Which split-layout specialization to launch for `tokens`: its slot, token
 /// tile and row tile. `proj_tile_for`'s selection rule, over `SPLIT_TILES`.
 fn split_tile_for(tokens: usize) -> (usize, u32, u32) {
@@ -3388,6 +3400,33 @@ fn check_len(what: &'static str, expected: usize, got: usize) -> Result<(), GdnB
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_exact_token_ceiling_marks_the_end_of_the_row_tile_4_family() {
+        // `SPLIT_PROJ_EXACT_TOKENS` promises that every split tile at or
+        // below it keeps the GEMV's row grouping (row tile 4) — the property
+        // verify windows rely on for bit-identity with one-token decode —
+        // and that the next tile up genuinely abandons it (otherwise the
+        // ceiling is stale and verify is chunking more finely than needed).
+        for &(tokens, row_tile) in SPLIT_TILES.iter() {
+            if tokens as usize <= SPLIT_PROJ_EXACT_TOKENS {
+                assert_eq!(
+                    row_tile, 4,
+                    "split tile ({tokens}, {row_tile}) inside the exact family must keep row \
+                     tile 4",
+                );
+            }
+        }
+        let first_past = SPLIT_TILES
+            .iter()
+            .find(|&&(t, _)| t as usize > SPLIT_PROJ_EXACT_TOKENS)
+            .expect("a wider tile exists");
+        assert_ne!(
+            first_past.1, 4,
+            "the first tile past SPLIT_PROJ_EXACT_TOKENS changes the row tile; if it no \
+             longer does, raise the ceiling",
+        );
+    }
+
     #[test]
     fn the_projection_tiles_match_the_kernel() {
         // NVRTC compiles from a string with no access to Rust constants, so

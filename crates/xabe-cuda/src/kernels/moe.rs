@@ -3666,6 +3666,9 @@ pub struct MoeKernels {
     /// no fused variant, and the down path reads this to know whether it
     /// still owes a `quantize_rows`.
     fused_iq: bool,
+    /// Pin the routed-expert path to the flat decode-regime kernels
+    /// regardless of `max_tokens` — see [`Self::set_exact_decode_regime`].
+    exact_regime: bool,
 }
 
 impl MoeKernels {
@@ -3814,6 +3817,7 @@ impl MoeKernels {
             geometry,
             mma_m,
             fused_iq,
+            exact_regime: false,
         })
     }
 
@@ -3862,6 +3866,24 @@ impl MoeKernels {
     /// needs to quantize activations is dropped.
     pub fn disable_tensor_cores(&mut self) {
         self.mma = None;
+    }
+
+    /// Pin the routed-expert kernels to the flat decode regime — the direct
+    /// `(token, expert)`-pair GEMVs — regardless of this geometry's
+    /// `max_tokens`.
+    ///
+    /// The flat family is the one `moe_differential` proves bit-identical to
+    /// the one-token GEMV, which is what makes "a sequence decodes
+    /// identically whether batched or alone" a checked property. Above
+    /// `MOE_NARROW_DECODE_MAX` the default selection moves to the tiled and
+    /// integer-tensor-core paths, which are *not* bit-identical per row —
+    /// fine for prefill, wrong for a speculative verify window, whose
+    /// per-row argmax must land exactly where plain decode's would. Verify
+    /// passes set this at construction; it trades the tile/MMA throughput
+    /// for exactness on a shape (a few tokens times a few sequences) where
+    /// the flat GEMVs are close to the same cost.
+    pub fn set_exact_decode_regime(&mut self, on: bool) {
+        self.exact_regime = on;
     }
 
     /// Whether the grouped GEMM will take the integer tensor-core path for a
@@ -3919,7 +3941,7 @@ impl MoeKernels {
             self.route(stream, buffers, logits)?;
             // At decode width the flat kernels consume `topk_ids` directly,
             // so sorting those same ids into expert buckets is dead work.
-            if g.max_tokens <= MOE_NARROW_DECODE_MAX {
+            if g.max_tokens <= MOE_NARROW_DECODE_MAX || self.exact_regime {
                 return Ok(());
             }
             return self.build_dispatch(stream, buffers);
@@ -4168,13 +4190,17 @@ impl MoeKernels {
             (ExpertQuant::Q8_0, ExpertQuant::Q8_0) => Some(ExpertQuant::Q8_0),
             _ => None,
         };
-        let use_mma = self.mma.is_some() && g.max_tokens >= MMA_MIN_TOKENS && mma_quant.is_some();
+        let use_mma = self.mma.is_some()
+            && g.max_tokens >= MMA_MIN_TOKENS
+            && mma_quant.is_some()
+            && !self.exact_regime;
 
         // `1 < N <= MOE_NARROW_DECODE_MAX`: below the integer-tensor-core
         // threshold, where almost every dispatch bucket the batch touches
         // still holds exactly one live token. See `MOE_NARROW_DECODE_MAX`'s
         // own comment.
-        let narrow = !gemv && !use_mma && g.max_tokens <= MOE_NARROW_DECODE_MAX;
+        let narrow =
+            !gemv && !use_mma && (g.max_tokens <= MOE_NARROW_DECODE_MAX || self.exact_regime);
 
         if gemv {
             let cfg = LaunchConfig {
@@ -4384,7 +4410,8 @@ impl MoeKernels {
         let down_mma = !gemv
             && self.mma.is_some()
             && g.max_tokens >= MMA_MIN_TOKENS
-            && down.quant == ExpertQuant::Q8_0;
+            && down.quant == ExpertQuant::Q8_0
+            && !self.exact_regime;
 
         if gemv {
             // Launched above, alongside its gate/up half. Falls through to the

@@ -316,7 +316,61 @@ pub fn run_layer_with_snapshots(
     ring: &mut GdnSnapshotRing,
     tokens: usize,
 ) -> Result<(), GdnVerifyError> {
-    if scratch.tokens != tokens || ring.depth() != tokens + 1 {
+    let mut states = [state];
+    let mut rings = [ring];
+    run_layer_with_snapshots_batch(
+        stream,
+        gdn,
+        weights,
+        int8,
+        &mut states,
+        hidden,
+        out,
+        scratch,
+        &mut rings,
+        tokens,
+    )
+}
+
+/// The batched sibling of [`run_layer_with_snapshots`]: `states.len()`
+/// independent sequences' windows of `window` positions each, laid out
+/// sequence-major in `hidden` (`[seq * window + i][hidden]`), through one
+/// Gated DeltaNet layer in one weight-read pass.
+///
+/// The weight-bound steps — the norm, the qkv/gate projections, the gates,
+/// the swiglu, the output projection and the residual — run **once** over
+/// all `states.len() * window` rows, which is the whole point of batching a
+/// verify step: the weight traffic of one pass serves every sequence's
+/// window. Only the two stateful steps (the convolution and the delta-rule
+/// mix) and the per-boundary snapshots loop per sequence per position,
+/// exactly as the single-sequence version loops per position — those read a
+/// sequence's own state, which nothing can amortize across sequences (the
+/// same decomposition [`GdnBlock::forward_batch_decode`] documents for
+/// width-N decode).
+///
+/// `scratch` must have been built for `states.len() * window` tokens, and
+/// every ring must have depth `window + 1`. `rings[s]` receives sequence
+/// `s`'s boundary snapshots; committing an accepted count per sequence is
+/// the caller's job, per [`GdnSnapshotRing::commit`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_layer_with_snapshots_batch(
+    stream: &Arc<CudaStream>,
+    gdn: &mut GdnBlock,
+    weights: &GdnLayerWeights,
+    int8: Option<&GdnLayerInt8>,
+    states: &mut [&mut GdnState],
+    hidden: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    scratch: &mut GdnVerifyScratch,
+    rings: &mut [&mut GdnSnapshotRing],
+    window: usize,
+) -> Result<(), GdnVerifyError> {
+    let sequences = states.len();
+    let tokens = sequences * window;
+    if scratch.tokens != tokens
+        || rings.len() != sequences
+        || rings.iter().any(|ring| ring.depth() != window + 1)
+    {
         return Err(GdnVerifyError::WrongTokenCount {
             expected: scratch.tokens,
             got: tokens,
@@ -350,28 +404,29 @@ pub fn run_layer_with_snapshots(
     //    repack — the differential test against a cold `GdnBlock`.
     let split = int8.filter(|_| tokens > 1 && !GdnBlock::uses_tensor_cores(tokens));
     if let Some(i8w) = split {
+        // In slices of at most `SPLIT_PROJ_EXACT_TOKENS` rows: the wider
+        // split tiles change the per-output accumulation order, and a
+        // verify window's floats must land exactly where a chain of
+        // one-token decodes would — see that constant's docs. The extra
+        // launches are weight-cache-warm repeats of the same matrix, a few
+        // per layer, dwarfed by the per-position state loop below.
         let (qkv_q, qkv_s) = i8w.qkv();
-        gdn.project_split_tiled(
-            stream,
-            qkv_q,
-            qkv_s,
-            &scratch.normed,
-            &mut scratch.qkv,
-            g.hidden,
-            conv_dim,
-            tokens,
-        )?;
         let (gate_q, gate_s) = i8w.gate();
-        gdn.project_split_tiled(
-            stream,
-            gate_q,
-            gate_s,
-            &scratch.normed,
-            &mut scratch.z,
-            g.hidden,
-            value_dim,
-            tokens,
-        )?;
+        for start in (0..tokens).step_by(crate::block::gdn::SPLIT_PROJ_EXACT_TOKENS) {
+            let piece = (tokens - start).min(crate::block::gdn::SPLIT_PROJ_EXACT_TOKENS);
+            let normed_i =
+                unsafe { subslice(stream, &scratch.normed, start * g.hidden, piece * g.hidden) };
+            let mut qkv_i =
+                unsafe { subslice(stream, &scratch.qkv, start * conv_dim, piece * conv_dim) };
+            gdn.project_split_tiled(
+                stream, qkv_q, qkv_s, &normed_i, &mut qkv_i, g.hidden, conv_dim, piece,
+            )?;
+            let mut z_i =
+                unsafe { subslice(stream, &scratch.z, start * value_dim, piece * value_dim) };
+            gdn.project_split_tiled(
+                stream, gate_q, gate_s, &normed_i, &mut z_i, g.hidden, value_dim, piece,
+            )?;
+        }
     } else {
         gdn.project(
             stream,
@@ -411,67 +466,71 @@ pub fn run_layer_with_snapshots(
         tokens,
     )?;
 
-    // Slot 0: the state the window started from — "0 of `tokens` positions
-    // committed". Every later slot is taken after processing one more
-    // position, so slot `i` always means "positions `0..i` committed".
-    ring.snapshot(stream, 0, state)?;
+    // Steps 3/4/5/7, one token at a time per sequence: `conv1d` and `mix`
+    // are the two steps that read and write a sequence's own state buffers,
+    // so — unlike 1, 2 and 6 above — they cannot be batched without losing
+    // the per-position snapshot this whole file exists to take. Both are
+    // weight-free or effectively so (`conv1d`'s filter is `conv_kernel *
+    // conv_dim` floats, a few hundred KiB; `mix` at `tokens == 1` reads no
+    // weight at all), so the small launches cost nothing next to the two
+    // big projections above.
+    for (seq, (state, ring)) in states.iter_mut().zip(rings.iter_mut()).enumerate() {
+        // Slot 0: the state this sequence's window started from — "0 of
+        // `window` positions committed". Every later slot is taken after
+        // processing one more position, so slot `i` always means
+        // "positions `0..i` committed".
+        ring.snapshot(stream, 0, state)?;
+        for i in 0..window {
+            let row = seq * window + i;
+            let qkv_i = unsafe { subslice(stream, &scratch.qkv, row * conv_dim, conv_dim) };
+            let mut conv_raw_i =
+                unsafe { subslice(stream, &scratch.conv_raw, row * conv_dim, conv_dim) };
+            gdn.layer_ops().conv1d(
+                stream,
+                &qkv_i,
+                &weights.conv1d,
+                &mut state.conv,
+                &mut conv_raw_i,
+                1,
+                conv_dim,
+                g.conv_kernel,
+            )?;
 
-    // Steps 3/4/5/7, one token at a time: `conv1d` and `mix` are the two
-    // steps that read and write `state`'s own buffers, so — unlike 1, 2 and
-    // 6 above — they cannot be batched without losing the per-position
-    // snapshot this whole file exists to take. Both are weight-free or
-    // effectively so (`conv1d`'s filter is `conv_kernel * conv_dim` floats,
-    // a few hundred KiB; `mix` at `tokens == 1` reads no weight at all), so
-    // `tokens` small launches cost nothing next to the two big projections
-    // above.
-    for i in 0..tokens {
-        let qkv_i = unsafe { subslice(stream, &scratch.qkv, i * conv_dim, conv_dim) };
-        let mut conv_raw_i = unsafe { subslice(stream, &scratch.conv_raw, i * conv_dim, conv_dim) };
-        gdn.layer_ops().conv1d(
-            stream,
-            &qkv_i,
-            &weights.conv1d,
-            &mut state.conv,
-            &mut conv_raw_i,
-            1,
-            conv_dim,
-            g.conv_kernel,
-        )?;
+            let mut conv_silu_i =
+                unsafe { subslice(stream, &scratch.conv_silu, row * conv_dim, conv_dim) };
+            let mut q_i = unsafe { subslice(stream, &scratch.q, row * key_dim, key_dim) };
+            let mut k_i = unsafe { subslice(stream, &scratch.k, row * key_dim, key_dim) };
+            let mut v_i = unsafe { subslice(stream, &scratch.v, row * value_dim, value_dim) };
+            gdn.silu_split_qkv(
+                stream,
+                &conv_raw_i,
+                &mut conv_silu_i,
+                &mut q_i,
+                &mut k_i,
+                &mut v_i,
+                1,
+            )?;
 
-        let mut conv_silu_i =
-            unsafe { subslice(stream, &scratch.conv_silu, i * conv_dim, conv_dim) };
-        let mut q_i = unsafe { subslice(stream, &scratch.q, i * key_dim, key_dim) };
-        let mut k_i = unsafe { subslice(stream, &scratch.k, i * key_dim, key_dim) };
-        let mut v_i = unsafe { subslice(stream, &scratch.v, i * value_dim, value_dim) };
-        gdn.silu_split_qkv(
-            stream,
-            &conv_raw_i,
-            &mut conv_silu_i,
-            &mut q_i,
-            &mut k_i,
-            &mut v_i,
-            1,
-        )?;
+            let log_decay_i = unsafe { subslice(stream, &scratch.log_decay, row * heads, heads) };
+            let beta_i = unsafe { subslice(stream, &scratch.beta, row * heads, heads) };
+            let mut core_i = unsafe { subslice(stream, &scratch.core, row * value_dim, value_dim) };
+            gdn.mix(
+                stream,
+                state,
+                &q_i,
+                &k_i,
+                &v_i,
+                &log_decay_i,
+                &beta_i,
+                &mut core_i,
+                1,
+            )?;
 
-        let log_decay_i = unsafe { subslice(stream, &scratch.log_decay, i * heads, heads) };
-        let beta_i = unsafe { subslice(stream, &scratch.beta, i * heads, heads) };
-        let mut core_i = unsafe { subslice(stream, &scratch.core, i * value_dim, value_dim) };
-        gdn.mix(
-            stream,
-            state,
-            &q_i,
-            &k_i,
-            &v_i,
-            &log_decay_i,
-            &beta_i,
-            &mut core_i,
-            1,
-        )?;
-
-        // Position `i` is now folded in, so this is slot `i + 1` — "positions
-        // `0..=i` committed". At `i == tokens - 1` this is slot `tokens`,
-        // the ring's last: everything in the window accepted.
-        ring.snapshot(stream, i + 1, state)?;
+            // Position `i` is now folded in, so this is slot `i + 1` —
+            // "positions `0..=i` committed". At `i == window - 1` this is
+            // slot `window`, the ring's last: everything accepted.
+            ring.snapshot(stream, i + 1, state)?;
+        }
     }
 
     // 8. `final_output-N = ssm_norm(core) * silu(z)`. No state, batches over
@@ -494,17 +553,37 @@ pub fn run_layer_with_snapshots(
     //       has no fused token-axis residual form, so this is always
     //       project-then-add, matching `run_batch_decode` at this width.
     if let Some(i8w) = split {
+        // Same slicing as step 2, same reason.
         let (out_q, out_s) = i8w.out();
-        gdn.project_split_tiled(
-            stream,
-            out_q,
-            out_s,
-            &scratch.final_output,
-            &mut scratch.projected,
-            value_dim,
-            g.hidden,
-            tokens,
-        )?;
+        for start in (0..tokens).step_by(crate::block::gdn::SPLIT_PROJ_EXACT_TOKENS) {
+            let piece = (tokens - start).min(crate::block::gdn::SPLIT_PROJ_EXACT_TOKENS);
+            let final_i = unsafe {
+                subslice(
+                    stream,
+                    &scratch.final_output,
+                    start * value_dim,
+                    piece * value_dim,
+                )
+            };
+            let mut proj_i = unsafe {
+                subslice(
+                    stream,
+                    &scratch.projected,
+                    start * g.hidden,
+                    piece * g.hidden,
+                )
+            };
+            gdn.project_split_tiled(
+                stream,
+                out_q,
+                out_s,
+                &final_i,
+                &mut proj_i,
+                value_dim,
+                g.hidden,
+                piece,
+            )?;
+        }
     } else {
         gdn.project(
             stream,

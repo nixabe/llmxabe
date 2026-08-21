@@ -1389,6 +1389,192 @@ fn gemv_and_direct_isolate_the_two_live_token_case() {
     );
 }
 
+/// The exact decode regime (`set_exact_decode_regime`) at a verify-window
+/// width: eight distinct tokens with distinct routings, forced onto the
+/// flat direct-pair kernels at `max_tokens = 8` — a width whose default
+/// selection is the integer-tensor-core path — and every token's row
+/// compared **exactly** against the same token run alone through the
+/// one-token GEMV. This is the property `Forward::run_batch_verify` stands
+/// on: a batched verify row's floats must land where plain decode's would,
+/// and `tests/batch_verify.rs` can only see the end-to-end argmax — this
+/// probe sees the vector.
+#[test]
+fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
+    let Some((ctx, file)) = device_and_model() else {
+        return;
+    };
+    let config = ModelConfig::qwen3_6_35b_a3b();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema must resolve");
+    let stream = ctx.default_stream();
+
+    let stacks: Vec<_> = [Role::MoeGateExps, Role::MoeUpExps, Role::MoeDownExps]
+        .iter()
+        .map(|&role| {
+            directory
+                .find(role, Some(LAYER))
+                .unwrap_or_else(|| panic!("{role} on layer {LAYER} missing"))
+        })
+        .collect();
+    let bytes: Vec<&[u8]> = stacks
+        .iter()
+        .map(|e| file.tensor_bytes(&e.spec.name).expect("tensor readable"))
+        .collect();
+    let d_gate = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[0].info.ggml_type),
+            bytes[0],
+        ))
+        .expect("upload gate");
+    let d_up = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[1].info.ggml_type),
+            bytes[1],
+        ))
+        .expect("upload up");
+    let d_down = stream
+        .clone_htod(&*to_device_layout(
+            quant_of(stacks[2].info.ggml_type),
+            bytes[2],
+        ))
+        .expect("upload down");
+    stream.synchronize().expect("sync");
+
+    const WIDTH: usize = 8;
+    let mut rng = Xorshift64Star::new(0x_5EED_BB03);
+    let hiddens: Vec<Vec<f32>> = (0..WIDTH)
+        .map(|_| rng.vec_f32(config.hidden_size as usize, -1.0, 1.0))
+        .collect();
+    assert_carries_signal("hidden state", &hiddens[0]);
+    let token_logits: Vec<Vec<f32>> = (0..WIDTH)
+        .map(|_| rng.vec_f32(config.moe.num_experts as usize, -8.0, 8.0))
+        .collect();
+
+    let gate = QuantTensor {
+        bytes: &d_gate,
+        quant: quant_of(stacks[0].info.ggml_type),
+    };
+    let up = QuantTensor {
+        bytes: &d_up,
+        quant: quant_of(stacks[1].info.ggml_type),
+    };
+    let down = QuantTensor {
+        bytes: &d_down,
+        quant: quant_of(stacks[2].info.ggml_type),
+    };
+
+    let run_gemv = |t: usize| -> (Vec<f32>, Vec<i32>, Vec<f32>) {
+        let g = MoeGeometry {
+            num_experts: config.moe.num_experts as usize,
+            experts_per_token: config.moe.experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: config.moe.expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: 1,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.disable_tensor_cores();
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let d_hidden = stream.clone_htod(&hiddens[t]).expect("upload hidden");
+        let d_logits = stream.clone_htod(&token_logits[t]).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, 1)
+            .expect("valid_tokens");
+        kernels
+            .route(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        kernels
+            .build_dispatch(&stream, &mut buffers)
+            .expect("dispatch");
+        let mut d_out = stream.alloc_zeros::<f32>(g.hidden).expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+        let partial = stream.clone_dtoh(buffers.partial()).expect("partial back");
+        stream.synchronize().expect("sync");
+        (full, ids, partial)
+    };
+
+    let run_exact_batch = |width: usize| -> (Vec<f32>, Vec<i32>, Vec<f32>) {
+        let g = MoeGeometry {
+            num_experts: config.moe.num_experts as usize,
+            experts_per_token: config.moe.experts_per_token as usize,
+            hidden: config.hidden_size as usize,
+            intermediate: config.moe.expert_intermediate as usize,
+            block_size: BLOCK_SIZE,
+            max_tokens: width,
+        };
+        let mut kernels = MoeKernels::new(&ctx, g).expect("compiles");
+        kernels.set_exact_decode_regime(true);
+        let mut buffers = kernels.buffers(&stream).expect("buffers");
+        let flat_hidden: Vec<f32> = hiddens[..width].iter().flatten().copied().collect();
+        let d_hidden = stream.clone_htod(&flat_hidden).expect("upload hidden");
+        let flat_logits: Vec<f32> = token_logits[..width].iter().flatten().copied().collect();
+        let d_logits = stream.clone_htod(&flat_logits).expect("upload logits");
+        kernels
+            .set_valid_tokens(&stream, &mut buffers, width)
+            .expect("valid_tokens");
+        kernels
+            .route_and_dispatch(&stream, &mut buffers, &d_logits)
+            .expect("route");
+        let mut d_out = stream
+            .alloc_zeros::<f32>(width * g.hidden)
+            .expect("out allocates");
+        kernels
+            .grouped_forward(&stream, &mut buffers, gate, up, down, &d_hidden, &mut d_out)
+            .expect("grouped forward");
+        stream.synchronize().expect("sync");
+        let full = stream.clone_dtoh(&d_out).expect("out back");
+        let ids = stream.clone_dtoh(buffers.topk_ids()).expect("ids back");
+        let partial = stream.clone_dtoh(buffers.partial()).expect("partial back");
+        stream.synchronize().expect("sync");
+        (full, ids, partial)
+    };
+
+    // The regime must hold across the width boundaries the default
+    // selection switches at: 4 is `MOE_NARROW_DECODE_MAX` (where the flag
+    // is a no-op against the native narrow regime), 5 is past it, and 8 is
+    // `MMA_MIN_TOKENS` — where the first version of the flag still let the
+    // Q8_0 down projection slip onto the tensor-core path and read dispatch
+    // tables the exact regime never builds.
+    let (alone0, _, _) = run_gemv(0);
+    for probe_width in [2usize, 4, 5, 8] {
+        let (out, _, _) = run_exact_batch(probe_width);
+        assert_eq!(
+            out[..config.hidden_size as usize],
+            alone0[..],
+            "width {probe_width}: token 0 through the exact regime must match the GEMV",
+        );
+        println!("width {probe_width}: token 0 exact-regime == gemv");
+    }
+
+    let (batch, batch_ids, _) = run_exact_batch(WIDTH);
+    let top_k = config.moe.experts_per_token as usize;
+    let hidden_dim = config.hidden_size as usize;
+    for t in 0..WIDTH {
+        let (alone, alone_ids, _) = run_gemv(t);
+        // Routing first: a routing mismatch means the divergence is upstream
+        // of the expert GEMVs entirely, and comparing outputs would only
+        // measure "different experts produce different floats".
+        assert_eq!(
+            device_ids_for(&alone_ids, 0, top_k),
+            device_ids_for(&batch_ids, t, top_k),
+            "token {t}: routing diverged between the one-token run and the batch",
+        );
+        let row = &batch[t * hidden_dim..(t + 1) * hidden_dim];
+        let result = compare(&alone, row);
+        println!("token {t}: gemv (alone) vs exact regime (batch of {WIDTH}): {result}");
+        assert_eq!(
+            alone, row,
+            "token {t}: the exact decode regime at {WIDTH} tokens must match the \
+             one-token GEMV bit for bit",
+        );
+    }
+}
+
 /// The shared expert's one-token GEMV (`moe_shared_ffn_gemv` /
 /// `moe_shared_down_gemv`, `max_tokens == 1`) against its token-tiled
 /// generalization (`moe_shared_ffn_gemv_t*` / `moe_shared_down_gemv_t*`,
