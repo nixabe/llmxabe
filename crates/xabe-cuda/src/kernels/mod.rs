@@ -118,15 +118,24 @@ pub fn compile(src: &str, name: &str) -> Result<Ptx, String> {
 
     NVRTC_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let started = std::time::Instant::now();
-    let result = cudarc::nvrtc::compile_ptx_with_opts(
-        src,
-        CompileOptions {
-            arch: Some(TARGET_ARCH),
-            name: Some(name.to_string()),
-            ..Default::default()
-        },
-    )
-    .map_err(|e| format!("{name}: {e:?}"));
+    // `catch_unwind` for the same reason `device::driver_available` needs one:
+    // cudarc loads `libnvrtc` on first use and panics from
+    // `panic_no_lib_found` when there is none, so without this a host with no
+    // CUDA libraries aborts here instead of getting the `Err` every caller is
+    // written to handle — including the two tests below, whose skip branch is
+    // reached only if this returns.
+    let result = std::panic::catch_unwind(|| {
+        cudarc::nvrtc::compile_ptx_with_opts(
+            src,
+            CompileOptions {
+                arch: Some(TARGET_ARCH),
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+        )
+    })
+    .map_err(|_| format!("{name}: NVRTC is not available on this host"))
+    .and_then(|compiled| compiled.map_err(|e| format!("{name}: {e:?}")));
 
     debug!(
         "nvrtc {name}: {} source bytes for {TARGET_ARCH} in {:.0} ms{}",
