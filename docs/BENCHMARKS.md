@@ -106,7 +106,7 @@ a replacement claim.
 | KV cache | binary16, 20 KiB/token over 10 attention layers |
 | Recurrent state | fixed ~2 MiB per GDN layer per sequence, independent of depth |
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
-| Speculative decode | `--spec-type ngram\|draft-mtp\|spec-dflash`, bit-exact against plain decode; off by default — see WHY and WHY NOT for where it pays |
+| Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default — a net win at N=1 only, see WHY and WHY NOT |
 
 ## Correctness gates
 
@@ -390,28 +390,42 @@ binary) is controlled for. Numbers in the enabling commits.
 
 ## Speculative decode: exact by construction, priced by the verify step
 
-All three drafters — the n-gram speculator, the trained MTP head, and the
-DFlash block drafter — feed one serving mechanism: per-sequence draft
-windows, then a single batched verify pass of `width × (draft + 1)` rows
-whose acceptance rule is token equality against the target's own output. A
-wrong drafter can only waste compute, never change a token
-(`serving_speculative_identity` asserts bit-identity for all three), so
-speculation is purely a throughput lever, and the lever's sign is set by
-batch width, not by acceptance. The verify pass is the prefill-shaped pass
-at tiny token counts, where fixed per-pass cost dominates: ~2.8× a plain
-decode step at N=1 (a 4-row window) and ~4.8× at N=3 (12 rows), while the
-best acceptance measured fills 10.3 of those 12 rows — the premium outruns
-the tokens it buys everywhere except narrow widths. The
-`LLMXABE_NGRAM_GATED` lever isolates the mechanism: the round-gated
-fallback (accepted tokens ride plain decode steps) at *identical*
-acceptance is 1.9× the batched verify at N=3 (166 vs 87 tok/s) and 8%
-behind it at N=1 (104 vs 113) — the batched verify wins exactly where its
-row count stays near the plain step's and loses where it triples it.
-N-gram drafts opportunistically (a verify fires only on a repeated-context
-hit) and is the one measured net win, +9% at N=1; the trained drafters
-verify every step at near-identical step cost to each other, so their gap
-is pure acceptance (2.86 vs 2.44 of a 4-row window: MTP +1.5%, DFlash
-−15% at N=1). Serving therefore defaults to `--spec-type none`.
+Seven drafters — five model-free n-gram policies (`ngram`, and llama.cpp's
+`ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`), the trained
+MTP head, and the DFlash block drafter — feed one serving mechanism:
+per-sequence draft windows, then a single batched verify pass of
+`width × (draft + 1)` rows whose acceptance rule is token equality against
+the target's own output. A wrong drafter can only waste compute, never
+change a token (`serving_speculative_identity` asserts bit-identity for all
+of them), so speculation is purely a throughput lever, and the lever's sign
+is set by batch width, not by acceptance.
+
+The verify pass is the prefill-shaped pass at tiny token counts, where
+fixed per-pass cost dominates — and at N=1 that cost is nearly flat in the
+window. `ngram`'s 4-row window averages 16.72 ms/step against
+`ngram-map-k`'s 49-row window at 16.86 ms, both over a 9.64 ms plain step:
+twelve times the rows for about 1% more time. Acceptance therefore
+converts almost directly into throughput at N=1, and the widest drafters
+win — `ngram-map-k`/`k4v` +20.9%/+20.8%, `ngram-simple` +16.3%,
+`ngram-mod` +11.1%, `ngram` +9.2% over 103.7 tok/s, six interleaved rounds,
+spreads under 0.7% and order bias under 0.2%.
+
+At N=3 the same 49-row window is 147 rows, well past that flat regime,
+while plain decode has meanwhile become *cheaper* per token by amortizing
+one weight read across three sequences inside a captured graph the verify
+path does not use. Every drafter loses there: `ngram-simple` −22.8%,
+`ngram` −57.7%, the map pair −77.8%/−78.8% against 210.9 tok/s, and
+`ngram-mod` at its own default cannot allocate at all. The
+`LLMXABE_NGRAM_GATED` lever isolates the same mechanism from the other
+side: the round-gated fallback (accepted tokens ride plain decode steps) at
+*identical* acceptance is 1.9× the batched verify at N=3 (166 vs 87 tok/s)
+and 8% behind it at N=1 (104 vs 113) — the batched verify wins exactly
+where its row count stays near the plain step's and loses where it
+multiplies it. The trained drafters verify every step at near-identical
+step cost to each other, so their gap is pure acceptance (2.86 vs 2.44 of a
+4-row window: MTP +1.5%, DFlash −15% at N=1). Serving therefore defaults to
+`--spec-type none`; the win is real, and large, only for single-stream
+deployments.
 
 ---
 
@@ -450,6 +464,8 @@ proposed twice.
 | I2F-free unpack (exact-mantissa trick) | Bit-exact, every gate green, **flat**. With both the load-issue and XU-pipe hypotheses dead, the flat decode GEMVs at 473–519 GB/s read as at their practical equilibrium for this quantization on this card. |
 | Even/odd MMA accumulator chains | −2% prefill, noise at decode. The compiler's schedule was not accumulator-stalled, and eight more registers on kernels already at ~230 costs more than the chain relief. |
 | Skipping the online-softmax rescale when the running max did not move | Bit-identical by construction and **2.8% slower** at 128K prefill. The identity multiplies hid under staged-load latency the schedule pays anyway; the vote-and-branch costs more than the work it skips. |
+| llama.cpp's n-gram drafters at N=3, at llama.cpp's own 48-token defaults | **−22.8%** (`ngram-simple`), **−77.8%**/**−78.8%** (`ngram-map-k`/`k4v`) against plain decode's 210.9 tok/s; three interleaved rounds, spreads ≤0.4%. Not an acceptance failure — the map pair fills 22 of 49 rows per sequence — but a row-count one: 3 × 49 = 147 verify rows against a captured 3-row graph step. The same policies win 16–21% at N=1, where the window is free. The map pair's *magnitude* is additionally inflated by `bench_worker_spec` letting a high-acceptance sequence run far past the timed quota while a straggler gates the window; the sign is not in doubt, the exact figure is. |
+| `ngram-mod` at llama.cpp's default `n_max` 64, N=3 | `CUDA_ERROR_OUT_OF_MEMORY` before the first step, in every round. The verify path holds one GDN snapshot ring set per decode slot — 30 layers × (32·128·128 + 8192·3) fp32 × `(drafts + 2)` — which is 4.05 GiB per slot at 64 drafts and 12.15 GiB for three, beside a 29.6 GiB model on a 48 GiB card. 48 drafts (9.2 GiB for three) fits and still loses. The draft cap is a VRAM knob, not only a scheduling one. |
 | Tensor cores for routed MoE at N=3 (`MMA_MIN_TOKENS` 8 → 3) | 135.2 vs 147.7 tok/s. Padding a three-row dispatch into MMA fragments and quantizing its activations costs more than the arithmetic recovers. |
 | The general fp32 expert tiles at N=3 (`MOE_NARROW_DECODE_MAX` 4 → 2) | 129.6 vs 147.7 tok/s. With the tensor-core result above, this brackets the current N=3 choice: both neighbouring kernel paths are slower. |
 | The scalar warp decode kernel at depth | 133.0 vs 148–151 tok/s at 32K N=3. The depth-aware dispatch onto the tensor-core kernel stands. |

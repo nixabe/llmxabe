@@ -221,23 +221,36 @@ llmxabe --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 12 --spec-ngram-ma
 Each type's draft cap — `size-m`, or `n-max` for `ngram-mod` — **is** the
 scheduler's per-step draft budget, so it is charged against the token budget
 like any other draft count. llama.cpp's defaults are large (48 and 64 against
-this engine's `ngram` default of 3), which buys longer accepted runs at the
-cost of a much wider verify pass; the previous speculative A/B on this host
-found the verify step's cost, not the acceptance rate, sets the sign of the
-result, so measure before assuming the bigger window wins.
+this engine's `ngram` default of 3), and which way that cuts depends entirely
+on batch width.
+
+**These have been measured; see
+[BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step)
+for the numbers and the method.** The short version: at **N=1 they are the
+best drafters this engine has**, because the verify pass costs about the same
+at 49 rows as at 4, so the wider window is nearly free — `ngram-map-k` and
+`ngram-map-k4v` +20.9%/+20.8%, `ngram-simple` +16.3%, `ngram-mod` +11.1%,
+against `ngram`'s +9.2%. At **N=3 every one of them loses**, from −22.8%
+(`ngram-simple`) to −78.8% (`ngram-map-k4v`), because three sequences of 49
+rows is a 147-row pass competing with a captured 3-row graph step. Serving
+still defaults to `--spec-type none`; turn one of these on for
+single-stream work, not for a full house.
 
 **Check VRAM before running the defaults.** The verify path holds one GDN
 snapshot ring set per decode slot, and it is sized by the draft count: 30 GDN
 layers × (32·128·128 + 8192·3) fp32 × `(drafts + 2)` slots, per decoding
-sequence. That is arithmetic from the model geometry, not a measurement, and
-it lands on the ~300 MiB per slot this document already quotes for `n = 3`:
+sequence. This is arithmetic from the model geometry that lands on the
+~300 MiB per slot quoted above for `n = 3` — and the top row of it has since
+been confirmed the hard way: `--spec-type ngram-mod` at its default `n-max`
+64 fails with `CUDA_ERROR_OUT_OF_MEMORY` before the first step at `-s 3` on
+this card.
 
-| Draft cap | Per decode slot | Per worker at `-s 3` |
-| --- | --- | --- |
-| 3 (`ngram` default) | 0.31 GiB | 0.92 GiB |
-| 12 | 0.86 GiB | 2.58 GiB |
-| 48 (`size-m` default) | 3.07 GiB | 9.20 GiB |
-| 64 (`n-max` default) | 4.05 GiB | 12.15 GiB |
+| Draft cap | Per decode slot | Per worker at `-s 3` | At `-s 3` on this card |
+| --- | --- | --- | --- |
+| 3 (`ngram` default) | 0.31 GiB | 0.92 GiB | runs |
+| 12 | 0.86 GiB | 2.58 GiB | runs |
+| 48 (`size-m` default) | 3.07 GiB | 9.20 GiB | runs |
+| 64 (`n-max` default) | 4.05 GiB | 12.15 GiB | **out of memory** |
 
 Against a 29.6 GiB model on a 48 GiB card, llama.cpp's defaults leave little
 room for the KV pool, so expect to lower `size-m`/`n-max`, `-s`, or `-c`
