@@ -321,9 +321,14 @@ sequences (the draft head embeds token ids; image spans have none).
 
 An earlier milestone measured the single-sequence, unbatched driver at 65.2%
 acceptance for about +7% and did not adopt it; the serving path above is the
-batched re-attempt that measurement asked for. Numbers for the batched path
-belong in [BENCHMARKS.md](BENCHMARKS.md) once measured — do not trust this
-paragraph to have kept up with them.
+batched re-attempt that measurement asked for.
+
+**Measured:** the batched path is **+1.4% at N=1** — the only trained
+drafter that is not a loss, and far behind the model-free `ngram-map-k`'s
++20.9% — and **−27.2% at N=3**. As with `spec-dflash`, raising
+`--spec-draft-n-max` to 15 makes it much worse (−55.4% at N=1), because the
+draft head's own pass scales with the block while the verify pass does not.
+See [BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step).
 
 ### `spec-dflash`
 
@@ -354,7 +359,17 @@ The two upstream implementations disagree about which residual-stream tap
 `target_layers` names (off by one layer) and about causal masking on the
 sliding-window layers; this engine follows llama.cpp, whose ecosystem the
 GGUF comes from — `xabe_model::dflash`'s module docs carry the details.
-Numbers belong in [BENCHMARKS.md](BENCHMARKS.md) once measured.
+
+**Measured, and it does not currently pay:** −14.8% at N=1 and −39.5% at
+N=3 against plain decode, at the default 3-token block. Raising the block
+makes it worse, not better — −65.8% at N=1 and −54.8% at N=3 at the trained
+maximum of 15 — because one drafter pass per step is cheap only while the
+block is short: 3 → 15 adds ~52.6 ms to a step whose plain form is 9.64 ms.
+That is the opposite of how the n-gram types behave, where a wider window is
+nearly free, and it is the thing to know before reaching for
+`--spec-draft-n-max`. See
+[BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step)
+for the method and the full table.
 
 ## Validation happens at preflight, not at first request
 
