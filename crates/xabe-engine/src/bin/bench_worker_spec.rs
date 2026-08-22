@@ -14,7 +14,12 @@
 //! ```
 //!
 //! Args: `[context] [tokens_per_seq]` (defaults 256, 512). `LLMXABE_SPEC`
-//! picks the decoder (`none`, `ngram`, `draft-mtp`, `dflash`);
+//! picks the decoder (`none`, `ngram`, `ngram-simple`, `ngram-mod`,
+//! `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `dflash`), each with
+//! llama.cpp's own defaults; `LLMXABE_SPEC_DRAFTS` overrides the per-step
+//! draft cap, which is what a matched-budget A/B across decoders needs
+//! (note that `ngram-simple` never drafts with a cap below its 12-token
+//! lookup — upstream drops any draft shorter than `size-n`);
 //! `LLMXABE_DRAFT_N_MIN` / `LLMXABE_DRAFT_P_MIN` set the corresponding
 //! serving gates (defaults 0, off);
 //! `LLMXABE_DFLASH` the drafter GGUF; `LLMXABE_MODEL` the model;
@@ -73,18 +78,66 @@ fn widths() -> Result<Vec<usize>, &'static str> {
     Ok(parsed)
 }
 
+/// llama.cpp's own default lookup length for the three variants that take
+/// one (`--spec-ngram-{simple,map-k,map-k4v}-size-n`).
+const LLAMA_CPP_SIZE_N: usize = 12;
+/// llama.cpp's default draft cap for those three (`*-size-m`).
+const LLAMA_CPP_SIZE_M: u32 = 48;
+/// llama.cpp's `--spec-ngram-mod-{n-match,n-min,n-max}` defaults.
+const LLAMA_CPP_MOD_N_MATCH: usize = 24;
+const LLAMA_CPP_MOD_N_MIN: usize = 48;
+const LLAMA_CPP_MOD_N_MAX: u32 = 64;
+
 fn speculation() -> Result<(Speculation, u32), String> {
     let raw = std::env::var("LLMXABE_SPEC").unwrap_or_else(|_| "none".to_owned());
+    // The draft cap is the scheduler's per-step count, so a matched-budget
+    // A/B across decoders overrides it here rather than per variant.
+    let cap = |default: u32| -> Result<u32, String> {
+        match std::env::var("LLMXABE_SPEC_DRAFTS") {
+            Ok(value) => value
+                .parse()
+                .map_err(|_| format!("LLMXABE_SPEC_DRAFTS={value} is not a token count")),
+            Err(_) => Ok(default),
+        }
+    };
     match raw.as_str() {
         "none" => Ok((Speculation::None, 0)),
         "ngram" => Ok((
             Speculation::Ngram { min: 2, max: 4 },
-            DEFAULT_DRAFT_TOKENS_PER_STEP,
+            cap(DEFAULT_DRAFT_TOKENS_PER_STEP)?,
         )),
-        "draft-mtp" => Ok((Speculation::Mtp, DEFAULT_DRAFT_TOKENS_PER_STEP)),
-        "dflash" => Ok((Speculation::DFlash, DEFAULT_DRAFT_TOKENS_PER_STEP)),
+        "ngram-simple" => Ok((
+            Speculation::NgramSimple {
+                size_n: LLAMA_CPP_SIZE_N,
+            },
+            cap(LLAMA_CPP_SIZE_M)?,
+        )),
+        "ngram-mod" => Ok((
+            Speculation::NgramMod {
+                n_match: LLAMA_CPP_MOD_N_MATCH,
+                n_min: LLAMA_CPP_MOD_N_MIN,
+            },
+            cap(LLAMA_CPP_MOD_N_MAX)?,
+        )),
+        "ngram-map-k" => Ok((
+            Speculation::NgramMapK {
+                size_n: LLAMA_CPP_SIZE_N,
+                min_hits: 1,
+            },
+            cap(LLAMA_CPP_SIZE_M)?,
+        )),
+        "ngram-map-k4v" => Ok((
+            Speculation::NgramMapK4v {
+                size_n: LLAMA_CPP_SIZE_N,
+                min_hits: 1,
+            },
+            cap(LLAMA_CPP_SIZE_M)?,
+        )),
+        "draft-mtp" => Ok((Speculation::Mtp, cap(DEFAULT_DRAFT_TOKENS_PER_STEP)?)),
+        "dflash" => Ok((Speculation::DFlash, cap(DEFAULT_DRAFT_TOKENS_PER_STEP)?)),
         other => Err(format!(
-            "LLMXABE_SPEC={other} is not none|ngram|draft-mtp|dflash"
+            "LLMXABE_SPEC={other} is not none|ngram|ngram-simple|ngram-mod|ngram-map-k|\
+             ngram-map-k4v|draft-mtp|dflash"
         )),
     }
 }

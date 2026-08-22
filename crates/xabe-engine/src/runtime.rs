@@ -18,8 +18,9 @@ use tracing::debug;
 use xabe_gguf::{GgufError, GgufFile};
 use xabe_model::ModelConfig;
 use xabe_model::weights::WeightSchema;
-use xabe_sched::ngram::{NgramConfig, NgramConfigError, NgramSpeculator};
+use xabe_sched::ngram::NgramConfigError;
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
+use xabe_sched::spec::{SelfSpecConfig, SelfSpecFactory, SelfSpeculator};
 
 use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
@@ -60,10 +61,10 @@ pub struct RuntimeConfig {
     pub prefill_chunk: usize,
     /// Widest decode batch this worker will be asked to run.
     pub max_batch: usize,
-    /// Speculative drafting, or `None` for no drafting at all.
-    pub ngram: Option<NgramConfig>,
+    /// Self-speculative (model-free) drafting, or `None` for none at all.
+    pub spec: Option<SelfSpecConfig>,
     /// Tokens the trained MTP head drafts per step, or zero for no MTP.
-    /// Mutually exclusive with `ngram`; `crate::worker` enforces that by
+    /// Mutually exclusive with `spec`; `crate::worker` enforces that by
     /// construction from the single `Speculation` enum.
     pub mtp_drafts: usize,
     /// DFlash drafter serving, or `None`. Mutually exclusive with the
@@ -294,7 +295,7 @@ struct RuntimeSequence {
     prompt: Vec<i32>,
     prefilled: usize,
     next_token: Option<i32>,
-    ngram: Option<NgramSpeculator>,
+    spec: Option<SelfSpeculator>,
     /// The MTP draft head's per-sequence state, when MTP serving is on and
     /// the sequence is eligible (text-only, not restored from a snapshot —
     /// a restored prefix was never caught up in the draft cache, and
@@ -429,7 +430,7 @@ pub struct DeviceRuntime {
     prefill_chunk: usize,
     max_batch: usize,
     vocab: u32,
-    ngram: Option<NgramConfig>,
+    spec: Option<SelfSpecFactory>,
     retention_interval: usize,
     snapshot_arena: SnapshotArena,
     sampled: Vec<i32>,
@@ -625,7 +626,7 @@ impl DeviceRuntime {
         let RuntimeConfig {
             prefill_chunk,
             max_batch,
-            ngram,
+            spec,
             mtp_drafts,
             dflash: dflash_serving,
             draft_n_min,
@@ -756,11 +757,14 @@ impl DeviceRuntime {
         } else if let Some(serving) = &dflash_serving {
             serving.drafts + 1
         } else {
-            ngram.map_or(0, |config| config.max_draft_tokens + 1)
+            spec.map_or(0, |config| config.max_draft_tokens() + 1)
         };
-        // The gating env is the n-gram A/B lever only: MTP and DFlash have
-        // no round-gated fallback drafter, so they always verify batched.
-        let gated = mtp_drafts == 0
+        // The gating env is the legacy n-gram A/B lever only: the other
+        // drafters have no round-gated fallback (`ngram-mod`/`ngram-map-*`
+        // additionally need the verify path's accept feedback), so they
+        // always verify batched.
+        let gated = matches!(spec, Some(SelfSpecConfig::Ngram(_)))
+            && mtp_drafts == 0
             && dflash_serving.is_none()
             && std::env::var_os("LLMXABE_NGRAM_GATED").is_some();
         let mut verify: Vec<Option<Forward>> = Vec::with_capacity(max_batch + 1);
@@ -969,7 +973,7 @@ impl DeviceRuntime {
             prefill_chunk,
             max_batch,
             vocab: config.vocab_size,
-            ngram,
+            spec: spec.map(SelfSpecFactory::new),
             retention_interval,
             snapshot_arena,
             sampled: Vec::with_capacity(max_batch),
@@ -1041,7 +1045,7 @@ impl DeviceRuntime {
             .prefill
             .new_state(&self.stream, req.full_seq_len() as usize + verify_slack)?;
         let draft = Vec::with_capacity(self.window.saturating_sub(1));
-        let ngram = self.ngram.map(NgramSpeculator::new);
+        let spec = self.spec.as_ref().map(SelfSpecFactory::new_speculator);
         // The draft head's per-sequence state: its own KV cache and seed
         // hidden state. Admission-time allocation, like image embeddings —
         // never on the per-step path rule 6 governs. Image-bearing
@@ -1076,7 +1080,7 @@ impl DeviceRuntime {
                 prompt,
                 prefilled: 0,
                 next_token: None,
-                ngram,
+                spec,
                 mtp,
                 dflash,
                 draft,
@@ -1192,8 +1196,8 @@ impl DeviceRuntime {
         if prefix == seq.prompt.len() {
             seq.next_token = snapshot.next_token();
         }
-        if let Some(ngram) = &mut seq.ngram {
-            ngram.observe_all(&seq.prompt[..prefix]);
+        if let Some(spec) = &mut seq.spec {
+            spec.observe_all(&seq.prompt[..prefix]);
         }
         Ok(())
     }
@@ -1306,8 +1310,8 @@ impl DeviceRuntime {
             self.dflash_draft(&mut owned)?;
         }
         for (_, seq) in &mut owned {
-            if let Some(ngram) = &seq.ngram {
-                ngram.propose_into(&mut seq.draft);
+            if let Some(spec) = &mut seq.spec {
+                spec.propose_into(&mut seq.draft);
             }
             let remaining_after_plain = seq.max_output.saturating_sub(seq.emitted + 1) as usize;
             seq.draft.truncate(remaining_after_plain);
@@ -1480,8 +1484,8 @@ impl DeviceRuntime {
                     stopped.push(*id);
                     continue;
                 }
-                if let Some(ngram) = &mut seq.ngram {
-                    ngram.observe(output);
+                if let Some(spec) = &mut seq.spec {
+                    spec.observe(output);
                 }
                 generated.push((*id, output));
                 seq.emitted += 1;
@@ -1783,6 +1787,21 @@ impl DeviceRuntime {
                 emit.push(seq_rows[accepted]);
             }
 
+            // llama.cpp's accept feedback, only for sequences that drafted
+            // (its server calls `common_speculative_accept` only on slots
+            // that speculated): `ngram-mod` counts low-acceptance streaks
+            // toward a table reset, `ngram-map-*` caps the next draft from
+            // this key at what the target just accepted. The count is
+            // against the draft that actually ran, so a window the
+            // retention boundary or `draft_n_min` shortened reports its
+            // shortened length — these drafters only get more conservative
+            // from that, and nothing they decide can change a token.
+            if d_real > 0
+                && let Some(spec) = &mut seq.spec
+            {
+                spec.accept(emit.len() - 1);
+            }
+
             // A mid-window end-of-turn truncates the step at the eos: the
             // tokens before it are real inputs, the eos itself ends the
             // sequence exactly as it does on the plain decode path.
@@ -1891,8 +1910,8 @@ impl DeviceRuntime {
                 &emit[..]
             };
             for &token in real {
-                if let Some(ngram) = &mut seq.ngram {
-                    ngram.observe(token);
+                if let Some(spec) = &mut seq.spec {
+                    spec.observe(token);
                 }
                 generated.push((*id, token));
                 seq.emitted += 1;
@@ -2266,8 +2285,8 @@ impl DeviceRuntime {
             .as_mut()
             .expect("resident sequence has state")
             .set_rope_delta(rope_delta_at(&seq.images, seq.prefilled));
-        if let Some(ngram) = &mut seq.ngram {
-            ngram.observe_all(work);
+        if let Some(spec) = &mut seq.spec {
+            spec.observe_all(work);
         }
         if seq.prefilled == seq.prompt.len() && seq.max_output > 0 {
             let at_retained_boundary = seq
@@ -2297,8 +2316,8 @@ impl DeviceRuntime {
                 seq.emitted = seq.max_output;
                 stopped.push(id);
             } else {
-                if let Some(ngram) = &mut seq.ngram {
-                    ngram.observe(next);
+                if let Some(spec) = &mut seq.spec {
+                    spec.observe(next);
                 }
                 generated.push((id, next));
                 seq.emitted += 1;

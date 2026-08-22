@@ -22,6 +22,9 @@ use xabe_cache::pool::{BlockId, BlockPool};
 use xabe_sched::config::SchedulerConfig;
 use xabe_sched::error::AdmissionError;
 use xabe_sched::ngram::NgramConfig;
+use xabe_sched::ngram_map::{NgramMapConfig, NgramSimpleConfig};
+use xabe_sched::ngram_mod::NgramModConfig;
+use xabe_sched::spec::SelfSpecConfig;
 
 use xabe_model::ModelConfig;
 use xabe_sched::request::{BatchDescription, NewRequest, RequestId};
@@ -48,6 +51,40 @@ pub enum Speculation {
         min: usize,
         /// Longest suffix matched before giving up.
         max: usize,
+    },
+    /// llama.cpp's `ngram-simple`: backward scan for the newest earlier
+    /// occurrence of a fixed-length tail. The draft length (its `size_m`)
+    /// is the scheduler's draft count, per the rule above.
+    NgramSimple {
+        /// Lookup n-gram length (llama.cpp `--spec-ngram-simple-size-n`).
+        size_n: usize,
+    },
+    /// llama.cpp's `ngram-mod`: a hash table from n-gram to next token,
+    /// shared by every sequence this worker serves. Its `n_max` is the
+    /// scheduler's draft count.
+    NgramMod {
+        /// Lookup n-gram length (llama.cpp `--spec-ngram-mod-n-match`).
+        n_match: usize,
+        /// Drop any draft shorter than this (`--spec-ngram-mod-n-min`).
+        n_min: usize,
+    },
+    /// llama.cpp's `ngram-map-k`: per-sequence key-n-gram map, drafting
+    /// straight from the newest key match. Its `size_m` is the scheduler's
+    /// draft count.
+    NgramMapK {
+        /// Key n-gram length (llama.cpp `--spec-ngram-map-k-size-n`).
+        size_n: usize,
+        /// Minimum key hits kept for llama.cpp parity (`--spec-ngram-map-k-min-hits`);
+        /// the key-only draft path does not consult it, as upstream's does not.
+        min_hits: u16,
+    },
+    /// llama.cpp's `ngram-map-k4v`: as `ngram-map-k`, but tracking up to
+    /// four continuations per key and drafting only a dominant one.
+    NgramMapK4v {
+        /// Key n-gram length (llama.cpp `--spec-ngram-map-k4v-size-n`).
+        size_n: usize,
+        /// Minimum key hits before drafting (`--spec-ngram-map-k4v-min-hits`).
+        min_hits: u16,
     },
     /// The model's own trained next-token-prediction head (GGUF block 40)
     /// drafts; the same batched verify pass the n-gram path uses accepts.
@@ -331,22 +368,38 @@ impl Worker {
         let drafts = self.scheduler.config().draft_tokens_per_step() as usize;
         let history_capacity =
             (self.attention_pool.total() * self.cache.attention_block_size()) as usize;
-        let ngram = match serving.speculation {
-            Speculation::Ngram { min, max } if drafts > 0 => Some(
+        // The self-speculative drafters' draft caps (`ngram`'s window,
+        // `ngram-simple`/`ngram-map-*`'s `size_m`, `ngram-mod`'s `n_max`)
+        // are the scheduler's draft count: the scheduler charges those
+        // tokens against its step budget, and a second copy here could
+        // disagree.
+        let spec = match serving.speculation {
+            _ if drafts == 0 => None,
+            Speculation::None | Speculation::Mtp | Speculation::DFlash => None,
+            Speculation::Ngram { min, max } => Some(SelfSpecConfig::Ngram(
                 NgramConfig::new(min, max, drafts, history_capacity)
                     .map_err(RuntimeError::Speculation)?,
-            ),
-            Speculation::Ngram { .. }
-            | Speculation::None
-            | Speculation::Mtp
-            | Speculation::DFlash => None,
+            )),
+            Speculation::NgramSimple { size_n } => Some(SelfSpecConfig::Simple(
+                NgramSimpleConfig::new(size_n, drafts, history_capacity)
+                    .map_err(RuntimeError::Speculation)?,
+            )),
+            Speculation::NgramMod { n_match, n_min } => Some(SelfSpecConfig::Mod(
+                NgramModConfig::new(n_match, n_min, drafts, history_capacity)
+                    .map_err(RuntimeError::Speculation)?,
+            )),
+            Speculation::NgramMapK { size_n, min_hits } => Some(SelfSpecConfig::Map(
+                NgramMapConfig::new(size_n, drafts, true, min_hits, history_capacity)
+                    .map_err(RuntimeError::Speculation)?,
+            )),
+            Speculation::NgramMapK4v { size_n, min_hits } => Some(SelfSpecConfig::Map(
+                NgramMapConfig::new(size_n, drafts, false, min_hits, history_capacity)
+                    .map_err(RuntimeError::Speculation)?,
+            )),
         };
-        // The draft count comes from the scheduler for the same reason the
-        // enum carries none: the scheduler charges those tokens against its
-        // step budget, and a second copy here could disagree.
         let mtp_drafts = match serving.speculation {
             Speculation::Mtp => drafts,
-            Speculation::None | Speculation::Ngram { .. } | Speculation::DFlash => 0,
+            _ => 0,
         };
         let dflash = match serving.speculation {
             Speculation::DFlash if drafts > 0 => Some(crate::runtime::DFlashServing {
@@ -367,7 +420,7 @@ impl Worker {
             RuntimeConfig {
                 prefill_chunk: serving.prefill_chunk,
                 max_batch,
-                ngram,
+                spec,
                 mtp_drafts,
                 dflash,
                 draft_n_min: serving.draft_n_min,

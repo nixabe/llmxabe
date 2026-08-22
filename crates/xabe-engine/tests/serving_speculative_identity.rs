@@ -262,6 +262,87 @@ fn serving_with_dflash_speculation_matches_serving_without() {
     );
 }
 
+/// The same exactness contract for the four llama.cpp-derived drafters
+/// (`ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`): each must
+/// emit exactly what `Speculation::None` emits, through the real serving
+/// loop and the batched verify.
+///
+/// One plain baseline is shared by all four so the case pays for five model
+/// loads rather than eight. The lookups are deliberately short (2–3 tokens
+/// against llama.cpp's 12–24): the draft cap here is the scheduler's
+/// `DRAFTS`, and `ngram-simple` drops any draft shorter than its own
+/// `size_n`, so upstream's defaults could never draft at this cap.
+#[test]
+fn serving_with_the_llama_cpp_ngram_variants_matches_serving_without() {
+    let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
+    if !gpu_available() {
+        return;
+    }
+    let vocab = ModelConfig::qwen3_6_35b_a3b().vocab_size as i64;
+
+    let cycle = [791i32, 1131, 1721, 2217];
+    let periodic: Vec<i32> = cycle.iter().copied().cycle().take(32).collect();
+    let random = xorshift_prompt(0x5EED_CAFE, 16, vocab);
+    let prompts = vec![periodic, random];
+
+    let plain = run_serving(Speculation::None, 0, &prompts).expect("plain serving runs");
+
+    let variants = [
+        ("ngram-simple", Speculation::NgramSimple { size_n: 3 }),
+        (
+            "ngram-mod",
+            Speculation::NgramMod {
+                n_match: 3,
+                n_min: 0,
+            },
+        ),
+        (
+            "ngram-map-k",
+            Speculation::NgramMapK {
+                size_n: 2,
+                min_hits: 1,
+            },
+        ),
+        (
+            "ngram-map-k4v",
+            Speculation::NgramMapK4v {
+                size_n: 2,
+                min_hits: 1,
+            },
+        ),
+    ];
+
+    for (name, speculation) in variants {
+        let spec = run_serving(speculation, DRAFTS, &prompts)
+            .unwrap_or_else(|e| panic!("{name} serving runs: {e}"));
+        println!(
+            "{name}: {} steps ({} plain), {} multi-token steps",
+            spec.steps, plain.steps, spec.multi_token_steps,
+        );
+        for (i, (a, b)) in plain.outputs.iter().zip(&spec.outputs).enumerate() {
+            let n = MIN_TOKENS.min(a.len()).min(b.len());
+            assert_eq!(
+                a[..n],
+                b[..n],
+                "{name} request {i}: speculative serving diverged from plain serving",
+            );
+        }
+        // The periodic request is draftable by every one of these policies;
+        // zero accepted drafts would mean the identity above was proved of
+        // a drafter that never drafted.
+        assert!(
+            spec.multi_token_steps > 0,
+            "{name}: no step emitted more than one token; no draft was ever accepted",
+        );
+        assert!(
+            spec.steps <= plain.steps,
+            "{name}: speculation took more steps ({}) than plain decoding ({})",
+            spec.steps,
+            plain.steps,
+        );
+    }
+}
+
 #[test]
 fn serving_with_ngram_speculation_matches_serving_without() {
     let _gpu_case = GPU_CASE.lock().expect("GPU test lock poisoned");
