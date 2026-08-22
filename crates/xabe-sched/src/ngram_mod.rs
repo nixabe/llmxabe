@@ -186,8 +186,8 @@ impl NgramModSpeculator {
     /// Add one generated token. The first call marks the prompt/generation
     /// boundary and runs upstream's `begin`: index every prompt n-gram into
     /// the shared table, then reset the table if the whole thing has grown
-    /// past [`OCCUPANCY_RESET_FRACTION`] — a saturating table is mostly
-    /// collisions, and its drafts stop earning their verify slots.
+    /// past 25% occupancy — a saturating table is mostly collisions, and
+    /// its drafts stop earning their verify slots.
     pub fn observe(&mut self, token: i32) {
         if !self.generation_started {
             self.generation_started = true;

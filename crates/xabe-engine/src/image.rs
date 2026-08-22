@@ -4,7 +4,7 @@
 //! the vocabulary check, the tokenizer round-trip and the embed kernel all
 //! keep working untouched — and this side channel carries what those slots
 //! *mean*: which image, what merged grid, and a content hash that makes the
-//! prefix cache image-aware (see [`crate::prefix`]).
+//! prefix cache image-aware (see the `prefix` module).
 
 /// One image's placement inside a prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

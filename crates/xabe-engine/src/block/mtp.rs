@@ -514,7 +514,7 @@ impl MtpBlock {
     /// `positions` serves as both the cache-slot scalar and the rope
     /// position, matching the single-sequence path's `RopeSource::Scalar`
     /// (the draft head never applies an M-RoPE delta; see
-    /// [`Self::finish_forward`] on why that cannot affect exactness).
+    /// `finish_forward` on why that cannot affect exactness).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_batch_decode(
         &mut self,

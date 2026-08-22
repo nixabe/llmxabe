@@ -3093,7 +3093,7 @@ impl Forward {
     /// `src` starting at its row `src_row` (rows are `hidden` floats).
     ///
     /// The copy into staging happens now; the copy into the residual
-    /// stream happens inside [`Self::body`], after the embedding gather
+    /// stream happens inside `body`, after the embedding gather
     /// has written the placeholder rows this replaces.
     pub fn stage_image_rows(
         &mut self,
