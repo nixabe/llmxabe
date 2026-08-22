@@ -106,6 +106,7 @@ a replacement claim.
 | KV cache | binary16, 20 KiB/token over 10 attention layers |
 | Recurrent state | fixed ~2 MiB per GDN layer per sequence, independent of depth |
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
+| Speculative decode | `--spec-type ngram\|draft-mtp\|spec-dflash`, bit-exact against plain decode; off by default — see WHY and WHY NOT for where it pays |
 
 ## Correctness gates
 
@@ -387,6 +388,31 @@ another): decode N=3 +0.5% with the new binary winning 2 of 3, prefill at
 parity once position-in-session drift (~0.8%, first runner wins regardless of
 binary) is controlled for. Numbers in the enabling commits.
 
+## Speculative decode: exact by construction, priced by the verify step
+
+All three drafters — the n-gram speculator, the trained MTP head, and the
+DFlash block drafter — feed one serving mechanism: per-sequence draft
+windows, then a single batched verify pass of `width × (draft + 1)` rows
+whose acceptance rule is token equality against the target's own output. A
+wrong drafter can only waste compute, never change a token
+(`serving_speculative_identity` asserts bit-identity for all three), so
+speculation is purely a throughput lever, and the lever's sign is set by
+batch width, not by acceptance. The verify pass is the prefill-shaped pass
+at tiny token counts, where fixed per-pass cost dominates: ~2.8× a plain
+decode step at N=1 (a 4-row window) and ~4.8× at N=3 (12 rows), while the
+best acceptance measured fills 10.3 of those 12 rows — the premium outruns
+the tokens it buys everywhere except narrow widths. The
+`LLMXABE_NGRAM_GATED` lever isolates the mechanism: the round-gated
+fallback (accepted tokens ride plain decode steps) at *identical*
+acceptance is 1.9× the batched verify at N=3 (166 vs 87 tok/s) and 8%
+behind it at N=1 (104 vs 113) — the batched verify wins exactly where its
+row count stays near the plain step's and loses where it triples it.
+N-gram drafts opportunistically (a verify fires only on a repeated-context
+hit) and is the one measured net win, +9% at N=1; the trained drafters
+verify every step at near-identical step cost to each other, so their gap
+is pure acceptance (2.86 vs 2.44 of a 4-row window: MTP +1.5%, DFlash
+−15% at N=1). Serving therefore defaults to `--spec-type none`.
+
 ---
 
 # WHY NOT
@@ -436,7 +462,7 @@ proposed twice.
 | The two-kernel `bm == 1` split, first attempt | −5.2% before `bucket_live` existed: both kernels then walked `sorted_token_ids` and crossed two barriers per bucket to compute `bm`, and only one used the answer. It landed as a win only once `bm` became a table read. |
 | GEMV unroll pragmas on the direct-1 helpers | 20% slower on ffn. A register cliff — the standalone GEMV kernel's unroll depth was tuned against a register budget the narrow kernel, which carries the tiled fallback in the same function, does not have. |
 | A `KU` unroll hint on the GDN tiled projection | Byte-identical SASS at the width N=3 actually uses; −9% at N=2. `ptxas` already reached the same schedule. Whatever closes that kernel's 28%-of-roofline ceiling must change what ptxas schedules, not hint at a schedule it already finds. |
-| MTP speculative decode, as it currently stands | 65.2% acceptance and bit-identical output, for **~7%** — real, but not the 30–40% the N=3 gap needs, and the runtime does not batch MTP sessions across sequences. Valid future feature; rejected as the next lever. |
+| Speculative decode as the N=3 lever (n-gram, MTP, DFlash; serving A/B, four interleaved rounds with a reversal) | Every arm loses at N=3: 87.5 / 150.7 / 125.2 tok/s against plain 211.4, despite up to 10.3 accepted tokens per 12-row verify window. The batched verify's fixed cost (~4.8× a plain batch-3 step) outruns the tokens it saves, and the round-gated fallback at identical acceptance also loses (166 vs 211). The measured net wins are n-gram **+9%** and MTP **+1.5%**, both at N=1 only — see WHY. Making the verify pass ride decode's launch machinery instead of the prefill shape is the untried lever. |
 | Removing the routed-partial clear | Below run-to-run spread, and reversing. Deleting a defensive correctness aid for a result smaller than host drift is not justified. |
 
 ## Rejected on arithmetic, before building
