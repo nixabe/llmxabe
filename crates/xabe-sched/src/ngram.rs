@@ -64,6 +64,10 @@ pub enum NgramConfigError {
     InvalidNgramRange,
     ZeroDraftTokens,
     HistoryTooShort,
+    /// A map variant's `min_hits` was zero; llama.cpp requires at least 1
+    /// ("ngram min hits must be at least 1"), and the key hit count a draft
+    /// is gated on is never below 1 anyway.
+    ZeroMinHits,
 }
 
 impl core::fmt::Display for NgramConfigError {
@@ -72,6 +76,7 @@ impl core::fmt::Display for NgramConfigError {
             Self::InvalidNgramRange => write!(f, "n-gram range must satisfy 0 < min <= max"),
             Self::ZeroDraftTokens => write!(f, "an n-gram draft must allow at least one token"),
             Self::HistoryTooShort => write!(f, "history capacity must exceed max n-gram length"),
+            Self::ZeroMinHits => write!(f, "min hits must be at least 1"),
         }
     }
 }

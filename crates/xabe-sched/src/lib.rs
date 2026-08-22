@@ -23,8 +23,11 @@
 pub mod config;
 pub mod error;
 pub mod ngram;
+pub mod ngram_map;
+pub mod ngram_mod;
 pub mod request;
 pub mod scheduler;
+pub mod spec;
 
 pub use config::SchedulerConfig;
 pub use error::{AdmissionError, SchedulerConfigError};
