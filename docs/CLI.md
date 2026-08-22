@@ -52,10 +52,22 @@ the value nor the variable's contents appear in `--help` or in any log line.
 | `-c, --total-context <N>` | — | `393216` | Total context tokens across all slots, used to size the KV pool and the VRAM budget. The default matches the baseline's `-c 393216`. |
 | `-pc, --prefill-chunk <N>` | — | `4096` | Tokens per chunked-prefill step. |
 | `--cache-ram <SIZE>` | `LLMXABE_CACHE_RAM` | 24 snapshots per worker (≈7.2 GiB for three) | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
-| `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, `draft-mtp`, or `spec-dflash`. See below. |
+| `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, or `spec-dflash`. See below. |
 | `--spec-ngram-n-max <N>` | — | `3` | `ngram`: most tokens proposed from one suffix match. |
 | `--spec-ngram-min <N>` | — | `2` | `ngram`: shortest suffix worth matching on. |
 | `--spec-ngram-max <N>` | — | `4` | `ngram`: longest suffix matched before giving up. |
+| `--spec-ngram-simple-size-n <N>` | — | `12` | `ngram-simple`: length of the lookup n-gram. |
+| `--spec-ngram-simple-size-m <N>` | — | `48` | `ngram-simple`: length of the draft m-gram, and so the per-step draft budget. |
+| `--spec-ngram-simple-min-hits <N>` | — | `1` | Accepted for llama.cpp flag compatibility; `ngram-simple` keeps no hit statistics (llama.cpp's ignores it too). |
+| `--spec-ngram-mod-n-match <N>` | — | `24` | `ngram-mod`: lookup n-gram length. |
+| `--spec-ngram-mod-n-min <N>` | — | `48` | `ngram-mod`: drop a draft whose chain breaks before this many tokens. |
+| `--spec-ngram-mod-n-max <N>` | — | `64` | `ngram-mod`: longest chain drafted per step, and so the per-step draft budget. |
+| `--spec-ngram-map-k-size-n <N>` | — | `12` | `ngram-map-k`: key n-gram length. |
+| `--spec-ngram-map-k-size-m <N>` | — | `48` | `ngram-map-k`: draft m-gram length, and so the per-step draft budget. |
+| `--spec-ngram-map-k-min-hits <N>` | — | `1` | Kept for llama.cpp flag parity; the key-only draft path ignores it, as llama.cpp's does. |
+| `--spec-ngram-map-k4v-size-n <N>` | — | `12` | `ngram-map-k4v`: key n-gram length. |
+| `--spec-ngram-map-k4v-size-m <N>` | — | `48` | `ngram-map-k4v`: draft m-gram length, and so the per-step draft budget. |
+| `--spec-ngram-map-k4v-min-hits <N>` | — | `1` | `ngram-map-k4v`: key hits required before a draft is proposed. |
 | `--spec-draft-n-max <N>` | — | `3` | `draft-mtp`/`spec-dflash`: most tokens the drafter proposes per step. |
 | `--spec-draft-n-min <N>` | — | `0` | Drop any draft that comes out shorter than this; `0` keeps every draft. |
 | `--spec-draft-p-min <P>` | — | `0` | `draft-mtp`/`spec-dflash`: stop drafting at the first token whose probability under the drafter's own head falls below this; `0` disables the gate. |
@@ -139,7 +151,11 @@ weight-read pass. It ships as `none`.
 | Type | What drafts | Status |
 | --- | --- | --- |
 | `none` | nothing — one token per step | the default |
-| `ngram` | a suffix match against the sequence's own prompt and output | works |
+| `ngram` | a variable-length suffix match against the sequence's own prompt and output | works |
+| `ngram-simple` | llama.cpp's fixed-length backward scan for the same tail | works; see below |
+| `ngram-mod` | llama.cpp's n-gram → next-token table, shared across the worker's sequences | works; see below |
+| `ngram-map-k` | llama.cpp's key-n-gram map, drafting from the newest key match | works; see below |
+| `ngram-map-k4v` | as `ngram-map-k`, but tracking four continuations per key and drafting only a dominant one | works; see below |
 | `draft-mtp` | the model's own multi-token-prediction head | works; see below |
 | `spec-dflash` | a trained DFlash drafter (separate GGUF, `--spec-dflash`) | works; see below |
 
@@ -185,6 +201,82 @@ per-width verify passes — allocated only when `--spec-type ngram` is on.
 `LLMXABE_NGRAM_GATED=1` falls back to the older round-gated loop (drafts
 gate extra one-token rounds and are never model inputs), kept as the A/B
 lever for measuring the verify path against.
+
+### The llama.cpp n-gram family
+
+`ngram-simple`, `ngram-mod`, `ngram-map-k` and `ngram-map-k4v` are ports of
+llama.cpp's own self-speculative drafters (upstream PRs #18471 and #19164),
+flag names and defaults included, so a head-to-head runs the same policy on
+both sides. They share `ngram`'s machinery from the draft outward: the same
+batched verify pass, the same exactness contract, the same VRAM cost — only
+the choice of what to draft differs.
+
+```sh
+llmxabe --spec-type ngram-simple  --spec-ngram-simple-size-n 12 --spec-ngram-simple-size-m 48
+llmxabe --spec-type ngram-mod     --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
+llmxabe --spec-type ngram-map-k   --spec-ngram-map-k-size-n 12 --spec-ngram-map-k-size-m 48
+llmxabe --spec-type ngram-map-k4v --spec-ngram-map-k4v-size-n 12 --spec-ngram-map-k4v-size-m 48 --spec-ngram-map-k4v-min-hits 1
+```
+
+Each type's draft cap — `size-m`, or `n-max` for `ngram-mod` — **is** the
+scheduler's per-step draft budget, so it is charged against the token budget
+like any other draft count. llama.cpp's defaults are large (48 and 64 against
+this engine's `ngram` default of 3), which buys longer accepted runs at the
+cost of a much wider verify pass; the previous speculative A/B on this host
+found the verify step's cost, not the acceptance rate, sets the sign of the
+result, so measure before assuming the bigger window wins.
+
+**Check VRAM before running the defaults.** The verify path holds one GDN
+snapshot ring set per decode slot, and it is sized by the draft count: 30 GDN
+layers × (32·128·128 + 8192·3) fp32 × `(drafts + 2)` slots, per decoding
+sequence. That is arithmetic from the model geometry, not a measurement, and
+it lands on the ~300 MiB per slot this document already quotes for `n = 3`:
+
+| Draft cap | Per decode slot | Per worker at `-s 3` |
+| --- | --- | --- |
+| 3 (`ngram` default) | 0.31 GiB | 0.92 GiB |
+| 12 | 0.86 GiB | 2.58 GiB |
+| 48 (`size-m` default) | 3.07 GiB | 9.20 GiB |
+| 64 (`n-max` default) | 4.05 GiB | 12.15 GiB |
+
+Against a 29.6 GiB model on a 48 GiB card, llama.cpp's defaults leave little
+room for the KV pool, so expect to lower `size-m`/`n-max`, `-s`, or `-c`
+rather than to run all three at their defaults at once. Lowering the cap is
+the cheapest of the three, and for `ngram-simple` it must still stay at or
+above `size-n` or that type can never draft.
+
+Two behaviors carried over verbatim, because changing them would change what
+is drafted:
+
+- **`ngram-simple` drops any draft shorter than its own `size-n`.** With
+  `--spec-ngram-simple-size-m` below `--spec-ngram-simple-size-n` it can
+  therefore never draft at all. That is upstream's rule, not a port artifact.
+- **`ngram-mod`'s table is shared by every sequence a worker serves**, as
+  upstream shares one `common_ngram_mod` across a context's sequences: what
+  one request teaches the table, a concurrent request drafts from. It resets
+  itself when occupancy passes 25% at a sequence's start, or after five
+  consecutive rounds with under a quarter of the draft accepted.
+
+#### `ngram` versus `ngram-simple`
+
+They are different algorithms, not two names for one. Both look for an
+earlier occurrence of the sequence's current tail and draft what followed it,
+and they differ in four ways that matter:
+
+| | `ngram` | `ngram-simple` |
+| --- | --- | --- |
+| Tail length | variable: tries `--spec-ngram-max` down to `--spec-ngram-min` (default 4 → 2), longest match wins | fixed at `--spec-ngram-simple-size-n` (default 12) |
+| Lookup | hash index per length, one probe, collision-verified against the history before drafting | backward linear scan of the whole history, newest match wins |
+| History | fixed-capacity ring; the oldest tokens are evicted | append-only, the whole context |
+| Short drafts | proposed — any length from 1 up to the cap | dropped entirely below `size-n` tokens |
+
+The practical split: `ngram` matches short tails, so it fires often and
+proposes a few tokens; `ngram-simple` demands a 12-token repeat, so it fires
+rarely and proposes up to 48 when it does. `ngram`'s index also makes its
+per-step host cost independent of context length, where `ngram-simple`'s scan
+grows with it — which is why `ngram` was written that way in the first place
+(see the module docs in `crates/xabe-sched/src/ngram.rs`). The port keeps the
+scan, because parity with upstream's draft choice is the point of having it.
 
 ### `draft-mtp`
 
