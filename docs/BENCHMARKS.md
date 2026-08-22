@@ -458,9 +458,44 @@ worth keeping: at a 15-token block DFlash outlasts MTP at N=3 (−54.8%
 against −67.3%, 24.1 vs 15.4 tokens per step), which is block in-fill
 still accepting where a chained head has drifted.
 
-Serving therefore defaults to `--spec-type none`. The win is real, and
-large, only for single-stream deployments, and there it belongs to the
-model-free drafters — the ones whose draft side costs nothing to widen.
+**Everything above is a shallow-context result (256-token prompts), and it
+does not survive depth.** Re-measured at this project's actual N=3 target —
+three slots of ~120K, the most that fits beside its own output in a
+393,216-token pool — the ranking does not shrink, it inverts:
+
+| Drafter at N=3, ~120K/slot | prefill | decode | tokens/step |
+| --- | --- | --- | --- |
+| plain (`none`) | **821 tok/s** | **99.7 tok/s** | 3.0 |
+| `ngram-map-k4v`, cap 8 | 745 (−9.3%) | 19.3 (**−80.6%**) | 27.0 |
+| `draft-mtp`, 3 | 642 (−21.8%) | 9.2 (**−90.8%**) | 12.0 |
+| `ngram-map-k4v`, cap 32 or 48 | — | — | out of memory |
+| `spec-dflash`, 2 or 3 | — | — | out of memory |
+
+Acceptance is not what fails. It is *perfect*: MTP took 12.0 of 12
+available tokens per step and the map drafter 27.0 of 27, and both still
+lost by an order of magnitude. What fails is that **at depth the verify
+step's cost is set by context, not by window** — 1.30 s carrying 12 rows,
+1.38 s carrying 27 — against a 30 ms captured plain decode step. A ~45×
+per-step premium cannot be repaid by a 9× token multiple, and no drafting
+policy can change the premium. At 256 tokens that premium was 1.7×, which
+is the entire reason the sign flips.
+
+Two second-order effects are worth carrying. Speculation costs *prefill*
+at N=3 even when nothing is drafted during it: a decoding sequence charges
+`1 + drafts` against the per-step token budget, so concurrent prefill
+chunks get less of it — 9.3% for a cap of 8, before MTP's own per-chunk
+catch-up pass takes it to 21.8%. And VRAM at this depth is the binding
+constraint on the drafters that were best when shallow: the KV pool leaves
+so little room that `ngram-map-k4v` cannot run above a cap of ~8, and
+DFlash — whose six draft-layer caches are sized to the *full sequence*, so
+they scale with context rather than with the draft count — does not run at
+all.
+
+Serving therefore defaults to `--spec-type none`, and at the N=3 deep
+target that default is not a compromise but the best configuration
+measured. The win is real, and large, only for **shallow single-stream**
+work, and there it belongs to the model-free drafters — the ones whose
+draft side costs nothing to widen.
 
 ---
 
@@ -500,6 +535,7 @@ proposed twice.
 | Even/odd MMA accumulator chains | −2% prefill, noise at decode. The compiler's schedule was not accumulator-stalled, and eight more registers on kernels already at ~230 costs more than the chain relief. |
 | Skipping the online-softmax rescale when the running max did not move | Bit-identical by construction and **2.8% slower** at 128K prefill. The identity multiplies hid under staged-load latency the schedule pays anyway; the vote-and-branch costs more than the work it skips. |
 | llama.cpp's n-gram drafters at N=3, at llama.cpp's own 48-token defaults | **−22.8%** (`ngram-simple`), **−77.8%**/**−78.8%** (`ngram-map-k`/`k4v`) against plain decode's 210.9 tok/s; three interleaved rounds, spreads ≤0.4%. Not an acceptance failure — the map pair fills 22 of 49 rows per sequence — but a row-count one: 3 × 49 = 147 verify rows against a captured 3-row graph step. The same policies win 16–21% at N=1, where the window is free. The map pair's *magnitude* is additionally inflated by `bench_worker_spec` letting a high-acceptance sequence run far past the timed quota while a straggler gates the window; the sign is not in doubt, the exact figure is. |
+| Any speculative decoding at the N=3 deep-context target (~120K per slot) | **−80.6%** (`ngram-map-k4v` at a cap of 8) and **−90.8%** (`draft-mtp` at 3) on decode, plus −9.3% and −21.8% on *prefill*; `spec-dflash` and the wider n-gram caps do not fit in VRAM at all. Interleaved rounds, decode spreads ≤2.6%. Acceptance was perfect in both survivors (12.0 of 12 and 27.0 of 27 tokens per step) and irrelevant: the verify step costs 1.30 s at 12 rows and 1.38 s at 27 against a 30 ms captured decode step, so its price is set by context depth rather than window width and no policy can repay it. The same drafters win 16–21% at 256 tokens; **a speculative result measured shallow says nothing about the deep target.** |
 | Widening the trained drafters to the drafter's trained maximum (`--spec-draft-n-max 15`) | MTP **+1.4% → −55.4%** and DFlash **−14.8% → −65.8%** at N=1; −27.2% → −67.3% and −39.5% → −54.8% at N=3. Three interleaved rounds, spreads ≤1.0%. Acceptance did rise (MTP 2.86 → 3.90 tokens per step at N=1) and was nowhere near enough: a 3 → 15 block adds **+57.2 ms/step** (MTP) and **+52.6 ms** (DFlash) onto a 9.64 ms plain step, because the *drafter* pass scales with the block even though the verify pass does not (4 → 49 verify rows is +0.14 ms). A wider window is free only when the draft side is a host lookup; making a trained drafter pay means making its pass cheaper, not longer. |
 | `ngram-mod` at llama.cpp's default `n_max` 64, N=3 | `CUDA_ERROR_OUT_OF_MEMORY` before the first step, in every round. The verify path holds one GDN snapshot ring set per decode slot — 30 layers × (32·128·128 + 8192·3) fp32 × `(drafts + 2)` — which is 4.05 GiB per slot at 64 drafts and 12.15 GiB for three, beside a 29.6 GiB model on a 48 GiB card. 48 drafts (9.2 GiB for three) fits and still loses. The draft cap is a VRAM knob, not only a scheduling one. |
 | Tensor cores for routed MoE at N=3 (`MMA_MIN_TOKENS` 8 → 3) | 135.2 vs 147.7 tok/s. Padding a three-row dispatch into MMA fragments and quantizing its activations costs more than the arithmetic recovers. |

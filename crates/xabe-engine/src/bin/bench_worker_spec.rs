@@ -157,7 +157,7 @@ fn run_width(
     width: usize,
     speculation: Speculation,
     drafts: u32,
-) -> Result<(f64, f64, u64), String> {
+) -> Result<WidthResult, String> {
     let cache = CacheConfig::with_defaults(model.clone()).map_err(|error| error.to_string())?;
     let scheduler = SchedulerConfig::new(
         TOKEN_BUDGET,
@@ -200,7 +200,15 @@ fn run_width(
     // sequence works through its quota, the fastest can emit up to a whole
     // verify window per step. The output budget must cover that divergence,
     // or a fast sequence retires at its cap before the window closes.
-    let max_output = quota * (drafts + 1) + 8;
+    // Deep-context runs need this set explicitly: prefilling a long prompt
+    // makes sequences decode-ready at very different times, so a budget
+    // derived from the draft count alone retires the earliest starter before
+    // the latest one has caught up. An explicit value is also the fair one —
+    // it reserves identical KV for every drafter.
+    let max_output = std::env::var("LLMXABE_MAX_OUTPUT")
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(quota * (drafts + 1) + 8);
     for sequence in 0..width {
         let request = NewRequest {
             id: RequestId(sequence as u64 + 1),
@@ -217,11 +225,33 @@ fn run_width(
             .map_err(|error| error.to_string())?;
     }
 
-    // Prefill plus warm-up generation, untimed: the window opens once every
-    // sequence has cleared the warm-up quota.
+    // Prefill, timed separately: a sequence emits its first token from the
+    // last chunk of its own prefill, so "every sequence has emitted one" is
+    // the moment chunked prefill has finished for all of them. Speculation
+    // never drafts here, but the trained drafters do extra per-chunk work
+    // (the MTP head's catch-up pass, DFlash's feature taps), so this is the
+    // number that says what a drafter costs before it has helped at all.
     let mut emitted = vec![0u32; width];
     let step_ceiling = 4 * (quota as usize + context.div_ceil(PREFILL_CHUNK)) * width + 64;
     let mut steps_taken = 0usize;
+    let prefill_started = Instant::now();
+    while emitted.contains(&0) {
+        let step = worker.step_device().map_err(|error| error.to_string())?;
+        for (id, _) in &step.generated {
+            emitted[(id.0 - 1) as usize] += 1;
+        }
+        steps_taken += 1;
+        if steps_taken > step_ceiling {
+            return Err(format!(
+                "prefill made no progress after {steps_taken} steps (ceiling {step_ceiling}), emitted {emitted:?}"
+            ));
+        }
+    }
+    let prefill_elapsed = prefill_started.elapsed().as_secs_f64();
+    let prefill_tps = (context * width) as f64 / prefill_elapsed;
+
+    // The rest of the warm-up, untimed: the decode window opens once every
+    // sequence has cleared the warm-up quota.
     while emitted.iter().any(|&count| count < WARMUP_TOKENS) {
         let step = worker.step_device().map_err(|error| error.to_string())?;
         for (id, _) in &step.generated {
@@ -229,7 +259,9 @@ fn run_width(
         }
         steps_taken += 1;
         if steps_taken > step_ceiling {
-            return Err("warm-up made no progress".to_owned());
+            return Err(format!(
+                "warm-up made no progress after {steps_taken} steps (ceiling {step_ceiling}), emitted {emitted:?}"
+            ));
         }
     }
 
@@ -238,19 +270,30 @@ fn run_width(
     // the token count and the step count are measured, not assumed.
     let window_start: Vec<u32> = emitted.clone();
     let mut timed_steps = 0u64;
+    // A fixed number of scheduler steps is the honest window once drafts get
+    // long or prefill is deep: "until every sequence gains N" is gated by the
+    // slowest sequence while the fastest runs arbitrarily far ahead, which
+    // both skews the token count and grows the racers' contexts mid-window.
+    let fixed_steps: Option<u64> = std::env::var("LLMXABE_TIMED_STEPS")
+        .ok()
+        .and_then(|raw| raw.parse().ok());
     let started = Instant::now();
-    while emitted
-        .iter()
-        .zip(&window_start)
-        .any(|(&count, &start)| count < start + tokens_per_seq)
-    {
+    while match fixed_steps {
+        Some(target) => timed_steps < target,
+        None => emitted
+            .iter()
+            .zip(&window_start)
+            .any(|(&count, &start)| count < start + tokens_per_seq),
+    } {
         let step = worker.step_device().map_err(|error| error.to_string())?;
         for (id, _) in &step.generated {
             emitted[(id.0 - 1) as usize] += 1;
         }
         timed_steps += 1;
         if steps_taken + timed_steps as usize > step_ceiling {
-            return Err("timed window made no progress".to_owned());
+            return Err(format!(
+                "timed window stalled: {steps_taken} pre + {timed_steps} timed vs ceiling {step_ceiling}, emitted {emitted:?}, start {window_start:?}"
+            ));
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
@@ -262,7 +305,21 @@ fn run_width(
         .sum();
     let tps = f64::from(window_tokens) / elapsed;
     let tokens_per_step = f64::from(window_tokens) / timed_steps as f64;
-    Ok((tps, tokens_per_step, timed_steps))
+    Ok(WidthResult {
+        prefill_tps,
+        tps,
+        tokens_per_step,
+        timed_steps,
+    })
+}
+
+/// One width's measurement: prefill and decode are separate regimes and a
+/// drafter can move them in opposite directions, so neither is folded away.
+struct WidthResult {
+    prefill_tps: f64,
+    tps: f64,
+    tokens_per_step: f64,
+    timed_steps: u64,
 }
 
 fn main() -> ExitCode {
@@ -296,11 +353,14 @@ fn main() -> ExitCode {
     info!(
         "bench_worker_spec: context={context} tokens/seq={tokens_per_seq} spec={spec:?} drafts={drafts}",
     );
-    info!("N        tok/s aggregate   tokens/step   steps");
+    info!("N     prefill tok/s   decode tok/s   tokens/step   steps");
     for &width in &widths {
         match run_width(&path, &model, context, tokens_per_seq, width, spec, drafts) {
-            Ok((tps, per_step, steps)) => {
-                info!("N={width}      {tps:10.1}       {per_step:7.3}      {steps}");
+            Ok(r) => {
+                info!(
+                    "N={width}   {:12.1}   {:12.1}       {:7.3}      {}",
+                    r.prefill_tps, r.tps, r.tokens_per_step, r.timed_steps
+                );
             }
             Err(error) => {
                 error!("N={width}: {error}");

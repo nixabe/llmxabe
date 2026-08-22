@@ -226,15 +226,23 @@ on batch width.
 
 **These have been measured; see
 [BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step)
-for the numbers and the method.** The short version: at **N=1 they are the
-best drafters this engine has**, because the verify pass costs about the same
-at 49 rows as at 4, so the wider window is nearly free — `ngram-map-k` and
+for the numbers and the method.** The short version, and the qualifier
+matters more than the numbers: at **N=1 with short prompts they are the best
+drafters this engine has**, because the verify pass costs about the same at
+49 rows as at 4, so the wider window is nearly free — `ngram-map-k` and
 `ngram-map-k4v` +20.9%/+20.8%, `ngram-simple` +16.3%, `ngram-mod` +11.1%,
 against `ngram`'s +9.2%. At **N=3 every one of them loses**, from −22.8%
-(`ngram-simple`) to −78.8% (`ngram-map-k4v`), because three sequences of 49
-rows is a 147-row pass competing with a captured 3-row graph step. Serving
-still defaults to `--spec-type none`; turn one of these on for
-single-stream work, not for a full house.
+(`ngram-simple`) to −78.8% (`ngram-map-k4v`).
+
+**At long context the picture is worse, and it is the one to plan against.**
+At three slots of ~120K, `ngram-map-k4v` is −80.6% on decode and −9.3% on
+prefill, and that is at a draft cap of 8 — the wide llama.cpp defaults do
+not fit in VRAM at that depth at all. Acceptance there is *perfect* (27 of
+27 tokens per step) and loses anyway, because a verify step costs ~1.4 s
+against a 30 ms plain decode step whatever it carries. Serving defaults to
+`--spec-type none`, and for a full house at long context that default is
+simply the fastest thing measured. Reach for a drafter for shallow
+single-stream work, and do not extrapolate a shallow win to a deep one.
 
 **Check VRAM before running the defaults.** The verify path holds one GDN
 snapshot ring set per decode slot, and it is sized by the draft count: 30 GDN
@@ -323,11 +331,14 @@ An earlier milestone measured the single-sequence, unbatched driver at 65.2%
 acceptance for about +7% and did not adopt it; the serving path above is the
 batched re-attempt that measurement asked for.
 
-**Measured:** the batched path is **+1.4% at N=1** — the only trained
-drafter that is not a loss, and far behind the model-free `ngram-map-k`'s
-+20.9% — and **−27.2% at N=3**. As with `spec-dflash`, raising
-`--spec-draft-n-max` to 15 makes it much worse (−55.4% at N=1), because the
-draft head's own pass scales with the block while the verify pass does not.
+**Measured:** the batched path is **+1.4% at N=1** on short prompts — the
+only trained drafter that is not a loss, and far behind the model-free
+`ngram-map-k`'s +20.9% — and **−27.2% at N=3**. As with `spec-dflash`,
+raising `--spec-draft-n-max` to 15 makes it much worse (−55.4% at N=1),
+because the draft head's own pass scales with the block while the verify
+pass does not. At three slots of ~120K it is **−90.8% on decode and −21.8%
+on prefill**, the latter because its catch-up pass runs on every prefill
+chunk; it accepts every token it drafts there and loses anyway.
 See [BENCHMARKS.md](BENCHMARKS.md#speculative-decode-exact-by-construction-priced-by-the-verify-step).
 
 ### `spec-dflash`
@@ -361,10 +372,14 @@ sliding-window layers; this engine follows llama.cpp, whose ecosystem the
 GGUF comes from — `xabe_model::dflash`'s module docs carry the details.
 
 **Measured, and it does not currently pay:** −14.8% at N=1 and −39.5% at
-N=3 against plain decode, at the default 3-token block. Raising the block
-makes it worse, not better — −65.8% at N=1 and −54.8% at N=3 at the trained
-maximum of 15 — because one drafter pass per step is cheap only while the
-block is short: 3 → 15 adds ~52.6 ms to a step whose plain form is 9.64 ms.
+N=3 against plain decode, at the default 3-token block, on short prompts.
+Raising the block makes it worse, not better — −65.8% at N=1 and −54.8% at
+N=3 at the trained maximum of 15 — because one drafter pass per step is
+cheap only while the block is short: 3 → 15 adds ~52.6 ms to a step whose
+plain form is 9.64 ms. **At long context it does not run at all:** its six
+draft-layer KV caches are sized to the full sequence, so they scale with
+context rather than with the draft count, and three slots of ~120K is out
+of memory even at a 2-token block.
 That is the opposite of how the n-gram types behave, where a wider window is
 nearly free, and it is the thing to know before reaching for
 `--spec-draft-n-max`. See
