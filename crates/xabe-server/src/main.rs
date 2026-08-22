@@ -49,6 +49,15 @@ enum SpecType {
     None,
     /// Suffix lookup over the sequence's own prompt and output.
     Ngram,
+    /// llama.cpp's ngram-simple: backward scan for a fixed-length tail.
+    NgramSimple,
+    /// llama.cpp's ngram-mod: worker-shared n-gram-to-next-token table.
+    NgramMod,
+    /// llama.cpp's ngram-map-k: key-n-gram map, drafts the newest match.
+    NgramMapK,
+    /// llama.cpp's ngram-map-k4v: as ngram-map-k, tracking up to four
+    /// continuations per key and drafting only a dominant one.
+    NgramMapK4v,
     /// The model's own multi-token-prediction head.
     DraftMtp,
     /// A trained DFlash drafter (block in-fill; needs --spec-dflash).
@@ -154,6 +163,57 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     spec_ngram_max: usize,
 
+    /// ngram-simple: ngram size N, length of the lookup n-gram
+    #[arg(long, default_value_t = 12)]
+    spec_ngram_simple_size_n: u32,
+
+    /// ngram-simple: ngram size M, length of the draft m-gram
+    #[arg(long, default_value_t = 48)]
+    spec_ngram_simple_size_m: u32,
+
+    /// Accepted for llama.cpp flag compatibility; ngram-simple keeps no
+    /// hit statistics (llama.cpp's ignores it too)
+    #[arg(long, default_value_t = 1)]
+    spec_ngram_simple_min_hits: u32,
+
+    /// ngram-mod: lookup n-gram length
+    #[arg(long, default_value_t = 24)]
+    spec_ngram_mod_n_match: u32,
+
+    /// ngram-mod: minimum number of ngram tokens to draft; a chain that
+    /// breaks earlier is dropped
+    #[arg(long, default_value_t = 48)]
+    spec_ngram_mod_n_min: u32,
+
+    /// ngram-mod: maximum number of ngram tokens to draft per step
+    #[arg(long, default_value_t = 64)]
+    spec_ngram_mod_n_max: u32,
+
+    /// ngram-map-k: ngram size N, length of the lookup n-gram
+    #[arg(long, default_value_t = 12)]
+    spec_ngram_map_k_size_n: u32,
+
+    /// ngram-map-k: ngram size M, length of the draft m-gram
+    #[arg(long, default_value_t = 48)]
+    spec_ngram_map_k_size_m: u32,
+
+    /// ngram-map-k: minimum hits at ngram lookup for a draft; kept for
+    /// llama.cpp flag parity (its key-only draft path ignores it too)
+    #[arg(long, default_value_t = 1)]
+    spec_ngram_map_k_min_hits: u32,
+
+    /// ngram-map-k4v: ngram size N, length of the lookup n-gram
+    #[arg(long, default_value_t = 12)]
+    spec_ngram_map_k4v_size_n: u32,
+
+    /// ngram-map-k4v: ngram size M, length of the draft m-gram
+    #[arg(long, default_value_t = 48)]
+    spec_ngram_map_k4v_size_m: u32,
+
+    /// ngram-map-k4v: minimum hits at ngram lookup for a draft
+    #[arg(long, default_value_t = 1)]
+    spec_ngram_map_k4v_min_hits: u32,
+
     /// Fraction of the KV pool held back as admission headroom, in [0, 1)
     #[arg(long, default_value_t = xabe_sched::config::DEFAULT_WATERMARK_FRACTION)]
     watermark: f64,
@@ -208,6 +268,24 @@ fn expand_two_letter_shorts(args: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// llama.cpp's range for every `--spec-ngram-*` size argument.
+fn ngram_size_in_range(value: u32, flag: &str) -> Result<(), String> {
+    if value == 0 || value > 1024 {
+        return Err(format!(
+            "{flag} {value} must be between 1 and 1024 inclusive"
+        ));
+    }
+    Ok(())
+}
+
+/// llama.cpp's bound for every `--spec-ngram-*-min-hits` argument.
+fn min_hits_at_least_one(value: u32, flag: &str) -> Result<(), String> {
+    if value == 0 || value > u32::from(u16::MAX) {
+        return Err(format!("{flag} {value} must be between 1 and 65535"));
+    }
+    Ok(())
+}
+
 /// Resolve `--spec-type` and its family into the draft count the scheduler
 /// must budget for and the decoder a worker will run.
 fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
@@ -250,6 +328,81 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
                 Speculation::Ngram {
                     min: args.spec_ngram_min,
                     max: args.spec_ngram_max,
+                },
+            ))
+        }
+        SpecType::NgramSimple => {
+            ngram_size_in_range(args.spec_ngram_simple_size_n, "--spec-ngram-simple-size-n")?;
+            ngram_size_in_range(args.spec_ngram_simple_size_m, "--spec-ngram-simple-size-m")?;
+            min_hits_at_least_one(
+                args.spec_ngram_simple_min_hits,
+                "--spec-ngram-simple-min-hits",
+            )?;
+            Ok((
+                args.spec_ngram_simple_size_m,
+                Speculation::NgramSimple {
+                    size_n: args.spec_ngram_simple_size_n as usize,
+                },
+            ))
+        }
+        SpecType::NgramMod => {
+            ngram_size_in_range(args.spec_ngram_mod_n_match, "--spec-ngram-mod-n-match")?;
+            // llama.cpp allows 0 for both (and n-min > n-max): n-max 0 simply
+            // never drafts, which --spec-type none states outright.
+            if args.spec_ngram_mod_n_min > 1024 {
+                return Err(format!(
+                    "--spec-ngram-mod-n-min {} must be between 0 and 1024 inclusive",
+                    args.spec_ngram_mod_n_min
+                ));
+            }
+            if args.spec_ngram_mod_n_max == 0 || args.spec_ngram_mod_n_max > 1024 {
+                return Err(format!(
+                    "--spec-ngram-mod-n-max {} must be between 1 and 1024 inclusive \
+                     (0 drafts nothing; use --spec-type none instead)",
+                    args.spec_ngram_mod_n_max
+                ));
+            }
+            Ok((
+                args.spec_ngram_mod_n_max,
+                Speculation::NgramMod {
+                    n_match: args.spec_ngram_mod_n_match as usize,
+                    n_min: args.spec_ngram_mod_n_min as usize,
+                },
+            ))
+        }
+        SpecType::NgramMapK => {
+            ngram_size_in_range(args.spec_ngram_map_k_size_n, "--spec-ngram-map-k-size-n")?;
+            ngram_size_in_range(args.spec_ngram_map_k_size_m, "--spec-ngram-map-k-size-m")?;
+            min_hits_at_least_one(
+                args.spec_ngram_map_k_min_hits,
+                "--spec-ngram-map-k-min-hits",
+            )?;
+            Ok((
+                args.spec_ngram_map_k_size_m,
+                Speculation::NgramMapK {
+                    size_n: args.spec_ngram_map_k_size_n as usize,
+                    min_hits: args.spec_ngram_map_k_min_hits as u16,
+                },
+            ))
+        }
+        SpecType::NgramMapK4v => {
+            ngram_size_in_range(
+                args.spec_ngram_map_k4v_size_n,
+                "--spec-ngram-map-k4v-size-n",
+            )?;
+            ngram_size_in_range(
+                args.spec_ngram_map_k4v_size_m,
+                "--spec-ngram-map-k4v-size-m",
+            )?;
+            min_hits_at_least_one(
+                args.spec_ngram_map_k4v_min_hits,
+                "--spec-ngram-map-k4v-min-hits",
+            )?;
+            Ok((
+                args.spec_ngram_map_k4v_size_m,
+                Speculation::NgramMapK4v {
+                    size_n: args.spec_ngram_map_k4v_size_n as usize,
+                    min_hits: args.spec_ngram_map_k4v_min_hits as u16,
                 },
             ))
         }
@@ -408,6 +561,28 @@ fn main() -> std::process::ExitCode {
                 sched.draft_tokens_per_step(),
                 args.spec_ngram_min,
                 args.spec_ngram_max
+            ),
+            SpecType::NgramSimple => format!(
+                "{} ngram-simple drafts from {}-token lookups",
+                sched.draft_tokens_per_step(),
+                args.spec_ngram_simple_size_n
+            ),
+            SpecType::NgramMod => format!(
+                "{} ngram-mod drafts from {}-token lookups (n-min {})",
+                sched.draft_tokens_per_step(),
+                args.spec_ngram_mod_n_match,
+                args.spec_ngram_mod_n_min
+            ),
+            SpecType::NgramMapK => format!(
+                "{} ngram-map-k drafts from {}-token keys",
+                sched.draft_tokens_per_step(),
+                args.spec_ngram_map_k_size_n
+            ),
+            SpecType::NgramMapK4v => format!(
+                "{} ngram-map-k4v drafts from {}-token keys (min hits {})",
+                sched.draft_tokens_per_step(),
+                args.spec_ngram_map_k4v_size_n,
+                args.spec_ngram_map_k4v_min_hits
             ),
             SpecType::DraftMtp => format!(
                 "{} tokens per step from the trained MTP head",
@@ -613,6 +788,10 @@ mod tests {
             match spec {
                 SpecType::None => "none",
                 SpecType::Ngram => "ngram",
+                SpecType::NgramSimple => "ngram-simple",
+                SpecType::NgramMod => "ngram-mod",
+                SpecType::NgramMapK => "ngram-map-k",
+                SpecType::NgramMapK4v => "ngram-map-k4v",
                 SpecType::DraftMtp => "draft-mtp",
                 SpecType::SpecDflash => "spec-dflash",
             },
@@ -682,6 +861,130 @@ mod tests {
         let mut wide = args(SpecType::Ngram);
         wide.spec_ngram_max = wide.total_context as usize;
         assert!(resolve_speculation(&wide).is_err());
+    }
+
+    #[test]
+    fn the_llama_cpp_ngram_variants_resolve_with_their_defaults() {
+        // The tuple's first element is what the scheduler budgets per step:
+        // the drafter's own cap (size-m or n-max), exactly as llama.cpp
+        // defaults them.
+        assert_eq!(
+            resolve_speculation(&args(SpecType::NgramSimple)),
+            Ok((48, Speculation::NgramSimple { size_n: 12 }))
+        );
+        assert_eq!(
+            resolve_speculation(&args(SpecType::NgramMod)),
+            Ok((
+                64,
+                Speculation::NgramMod {
+                    n_match: 24,
+                    n_min: 48
+                }
+            ))
+        );
+        assert_eq!(
+            resolve_speculation(&args(SpecType::NgramMapK)),
+            Ok((
+                48,
+                Speculation::NgramMapK {
+                    size_n: 12,
+                    min_hits: 1
+                }
+            ))
+        );
+        assert_eq!(
+            resolve_speculation(&args(SpecType::NgramMapK4v)),
+            Ok((
+                48,
+                Speculation::NgramMapK4v {
+                    size_n: 12,
+                    min_hits: 1
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn the_ngram_variant_flags_enforce_llama_cpp_ranges() {
+        let mut bad = args(SpecType::NgramSimple);
+        bad.spec_ngram_simple_size_n = 0;
+        assert!(resolve_speculation(&bad).is_err());
+        let mut bad = args(SpecType::NgramSimple);
+        bad.spec_ngram_simple_size_m = 1025;
+        assert!(resolve_speculation(&bad).is_err());
+        let mut bad = args(SpecType::NgramMod);
+        bad.spec_ngram_mod_n_match = 0;
+        assert!(resolve_speculation(&bad).is_err());
+        let mut bad = args(SpecType::NgramMod);
+        bad.spec_ngram_mod_n_min = 1025;
+        assert!(resolve_speculation(&bad).is_err());
+        let mut bad = args(SpecType::NgramMod);
+        bad.spec_ngram_mod_n_max = 0;
+        assert!(resolve_speculation(&bad).is_err());
+        let mut bad = args(SpecType::NgramMapK);
+        bad.spec_ngram_map_k_min_hits = 0;
+        assert!(resolve_speculation(&bad).is_err());
+        let mut bad = args(SpecType::NgramMapK4v);
+        bad.spec_ngram_map_k4v_size_n = 2000;
+        assert!(resolve_speculation(&bad).is_err());
+    }
+
+    #[test]
+    fn the_ngram_variant_flags_spell_exactly_like_llama_cpp() {
+        let parsed = Args::parse_from([
+            "--spec-type",
+            "ngram-mod",
+            "--spec-ngram-mod-n-match",
+            "16",
+            "--spec-ngram-mod-n-min",
+            "8",
+            "--spec-ngram-mod-n-max",
+            "32",
+        ]);
+        assert_eq!(
+            resolve_speculation(&parsed),
+            Ok((
+                32,
+                Speculation::NgramMod {
+                    n_match: 16,
+                    n_min: 8
+                }
+            ))
+        );
+        let parsed = Args::parse_from([
+            "--spec-type",
+            "ngram-map-k4v",
+            "--spec-ngram-map-k4v-size-n",
+            "8",
+            "--spec-ngram-map-k4v-size-m",
+            "24",
+            "--spec-ngram-map-k4v-min-hits",
+            "2",
+        ]);
+        assert_eq!(
+            resolve_speculation(&parsed),
+            Ok((
+                24,
+                Speculation::NgramMapK4v {
+                    size_n: 8,
+                    min_hits: 2
+                }
+            ))
+        );
+        let parsed = Args::parse_from([
+            "--spec-type",
+            "ngram-simple",
+            "--spec-ngram-simple-size-n",
+            "6",
+            "--spec-ngram-simple-size-m",
+            "12",
+            "--spec-ngram-simple-min-hits",
+            "3",
+        ]);
+        assert_eq!(
+            resolve_speculation(&parsed),
+            Ok((12, Speculation::NgramSimple { size_n: 6 }))
+        );
     }
 
     #[test]
