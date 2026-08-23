@@ -5,13 +5,13 @@ use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::chat::{
     Content, Conversation, Turn, image_misplaced, unsupported_role, unsupported_tool_choice,
 };
 use super::error::{ApiError, Dialect, parse_body};
-use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
+use super::generate::{Chunk, Collected, Finish, Generation, GenerationSpec, resolve_sampling};
 use super::tools::{ToolCallParser, ToolDefinition};
 use super::{AppState, sse_named};
 
@@ -174,6 +174,54 @@ fn stop_reason(finish: &Finish, tool_calls: usize) -> &'static str {
     }
 }
 
+/// The `content` array of a non-streaming message.
+///
+/// Split out from the handler so the block-shaping rules are testable without
+/// a live generation; they are the rules clients actually break on.
+fn content_blocks(collected: &Collected, request_id: u64) -> Vec<Value> {
+    let mut content = Vec::with_capacity(2 + collected.tool_calls.len());
+    if !collected.reasoning.is_empty() {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": collected.reasoning,
+            "signature": thinking_signature(request_id),
+        }));
+    }
+    // Only when it has something in it. An empty text block is not something
+    // the real API emits, and a client that replays this message into its
+    // next turn gets a 400 for it — text blocks must be non-empty on the way
+    // in. Cutting off mid-thought produced exactly that: a thinking block
+    // followed by an empty text block.
+    if !collected.text.is_empty() {
+        content.push(json!({ "type": "text", "text": collected.text }));
+    }
+    for (index, call) in collected.tool_calls.iter().enumerate() {
+        content.push(json!({
+            "type": "tool_use",
+            "id": tool_use_id(request_id, index),
+            "name": call.name,
+            "input": call.arguments,
+        }));
+    }
+    // Nothing at all is degenerate, but `content: []` is worse than one empty
+    // block for clients that index the first one.
+    if content.is_empty() {
+        content.push(json!({ "type": "text", "text": "" }));
+    }
+    content
+}
+
+/// The signature a served `thinking` block carries.
+///
+/// The real API signs these so a replayed block can be verified as its own.
+/// There is nothing to verify here, but the field may not be empty: the spec
+/// requires a non-empty signature, clients replay the block unmodified, and a
+/// validating one rejects `""`. So it is opaque, stable for a message, and
+/// ignored on the way back in.
+fn thinking_signature(request_id: u64) -> String {
+    format!("xabe-unverified-{request_id}")
+}
+
 /// The id a served `tool_use` block carries.
 fn tool_use_id(request_id: u64, index: usize) -> String {
     format!("toolu_{request_id}_{index}")
@@ -237,27 +285,7 @@ pub(crate) async fn messages(
     if !request.stream {
         let collected = generation.collect().await?;
         let finish = generation.finish();
-        let mut content = Vec::with_capacity(2 + collected.tool_calls.len());
-        if !collected.reasoning.is_empty() {
-            // The real API signs thinking blocks so they can be replayed;
-            // there is nothing to verify here, and clients that round-trip a
-            // block still need the field present.
-            content.push(
-                json!({ "type": "thinking", "thinking": collected.reasoning, "signature": "" }),
-            );
-        }
-        if !collected.text.is_empty() || collected.tool_calls.is_empty() {
-            content.push(json!({ "type": "text", "text": collected.text }));
-        }
-        let request_id = generation.request_id();
-        for (index, call) in collected.tool_calls.iter().enumerate() {
-            content.push(json!({
-                "type": "tool_use",
-                "id": tool_use_id(request_id, index),
-                "name": call.name,
-                "input": call.arguments,
-            }));
-        }
+        let content = content_blocks(&collected, generation.request_id());
         return Ok(axum::Json(json!({
             "id": id,
             "type": "message",
@@ -309,6 +337,20 @@ pub(crate) async fn messages(
                 // streams as one self-contained tool_use block: start, one
                 // input_json_delta with the whole input, stop.
                 if open.take().is_some() {
+                    // Anthropic signs a thinking block on the way out, as a
+                    // `signature_delta` just before the block closes. Clients
+                    // accumulate it and replay the block with it attached, so a
+                    // block that closes without one arrives back unsigned.
+                    if open == Some("thinking") {
+                        yield Ok(sse_named("content_block_delta", &json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": thinking_signature(request_id),
+                            },
+                        })));
+                    }
                     yield Ok(sse_named("content_block_stop", &json!({
                         "type": "content_block_stop", "index": index,
                     })));
@@ -343,6 +385,20 @@ pub(crate) async fn messages(
             };
             if open != Some(kind) {
                 if open.is_some() {
+                    // Anthropic signs a thinking block on the way out, as a
+                    // `signature_delta` just before the block closes. Clients
+                    // accumulate it and replay the block with it attached, so a
+                    // block that closes without one arrives back unsigned.
+                    if open == Some("thinking") {
+                        yield Ok(sse_named("content_block_delta", &json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "signature_delta",
+                                "signature": thinking_signature(request_id),
+                            },
+                        })));
+                    }
                     yield Ok(sse_named("content_block_stop", &json!({
                         "type": "content_block_stop", "index": index,
                     })));
@@ -376,6 +432,20 @@ pub(crate) async fn messages(
             open = Some("text");
         }
         if open.is_some() {
+            // Anthropic signs a thinking block on the way out, as a
+            // `signature_delta` just before the block closes. Clients
+            // accumulate it and replay the block with it attached, so a
+            // block that closes without one arrives back unsigned.
+            if open == Some("thinking") {
+                yield Ok(sse_named("content_block_delta", &json!({
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "signature_delta",
+                        "signature": thinking_signature(request_id),
+                    },
+                })));
+            }
             yield Ok(sse_named("content_block_stop", &json!({
                 "type": "content_block_stop", "index": index,
             })));
@@ -431,6 +501,79 @@ pub(crate) async fn count_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::tools::ParsedToolCall;
+
+    fn collected(reasoning: &str, text: &str, calls: Vec<ParsedToolCall>) -> Collected {
+        Collected {
+            reasoning: reasoning.to_owned(),
+            text: text.to_owned(),
+            tool_calls: calls,
+        }
+    }
+
+    fn call(name: &str) -> ParsedToolCall {
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("city".to_owned(), Value::String("Paris".to_owned()));
+        ParsedToolCall {
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn a_reply_cut_off_mid_thought_carries_no_empty_text_block() {
+        // The regression. Hitting max_tokens while still thinking used to
+        // emit a thinking block plus `{"type":"text","text":""}`. A client
+        // that replays that assistant turn is sending an empty text block
+        // back, which the API rejects — so the harness breaks on its *next*
+        // request, not this one.
+        let blocks = content_blocks(&collected("still thinking", "", vec![]), 7);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected only the thinking block: {blocks:?}"
+        );
+        assert_eq!(blocks[0]["type"], "thinking");
+    }
+
+    #[test]
+    fn a_thinking_block_is_signed_and_the_signature_is_never_empty() {
+        // The spec requires a non-empty signature and clients replay the
+        // block unmodified; a validating one rejects "".
+        let blocks = content_blocks(&collected("thought", "answer", vec![]), 7);
+        let signature = blocks[0]["signature"]
+            .as_str()
+            .expect("signature is a string");
+        assert!(
+            !signature.is_empty(),
+            "thinking blocks must carry a signature"
+        );
+    }
+
+    #[test]
+    fn tool_calls_follow_the_text_and_do_not_drag_an_empty_block_with_them() {
+        let blocks = content_blocks(&collected("", "", vec![call("get_weather")]), 7);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["input"]["city"], "Paris");
+    }
+
+    #[test]
+    fn a_reply_with_nothing_in_it_still_has_one_block() {
+        // `content: []` breaks clients that index the first block, so the
+        // degenerate case keeps one.
+        let blocks = content_blocks(&collected("", "", vec![]), 7);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+    }
+
+    #[test]
+    fn stop_reason_is_tool_use_only_when_a_call_was_made() {
+        assert_eq!(stop_reason(&Finish::EndOfTurn, 1), "tool_use");
+        assert_eq!(stop_reason(&Finish::EndOfTurn, 0), "end_turn");
+        assert_eq!(stop_reason(&Finish::Length, 1), "max_tokens");
+    }
 
     fn request(body: &str) -> MessagesRequest {
         serde_json::from_str(body).expect("test request should parse")

@@ -121,7 +121,15 @@ fn sse_json<T: Serialize>(value: &T) -> Event {
 /// A named SSE event carrying a JSON payload, as the Anthropic and Responses
 /// streams use.
 fn sse_named<T: Serialize>(name: &str, value: &T) -> Event {
-    sse_json(value).event(name)
+    // `event:` first, then `data:`. The SSE grammar accumulates both until
+    // the blank line, so either order dispatches correctly through a
+    // conforming parser — but every published example of these two streams
+    // puts the name first, and clients that scan for it rather than parse
+    // are common enough that matching the wire format costs nothing.
+    Event::default()
+        .event(name)
+        .json_data(value)
+        .expect("server-owned response types serialize")
 }
 
 async fn health() -> &'static str {

@@ -78,6 +78,8 @@ struct ResponsesRequest {
     #[serde(default)]
     tool_choice: Option<Value>,
     #[serde(default)]
+    parallel_tool_calls: Option<bool>,
+    #[serde(default)]
     previous_response_id: Option<String>,
     #[serde(default)]
     temperature: Option<f32>,
@@ -273,6 +275,15 @@ struct Envelope {
     id: String,
     created: u64,
     model: String,
+    /// Echoed back verbatim. `tools`, `tool_choice` and `parallel_tool_calls`
+    /// are *required* members of the Responses object — the official SDK
+    /// models them as non-optional, so a response without them fails
+    /// validation before a caller ever sees the output. They were missing,
+    /// which made this endpoint unusable from `openai-python` regardless of
+    /// what the model produced.
+    tools: Value,
+    tool_choice: Value,
+    parallel_tool_calls: bool,
 }
 
 impl Envelope {
@@ -334,6 +345,9 @@ impl Envelope {
             "status": status,
             "model": self.model,
             "output": output,
+            "parallel_tool_calls": self.parallel_tool_calls,
+            "tool_choice": self.tool_choice,
+            "tools": self.tools,
             "incomplete_details": incomplete,
             "instructions": Value::Null,
             "store": false,
@@ -405,6 +419,15 @@ pub(crate) async fn create(
         id: format!("resp_{}", generation.request_id()),
         created: unix_now(),
         model: state.model_name(request.model),
+        // Echoed as sent. `tool_choice` defaults to "auto" and
+        // `parallel_tool_calls` to true, matching what the API does when the
+        // caller omits them — several tool calls in one turn is a shape this
+        // server does serve.
+        tools: Value::Array(request.tools.unwrap_or_default()),
+        tool_choice: request
+            .tool_choice
+            .unwrap_or_else(|| Value::String("auto".to_owned())),
+        parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
     };
 
     if !request.stream {
@@ -628,6 +651,46 @@ pub(crate) async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three fields the official SDK models as non-optional.
+    #[test]
+    fn the_response_object_carries_every_field_the_sdk_requires() {
+        // These were missing, and their absence is not a soft failure: the
+        // SDK validates the object before a caller sees any output, so every
+        // call through `openai-python` failed regardless of what was served.
+        let envelope = Envelope {
+            id: "resp_1".to_owned(),
+            created: 0,
+            model: "m".to_owned(),
+            tools: Value::Array(vec![]),
+            tool_choice: Value::String("auto".to_owned()),
+            parallel_tool_calls: true,
+        };
+        let object = envelope.object("completed", Value::Null, vec![], Value::Null);
+        for field in [
+            "id",
+            "created_at",
+            "model",
+            "object",
+            "output",
+            "parallel_tool_calls",
+            "tool_choice",
+            "tools",
+        ] {
+            assert!(
+                object.get(field).is_some(),
+                "missing required field `{field}`"
+            );
+        }
+        assert_eq!(object["object"], "response");
+    }
+
+    #[test]
+    fn an_incomplete_response_says_why_it_is_incomplete() {
+        let (status, incomplete) = status_of(&Finish::Length);
+        assert_eq!(status, "incomplete");
+        assert_eq!(incomplete["reason"], "max_output_tokens");
+    }
 
     fn request(body: &str) -> ResponsesRequest {
         serde_json::from_str(body).expect("test request should parse")
