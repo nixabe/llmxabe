@@ -9,6 +9,7 @@
 |   cache-aware router  -- score(w) = a*prefix_match(w)        |
 |            |                       - b*queued_tokens(w)      |
 |            |                       - c*kv_utilization(w)     |
+|            |                       - d*resident_sequences(w) |
 |      +-----+-----+                                           |
 |      v     v     v                                           |
 |   worker0 worker1 worker2   each: own CUDA context, stream,  |
@@ -155,13 +156,34 @@ Graph capture also imposes a constraint the safe Rust wrapper does not survive
 Requests are scored per worker:
 
 ```
-score(w) = a * prefix_match(w) - b * queued_tokens(w) - c * kv_utilization(w)
+score(w) = a * prefix_match(w)
+         - b * queued_tokens(w)
+         - c * kv_utilization(w)
+         - d * resident_sequences(w)
 ```
 
 Cache affinity pulls a request toward the worker that already holds its prefix;
-the load terms push back when that worker is saturated. The coefficients are
-tuning parameters, not constants — they trade time-to-first-token against
-inter-token latency, and the right balance depends on traffic shape.
+the load terms push back when that worker is busy. The coefficients are tuning
+parameters, not constants — they trade time-to-first-token against inter-token
+latency, and the right balance depends on traffic shape.
+
+**`d` is what balances, and the first three terms did not.** Queued tokens
+count work scheduled but not yet computed, so a sequence past prefill and into
+decode contributes almost nothing, and KV utilization moves too slowly to
+matter at the context sizes one card holds. Sibling agents sharing a system
+prompt therefore all scored highest on whichever worker warmed it first and
+piled onto that card while the others idled. `resident_sequences` counts
+requests — waiting and running alike, since a burst that arrives together has
+yet to run anything.
+
+It is a raw count rather than a fraction of slot capacity, which is the one
+place the router departs from normalizing its inputs. Normalizing would make
+one sequence worth `1 / slots`, so a larger `--slots-per-worker` would shrink
+the term back under cache affinity and the balance would silently depend on an
+unrelated flag. With `d` above `a + c`, one extra resident sequence outweighs
+any prefix and KV advantage: the least-loaded worker wins, and affinity breaks
+ties between equally loaded ones. `RouterConfig::balances_before_it_prefers_cache`
+states that relationship, and a hand-tuned config is free to fail it.
 
 **Migration on cold hit.** When the best-matching worker is saturated, the
 prefix is looked up in the host tree, copied to a less-loaded worker, and only

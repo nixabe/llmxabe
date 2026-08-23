@@ -303,6 +303,17 @@ impl Worker {
         f64::from(used) / f64::from(total)
     }
 
+    /// Sequences assigned to this worker and not yet finished.
+    ///
+    /// Waiting and running both, because both will occupy a decode slot. This
+    /// is what the router balances on: [`Self::queued_tokens`] charges a
+    /// waiting request a whole token budget but a resident decoding one only
+    /// `tokens_per_decode_step`, so on its own it is nearly blind to a card
+    /// that is already busy generating.
+    pub fn resident_sequences(&self) -> u32 {
+        (self.scheduler.waiting_len() + self.scheduler.running_len()) as u32
+    }
+
     /// Tokens scheduled but not yet computed.
     ///
     /// Approximated as one step's worth of budget per running request, which
@@ -327,6 +338,7 @@ impl Worker {
             matched_tokens,
             queued_tokens: self.queued_tokens(),
             kv_utilization: self.kv_utilization(),
+            resident_sequences: self.resident_sequences(),
             can_admit: self.scheduler.can_admit(req),
         }
     }

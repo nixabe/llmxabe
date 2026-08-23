@@ -8,21 +8,40 @@
 //! The scoring function is
 //!
 //! ```text
-//! score(w) = a * prefix_match(w) - b * queue_pressure(w) - c * kv_utilization(w)
+//! score(w) = a * prefix_match(w)
+//!          - b * queue_pressure(w)
+//!          - c * kv_utilization(w)
+//!          - d * resident_sequences(w)
 //! ```
 //!
 //! Cache affinity pulls a request toward the worker holding its prefix; the
-//! load terms push back when that worker is saturated. Without the load terms
-//! a popular prefix would pin all traffic to one card while two sit idle.
+//! load terms push back when that worker is busy. Without the load terms a
+//! popular prefix would pin all traffic to one card while two sit idle.
+//!
+//! That is not hypothetical, and the first three terms did not prevent it.
+//! Queue pressure counts work *scheduled but not yet computed*, so a sequence
+//! that has finished prefill and is decoding barely registers, and KV
+//! utilization moves too slowly to matter at the context sizes one card
+//! holds. Three agents sharing a system prompt therefore piled onto whichever
+//! worker warmed it first, and two cards idled. `resident_sequences` is the
+//! term that actually balances: it counts requests.
 
 use crate::worker::WorkerId;
 
 /// Weights for the routing score.
 ///
-/// All three inputs are normalized to roughly `[0, 1]` before weighting (see
-/// [`WorkerLoad`]), which is what makes these coefficients comparable to each
-/// other. Scoring raw token counts against a utilization fraction would make
-/// the weights carry units and the balance impossible to reason about.
+/// The cache and load *fractions* are normalized to roughly `[0, 1]` before
+/// weighting (see [`WorkerLoad`]), which is what makes those coefficients
+/// comparable to each other. Scoring raw token counts against a utilization
+/// fraction would make the weights carry units and the balance impossible to
+/// reason about.
+///
+/// `residency_weight` is the deliberate exception: it multiplies a raw count
+/// of sequences, not a fraction. Normalizing it by the slot count would make
+/// the guarantee below depend on `--slots-per-worker`, since one sequence
+/// would be worth `1 / slots` and a large slot count would shrink it back
+/// under cache affinity. A raw count keeps one sequence worth the same
+/// everywhere.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RouterConfig {
     /// `a` — reward for holding a prefix of the incoming request.
@@ -31,6 +50,8 @@ pub struct RouterConfig {
     pub queue_weight: f64,
     /// `c` — penalty for a nearly-full KV pool.
     pub kv_weight: f64,
+    /// `d` — penalty per sequence already assigned to this worker.
+    pub residency_weight: f64,
 }
 
 impl RouterConfig {
@@ -51,7 +72,32 @@ impl RouterConfig {
             prefix_weight: 1.0,
             queue_weight: 0.3,
             kv_weight: 0.5,
+            residency_weight: 2.0,
         }
+    }
+
+    /// The most any combination of the other terms can favour one worker
+    /// over another.
+    ///
+    /// `prefix_fraction` and `kv_utilization` are both bounded by `[0, 1]`,
+    /// so their weights bound the swing. Queue pressure is unbounded above
+    /// but only ever *subtracts*, so it cannot help a busier worker win.
+    ///
+    /// `residency_weight` is set above this on purpose: one extra resident
+    /// sequence must outweigh a perfect cache hit, which is what makes
+    /// [`Self::balances_before_it_prefers_cache`] hold.
+    pub fn max_preference_swing(&self) -> f64 {
+        self.prefix_weight + self.kv_weight
+    }
+
+    /// Whether these weights balance load before honouring cache affinity.
+    ///
+    /// True when a worker holding one fewer sequence outranks a busier one
+    /// regardless of prefix and KV state, leaving affinity to break ties
+    /// between equally loaded workers. [`Self::balanced`] satisfies it; a
+    /// hand-tuned config need not, and is free not to.
+    pub fn balances_before_it_prefers_cache(&self) -> bool {
+        self.residency_weight > self.max_preference_swing()
     }
 }
 
@@ -76,6 +122,18 @@ pub struct WorkerLoad {
     pub queued_tokens: u32,
     /// Fraction of the attention block pool currently in use, in `[0, 1]`.
     pub kv_utilization: f64,
+    /// Sequences assigned to this worker and not yet finished — waiting and
+    /// running alike.
+    ///
+    /// Both count, and the waiting ones matter most: requests that arrive
+    /// together all see a running count of zero, so counting only the running
+    /// batch would let a burst of sibling agents pile onto one card before
+    /// any of them started.
+    ///
+    /// This is a count rather than a fraction of capacity, which is what lets
+    /// the router balance the same way whatever `--slots-per-worker` is set
+    /// to. See [`RouterConfig`].
+    pub resident_sequences: u32,
     /// Whether this worker can accept the request at all.
     ///
     /// A worker that cannot admit is excluded outright, regardless of how
@@ -116,6 +174,7 @@ impl WorkerLoad {
         cfg.prefix_weight * self.prefix_fraction(prompt_tokens)
             - cfg.queue_weight * self.queue_pressure(token_budget)
             - cfg.kv_weight * self.kv_utilization
+            - cfg.residency_weight * f64::from(self.resident_sequences)
     }
 }
 
@@ -201,7 +260,16 @@ mod tests {
             matched_tokens: matched,
             queued_tokens: queued,
             kv_utilization: kv,
+            resident_sequences: 0,
             can_admit: true,
+        }
+    }
+
+    /// A worker already serving `resident` sequences.
+    fn busy(id: u32, matched: u32, resident: u32) -> WorkerLoad {
+        WorkerLoad {
+            resident_sequences: resident,
+            ..load(id, matched, 0, 0.0)
         }
     }
 
@@ -271,6 +339,106 @@ mod tests {
             WorkerId(1),
             "admission is a hard constraint, not a preference"
         );
+    }
+
+    #[test]
+    fn three_agents_sharing_a_prompt_land_on_three_cards() {
+        // The regression this term exists for. Three sibling agents share a
+        // system prompt, so whichever worker warms it first holds a near
+        // perfect prefix for the other two. Before `resident_sequences` they
+        // all routed to that one card and two sat idle.
+        let cfg = RouterConfig::balanced();
+        let mut resident = [0u32; 3];
+        let mut chosen = Vec::new();
+        for _ in 0..3 {
+            let loads: Vec<WorkerLoad> = (0..3)
+                .map(|i| {
+                    // Worker 0 holds the whole shared prefix; the others hold
+                    // nothing at all.
+                    let matched = if i == 0 { 9_500 } else { 0 };
+                    busy(i, matched, resident[i as usize])
+                })
+                .collect();
+            let r = route(&cfg, &loads, 10_000, BUDGET).unwrap();
+            resident[r.worker.0 as usize] += 1;
+            chosen.push(r.worker);
+        }
+        assert_eq!(
+            chosen,
+            vec![WorkerId(0), WorkerId(1), WorkerId(2)],
+            "each agent must take an idle card, not pile onto the warm one"
+        );
+        assert_eq!(resident, [1, 1, 1], "one sequence per worker");
+    }
+
+    #[test]
+    fn a_decoding_sequence_repels_as_much_as_a_waiting_one() {
+        // Queue pressure charges a waiting request a whole token budget and a
+        // resident decoding one a single token, so on its own it is blind to
+        // a card that is busy generating. Residency must not be.
+        let cfg = RouterConfig::balanced();
+        let decoding = busy(0, 0, 1).score(&cfg, 10_000, BUDGET);
+        let waiting = WorkerLoad {
+            queued_tokens: BUDGET,
+            ..busy(1, 0, 1)
+        }
+        .score(&cfg, 10_000, BUDGET);
+        let idle = busy(2, 0, 0).score(&cfg, 10_000, BUDGET);
+        assert!(
+            idle > decoding,
+            "an idle worker must outrank a decoding one"
+        );
+        assert!(idle > waiting);
+    }
+
+    #[test]
+    fn cache_affinity_still_breaks_ties_between_equally_loaded_workers() {
+        // Balancing must not cost the prefix sharing the engine exists for.
+        // With load equal, the warm worker still wins.
+        let cfg = RouterConfig::balanced();
+        let loads = [busy(0, 0, 2), busy(1, 9_500, 2), busy(2, 0, 2)];
+        let r = route(&cfg, &loads, 10_000, BUDGET).unwrap();
+        assert_eq!(r.worker, WorkerId(1));
+        assert_eq!(r.matched_tokens, 9_500);
+    }
+
+    #[test]
+    fn one_extra_sequence_outweighs_any_cache_and_kv_advantage() {
+        // The dominance relationship `balanced()` is built on, checked at the
+        // adversarial extreme rather than assumed: perfect prefix and an empty
+        // pool on the busier worker, nothing and a full pool on the idler one.
+        let cfg = RouterConfig::balanced();
+        assert!(cfg.balances_before_it_prefers_cache());
+        let warm = WorkerLoad {
+            kv_utilization: 0.0,
+            ..busy(0, 10_000, 1)
+        };
+        let idle = WorkerLoad {
+            kv_utilization: 1.0,
+            ..busy(1, 0, 0)
+        };
+        let r = route(&cfg, &[warm, idle], 10_000, BUDGET).unwrap();
+        assert_eq!(r.worker, WorkerId(1));
+    }
+
+    #[test]
+    fn weights_that_do_not_dominate_are_reported_as_such() {
+        // The invariant is a property of the weights, not of the router, and a
+        // hand-tuned config is free to prefer cache over balance. It must say
+        // so rather than silently claiming to balance.
+        let cache_first = RouterConfig {
+            residency_weight: 0.1,
+            ..RouterConfig::balanced()
+        };
+        assert!(!cache_first.balances_before_it_prefers_cache());
+        let r = route(
+            &cache_first,
+            &[busy(0, 9_500, 1), busy(1, 0, 0)],
+            10_000,
+            BUDGET,
+        )
+        .unwrap();
+        assert_eq!(r.worker, WorkerId(0), "these weights keep the warm card");
     }
 
     #[test]
