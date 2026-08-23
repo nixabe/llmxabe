@@ -32,13 +32,24 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:$PATH
 
 # `--default-toolchain none` is deliberate: the toolchain is whatever
-# rust-toolchain.toml pins, and rustup installs it — with the components that
-# file names — on the first cargo invocation below. One pin, honoured
-# everywhere.
+# rust-toolchain.toml pins. One pin, honoured everywhere.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --no-modify-path --default-toolchain none
 
 WORKDIR /src
+
+# Install that pinned toolchain explicitly, from the pin alone and before the
+# source arrives. Leaving it to rustup's implicit auto-install on the first
+# `cargo` call builds here and fails elsewhere: auto-install is off under
+# RUSTUP_AUTO_INSTALL=0, it has varied across rustup versions, and where it
+# does not fire the build dies with "rustup could not choose a version of
+# cargo to run, because one wasn't specified explicitly, and no default is
+# configured" — which reads like a missing toolchain file rather than what it
+# is. The no-argument form reads rust-toolchain.toml, so the channel and its
+# components stay stated once. It is also a layer no source edit invalidates.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
+
 COPY . .
 
 # The release profile carries `debug = 1` so local profiling has symbols. An
