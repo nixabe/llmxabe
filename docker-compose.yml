@@ -1,0 +1,129 @@
+# llmxabe — one process, one worker per visible card, one shared prefix cache.
+#
+#   docker compose up --build          # build the image and serve
+#   docker compose logs -f             # preflight, then the serving banner
+#   curl localhost:8000/health
+#
+# Every value below can be overridden from a `.env` file beside this one, or
+# from the environment. The defaults are this project's own machine: three
+# Quadro RTX 8000 and the GGUF pair under /home/nixabe/llama.cpp/models.
+#
+# Nothing here is a benchmark claim. The measurements behind the `command:`
+# are in docs/BENCHMARKS.md, which is the only place numbers belong.
+
+name: llmxabe
+
+services:
+  llmxabe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llmxabe:latest
+    container_name: llmxabe
+
+    # The serving configuration this project measured; docs/DOCKER.md gives the
+    # reasoning flag by flag. Only -c, --max-tokens and --top-p differ from the
+    # binary's own defaults — the rest are spelled out so the shape being
+    # served is visible in `docker compose config` rather than implied.
+    #
+    # -c is the one that repays reading. --total-context and
+    # --slots-per-worker are *per worker*, and a worker divides its context
+    # across slots as prompt **plus** output. 405504 / 3 = 135168 per slot: a
+    # full 128K prompt (131072) with 4096 of output room. At the 393216
+    # default a slot gets 131072 *including* its output, and admission — which
+    # checks the whole sequence length, not the first chunk — refuses a
+    # literal 128K prompt rather than truncating it.
+    #
+    # --spec-type none is the measured choice at this shape, not an omission:
+    # every drafter loses at three concurrent slots and this context depth,
+    # and some do not fit in VRAM at all. See docs/BENCHMARKS.md.
+    command:
+      - --spec-type
+      - none
+      - -c
+      - "405504"
+      - -s
+      - "3"
+      - -tb
+      - "4096"
+      - -pc
+      - "4096"
+      - --max-tokens
+      - "4096"
+      - --temp
+      - "1.0"
+      - --top-p
+      - "0.95"
+      - --min-p
+      - "0.0"
+
+    environment:
+      # `environment:` wins over `env_file:`, so pinning the bind here keeps a
+      # stray LLMXABE_HOST in a .env from making the published port dead.
+      LLMXABE_HOST: 0.0.0.0
+      LLMXABE_PORT: "8000"
+      # Paths as seen inside the container, under the read-only mount below.
+      LLMXABE_MODEL: /models/${LLMXABE_MODEL_REL:-Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf}
+      # Vision. Setting this is what enables image input; a server started
+      # without it allocates nothing for the tower and serves text unchanged.
+      LLMXABE_MMPROJ: /models/${LLMXABE_MMPROJ_REL:-Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf}
+      # Model id reported by /v1/models and echoed back in responses.
+      LLMXABE_SERVED_MODEL_NAME: ${LLMXABE_SERVED_MODEL_NAME:-qwen3.6-35b-a3b}
+      RUST_BACKTRACE: "1"
+
+    # Listed without values on purpose: compose passes these through only when
+    # they are set on the host, and an unset key must stay unset. An empty
+    # LLMXABE_API_KEY would not mean "no key" — it would mean callers have to
+    # present an empty one.
+    #
+    #   LLMXABE_API_KEY   require Authorization: Bearer / x-api-key
+    #   LLMXABE_CACHE_RAM host RAM for pinned prefix snapshots, e.g. 8GiB
+    #   LLMXABE_DFLASH    path to a DFlash drafter GGUF (--spec-type spec-dflash)
+    env_file:
+      - path: .env
+        required: false
+
+    volumes:
+      # The models directory, read-only — the engine mmaps the GGUF and never
+      # writes here.
+      - ${LLMXABE_MODELS_DIR:-/home/nixabe/llama.cpp/models}:/models:ro
+
+    # Bound to loopback by default. A server with no --api-key accepts every
+    # caller, and its own preflight says so; set LLMXABE_BIND_ADDR=0.0.0.0
+    # only together with LLMXABE_API_KEY.
+    ports:
+      - "${LLMXABE_BIND_ADDR:-127.0.0.1}:${LLMXABE_HOST_PORT:-8000}:8000"
+
+    # One worker per device. To serve on a subset, replace `count` with
+    # `device_ids: ["0", "1"]`.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${LLMXABE_GPU_COUNT:-all}
+              capabilities: [gpu]
+
+    # Not boilerplate. The prefix cache's snapshot arenas are page-locked host
+    # memory — 7.23 GiB at the defaults — and cuMemHostAlloc fails against a
+    # default memlock limit. Rule 6 pre-allocates them at startup, so the
+    # failure at least lands during load rather than mid-serve.
+    ulimits:
+      memlock: -1
+
+    # /health is outside the authenticated routes, and the listener only binds
+    # after preflight, the weights, and the vision tower are all up — so a
+    # 200 here means the engine is serving, not merely that the process
+    # started. That takes about a minute once the GGUF is in the page cache
+    # and longer on a cold 32 GB read, so start_period is generous; the
+    # container reports `starting` until then, never `unhealthy`.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20m
+      start_interval: 10s
+
+    restart: unless-stopped
+    stop_grace_period: 30s

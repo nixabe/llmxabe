@@ -150,6 +150,17 @@ tool calling in every chat dialect. See
 [docs/TESTING.md](docs/TESTING.md) for what the serving checks do and do not
 cover.
 
+To serve it in a container instead, with the models directory mounted and
+images enabled:
+
+```sh
+docker compose up --build
+```
+
+That runs the configuration this project measured, on every card the NVIDIA
+container runtime exposes. What it sets and why is in
+[docs/DOCKER.md](docs/DOCKER.md).
+
 Every binary logs through `tracing` and takes `--log-level info | debug |
 trace`; the levels and their meanings are in
 [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -181,6 +192,7 @@ of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | [docs/TESTING.md](docs/TESTING.md) | Differential harness and numerics thresholds |
 | [docs/API.md](docs/API.md) | HTTP endpoints, streaming, authentication, and what they refuse |
 | [docs/CLI.md](docs/CLI.md) | The server binary's command-line arguments |
+| [docs/DOCKER.md](docs/DOCKER.md) | Serving from the container image, and what the compose defaults mean |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Environment, reference checkouts, and the llama.cpp baseline configuration |
 
 ## License

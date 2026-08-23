@@ -13,6 +13,10 @@ cargo run -p xabe-server -- [OPTIONS]
 version. This document explains what the options mean and why their defaults
 are what they are.
 
+The container image takes the same arguments — its entrypoint *is* this
+binary, and `command:` in `docker-compose.yml` is the argument list. See
+[DOCKER.md](DOCKER.md) for the configuration it ships with.
+
 ## Precedence
 
 For options that also read an environment variable, the order is:

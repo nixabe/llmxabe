@@ -1,0 +1,30 @@
+# The build context is the source tree and nothing else. `target/` alone is
+# tens of gigabytes and would be uploaded to the daemon on every build; the
+# builder stage keeps its own compilation cache in a BuildKit cache mount.
+/target
+/.git
+/.github
+
+# Never in an image, same as .gitignore: weights, goldens, benchmark output,
+# and the local design draft (AGENTS.md).
+*.gguf
+*.safetensors
+/goldens/
+/.golden/
+/bench-results/
+/qwen36-rust-engine-plan.md
+
+# Editor and agent scratch.
+/.omc
+/.claude
+**/*.rs.bk
+*.pdb
+
+# Nothing under here affects the binary, and a change to one of them should
+# not invalidate the build cache.
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Compose reads .env at run time; it must never be baked into a layer.
+/.env

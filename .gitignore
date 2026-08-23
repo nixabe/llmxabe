@@ -8,6 +8,10 @@
 # OMC session state
 .omc/
 
+# docker compose reads this for host paths and secrets; LLMXABE_API_KEY lives
+# here. See docs/DOCKER.md.
+/.env
+
 # Model weights and captured goldens are far too large to track.
 *.gguf
 *.safetensors
