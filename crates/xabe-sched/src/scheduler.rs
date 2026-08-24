@@ -64,6 +64,15 @@ pub struct Scheduler {
     running: Vec<TrackedRequest>,
 }
 
+/// How much of a step's token budget is held back for admission while a long
+/// prefill is in flight, as a divisor: a quarter of the budget.
+///
+/// Large enough that a newcomer's first chunk is real work rather than a
+/// token or two, small enough that the prompt already in flight keeps most of
+/// the step. It applies only when the waiting queue is non-empty, so it costs
+/// nothing in the throughput case.
+const ADMISSION_RESERVE_FRACTION: u32 = 4;
+
 impl Scheduler {
     pub fn new(config: SchedulerConfig, total_attention_blocks: u32) -> Self {
         Self {
@@ -313,13 +322,39 @@ impl Scheduler {
 
         let mut chunked_this_step = false;
 
+        // How much of this step to hold back so a waiting request can start.
+        //
+        // Zero when nothing is waiting, and that is the whole point: with an
+        // empty queue there is nobody to hold it for, the chunk below takes
+        // the entire budget exactly as it always did, and peak prefill
+        // throughput is untouched. The reserve only exists in the state that
+        // was pathological — a long prompt mid-flight and somebody queued
+        // behind it.
+        //
+        // Without it, a prefill longer than one step took the whole budget
+        // every step until it finished, so phase 3 never ran and a newcomer's
+        // time to first token became the *remaining* duration of whatever
+        // large prompt happened to be in flight. Measured on a 63K-token
+        // prompt, that was 0.0015 s idle against 29 s behind it.
+        let admission_reserve = if self.waiting.is_empty() {
+            0
+        } else {
+            self.config.token_budget() / ADMISSION_RESERVE_FRACTION
+        };
+
         // Phase 2: running requests still mid-prefill continue first.
         for req in self.running.iter_mut().filter(|r| !r.is_decode_ready()) {
             if chunked_this_step || budget == 0 {
                 break;
             }
             let remaining = req.prompt_tokens - req.computed_tokens;
-            let chunk = remaining.min(budget);
+            let chunk = remaining.min(budget.saturating_sub(admission_reserve));
+            if chunk == 0 {
+                // The reserve is all that is left. Leave it for phase 3
+                // rather than spend it here; this request continues next
+                // step, one step later than it would have.
+                break;
+            }
             batch.prefills.push(PrefillItem {
                 id: req.id,
                 tokens: chunk,
@@ -332,10 +367,13 @@ impl Scheduler {
         }
 
         // Phase 3: admit from the waiting queue, watermark-gated.
-        while !chunked_this_step
-            && budget > 0
-            && self.running.len() < self.config.max_concurrent_decodes() as usize
-        {
+        //
+        // Deliberately not gated on `chunked_this_step`. In the old
+        // accounting that flag was redundant — a truncated chunk had taken
+        // the whole budget, so `budget > 0` already ended the loop — and it
+        // is precisely what would stop the reserve above from ever being
+        // spent. One truncated admission still ends the loop, below.
+        while budget > 0 && self.running.len() < self.config.max_concurrent_decodes() as usize {
             let Some(candidate) = self.waiting.front() else {
                 break;
             };
@@ -363,10 +401,15 @@ impl Scheduler {
             });
             req.computed_tokens += chunk;
             budget -= chunk;
-            if chunk < remaining {
-                chunked_this_step = true;
-            }
+            let truncated = chunk < remaining;
             self.running.push(req);
+            if truncated {
+                // One partially-prefilled newcomer per step. Admitting a
+                // second would split the step between two prompts that both
+                // then need several more, which is slower for both than
+                // finishing one.
+                break;
+            }
         }
     }
 }
@@ -374,6 +417,100 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long prefill with nothing queued behind it must be unchanged.
+    #[test]
+    fn a_lone_long_prefill_still_takes_the_whole_step() {
+        // The throughput case, and the reason the reserve is conditional. No
+        // waiting request means no reserve, so the chunk is the full budget
+        // exactly as before this existed.
+        let mut s = sched(4096, 256, 3, 100_000);
+        s.admit(NewRequest {
+            id: RequestId(1),
+            prompt_tokens: 60_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        let mut batch = BatchDescription::default();
+        s.step_into(&mut batch); // first step admits it
+        for _ in 0..3 {
+            batch.prefills.clear();
+            s.step_into(&mut batch);
+            let chunk: u32 = batch.prefills.iter().map(|p| p.tokens).sum();
+            assert_eq!(chunk, 4096, "a lone prefill must keep the entire budget");
+        }
+    }
+
+    /// The regression: a newcomer must not wait out a 60K prompt.
+    #[test]
+    fn a_waiting_request_starts_while_a_long_prefill_is_still_running() {
+        let mut s = sched(4096, 256, 3, 100_000);
+        s.admit(NewRequest {
+            id: RequestId(1),
+            prompt_tokens: 60_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        let mut batch = BatchDescription::default();
+        s.step_into(&mut batch); // the long prompt starts
+
+        // Somebody queues behind it.
+        s.admit(NewRequest {
+            id: RequestId(2),
+            prompt_tokens: 100,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        batch.prefills.clear();
+        s.step_into(&mut batch);
+
+        let served: Vec<RequestId> = batch.prefills.iter().map(|p| p.id).collect();
+        assert!(
+            served.contains(&RequestId(2)),
+            "the newcomer must get tokens in the same step, not after 60K: {served:?}"
+        );
+        assert!(
+            served.contains(&RequestId(1)),
+            "the long prompt must keep progressing too"
+        );
+        let total: u32 = batch.prefills.iter().map(|p| p.tokens).sum();
+        assert!(
+            total <= 4096,
+            "the step must not overspend its budget: {total}"
+        );
+    }
+
+    #[test]
+    fn the_long_prefill_keeps_most_of_the_step_it_shares() {
+        // Sharing must not become starvation in the other direction.
+        let mut s = sched(4096, 256, 3, 100_000);
+        s.admit(NewRequest {
+            id: RequestId(1),
+            prompt_tokens: 60_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        let mut batch = BatchDescription::default();
+        s.step_into(&mut batch);
+        s.admit(NewRequest {
+            id: RequestId(2),
+            prompt_tokens: 60_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        batch.prefills.clear();
+        s.step_into(&mut batch);
+        let first = batch
+            .prefills
+            .iter()
+            .find(|p| p.id == RequestId(1))
+            .expect("still running");
+        assert_eq!(
+            first.tokens,
+            4096 - 4096 / 4,
+            "three quarters of the step stays with it"
+        );
+    }
 
     fn sched(
         token_budget: u32,
