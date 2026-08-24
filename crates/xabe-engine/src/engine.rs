@@ -249,16 +249,48 @@ impl Engine {
     }
 
     /// Load one model replica on every worker's configured device.
+    ///
+    /// All of them at once. The devices are independent — separate contexts,
+    /// separate arenas, separate PCIe paths — so loading them one after
+    /// another simply multiplied startup by the worker count.
+    ///
+    /// The larger win is on the host side, and it is why this matters even
+    /// though a single upload is not PCIe-bound: every worker reads the *same*
+    /// mapped file. Serially, each read raced the page cache and lost whenever
+    /// the model did not fit in what was left of it, so the file was pulled
+    /// off disk once per worker. Concurrently, the first fault brings a page
+    /// in and the others find it already there — one pass over the file
+    /// instead of three, which on a slow disk is the whole startup.
+    ///
+    /// A failure is reported after every worker has finished rather than at
+    /// the first error, because the scope must join them all regardless; the
+    /// lowest-numbered failing worker is the one named.
     pub fn bind_devices(
         &mut self,
         model_path: &Path,
         model: ModelConfig,
         serving: ServingConfig,
     ) -> Result<(), (WorkerId, RuntimeError)> {
-        for worker in &mut self.workers {
-            if let Err(error) = worker.bind_device(model_path, model.clone(), serving.clone()) {
-                return Err((worker.id(), error));
-            }
+        let outcomes: Vec<(WorkerId, Result<(), RuntimeError>)> = std::thread::scope(|scope| {
+            let threads: Vec<_> = self
+                .workers
+                .iter_mut()
+                .map(|worker| {
+                    let model = model.clone();
+                    let serving = serving.clone();
+                    scope.spawn(move || {
+                        let id = worker.id();
+                        (id, worker.bind_device(model_path, model, serving))
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().expect("a worker bind thread panicked"))
+                .collect()
+        });
+        for (id, outcome) in outcomes {
+            outcome.map_err(|error| (id, error))?;
         }
         Ok(())
     }

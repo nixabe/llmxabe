@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DriverError};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 use xabe_cuda::arena::{ALIGNMENT, Allocation, ArenaError, DeviceArena, memory_info};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::weights::{Directory, Role};
@@ -361,7 +361,10 @@ impl DeviceWeights {
         );
 
         let tensors = placements.len();
-        debug!(
+        // `info` rather than `debug`: this is the line that says where startup
+        // went. Below it, a load slow enough to look like a hang has nothing
+        // to point at without restarting under a raised log level.
+        info!(
             "device {}: {tensors} tensors, {:.3} GiB in {:.1} s ({:.2} GB/s); {:.3} GiB free after",
             ctx.ordinal(),
             bytes as f64 / (1u64 << 30) as f64,
