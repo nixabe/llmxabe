@@ -192,7 +192,25 @@ All three chat dialects take tool definitions and return structured calls:
 | --- | --- | --- |
 | `/v1/chat/completions` | `tools: [{type:"function", function:{name, description, parameters}}]` | `message.tool_calls`, finish reason `tool_calls`; streamed as one `delta.tool_calls` entry per call |
 | `/v1/messages` | `tools: [{name, description, input_schema}]` | `tool_use` content blocks, stop reason `tool_use`; streamed as a `tool_use` block with one `input_json_delta` |
-| `/v1/responses` | `tools: [{type:"function", name, description, parameters}]` | `function_call` output items; streamed with `response.function_call_arguments.delta` / `.done` |
+| `/v1/responses` | `tools: [{type:"function", name, description, parameters}]`, and `namespace` groups of them | `function_call` output items; streamed with `response.function_call_arguments.delta` / `.done` |
+
+A `/v1/responses` tool may also be a **`namespace`** group —
+`{type:"namespace", name, description, tools:[…]}` — which harnesses use to
+keep a large tool surface from spending its whole prompt budget on schemas.
+The group is flattened into its members, whose prompt names become
+`group.member` so two namespaces may each hold a `search`. A served call
+splits them back apart, because the wire format carries the namespace as its
+own field beside the name rather than as a prefix on it:
+
+```json
+{ "type": "function_call", "name": "list_orders", "namespace": "crm",
+  "call_id": "call_1", "arguments": "{}" }
+```
+
+A member's `defer_loading` is accepted and ignored: it exists so a schema can
+be fetched later by tool search, which this server does not implement. Every
+schema is offered up front instead — it costs prompt tokens and leaves the
+tool callable, which is the better failure.
 
 Results go back in the dialect's own shape — the `tool` role with
 `tool_call_id`, a `tool_result` content block, a `function_call_output`

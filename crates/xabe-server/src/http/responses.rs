@@ -10,6 +10,8 @@
 //! conversation reference it cannot resolve would answer without the context
 //! the caller believed it had sent.
 
+use std::collections::HashSet;
+
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::sse::{KeepAlive, Sse};
@@ -107,9 +109,25 @@ impl ResponsesRequest {
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .map(ToolDefinition::from_responses)
-            .collect::<Result<_, _>>()
+            .map(ToolDefinition::from_responses_entry)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|groups| groups.into_iter().flatten().collect())
             .map_err(|failure| ApiError::bad_request(DIALECT, failure))
+    }
+
+    /// The names of the `namespace` groups the caller offered.
+    ///
+    /// Kept so a served call can be split back into name and namespace; the
+    /// wire format carries them as separate fields.
+    fn namespaces(&self) -> HashSet<String> {
+        self.tools
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("namespace"))
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
     }
 
     fn thinking_enabled(&self, default: bool) -> bool {
@@ -284,6 +302,7 @@ struct Envelope {
     tools: Value,
     tool_choice: Value,
     parallel_tool_calls: bool,
+    namespaces: HashSet<String>,
 }
 
 impl Envelope {
@@ -322,19 +341,35 @@ impl Envelope {
         format!("call_{}_{index}", self.id.trim_start_matches("resp_"))
     }
 
+    /// Split a served call name into its tool name and namespace.
+    ///
+    /// Namespaced tools are offered to the model as `group.member` so their
+    /// names cannot collide, but the wire format wants the two apart.
+    fn split_namespace<'a>(&self, name: &'a str) -> (&'a str, Option<&'a str>) {
+        match name.split_once('.') {
+            Some((group, member)) if self.namespaces.contains(group) => (member, Some(group)),
+            _ => (name, None),
+        }
+    }
+
     fn function_call_item(&self, index: usize, call: &ParsedToolCall, status: &str) -> Value {
-        json!({
+        let (name, namespace) = self.split_namespace(&call.name);
+        let mut item = json!({
             "id": self.function_call_item_id(index),
             "type": "function_call",
             "status": status,
             "call_id": self.function_call_id(index),
-            "name": call.name,
+            "name": name,
             "arguments": if status == "in_progress" {
                 String::new()
             } else {
                 call.arguments_json()
             },
-        })
+        });
+        if let Some(namespace) = namespace {
+            item["namespace"] = Value::String(namespace.to_owned());
+        }
+        item
     }
 
     fn object(&self, status: &str, incomplete: Value, output: Vec<Value>, usage: Value) -> Value {
@@ -415,6 +450,9 @@ pub(crate) async fn create(
         tool_parser,
     };
     let mut generation = Generation::start(&state, spec, DIALECT)?;
+    // Read off the request before `model` is moved out of it.
+    let namespaces = request.namespaces();
+    let offered_tools = Value::Array(request.tools.clone().unwrap_or_default());
     let envelope = Envelope {
         id: format!("resp_{}", generation.request_id()),
         created: unix_now(),
@@ -423,7 +461,8 @@ pub(crate) async fn create(
         // `parallel_tool_calls` to true, matching what the API does when the
         // caller omits them — several tool calls in one turn is a shape this
         // server does serve.
-        tools: Value::Array(request.tools.unwrap_or_default()),
+        namespaces,
+        tools: offered_tools,
         tool_choice: request
             .tool_choice
             .unwrap_or_else(|| Value::String("auto".to_owned())),
@@ -652,6 +691,108 @@ pub(crate) async fn create(
 mod tests {
     use super::*;
 
+    fn namespaced_envelope() -> Envelope {
+        Envelope {
+            id: "resp_1".to_owned(),
+            created: 0,
+            model: "m".to_owned(),
+            tools: Value::Array(vec![]),
+            tool_choice: Value::String("auto".to_owned()),
+            parallel_tool_calls: true,
+            namespaces: HashSet::from(["crm".to_owned()]),
+        }
+    }
+
+    fn parsed(name: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_owned(),
+            arguments: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn a_namespace_group_is_flattened_into_its_member_tools() {
+        // Harnesses group tools to keep a big surface from spending its whole
+        // budget on schemas. Rejecting the group outright took every tool in
+        // it with them.
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": "hi",
+            "tools": [{
+                "type": "namespace",
+                "name": "crm",
+                "description": "CRM tools.",
+                "tools": [
+                    {"type": "function", "name": "get_customer", "parameters": {"type": "object"}},
+                    {"type": "function", "name": "list_orders", "defer_loading": true,
+                     "parameters": {"type": "object"}},
+                ],
+            }],
+        }))
+        .expect("request parses");
+        let tools = request.tool_definitions().expect("namespace flattens");
+        assert_eq!(tools.len(), 2, "both members must be offered");
+        assert_eq!(request.namespaces(), HashSet::from(["crm".to_owned()]));
+    }
+
+    #[test]
+    fn a_namespaced_call_is_served_with_the_namespace_in_its_own_field() {
+        // The wire format carries the namespace beside the name, not as a
+        // prefix on it. A client matching on `name` never sees `crm.`.
+        let item =
+            namespaced_envelope().function_call_item(0, &parsed("crm.list_orders"), "completed");
+        assert_eq!(item["name"], "list_orders");
+        assert_eq!(item["namespace"], "crm");
+    }
+
+    #[test]
+    fn a_plain_call_carries_no_namespace_field_at_all() {
+        let item = namespaced_envelope().function_call_item(0, &parsed("list_orders"), "completed");
+        assert_eq!(item["name"], "list_orders");
+        assert!(
+            item.get("namespace").is_none(),
+            "unnamespaced calls stay unnamespaced"
+        );
+    }
+
+    #[test]
+    fn a_dot_that_is_not_a_known_namespace_stays_part_of_the_name() {
+        // Tool names may legitimately contain a dot. Only a prefix matching a
+        // group the caller actually offered is treated as a namespace.
+        let item = namespaced_envelope().function_call_item(0, &parsed("v1.search"), "completed");
+        assert_eq!(item["name"], "v1.search");
+        assert!(item.get("namespace").is_none());
+    }
+
+    #[test]
+    fn two_namespaces_may_each_hold_the_same_tool_name() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": "hi",
+            "tools": [
+                {"type": "namespace", "name": "crm", "tools": [
+                    {"type": "function", "name": "search", "parameters": {"type": "object"}}]},
+                {"type": "namespace", "name": "docs", "tools": [
+                    {"type": "function", "name": "search", "parameters": {"type": "object"}}]},
+            ],
+        }))
+        .expect("request parses");
+        let tools = request.tool_definitions().expect("both namespaces flatten");
+        assert_eq!(
+            tools.len(),
+            2,
+            "prompt names are `group.member`, so they do not collide"
+        );
+    }
+
+    #[test]
+    fn a_namespace_holding_a_non_function_tool_is_refused_by_name() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": "hi",
+            "tools": [{"type": "namespace", "name": "crm", "tools": [{"type": "mcp"}]}],
+        }))
+        .expect("request parses");
+        assert!(request.tool_definitions().is_err());
+    }
+
     /// The three fields the official SDK models as non-optional.
     #[test]
     fn the_response_object_carries_every_field_the_sdk_requires() {
@@ -665,6 +806,7 @@ mod tests {
             tools: Value::Array(vec![]),
             tool_choice: Value::String("auto".to_owned()),
             parallel_tool_calls: true,
+            namespaces: HashSet::new(),
         };
         let object = envelope.object("completed", Value::Null, vec![], Value::Null);
         for field in [

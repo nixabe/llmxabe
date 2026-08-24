@@ -129,12 +129,64 @@ impl ToolDefinition {
         )
     }
 
+    /// One entry of a Responses API `tools` array.
+    ///
+    /// Either a flat function, or a `namespace` group holding several — the
+    /// shape harnesses use to keep a large tool surface from spending its
+    /// whole budget on schemas. A group is flattened into its members, whose
+    /// prompt names become `group.member` so two namespaces may each hold a
+    /// `search` without colliding. The dotted name is split back apart when
+    /// the call is served, because the wire format carries the namespace as
+    /// its own field rather than as a prefix.
+    ///
+    /// `defer_loading` on a member is accepted and ignored: it exists so a
+    /// schema can be fetched later by tool search, which this server does not
+    /// implement. Every schema is offered up front instead, which costs
+    /// prompt tokens and leaves the tool callable.
+    pub(crate) fn from_responses_entry(value: &Value) -> Result<Vec<Self>, String> {
+        match value.get("type").and_then(Value::as_str) {
+            Some("namespace") => {
+                let group = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .ok_or("a `namespace` tool needs a non-empty `name`")?;
+                if group.contains('.') {
+                    return Err(format!(
+                        "namespace `{group}` cannot contain `.`; it separates the \
+                         namespace from the tool name"
+                    ));
+                }
+                value
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| format!("namespace `{group}` needs a `tools` array"))?
+                    .iter()
+                    .map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) != Some("function") {
+                            return Err(format!(
+                                "namespace `{group}` may only hold `function` tools"
+                            ));
+                        }
+                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                        Self::build(
+                            &format!("{group}.{name}"),
+                            tool.get("description"),
+                            tool.get("parameters"),
+                        )
+                    })
+                    .collect()
+            }
+            _ => Ok(vec![Self::from_responses(value)?]),
+        }
+    }
+
     /// A Responses API tool: flat `{"type":"function","name":...}`.
     pub(crate) fn from_responses(value: &Value) -> Result<Self, String> {
         if value.get("type").and_then(Value::as_str) != Some("function") {
             return Err(format!(
                 "tools of type `{}` are not supported; this server executes nothing itself, \
-                 so only `function` tools make sense",
+                 so only `function` tools, and `namespace` groups of them, make sense",
                 value.get("type").and_then(Value::as_str).unwrap_or(""),
             ));
         }
