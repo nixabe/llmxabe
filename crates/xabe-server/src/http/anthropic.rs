@@ -12,7 +12,8 @@ use super::chat::{
 };
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Collected, Finish, Generation, GenerationSpec, resolve_sampling};
-use super::tools::{ToolCallParser, ToolDefinition};
+use super::tools::{OfferedTools, ToolCallParser};
+use super::warn_unsupported;
 use super::{AppState, sse_named};
 
 const DIALECT: Dialect = Dialect::Anthropic;
@@ -83,13 +84,8 @@ impl MessagesRequest {
         }
     }
 
-    fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, ApiError> {
-        self.tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(ToolDefinition::from_anthropic)
-            .collect::<Result<_, _>>()
+    fn tool_definitions(&self) -> Result<OfferedTools, ApiError> {
+        OfferedTools::from_anthropic(self.tools.as_deref().unwrap_or_default())
             .map_err(|failure| ApiError::bad_request(DIALECT, failure))
     }
 
@@ -240,7 +236,9 @@ fn start(state: &AppState, request: &MessagesRequest) -> Result<Generation, ApiE
     let thinking = request.thinking_enabled(state.default_reasoning);
     let mut conversation = request.conversation()?;
     if request.tools_offered()? {
-        conversation.tools = request.tool_definitions()?;
+        let offered = request.tool_definitions()?;
+        warn_unsupported(&offered);
+        conversation.tools = offered.definitions;
     }
     let tool_parser =
         (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
@@ -481,7 +479,9 @@ pub(crate) async fn count_tokens(
     let request: MessagesRequest = parse_body(&body, DIALECT)?;
     let mut conversation = request.conversation()?;
     if request.tools_offered()? {
-        conversation.tools = request.tool_definitions()?;
+        let offered = request.tool_definitions()?;
+        warn_unsupported(&offered);
+        conversation.tools = offered.definitions;
     }
     let prompt = conversation.render(request.thinking_enabled(state.default_reasoning));
     let encoding = state

@@ -24,7 +24,8 @@ use super::chat::{
 };
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
-use super::tools::{ParsedToolCall, ToolCallParser, ToolDefinition};
+use super::tools::{OfferedTools, ParsedToolCall, ToolCallParser};
+use super::warn_unsupported;
 use super::{AppState, sse_named, unix_now};
 
 const DIALECT: Dialect = Dialect::OpenAi;
@@ -104,14 +105,8 @@ impl ResponsesRequest {
         }
     }
 
-    fn tool_definitions(&self) -> Result<Vec<ToolDefinition>, ApiError> {
-        self.tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(ToolDefinition::from_responses_entry)
-            .collect::<Result<Vec<_>, _>>()
-            .map(|groups| groups.into_iter().flatten().collect())
+    fn tool_definitions(&self) -> Result<OfferedTools, ApiError> {
+        OfferedTools::from_responses(self.tools.as_deref().unwrap_or_default())
             .map_err(|failure| ApiError::bad_request(DIALECT, failure))
     }
 
@@ -414,7 +409,9 @@ pub(crate) async fn create(
     let thinking = request.thinking_enabled(state.default_reasoning);
     let mut conversation = request.conversation()?;
     if request.tools_offered()? {
-        conversation.tools = request.tool_definitions()?;
+        let offered = request.tool_definitions()?;
+        warn_unsupported(&offered);
+        conversation.tools = offered.definitions;
     }
     let tool_parser =
         (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
@@ -691,6 +688,46 @@ pub(crate) async fn create(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_hosted_tool_is_dropped_and_the_function_tools_beside_it_still_serve() {
+        // The regression. `web_search` is run by the provider, and there is
+        // no provider here — but refusing the request over it took the
+        // caller's own tools down too, so nothing served at all.
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": "hi",
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "get_customer", "parameters": {"type": "object"}},
+                {"type": "mcp", "server_label": "x"},
+            ],
+        }))
+        .expect("request parses");
+        let offered = request
+            .tool_definitions()
+            .expect("hosted tools do not fail the request");
+        assert_eq!(
+            offered.definitions.len(),
+            1,
+            "the function tool still serves"
+        );
+        assert_eq!(offered.unsupported, vec!["web_search", "mcp"]);
+    }
+
+    #[test]
+    fn a_malformed_function_tool_is_still_an_error() {
+        // Dropping what cannot be executed must not start swallowing the
+        // caller's own mistakes: a nameless function is a bug to report.
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": "hi",
+            "tools": [{"type": "function", "parameters": {"type": "object"}}],
+        }))
+        .expect("request parses");
+        assert!(
+            request.tool_definitions().is_err(),
+            "a nameless tool is the caller's bug"
+        );
+    }
+
     fn namespaced_envelope() -> Envelope {
         Envelope {
             id: "resp_1".to_owned(),
@@ -730,7 +767,7 @@ mod tests {
         }))
         .expect("request parses");
         let tools = request.tool_definitions().expect("namespace flattens");
-        assert_eq!(tools.len(), 2, "both members must be offered");
+        assert_eq!(tools.definitions.len(), 2, "both members must be offered");
         assert_eq!(request.namespaces(), HashSet::from(["crm".to_owned()]));
     }
 
@@ -777,7 +814,7 @@ mod tests {
         .expect("request parses");
         let tools = request.tool_definitions().expect("both namespaces flatten");
         assert_eq!(
-            tools.len(),
+            tools.definitions.len(),
             2,
             "prompt names are `group.member`, so they do not collide"
         );

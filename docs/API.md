@@ -207,6 +207,20 @@ own field beside the name rather than as a prefix on it:
   "call_id": "call_1", "arguments": "{}" }
 ```
 
+**Hosted tools are dropped, not refused.** `web_search`, `file_search`,
+`code_interpreter`, an `mcp` server, Anthropic's dated `web_search_*` and
+`bash_*` — all of these are executed by the provider, and there is no provider
+here. Failing the request over one used to take the caller's own function
+tools down with it, so a harness offering `web_search` alongside six functions
+got nothing served at all. They are now dropped and the rest are served, in
+every dialect. The drop is not silent: a `warn!` names the types that went
+missing and how many function tools were served instead, so a harness that
+genuinely needed one can be diagnosed from the log rather than from a worse
+answer. Anything unrecognized is dropped the same way, which keeps a tool type
+invented next year from taking a working request down with it. A *malformed*
+function tool — no name, an unrenderable name — is still a 400, because that
+is the caller's bug rather than a missing capability.
+
 A member's `defer_loading` is accepted and ignored: it exists so a schema can
 be fetched later by tool search, which this server does not implement. Every
 schema is offered up front instead — it costs prompt tokens and leaves the

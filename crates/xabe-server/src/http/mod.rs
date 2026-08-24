@@ -36,7 +36,7 @@ use axum::routing::{get, post};
 use serde::Serialize;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use xabe_engine::Engine;
 use xabe_sched::request::RequestId;
 
@@ -130,6 +130,24 @@ fn sse_named<T: Serialize>(name: &str, value: &T) -> Event {
         .event(name)
         .json_data(value)
         .expect("server-owned response types serialize")
+}
+
+/// Report tools this server dropped because it cannot execute them.
+///
+/// At `warn` so it appears by default. The request still serves — refusing it
+/// outright would take the caller's own function tools down with the hosted
+/// one — but a harness that actually needed the dropped tool would otherwise
+/// only discover it as a worse answer, with nothing to point at.
+fn warn_unsupported(offered: &crate::http::tools::OfferedTools) {
+    if !offered.unsupported.is_empty() {
+        warn!(
+            "dropped {} tool(s) this server cannot execute: {}; serving the {} function tool(s) \
+             offered alongside them",
+            offered.unsupported.len(),
+            offered.unsupported.join(", "),
+            offered.definitions.len(),
+        );
+    }
 }
 
 async fn health() -> &'static str {

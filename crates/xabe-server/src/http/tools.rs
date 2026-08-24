@@ -54,6 +54,102 @@ fn schema_is_string(schema: &Value) -> bool {
     }
 }
 
+/// The tools a request offered, after dropping the ones this server cannot
+/// serve.
+///
+/// A hosted tool — `web_search`, `file_search`, `code_interpreter`, an `mcp`
+/// server, Anthropic's versioned `bash_*` and `text_editor_*` — is executed by
+/// the provider, and there is no provider here. Refusing the whole request
+/// over one was the wrong failure: a harness that offers `web_search`
+/// alongside six function tools lost all seven and got nothing served at all.
+///
+/// So they are dropped and the rest are served. The drop is reported rather
+/// than silent: the caller's own tools still work, and a `warn!` names what
+/// went missing so a harness that genuinely needed it can be found out from
+/// the log rather than from a wrong answer. Anything unrecognized is dropped
+/// the same way, which keeps a tool type invented next year from taking a
+/// working request down with it.
+pub(crate) struct OfferedTools {
+    pub(crate) definitions: Vec<ToolDefinition>,
+    /// Distinct tool types dropped, in the order first seen.
+    pub(crate) unsupported: Vec<String>,
+}
+
+impl OfferedTools {
+    fn drop_kind(&mut self, kind: &str) {
+        let kind = if kind.is_empty() { "(untyped)" } else { kind };
+        if !self.unsupported.iter().any(|seen| seen == kind) {
+            self.unsupported.push(kind.to_owned());
+        }
+    }
+
+    fn kind_of(value: &Value) -> &str {
+        value.get("type").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// Responses API: flat functions, and `namespace` groups of them.
+    pub(crate) fn from_responses(values: &[Value]) -> Result<Self, String> {
+        let mut offered = Self {
+            definitions: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        for value in values {
+            match Self::kind_of(value) {
+                "function" | "namespace" => {
+                    offered
+                        .definitions
+                        .extend(ToolDefinition::from_responses_entry(value)?);
+                }
+                kind => offered.drop_kind(kind),
+            }
+        }
+        Ok(offered)
+    }
+
+    /// OpenAI chat completions: `{"type":"function","function":{…}}`.
+    pub(crate) fn from_openai(values: &[Value]) -> Result<Self, String> {
+        let mut offered = Self {
+            definitions: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        for value in values {
+            match Self::kind_of(value) {
+                "function" => offered
+                    .definitions
+                    .push(ToolDefinition::from_openai(value)?),
+                kind => offered.drop_kind(kind),
+            }
+        }
+        Ok(offered)
+    }
+
+    /// Anthropic: a client tool carries `input_schema` and either no `type` or
+    /// a `custom` one. A versioned `type` is one of Anthropic's own server
+    /// tools.
+    pub(crate) fn from_anthropic(values: &[Value]) -> Result<Self, String> {
+        let mut offered = Self {
+            definitions: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        for value in values {
+            match Self::kind_of(value) {
+                "" | "custom" => {
+                    offered
+                        .definitions
+                        .push(ToolDefinition::from_anthropic(value)?);
+                }
+                kind if kind.starts_with("custom") => {
+                    offered
+                        .definitions
+                        .push(ToolDefinition::from_anthropic(value)?);
+                }
+                kind => offered.drop_kind(kind),
+            }
+        }
+        Ok(offered)
+    }
+}
+
 impl ToolDefinition {
     fn build(
         name: &str,
@@ -457,6 +553,47 @@ fn parse_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anthropic_server_tools_are_dropped_and_client_tools_beside_them_serve() {
+        // Anthropic's own hosted tools carry a dated type. The server runs
+        // them; this one cannot, but the caller's client tools are fine.
+        let offered = OfferedTools::from_anthropic(&[
+            json!({"type": "web_search_20250305", "name": "web_search"}),
+            json!({"type": "bash_20250124", "name": "bash"}),
+            json!({"name": "get_weather", "input_schema": {"type": "object"}}),
+            json!({"type": "custom", "name": "lookup", "input_schema": {"type": "object"}}),
+        ])
+        .expect("hosted tools do not fail the request");
+        assert_eq!(offered.definitions.len(), 2, "both client tools serve");
+        assert_eq!(
+            offered.unsupported,
+            vec!["web_search_20250305", "bash_20250124"]
+        );
+    }
+
+    #[test]
+    fn openai_chat_drops_what_it_cannot_run_too() {
+        let offered = OfferedTools::from_openai(&[
+            json!({"type": "web_search"}),
+            json!({"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}),
+        ])
+        .expect("hosted tools do not fail the request");
+        assert_eq!(offered.definitions.len(), 1);
+        assert_eq!(offered.unsupported, vec!["web_search"]);
+    }
+
+    #[test]
+    fn the_same_dropped_type_is_reported_once_however_often_it_appears() {
+        let offered = OfferedTools::from_openai(&[
+            json!({"type": "web_search"}),
+            json!({"type": "web_search"}),
+            json!({}),
+        ])
+        .expect("parses");
+        assert_eq!(offered.unsupported, vec!["web_search", "(untyped)"]);
+        assert!(offered.definitions.is_empty());
+    }
 
     fn weather_tool() -> ToolDefinition {
         ToolDefinition::from_openai(&json!({

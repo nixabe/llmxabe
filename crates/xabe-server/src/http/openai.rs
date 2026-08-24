@@ -12,7 +12,8 @@ use super::chat::{
 };
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
-use super::tools::{ParsedToolCall, ToolCallParser, ToolDefinition};
+use super::tools::{OfferedTools, ParsedToolCall, ToolCallParser};
+use super::warn_unsupported;
 use super::{AppState, sse_json, unix_now};
 
 const DIALECT: Dialect = Dialect::OpenAi;
@@ -501,14 +502,10 @@ pub(crate) async fn chat_completions(
         .unwrap_or(state.default_reasoning);
     let mut conversation = conversation(request.messages)?;
     if tools_offered(request.tool_choice.as_ref())? {
-        conversation.tools = request
-            .tools
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(ToolDefinition::from_openai)
-            .collect::<Result<_, _>>()
+        let offered = OfferedTools::from_openai(request.tools.as_deref().unwrap_or_default())
             .map_err(|failure| ApiError::bad_request(DIALECT, failure))?;
+        warn_unsupported(&offered);
+        conversation.tools = offered.definitions;
     }
     let tool_parser =
         (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
