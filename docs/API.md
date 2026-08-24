@@ -207,6 +207,22 @@ own field beside the name rather than as a prefix on it:
   "call_id": "call_1", "arguments": "{}" }
 ```
 
+**A `reasoning` input item is accepted and replayed.** Continuing a reasoning
+conversation means handing the previous `output` back as `input`, reasoning
+items included, so refusing them broke every agentic loop that replayed what
+this server had just emitted. The text is read from the item's `content`
+(`reasoning_text`) or its `summary` (`summary_text`) and folded into the
+assistant turn rather than dropped — `Conversation::render` replays the
+reasoning that came after the caller's last question, which is exactly a
+tool-calling loop's, and is the chain the model needs to keep across the call.
+
+Items recording work a provider did on the model's behalf — `web_search_call`,
+`mcp_call`, anything ending `_call` — are skipped with a warning. This server
+executed none of it and cannot replay a result it never produced, but the
+turns around them are still a conversation. An `item_reference` remains a 400:
+it names content held server-side and this server stores nothing, so skipping
+it would silently drop conversation rather than a trace.
+
 **Hosted tools are dropped, not refused.** `web_search`, `file_search`,
 `code_interpreter`, an `mcp` server, Anthropic's dated `web_search_*` and
 `bash_*` — all of these are executed by the provider, and there is no provider

@@ -53,6 +53,14 @@ pub(crate) enum KnownPart {
     OutputText { text: String },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// Responses API: the parts of a `reasoning` item being replayed. The
+    /// model's own prior thinking, handed back so an agentic loop keeps its
+    /// chain across a tool call — the same role `thinking` plays for
+    /// Anthropic.
+    #[serde(rename = "reasoning_text")]
+    ReasoningText { text: String },
+    #[serde(rename = "summary_text")]
+    SummaryText { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         name: String,
@@ -202,9 +210,11 @@ impl Content {
                     | KnownPart::InputText { text: value }
                     | KnownPart::OutputText { text: value },
                 ) => (&mut folded.text, value.as_str()),
-                Part::Known(KnownPart::Thinking { thinking: value }) => {
-                    (&mut folded.thinking, value.as_str())
-                }
+                Part::Known(
+                    KnownPart::Thinking { thinking: value }
+                    | KnownPart::ReasoningText { text: value }
+                    | KnownPart::SummaryText { text: value },
+                ) => (&mut folded.thinking, value.as_str()),
                 Part::Known(KnownPart::ToolUse { name, input }) => {
                     folded.tool_calls.push(ParsedToolCall {
                         name: name.clone(),

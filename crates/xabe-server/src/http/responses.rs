@@ -25,6 +25,8 @@ use super::chat::{
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
 use super::tools::{OfferedTools, ParsedToolCall, ToolCallParser};
+use tracing::warn;
+
 use super::warn_unsupported;
 use super::{AppState, sse_named, unix_now};
 
@@ -46,6 +48,10 @@ struct InputItem {
     arguments: Option<String>,
     #[serde(default)]
     output: Option<Value>,
+    /// A `reasoning` item's summary parts, which is where some producers put
+    /// the text instead of in `content`.
+    #[serde(default)]
+    summary: Option<Content>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,12 +210,69 @@ impl ResponsesRequest {
                             conversation.push_tool_result(output);
                             continue;
                         }
+                        // The model's own prior thinking, handed back. This is
+                        // how a reasoning conversation is continued, and
+                        // refusing it broke every agentic loop that replayed
+                        // what this server had just emitted. It is folded into
+                        // the assistant turn rather than dropped, because
+                        // `Conversation::render` replays the reasoning that
+                        // came after the caller's last question — which is
+                        // exactly a tool-calling loop's, and is the chain the
+                        // model needs to keep across the call.
+                        Some("reasoning") => {
+                            let mut thinking = String::new();
+                            for part in [item.content.as_ref(), item.summary.as_ref()]
+                                .into_iter()
+                                .flatten()
+                            {
+                                let folded = part
+                                    .fold()
+                                    .map_err(|failure| ApiError::bad_request(DIALECT, failure))?;
+                                for piece in [folded.thinking, folded.text] {
+                                    if !piece.is_empty() {
+                                        if !thinking.is_empty() {
+                                            thinking.push('\n');
+                                        }
+                                        thinking.push_str(&piece);
+                                    }
+                                }
+                            }
+                            if !thinking.is_empty() {
+                                match conversation.turns.last_mut() {
+                                    Some(Turn::Assistant { reasoning, .. })
+                                        if reasoning.is_empty() =>
+                                    {
+                                        *reasoning = thinking;
+                                    }
+                                    _ => conversation.turns.push(Turn::Assistant {
+                                        reasoning: thinking,
+                                        content: String::new(),
+                                        tool_calls: Vec::new(),
+                                    }),
+                                }
+                            }
+                            continue;
+                        }
+                        // Traces of work a provider did on the model's behalf.
+                        // This server runs none of it, and cannot replay a
+                        // result it never produced — but the turns around them
+                        // are still a conversation, so they are skipped rather
+                        // than made fatal.
+                        Some(kind)
+                            if kind.ends_with("_call")
+                                || kind.ends_with("_call_output")
+                                || kind.starts_with("mcp_") =>
+                        {
+                            warn!("skipping input item of type `{kind}`: nothing here executed it");
+                            continue;
+                        }
                         Some(kind) => {
                             return Err(ApiError::bad_request(
                                 DIALECT,
                                 format!(
                                     "input items of type `{kind}` are not supported; send \
-                                     `message`, `function_call`, or `function_call_output` items"
+                                     `message`, `reasoning`, `function_call`, or \
+                                     `function_call_output` items"
                                 ),
                             ));
                         }
@@ -687,6 +750,94 @@ pub(crate) async fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn turns_of(value: serde_json::Value) -> Vec<Turn> {
+        let request: ResponsesRequest = serde_json::from_value(value).expect("request parses");
+        request
+            .conversation()
+            .expect("input items are accepted")
+            .turns
+    }
+
+    #[test]
+    fn a_reasoning_item_replayed_from_our_own_output_is_accepted() {
+        // The regression, in the exact shape this server emits: a harness
+        // continuing a reasoning conversation hands the previous `output`
+        // back as `input`. Refusing `reasoning` broke every such loop.
+        let turns = turns_of(json!({
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "Weather in Paris?"}]},
+                {"id": "rs_1", "type": "reasoning", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "Call the tool."}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather",
+                 "arguments": "{\"city\":\"Paris\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "18C"},
+            ],
+        }));
+        let assistant = turns
+            .iter()
+            .find_map(|turn| match turn {
+                Turn::Assistant {
+                    reasoning,
+                    tool_calls,
+                    ..
+                } => Some((reasoning, tool_calls)),
+                _ => None,
+            })
+            .expect("the reasoning and the call share one assistant turn");
+        assert_eq!(
+            assistant.0, "Call the tool.",
+            "the chain must survive the round trip"
+        );
+        assert_eq!(assistant.1.len(), 1, "the call joins the same turn");
+    }
+
+    #[test]
+    fn a_reasoning_item_carrying_its_text_in_summary_is_read_too() {
+        let turns = turns_of(json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"id": "rs_1", "type": "reasoning",
+                 "summary": [{"type": "summary_text", "text": "Thought about it."}],
+                 "content": []},
+            ],
+        }));
+        assert!(turns.iter().any(|turn| matches!(
+            turn,
+            Turn::Assistant { reasoning, .. } if reasoning == "Thought about it."
+        )));
+    }
+
+    #[test]
+    fn a_hosted_call_trace_is_skipped_without_failing_the_turn_around_it() {
+        // Nothing here executed a web search, so its trace cannot be
+        // replayed — but the conversation it sits inside is still valid.
+        let turns = turns_of(json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "Hello"}]},
+            ],
+        }));
+        assert_eq!(
+            turns.len(),
+            2,
+            "user and assistant survive; the trace does not"
+        );
+    }
+
+    #[test]
+    fn an_input_item_this_server_cannot_place_is_still_refused() {
+        // `item_reference` names content held server-side, and this server
+        // stores nothing. Skipping it would silently drop conversation.
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "input": [{"type": "item_reference", "id": "msg_1"}],
+        }))
+        .expect("request parses");
+        assert!(request.conversation().is_err());
+    }
 
     #[test]
     fn a_hosted_tool_is_dropped_and_the_function_tools_beside_it_still_serve() {
