@@ -207,6 +207,19 @@ own field beside the name rather than as a prefix on it:
   "call_id": "call_1", "arguments": "{}" }
 ```
 
+**An unrecognized content part is skipped, not refused.** The parts a
+provider invents are overwhelmingly its own artifacts — a redacted or signed
+reasoning block, a trace of a search it ran — and failing the request over one
+throws away a conversation this server could have served. `refusal` is read as
+the assistant turn's text, since that is what it is.
+
+The exception is content belonging to the *caller* rather than the provider:
+`input_file`, `document`, `input_audio`, `video` and their spellings are
+refused by name. This server cannot read any of them, and skipping one means
+answering about something it never saw — a wrong answer, where the 400 is
+merely an unsupported one. Video is out of scope for the engine rather than
+unimplemented, so it belongs on that list permanently.
+
 **A `reasoning` input item is accepted and replayed.** Continuing a reasoning
 conversation means handing the previous `output` back as `input`, reasoning
 items included, so refusing them broke every agentic loop that replayed what

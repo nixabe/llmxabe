@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 
 use serde::Deserialize;
 use serde_json::Value;
+use tracing::warn;
 
 use super::error::{ApiError, Dialect};
 use super::tools::{ParsedToolCall, ToolDefinition};
@@ -59,6 +60,10 @@ pub(crate) enum KnownPart {
     /// Anthropic.
     #[serde(rename = "reasoning_text")]
     ReasoningText { text: String },
+    /// The model declining, replayed from a previous assistant turn. It is
+    /// that turn's text as far as the prompt is concerned.
+    #[serde(rename = "refusal")]
+    Refusal { refusal: String },
     #[serde(rename = "summary_text")]
     SummaryText { text: String },
     #[serde(rename = "tool_use")]
@@ -192,6 +197,34 @@ fn tool_result_text(content: Option<&Value>) -> Result<String, String> {
     }
 }
 
+/// Content this server must refuse rather than skip.
+///
+/// The default for an unrecognized part is to skip it, because the parts a
+/// provider invents are overwhelmingly its own artifacts — a redacted or
+/// signed reasoning block, a trace of a search it ran — and refusing the
+/// request over one throws away a conversation this server could have served.
+/// Four rounds of exactly that failure are why the default is what it is.
+///
+/// These are the exception, and the distinction is who the content belongs
+/// to. They carry the *caller's* material: a document, a file, audio. This
+/// server cannot read any of them, and skipping one means answering about
+/// something it never saw — a wrong answer where the 400 is merely an
+/// unsupported one.
+const CONTENT_THIS_SERVER_CANNOT_READ: &[&str] = &[
+    "input_file",
+    "file",
+    "document",
+    "input_audio",
+    "audio",
+    "output_audio",
+    "container_upload",
+    // Video is out of scope for this engine, not merely unimplemented, so a
+    // video part is content it will never read rather than one it might.
+    "video",
+    "video_url",
+    "input_video",
+];
+
 impl Content {
     /// Fold content into its text, reasoning, and replayed tool blocks.
     pub(crate) fn fold(&self) -> Result<FoldedContent, String> {
@@ -208,7 +241,8 @@ impl Content {
                 Part::Known(
                     KnownPart::Text { text: value }
                     | KnownPart::InputText { text: value }
-                    | KnownPart::OutputText { text: value },
+                    | KnownPart::OutputText { text: value }
+                    | KnownPart::Refusal { refusal: value },
                 ) => (&mut folded.text, value.as_str()),
                 Part::Known(
                     KnownPart::Thinking { thinking: value }
@@ -248,10 +282,15 @@ impl Content {
                         .get("type")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("(untyped)");
-                    return Err(format!(
-                        "content parts of type `{kind}` are not supported; send text, \
-                         image, or tool parts"
-                    ));
+                    if CONTENT_THIS_SERVER_CANNOT_READ.contains(&kind) {
+                        return Err(format!(
+                            "content parts of type `{kind}` are not supported; this server \
+                             reads text and images. Dropping one would answer about \
+                             something it never saw"
+                        ));
+                    }
+                    warn!("skipping content part of type `{kind}`: nothing here produced it");
+                    continue;
                 }
             };
             if !target.is_empty() {
@@ -505,6 +544,47 @@ pub(crate) fn unsupported_tool_choice(dialect: Dialect, choice: &str) -> ApiErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parts(value: serde_json::Value) -> Content {
+        serde_json::from_value(value).expect("content parses")
+    }
+
+    #[test]
+    fn a_refusal_part_renders_as_the_turn_s_text() {
+        // `refusal` is a valid assistant content type, so a harness replaying
+        // an assistant turn that contained one was sending something this
+        // server refused outright.
+        let folded = parts(serde_json::json!([{"type": "refusal", "refusal": "I can't help."}]))
+            .fold()
+            .expect("a refusal is content, not an error");
+        assert_eq!(folded.text, "I can't help.");
+    }
+
+    #[test]
+    fn an_unrecognized_part_is_skipped_rather_than_failing_the_turn() {
+        // The default that four rounds of harness breakage argued for. A part
+        // a provider invented is its own artifact; the text beside it is the
+        // conversation, and it must still serve.
+        let folded = parts(serde_json::json!([
+            {"type": "text", "text": "before"},
+            {"type": "redacted_thinking", "data": "opaque"},
+            {"type": "text", "text": "after"},
+        ]))
+        .fold()
+        .expect("an unknown part must not fail the request");
+        assert_eq!(folded.text, "before\nafter");
+    }
+
+    #[test]
+    fn content_the_server_cannot_read_is_still_refused() {
+        // The exception, and the reason it is one: these carry the caller's
+        // own material. Skipping a document means answering about something
+        // never seen, which is worse than saying it is unsupported.
+        for kind in ["input_file", "document", "input_audio"] {
+            let refused = parts(serde_json::json!([{"type": kind}])).fold();
+            assert!(refused.is_err(), "`{kind}` must be refused, not skipped");
+        }
+    }
 
     fn user(text: &str) -> Turn {
         Turn::User(text.to_owned())
