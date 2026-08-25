@@ -65,13 +65,23 @@ pub struct Scheduler {
 }
 
 /// How much of a step's token budget is held back for admission while a long
-/// prefill is in flight, as a divisor: a quarter of the budget.
+/// prefill is in flight, as a divisor: half of the budget.
 ///
-/// Large enough that a newcomer's first chunk is real work rather than a
-/// token or two, small enough that the prompt already in flight keeps most of
-/// the step. It applies only when the waiting queue is non-empty, so it costs
-/// nothing in the throughput case.
-const ADMISSION_RESERVE_FRACTION: u32 = 4;
+/// A half rather than some smaller slice because of what the *runtime* does
+/// with a grant. A prefill pass may not straddle a snapshot boundary, so with
+/// a retention interval of 2048 the widest pass the engine ever issues is
+/// 2048 — `-pc 4096` decomposes into two of them, never one wide pass. A
+/// grant is therefore only as good as its alignment to that interval: 2048
+/// lands as one full-width pass, while 3072 lands as one full-width pass plus
+/// a 1024 remainder chopped into four 256-wide passes, because the prebuilt
+/// tail shapes stop at 256.
+///
+/// So halving the budget is not the conservative choice between a quarter and
+/// a half — at a 4096 budget it is the choice that keeps *both* the
+/// continuing prefill and the newcomer on one aligned 2048-wide pass each,
+/// where a quarter misaligns both. It applies only when the waiting queue is
+/// non-empty, so it costs nothing in the throughput case.
+const ADMISSION_RESERVE_FRACTION: u32 = 2;
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig, total_attention_blocks: u32) -> Self {
@@ -143,6 +153,35 @@ impl Scheduler {
         // draft window of scratch. Reserving it here keeps rule 4 honest:
         // the blocks a sequence will actually touch are the blocks reserved.
         (full_seq_len + self.config.draft_tokens_per_step()).div_ceil(self.config.block_size())
+    }
+
+    /// Whether phase 3 of a step could actually admit somebody, checked
+    /// before phases 1 and 2 spend the budget.
+    ///
+    /// The admission reserve is only worth holding if it can be spent. Phase
+    /// 3 needs three things at once — a queued request, a free decode slot,
+    /// and enough block headroom to take it without breaching the watermark —
+    /// and this asks the same three questions in the same order, against the
+    /// same state. Phases 1 and 2 move none of it: a decode step and a
+    /// prefill continuation neither admit a request nor reserve a block, so
+    /// the answer here is the answer phase 3 reaches.
+    ///
+    /// Gating the reserve on a non-empty queue alone was not enough. A worker
+    /// running its full complement of sequences with a further request queued
+    /// held back a slice of every step that phase 3 then refused to spend,
+    /// because `running.len() < max_concurrent_decodes` was already false —
+    /// dead budget on every step until a slot freed, which is exactly when
+    /// the queue is longest.
+    fn admission_can_proceed(&self) -> bool {
+        if self.running.len() >= self.config.max_concurrent_decodes() as usize {
+            return false;
+        }
+        let Some(candidate) = self.waiting.front() else {
+            return false;
+        };
+        let needed_blocks = self.attention_blocks_needed(candidate.full_seq_len());
+        let watermark = self.config.watermark_blocks(self.total_attention_blocks);
+        self.free_attention_blocks >= needed_blocks + watermark
     }
 
     /// Whether [`Self::admit`] would accept this request, without enqueueing
@@ -324,22 +363,22 @@ impl Scheduler {
 
         // How much of this step to hold back so a waiting request can start.
         //
-        // Zero when nothing is waiting, and that is the whole point: with an
-        // empty queue there is nobody to hold it for, the chunk below takes
-        // the entire budget exactly as it always did, and peak prefill
-        // throughput is untouched. The reserve only exists in the state that
-        // was pathological — a long prompt mid-flight and somebody queued
-        // behind it.
+        // Zero unless phase 3 can actually spend it, and that is the whole
+        // point: with nobody admittable there is nobody to hold it for, the
+        // chunk below takes the entire budget exactly as it always did, and
+        // peak prefill throughput is untouched. The reserve only exists in
+        // the state that was pathological — a long prompt mid-flight and
+        // somebody queued behind it who can be let in.
         //
         // Without it, a prefill longer than one step took the whole budget
         // every step until it finished, so phase 3 never ran and a newcomer's
         // time to first token became the *remaining* duration of whatever
         // large prompt happened to be in flight. Measured on a 63K-token
         // prompt, that was 0.0015 s idle against 29 s behind it.
-        let admission_reserve = if self.waiting.is_empty() {
-            0
-        } else {
+        let admission_reserve = if self.admission_can_proceed() {
             self.config.token_budget() / ADMISSION_RESERVE_FRACTION
+        } else {
+            0
         };
 
         // Phase 2: running requests still mid-prefill continue first.
@@ -481,8 +520,19 @@ mod tests {
     }
 
     #[test]
-    fn the_long_prefill_keeps_most_of_the_step_it_shares() {
-        // Sharing must not become starvation in the other direction.
+    fn a_shared_step_hands_out_retention_aligned_grants() {
+        // Sharing must not become starvation in the other direction — and it
+        // must not hand out a *misaligned* half either.
+        //
+        // This crate cannot see the retention interval; the runtime owns it.
+        // But the two are coupled, because `choose_prefill_width` refuses a
+        // pass that would straddle a snapshot boundary: a grant that is not a
+        // whole multiple of the interval leaves a remainder the engine can
+        // only spend through its prebuilt tail shapes, which stop at 256. At
+        // the shipped defaults that turned a 1024 remainder into four 256-wide
+        // passes on both sides of the split. So the property under test is
+        // alignment, not a fraction.
+        const RETENTION_INTERVAL: u32 = 2048;
         let mut s = sched(4096, 256, 3, 100_000);
         s.admit(NewRequest {
             id: RequestId(1),
@@ -507,9 +557,19 @@ mod tests {
             .expect("still running");
         assert_eq!(
             first.tokens,
-            4096 - 4096 / 4,
-            "three quarters of the step stays with it"
+            4096 - 4096 / 2,
+            "half the step stays with the prompt in flight"
         );
+        for item in &batch.prefills {
+            assert_eq!(
+                item.tokens % RETENTION_INTERVAL,
+                0,
+                "grant for {:?} is {} — not a whole number of {RETENTION_INTERVAL}-token \
+                 passes, so the runtime must spend the remainder 256 tokens at a time",
+                item.id,
+                item.tokens,
+            );
+        }
     }
 
     fn sched(
@@ -766,6 +826,81 @@ mod tests {
         assert_eq!(s.free_attention_blocks(), 4);
         let batch3 = s.step();
         assert!(batch3.prefills.iter().any(|p| p.id == RequestId(2)));
+    }
+
+    /// A queue that cannot be admitted from must not cost the step anything.
+    #[test]
+    fn a_full_worker_does_not_reserve_for_an_admission_it_would_refuse() {
+        // Every slot busy and a further request queued behind them. Phase 3
+        // cannot take it — `running.len() < max_concurrent_decodes` is
+        // already false — so holding a slice back for it is budget nothing
+        // in the step can spend, and this is exactly when the queue is
+        // longest.
+        let mut s = sched(4096, 256, 3, 100_000);
+        for id in 1..=3 {
+            s.admit(NewRequest {
+                id: RequestId(id),
+                prompt_tokens: 60_000,
+                max_output_tokens: 16,
+            })
+            .expect("admitted");
+        }
+        let mut batch = BatchDescription::default();
+        // Three steps: one admission each, since chunking the first request
+        // that does not fit ends the step.
+        for _ in 0..3 {
+            batch.prefills.clear();
+            s.step_into(&mut batch);
+        }
+        assert_eq!(s.running_len(), 3, "all three slots should be occupied");
+
+        s.admit(NewRequest {
+            id: RequestId(4),
+            prompt_tokens: 60_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        assert!(s.is_waiting(RequestId(4)));
+
+        batch.prefills.clear();
+        s.step_into(&mut batch);
+        let spent: u32 = batch.prefills.iter().map(|p| p.tokens).sum();
+        assert_eq!(
+            spent, 4096,
+            "the step must spend its whole budget when nobody can be admitted, \
+             not hold a slice back for a request phase 3 will refuse"
+        );
+        assert!(
+            batch.prefills.iter().all(|p| p.id != RequestId(4)),
+            "and the queued request is still not admitted"
+        );
+    }
+
+    /// The same, when it is the watermark rather than the slots that refuses.
+    #[test]
+    fn a_candidate_the_watermark_refuses_does_not_earn_a_reserve() {
+        // block_size 256, 40 total blocks, watermark 25% -> 10 held back.
+        // A's 6000-token prompt needs ceil(6000/256) = 24 blocks and fits
+        // (40 >= 24 + 10), leaving 16 free. B then needs 8, and 16 < 8 + 10,
+        // so the watermark refuses it however long it waits. Decode slots are
+        // deliberately plentiful so that the watermark is the only thing
+        // saying no — this is the case slot-counting alone would miss.
+        //
+        // A's prompt spans six steps at a 1024-token budget, so there is a
+        // mid-prefill step to observe. Its chunk must stay the whole budget:
+        // gated on a non-empty queue alone this was 1024 - 1024/2 = 512.
+        let config = SchedulerConfig::new(1024, 256, 4, 0.25, 0).unwrap();
+        let mut s = Scheduler::new(config, 40);
+        s.admit(req(1, 6000, 0)).unwrap();
+        s.step();
+        s.admit(req(2, 2000, 0)).unwrap();
+        let batch = s.step();
+        assert!(s.is_waiting(RequestId(2)), "the watermark still refuses it");
+        let spent: u32 = batch.prefills.iter().map(|p| p.tokens).sum();
+        assert_eq!(
+            spent, 1024,
+            "a request the watermark will refuse must not reserve budget"
+        );
     }
 
     #[test]
