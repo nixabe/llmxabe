@@ -35,6 +35,7 @@ use tracing::{error, info};
 use xabe_cache::CacheConfig;
 use xabe_engine::worker::Speculation;
 use xabe_engine::{SamplingParams, ServingConfig, Worker, WorkerId};
+use xabe_gguf::GgufFile;
 use xabe_model::ModelConfig;
 use xabe_sched::config::{
     DEFAULT_DRAFT_TOKENS_PER_STEP, DEFAULT_WATERMARK_FRACTION, SchedulerConfig,
@@ -348,8 +349,21 @@ fn main() -> ExitCode {
         }
     };
 
-    let model = ModelConfig::qwen3_6_35b_a3b();
     let path = model_path();
+    // The architecture comes from the file, not from a constant: this
+    // binary serves `qwen35` as well as `qwen35moe`, and a hardcoded config
+    // fails a dense file with a wall of shape mismatches instead of running
+    // it.
+    let model = match GgufFile::open(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|f| ModelConfig::from_gguf(&f).map_err(|e| e.to_string()))
+    {
+        Ok(model) => model,
+        Err(error) => {
+            error!("{}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
     info!(
         "bench_worker_spec: context={context} tokens/seq={tokens_per_seq} spec={spec:?} drafts={drafts}",
     );

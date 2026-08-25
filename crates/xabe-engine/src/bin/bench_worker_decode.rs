@@ -21,6 +21,7 @@ use std::time::Instant;
 use tracing::{debug, error, info};
 use xabe_cache::CacheConfig;
 use xabe_engine::{SamplingParams, ServingConfig, Worker, WorkerId};
+use xabe_gguf::GgufFile;
 use xabe_model::ModelConfig;
 use xabe_sched::config::{DEFAULT_WATERMARK_FRACTION, SchedulerConfig};
 use xabe_sched::request::{NewRequest, RequestId};
@@ -216,7 +217,17 @@ fn main() -> ExitCode {
         error!("model not found at {}", path.display());
         return ExitCode::FAILURE;
     }
-    let model = ModelConfig::qwen3_6_35b_a3b();
+    // From the file, not a constant — see `bench_worker_spec`.
+    let model = match GgufFile::open(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|f| ModelConfig::from_gguf(&f).map_err(|e| e.to_string()))
+    {
+        Ok(model) => model,
+        Err(error) => {
+            error!("{}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
     info!("scheduler-driven decode, context {context}, {steps} timed steps after {WARMUP} warmup");
     info!(
