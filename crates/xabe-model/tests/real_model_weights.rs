@@ -169,7 +169,7 @@ fn derived_parameter_count_agrees_with_the_file_section_by_section() {
         ),
         (
             "experts",
-            config.total_expert_params(),
+            config.total_ffn_params(),
             d.section_elements(Section::Experts),
         ),
         ("total", config.total_params(), d.total_elements()),

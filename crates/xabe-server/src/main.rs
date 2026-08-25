@@ -465,6 +465,19 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
     }
 }
 
+/// The transcribed configuration for whatever `path` declares itself to be.
+///
+/// Opening the GGUF here costs an mmap and a header parse; the alternative —
+/// defaulting to one architecture and letting `WeightSchema::resolve` object
+/// — produces a hundred shape mismatches for what is one fact.
+fn model_config_for(path: &std::path::Path) -> Result<ModelConfig, String> {
+    if !path.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    let file = xabe_gguf::GgufFile::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    ModelConfig::from_gguf(&file).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn main() -> std::process::ExitCode {
     let rest = xabe_log::init_from_args();
     let args = Args::parse_from(expand_two_letter_shorts(rest));
@@ -515,25 +528,41 @@ fn main() -> std::process::ExitCode {
         );
         return std::process::ExitCode::FAILURE;
     }
-    let vision_config = xabe_model::VisionConfig::qwen3_6_35b_a3b();
-
-    // 1. Model configuration.
-    let model = ModelConfig::qwen3_6_35b_a3b();
+    // 1. Model configuration, chosen by what the file says it is.
+    //
+    //    Read here rather than assumed, because the two architectures this
+    //    engine serves have the same tensor *names* for the mixer and would
+    //    otherwise fail deep in the weight resolver with a wall of shape
+    //    mismatches instead of one line naming the architecture.
+    let model = match model_config_for(&args.model) {
+        Ok(m) => m,
+        Err(e) => {
+            error!("model            FAIL — {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     match verify::check_config(&model) {
-        Ok(()) => info!("model            {} — config self-consistent", model.name),
+        Ok(()) => info!(
+            "model            {} ({}) — config self-consistent",
+            model.name, model.architecture
+        ),
         Err(e) => {
             error!("model            FAIL — {e}");
             return std::process::ExitCode::FAILURE;
         }
     }
     info!(
-        "                 {} layers ({} attention, {} GDN), {} experts, vocab {}",
+        "                 {} layers ({} attention, {} GDN), {}, vocab {}",
         model.num_layers,
         model.num_attention_layers(),
         model.num_gdn_layers(),
-        model.moe.num_experts,
+        match model.ffn {
+            xabe_model::FfnConfig::Moe(m) => format!("{} experts", m.num_experts),
+            xabe_model::FfnConfig::Dense(d) => format!("dense FFN {} wide", d.intermediate),
+        },
         model.vocab_size
     );
+    let vision_config = xabe_model::VisionConfig::for_model(&model);
 
     // 2. Cache geometry. Construction enforces that the retention interval is
     //    block-aligned; the two page sizes are never unified.

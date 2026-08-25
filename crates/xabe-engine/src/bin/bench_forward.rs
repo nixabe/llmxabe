@@ -42,7 +42,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use tracing::{error, info, warn};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_engine::forward::{Forward, arena_holds};
+use xabe_engine::forward::{Forward, arena_holds_for};
 use xabe_engine::weights::DeviceWeights;
 use xabe_gguf::GgufFile;
 use xabe_model::config::ModelConfig;
@@ -114,7 +114,7 @@ fn main() {
         .unwrap_or(5);
 
     let file = GgufFile::open(&path).expect("valid GGUF v3");
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("a supported architecture");
     let stream = ctx.default_stream();
     let (free_at_start, total) = memory_info(&ctx).expect("memory info");
 
@@ -129,9 +129,10 @@ fn main() {
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema resolves");
     let load = Instant::now();
-    let (weights, report) =
-        DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
-            .expect("weight load");
+    let (weights, report) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, |role| {
+        arena_holds_for(config.ffn, role)
+    })
+    .expect("weight load");
     info!(
         "arena:  {:.3} GiB in {:.1} s ({:.2} GB/s)\n",
         report.bytes as f64 / (1u64 << 30) as f64,

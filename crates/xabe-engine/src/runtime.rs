@@ -26,7 +26,7 @@ use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
 use crate::block::mtp::{MtpBlock, MtpBlockError};
 use crate::dflash::{DFlashDraftCache, DFlashError, DFlashForward, load_dflash_weights};
-use crate::forward::{BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds};
+use crate::forward::{BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_for};
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
     validate_placements,
@@ -665,9 +665,10 @@ impl DeviceRuntime {
             .then(|| file.get_u32("tokenizer.ggml.eos_token_id"))
             .flatten()
             .map(|token| token as i32);
-        // MTP serving needs block 40's tensors in the directory; its expert
-        // weights stay out of the arena either way (`arena_holds`) and are
-        // uploaded exactly once by the first `MtpBlock` below.
+        // MTP serving needs the last block's tensors in the directory; its
+        // feed-forward weights stay out of the arena either way
+        // (`arena_holds_for`) and are uploaded exactly once by the first
+        // `MtpBlock` below.
         let schema = if mtp_drafts > 0 {
             WeightSchema::with_mtp(&config)
         } else {
@@ -676,8 +677,10 @@ impl DeviceRuntime {
         let directory = schema
             .resolve(&file)
             .map_err(|errors| RuntimeError::Schema(format!("{errors:?}")))?;
-        let (weights, _) =
-            DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)?;
+        let ffn = config.ffn;
+        let (weights, _) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, |role| {
+            arena_holds_for(ffn, role)
+        })?;
         debug!(
             device = device_ordinal,
             elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
@@ -801,12 +804,14 @@ impl DeviceRuntime {
         // narrow catch-up remainders, which is why they exist even though
         // drafting itself only ever uses the scheduled decode width).
         let mtp = if mtp_drafts > 0 {
+            let eps_key = config.hparam_key(crate::forward::RMS_EPS_SUFFIX);
+            let rope_key = config.hparam_key(crate::forward::ROPE_FREQ_BASE_SUFFIX);
             let rms_eps = file
-                .get_f32(crate::forward::RMS_EPS_KEY)
-                .ok_or_else(|| RuntimeError::Schema(crate::forward::RMS_EPS_KEY.into()))?;
+                .get_f32(&eps_key)
+                .ok_or_else(|| RuntimeError::Schema(eps_key.clone()))?;
             let rope_theta = file
-                .get_f32(crate::forward::ROPE_FREQ_BASE_KEY)
-                .ok_or_else(|| RuntimeError::Schema(crate::forward::ROPE_FREQ_BASE_KEY.into()))?;
+                .get_f32(&rope_key)
+                .ok_or_else(|| RuntimeError::Schema(rope_key.clone()))?;
             // Width shapes first, with the LM head — drafting needs it.
             // Prefill shapes follow without one; a duplicate token count
             // (e.g. a prefill remainder equal to a draft width) keeps the

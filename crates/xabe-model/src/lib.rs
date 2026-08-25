@@ -1,5 +1,10 @@
-//! Structural description of Qwen3.6-35B-A3B and the resource budgets that
-//! follow from it.
+//! Structural description of the Qwen3.5-family models this engine serves,
+//! and the resource budgets that follow from it.
+//!
+//! Two architectures are described: `qwen35moe` (Qwen3.6-35B-A3B, a routed
+//! 256-expert MoE) and `qwen35` (Qwen3.8-27B, the dense sibling). They share
+//! the hybrid Gated-DeltaNet/Gated-Attention layer pattern and differ in the
+//! feed-forward block and in every width; see [`FfnConfig`].
 //!
 //! This crate holds no state and touches no device. It answers questions of
 //! the form "given this architecture, how many bytes does X cost" — VRAM
@@ -16,7 +21,10 @@ pub mod verify;
 pub mod vision;
 pub mod weights;
 
-pub use config::{AttentionConfig, GdnConfig, LayerKind, ModelConfig, MoeConfig};
+pub use config::{
+    AttentionConfig, DenseFfnConfig, FfnConfig, GdnConfig, LayerKind, ModelConfig, MoeConfig,
+    UnknownArchitecture,
+};
 pub use dflash::DFlashConfig;
 pub use vision::VisionConfig;
 pub use weights::{Directory, Role, Section, TensorSpec, WeightError, WeightSchema};

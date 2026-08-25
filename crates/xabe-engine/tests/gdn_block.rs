@@ -704,8 +704,9 @@ fn the_projection_gap_is_llama_cpps_activation_quantization() {
     let ours_out = report("this block vs f64", &ours2, &exact2);
     let theirs_out = report("llama.cpp vs f64", &theirs2, &exact2);
 
-    // The control: an f32 weight matrix, which llama.cpp does not route
-    // through its integer path.
+    // The control: a weight matrix llama.cpp does not route through its
+    // integer path. It is f32 in this file — the dense `qwen35` sibling
+    // stores the same tensor Q8_0, which is what `as_projection` is for.
     let mut d_alpha = fx
         .stream
         .alloc_zeros::<f32>(tokens * geo.value_heads)
@@ -713,7 +714,7 @@ fn the_projection_gap_is_llama_cpps_activation_quantization() {
     block
         .project(
             &fx.stream,
-            Projection::F32(&weights.alpha),
+            weights.alpha.as_projection(),
             &d_norm,
             &mut d_alpha,
             geo.hidden,
@@ -929,7 +930,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                Projection::F32(&weights.alpha),
+                weights.alpha.as_projection(),
                 &d_gold_norm,
                 &mut d_alpha,
                 geo.hidden,
@@ -940,7 +941,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                Projection::F32(&weights.beta),
+                weights.beta.as_projection(),
                 &d_gold_norm,
                 &mut d_beta_raw,
                 geo.hidden,

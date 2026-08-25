@@ -170,7 +170,9 @@ mod tests {
 
     #[test]
     fn every_token_k_pair_appears_exactly_once_among_valid_slots() {
-        let moe = xabe_model::ModelConfig::qwen3_6_35b_a3b().moe;
+        let moe = xabe_model::ModelConfig::qwen3_6_35b_a3b()
+            .moe()
+            .expect("the routed model");
         let mut rng = crate::rng::Xorshift64Star::new(42);
         let num_tokens = 37;
         let top_k = moe.experts_per_token as usize;

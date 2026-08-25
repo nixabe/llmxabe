@@ -116,8 +116,11 @@ impl AttentionConfig {
 
 /// Mixture-of-experts block geometry.
 ///
-/// Present on *every* layer of this model, including all Gated DeltaNet
-/// layers. There is no dense-layer shortcut.
+/// Present on *every* layer of a `qwen35moe` model, including all Gated
+/// DeltaNet layers. There is no dense-layer shortcut *within* such a model —
+/// but the sibling `qwen35` architecture replaces the whole block with a
+/// single [`DenseFfnConfig`] MLP, which is why this hangs off [`FfnConfig`]
+/// rather than off [`ModelConfig`] directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeConfig {
     /// Total number of routed experts to choose from.
@@ -152,11 +155,121 @@ impl MoeConfig {
     }
 }
 
+/// Dense feed-forward block geometry.
+///
+/// One SwiGLU MLP per layer — `down(silu(gate . x) * (up . x))` — with no
+/// router, no expert stack, and no shared-expert gate. This is what the
+/// `qwen35` architecture (Qwen3.8-27B) carries where `qwen35moe` carries
+/// [`MoeConfig`]; everything else about the two models — the 3:1 hybrid layer
+/// pattern, partial rotary at `head_dim` 256, the recurrent state geometry —
+/// is the same shape at different widths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseFfnConfig {
+    /// Intermediate width of the MLP.
+    pub intermediate: u32,
+}
+
+/// Which feed-forward block a model's layers carry.
+///
+/// The two variants differ in more than a width: the MoE block routes, sums
+/// eight experts and gates a shared one, while the dense block is a single
+/// MLP whose output goes straight to the residual. Keeping them apart in the
+/// type system is what stops a dense model from silently acquiring a router,
+/// and what makes "which architecture is this file" a question with one
+/// answer rather than a scatter of `if num_experts > 0` tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfnConfig {
+    /// A 256-expert routed block plus one shared expert.
+    Moe(MoeConfig),
+    /// A single dense SwiGLU MLP.
+    Dense(DenseFfnConfig),
+}
+
+impl FfnConfig {
+    /// The MoE geometry, if this is a routed block.
+    pub const fn moe(&self) -> Option<MoeConfig> {
+        match self {
+            Self::Moe(m) => Some(*m),
+            Self::Dense(_) => None,
+        }
+    }
+
+    /// The dense geometry, if this is a dense block.
+    pub const fn dense(&self) -> Option<DenseFfnConfig> {
+        match self {
+            Self::Dense(d) => Some(*d),
+            Self::Moe(_) => None,
+        }
+    }
+
+    /// Width of one FFN unit's intermediate dimension.
+    ///
+    /// For MoE that is a *single expert's* width, not the routed total.
+    pub const fn intermediate(&self) -> u32 {
+        match self {
+            Self::Moe(m) => m.expert_intermediate,
+            Self::Dense(d) => d.intermediate,
+        }
+    }
+
+    /// Number of FFN units whose weights exist in one layer.
+    ///
+    /// Routed experts plus shared experts, or one for a dense block.
+    pub const fn units_per_layer(&self) -> u32 {
+        match self {
+            Self::Moe(m) => m.num_experts + m.shared_experts,
+            Self::Dense(_) => 1,
+        }
+    }
+
+    /// Number of FFN units a single token actually reads.
+    pub const fn active_units(&self) -> u32 {
+        match self {
+            Self::Moe(m) => m.active_experts(),
+            Self::Dense(_) => 1,
+        }
+    }
+}
+
+/// A GGUF whose `general.architecture` no [`ModelConfig`] describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownArchitecture {
+    /// What the file declared.
+    pub declared: String,
+}
+
+impl fmt::Display for UnknownArchitecture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let known: Vec<&str> = ModelConfig::KNOWN
+            .iter()
+            .map(|b| b().architecture)
+            .collect();
+        write!(
+            f,
+            "architecture `{}` is not implemented; this engine serves {}",
+            self.declared,
+            known.join(" and "),
+        )
+    }
+}
+
+impl core::error::Error for UnknownArchitecture {}
+
 /// Complete structural description of the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelConfig {
     /// Human-readable model identifier.
     pub name: &'static str,
+    /// The GGUF `general.architecture` string a file must declare to be this
+    /// model.
+    ///
+    /// Also the prefix every hyperparameter key in the file carries, so it is
+    /// what [`Self::hparam_key`] builds metadata lookups from rather than any
+    /// module hard-coding `"qwen35moe."`.
+    pub architecture: &'static str,
+    /// Parameter count the model is published under, used only as the centre
+    /// of [`crate::verify::check_config`]'s plausibility band.
+    pub advertised_params: u64,
     /// Total transformer layers.
     pub num_layers: u32,
     /// Residual stream width.
@@ -175,8 +288,8 @@ pub struct ModelConfig {
     pub gdn: GdnConfig,
     /// Gated Attention geometry.
     pub attention: AttentionConfig,
-    /// MoE geometry, applied on every layer.
-    pub moe: MoeConfig,
+    /// Feed-forward geometry, applied on every layer.
+    pub ffn: FfnConfig,
     /// Native trained context length in tokens.
     pub native_context: u32,
     /// Extended context length reachable with YaRN scaling.
@@ -193,6 +306,8 @@ impl ModelConfig {
     pub const fn qwen3_6_35b_a3b() -> Self {
         Self {
             name: "Qwen3.6-35B-A3B",
+            architecture: "qwen35moe",
+            advertised_params: 35_000_000_000,
             num_layers: 40,
             hidden_size: 2048,
             vocab_size: 248_320,
@@ -211,16 +326,123 @@ impl ModelConfig {
                 head_dim: 256,
                 rope_dim: 64,
             },
-            moe: MoeConfig {
+            ffn: FfnConfig::Moe(MoeConfig {
                 num_experts: 256,
                 experts_per_token: 8,
                 shared_experts: 1,
                 expert_intermediate: 512,
-            },
+            }),
             native_context: 262_144,
             yarn_context: 1_010_000,
             has_mtp: true,
         }
+    }
+
+    /// The dense sibling: `unsloth/Qwen3.8-27B-GGUF`.
+    ///
+    /// Transcribed from the GGUF's own `qwen35.*` hyperparameters, which are
+    /// what `dump the file` reports and what `llama.cpp`'s `qwen35` loader
+    /// reads:
+    ///
+    /// ```text
+    ///   block_count 65 (64 layers + one MTP head)   embedding_length 5120
+    ///   attention.head_count 24 / head_count_kv 4   key/value_length 256
+    ///   rope.dimension_count 64                     full_attention_interval 4
+    ///   ssm.inner_size 6144  state_size 128         time_step_rank 48
+    ///   ssm.group_count 16   conv_kernel 4          feed_forward_length 17408
+    /// ```
+    ///
+    /// The GDN head split is not stated directly: `ssm.inner_size` is the
+    /// value width and `ssm.group_count` the number of q/k heads, so with
+    /// `ssm_norm.weight` of length 128 the head dimension is 128, giving 48
+    /// value heads and 16 q/k heads. That reading is checked against the
+    /// file: `attn_qkv.weight` is `[5120, 10240]` and `10240 = 2*16*128 +
+    /// 48*128`.
+    ///
+    /// Verified against the published 27B figure by
+    /// [`crate::verify::check_config`].
+    pub const fn qwen3_8_27b() -> Self {
+        Self {
+            name: "Qwen3.8-27B",
+            architecture: "qwen35",
+            advertised_params: 27_000_000_000,
+            num_layers: 64,
+            hidden_size: 5120,
+            vocab_size: 248_320,
+            pattern_period: 4,
+            attention_offset: 3,
+            gdn: GdnConfig {
+                value_heads: 48,
+                qk_heads: 16,
+                head_dim: 128,
+                conv_kernel: 4,
+                chunk_len: 64,
+            },
+            attention: AttentionConfig {
+                q_heads: 24,
+                kv_heads: 4,
+                head_dim: 256,
+                rope_dim: 64,
+            },
+            ffn: FfnConfig::Dense(DenseFfnConfig {
+                intermediate: 17_408,
+            }),
+            native_context: 262_144,
+            yarn_context: 1_010_000,
+            has_mtp: true,
+        }
+    }
+
+    /// Every model this engine has a transcribed configuration for.
+    pub const KNOWN: [fn() -> Self; 2] = [Self::qwen3_6_35b_a3b, Self::qwen3_8_27b];
+
+    /// The configuration for a GGUF `general.architecture` string.
+    ///
+    /// Returns `None` rather than guessing: a file whose architecture is not
+    /// listed here has hyperparameters nobody has transcribed, and inferring
+    /// them from the tensor shapes would produce a model that loads and is
+    /// wrong.
+    pub fn for_architecture(architecture: &str) -> Option<Self> {
+        Self::KNOWN
+            .iter()
+            .map(|f| f())
+            .find(|c| c.architecture == architecture)
+    }
+
+    /// The configuration for whatever `file` declares itself to be.
+    ///
+    /// The one place "which model is this" is answered. Everything that opens
+    /// a GGUF — the server, every benchmark, every smoke binary — goes
+    /// through here rather than defaulting to one architecture, because
+    /// defaulting produces a wall of shape mismatches for what is one fact.
+    pub fn from_gguf(file: &xabe_gguf::GgufFile) -> Result<Self, UnknownArchitecture> {
+        let declared = file.get_str("general.architecture");
+        declared
+            .and_then(Self::for_architecture)
+            .ok_or_else(|| UnknownArchitecture {
+                declared: declared.unwrap_or("<absent>").to_string(),
+            })
+    }
+
+    /// The full GGUF metadata key for an architecture-scoped hyperparameter.
+    ///
+    /// `cfg.hparam_key("rope.freq_base")` is `"qwen35moe.rope.freq_base"` for
+    /// the MoE model and `"qwen35.rope.freq_base"` for the dense one. Every
+    /// hyperparameter in a GGUF is prefixed this way, so a module that spells
+    /// one architecture's prefix into a literal reads nothing at all on the
+    /// other — silently, since these lookups all have defaults.
+    pub fn hparam_key(&self, suffix: &str) -> String {
+        format!("{}.{suffix}", self.architecture)
+    }
+
+    /// The MoE geometry, if this model has one.
+    pub const fn moe(&self) -> Option<MoeConfig> {
+        self.ffn.moe()
+    }
+
+    /// The dense FFN geometry, if this model has one.
+    pub const fn dense_ffn(&self) -> Option<DenseFfnConfig> {
+        self.ffn.dense()
     }
 
     /// Number of multi-token-prediction blocks that follow the transformer
@@ -278,26 +500,30 @@ impl ModelConfig {
         self.gdn.state_bytes_per_layer() * self.num_gdn_layers() as u64
     }
 
-    /// Parameters in one expert's three matrices.
-    pub const fn params_per_expert(&self) -> u64 {
-        MoeConfig::MATS_PER_EXPERT as u64
-            * self.hidden_size as u64
-            * self.moe.expert_intermediate as u64
+    /// Parameters in one FFN unit's three matrices.
+    ///
+    /// A unit is one expert on the MoE model and the whole MLP on the dense
+    /// one; `gate`, `up` and `down` are each `hidden x intermediate`.
+    pub const fn params_per_ffn_unit(&self) -> u64 {
+        MoeConfig::MATS_PER_EXPERT as u64 * self.hidden_size as u64 * self.ffn.intermediate() as u64
     }
 
-    /// Total parameters held in MoE expert weights across all layers.
+    /// Total parameters held in feed-forward weights across all layers.
     ///
-    /// This is the bulk of the model: about 32.2B of 34.2B.
-    pub const fn total_expert_params(&self) -> u64 {
-        let experts = (self.moe.num_experts + self.moe.shared_experts) as u64;
-        experts * self.params_per_expert() * self.num_layers as u64
+    /// The bulk of either model: about 32.2B of 34.2B on Qwen3.6-35B-A3B,
+    /// about 17.1B of 26.9B on Qwen3.8-27B.
+    pub const fn total_ffn_params(&self) -> u64 {
+        self.ffn.units_per_layer() as u64 * self.params_per_ffn_unit() * self.num_layers as u64
     }
 
-    /// Expert parameters actually read for a single token.
+    /// Feed-forward parameters actually read for a single token.
     ///
-    /// Nine of 257 experts per layer — the sparsity the whole design exploits.
-    pub const fn active_expert_params(&self) -> u64 {
-        self.moe.active_experts() as u64 * self.params_per_expert() * self.num_layers as u64
+    /// Nine of 257 experts per layer on the MoE model — the sparsity the
+    /// whole design exploits — and the entire MLP on the dense one, which is
+    /// why the dense model reads roughly 6x the FFN weight per token despite
+    /// being the smaller file.
+    pub const fn active_ffn_params(&self) -> u64 {
+        self.ffn.active_units() as u64 * self.params_per_ffn_unit() * self.num_layers as u64
     }
 
     /// Parameters in the input and output embedding matrices combined.
@@ -346,8 +572,11 @@ impl ModelConfig {
                     h * (q_dim + 2 * kv_dim) + q_dim * h + h * q_dim
                 }
             };
-            // MoE router: hidden -> num_experts, on every layer.
-            total += h * u64::from(self.moe.num_experts);
+            // MoE router: hidden -> num_experts, on every layer. The dense
+            // model has no router at all, not a router of width one.
+            if let Some(m) = self.moe() {
+                total += h * u64::from(m.num_experts);
+            }
         }
 
         total
@@ -355,7 +584,7 @@ impl ModelConfig {
 
     /// Total parameter count across the whole model.
     pub fn total_params(&self) -> u64 {
-        self.total_expert_params() + self.embedding_params() + self.projection_params()
+        self.total_ffn_params() + self.embedding_params() + self.projection_params()
     }
 
     /// Parameters read to decode a single token.
@@ -363,7 +592,7 @@ impl ModelConfig {
     /// Active experts, the LM head, and all projections — the numerator of the
     /// weight-bandwidth term in `docs/MODEL.md`.
     pub fn active_params_per_token(&self) -> u64 {
-        self.active_expert_params() + self.lm_head_params() + self.projection_params()
+        self.active_ffn_params() + self.lm_head_params() + self.projection_params()
     }
 }
 
@@ -450,8 +679,95 @@ mod tests {
     #[test]
     fn expert_weights_dominate_the_parameter_count() {
         let c = cfg();
-        let share = c.total_expert_params() as f64 / c.total_params() as f64;
+        let share = c.total_ffn_params() as f64 / c.total_params() as f64;
         assert!(share > 0.9, "experts should be >90% of params, got {share}");
+    }
+
+    fn dense() -> ModelConfig {
+        ModelConfig::qwen3_8_27b()
+    }
+
+    #[test]
+    fn the_dense_config_matches_the_published_27b_figure() {
+        let total = dense().total_params();
+        assert!(
+            (26_000_000_000..=28_000_000_000).contains(&total),
+            "total params {total} outside expected band; a config field is likely wrong"
+        );
+    }
+
+    #[test]
+    fn the_dense_model_reads_its_whole_ffn_per_token() {
+        let d = dense();
+        assert_eq!(d.total_ffn_params(), d.active_ffn_params());
+        // And the MoE model, emphatically, does not: 9 units of 257.
+        let m = cfg();
+        assert!(m.active_ffn_params() * 25 < m.total_ffn_params());
+    }
+
+    #[test]
+    fn the_smaller_file_reads_far_more_ffn_weight_per_token() {
+        // The dense model's whole cost story, and the reason a decode
+        // expectation transplanted from the MoE model reads wrong: 27B dense
+        // touches 17.1B of FFN weight per token where 35B-A3B touches 1.13B.
+        // The file is *smaller*; the per-token weight traffic is 15x larger.
+        let ratio = dense().active_ffn_params() as f64 / cfg().active_ffn_params() as f64;
+        assert!((14.0..16.0).contains(&ratio), "ratio {ratio}");
+    }
+
+    #[test]
+    fn the_dense_gdn_head_split_reproduces_the_files_qkv_width() {
+        // `blk.0.attn_qkv.weight` is `[5120, 10240]` in the GGUF. The head
+        // split is derived, not stated, so this is the check that it was
+        // derived right.
+        let g = dense().gdn;
+        let qkv = 2 * g.qk_heads * g.head_dim + g.value_heads * g.head_dim;
+        assert_eq!(qkv, 10_240);
+        assert_eq!(g.value_heads * g.head_dim, 6_144, "ssm.inner_size");
+    }
+
+    #[test]
+    fn the_dense_attention_reproduces_the_files_projection_widths() {
+        // `attn_q` is `[5120, 12288]` (query and gate interleaved),
+        // `attn_k`/`attn_v` `[5120, 1024]`, `attn_output` `[6144, 5120]`.
+        let a = dense().attention;
+        assert_eq!(a.q_heads * a.head_dim, 6_144);
+        assert_eq!(a.q_heads * a.head_dim * 2, 12_288);
+        assert_eq!(a.kv_heads * a.head_dim, 1_024);
+        assert_eq!(a.gqa_ratio(), 6);
+    }
+
+    #[test]
+    fn architectures_resolve_to_exactly_one_config_each() {
+        for build in ModelConfig::KNOWN {
+            let c = build();
+            assert_eq!(
+                ModelConfig::for_architecture(c.architecture).map(|f| f.name),
+                Some(c.name)
+            );
+        }
+        assert!(ModelConfig::for_architecture("llama").is_none());
+        assert_eq!(
+            cfg().hparam_key("rope.freq_base"),
+            "qwen35moe.rope.freq_base"
+        );
+        assert_eq!(
+            dense().hparam_key("rope.freq_base"),
+            "qwen35.rope.freq_base"
+        );
+    }
+
+    #[test]
+    fn the_dense_model_holds_more_kv_and_more_recurrent_state_per_slot() {
+        // 16 attention layers x 4 KV heads against 10 x 2, and 48 GDN layers
+        // of 48 heads against 30 of 32. Both terms grow: 3.2x the KV per
+        // token and 2.4x the recurrent state per slot, which is what makes
+        // the smaller model the more expensive one to serve at depth.
+        let d = dense();
+        assert_eq!(d.num_attention_layers(), 16);
+        assert_eq!(d.num_gdn_layers(), 48);
+        assert_eq!(d.kv_bytes_per_token(2), 65_536);
+        assert_eq!(d.gdn_state_bytes_per_sequence() / (1024 * 1024), 144);
     }
 
     #[test]
@@ -467,7 +783,12 @@ mod tests {
     #[test]
     fn naive_dispatch_would_launch_1080_gemvs_per_token() {
         let c = cfg();
-        assert_eq!(c.moe.naive_gemvs_per_token(c.num_layers), 1080);
+        assert_eq!(
+            c.moe()
+                .expect("the MoE model has a routed block")
+                .naive_gemvs_per_token(c.num_layers),
+            1080
+        );
     }
 
     #[test]

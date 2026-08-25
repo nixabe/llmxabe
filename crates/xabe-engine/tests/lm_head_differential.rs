@@ -57,8 +57,9 @@ use std::time::Instant;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_cuda::kernels::lm_head::{ARGMAX_BLOCKS, LmHeadGeometry, LmHeadKernels, MAX_BATCH_TILE};
-use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
+use xabe_cuda::kernels::lm_head::{
+    ARGMAX_BLOCKS, HeadTensor, LmHeadGeometry, LmHeadKernels, MAX_BATCH_TILE,
+};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_kernels::compare::{Tolerance, assert_matches, compare};
 use xabe_kernels::gemv::{argmax, gemv_batch};
@@ -361,10 +362,7 @@ fn device_lm_head_matches_the_scalar_reference_over_the_whole_vocabulary() {
 
     let bytes = lm_head_bytes(&file, &g);
     let d_weight = upload_head(&stream, bytes);
-    let weight = QuantTensor {
-        bytes: &d_weight,
-        quant: ExpertQuant::Q8_0,
-    };
+    let weight = HeadTensor::q8_0(&d_weight);
 
     let (live, flat) = hidden_states(&g, SINGLE_SEED, 1);
     assert_carries_signal("hidden state", &live[0]);
@@ -459,10 +457,7 @@ fn a_batch_of_tokens_matches_the_reference_and_costs_one_pass_over_the_weights()
 
     let bytes = lm_head_bytes(&file, &g);
     let d_weight = upload_head(&stream, bytes);
-    let weight = QuantTensor {
-        bytes: &d_weight,
-        quant: ExpertQuant::Q8_0,
-    };
+    let weight = HeadTensor::q8_0(&d_weight);
 
     let (live, flat) = hidden_states(&g, BATCH_SEED, BATCH);
     assert_carries_signal("hidden states", &live.concat());
@@ -643,10 +638,7 @@ fn the_row_tiled_three_token_paths_are_bit_identical_to_the_untiled_kernel() {
 
     let bytes = lm_head_bytes(&file, &g);
     let d_weight = upload_head(&stream, bytes);
-    let weight = QuantTensor {
-        bytes: &d_weight,
-        quant: ExpertQuant::Q8_0,
-    };
+    let weight = HeadTensor::q8_0(&d_weight);
 
     const TOKENS: usize = 3;
     let (live, flat) = hidden_states(&g, BATCH_SEED ^ 0x33, TOKENS);

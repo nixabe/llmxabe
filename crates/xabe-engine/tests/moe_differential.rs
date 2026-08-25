@@ -205,10 +205,10 @@ fn device_and_model() -> Option<(Arc<CudaContext>, GgufFile)> {
 fn geometry() -> MoeGeometry {
     let config = ModelConfig::qwen3_6_35b_a3b();
     MoeGeometry {
-        num_experts: config.moe.num_experts as usize,
-        experts_per_token: config.moe.experts_per_token as usize,
+        num_experts: moe_cfg(&config).num_experts as usize,
+        experts_per_token: moe_cfg(&config).experts_per_token as usize,
         hidden: config.hidden_size as usize,
-        intermediate: config.moe.expert_intermediate as usize,
+        intermediate: moe_cfg(&config).expert_intermediate as usize,
         block_size: BLOCK_SIZE,
         max_tokens: MAX_TOKENS,
     }
@@ -1138,7 +1138,7 @@ fn gemv_and_direct_isolate_the_one_live_token_case() {
     let mut rng = Xorshift64Star::new(0x_5EED_BB01);
     let hidden: Vec<f32> = rng.vec_f32(config.hidden_size as usize, -1.0, 1.0);
     assert_carries_signal("hidden state", &hidden);
-    let logits: Vec<f32> = rng.vec_f32(config.moe.num_experts as usize, -8.0, 8.0);
+    let logits: Vec<f32> = rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0);
 
     let gate = QuantTensor {
         bytes: &d_gate,
@@ -1155,10 +1155,10 @@ fn gemv_and_direct_isolate_the_one_live_token_case() {
 
     let run = |max_tokens: usize| -> Vec<f32> {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
             block_size: BLOCK_SIZE,
             max_tokens,
         };
@@ -1274,7 +1274,7 @@ fn gemv_and_direct_isolate_the_two_live_token_case() {
     assert_carries_signal("hidden state", &hidden0);
     // Same logits for both tokens -- identical top-k, so every one of the
     // 8 buckets they land in has `bucket_live == 2`, not a mix of 1 and 2.
-    let logits: Vec<f32> = rng.vec_f32(config.moe.num_experts as usize, -8.0, 8.0);
+    let logits: Vec<f32> = rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0);
 
     let gate = QuantTensor {
         bytes: &d_gate,
@@ -1291,10 +1291,10 @@ fn gemv_and_direct_isolate_the_two_live_token_case() {
 
     let run_gemv = || -> Vec<f32> {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
             block_size: BLOCK_SIZE,
             max_tokens: 1,
         };
@@ -1324,10 +1324,10 @@ fn gemv_and_direct_isolate_the_two_live_token_case() {
 
     let run_direct_token0 = || -> Vec<f32> {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
             block_size: BLOCK_SIZE,
             max_tokens: 2,
         };
@@ -1447,7 +1447,7 @@ fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
         .collect();
     assert_carries_signal("hidden state", &hiddens[0]);
     let token_logits: Vec<Vec<f32>> = (0..WIDTH)
-        .map(|_| rng.vec_f32(config.moe.num_experts as usize, -8.0, 8.0))
+        .map(|_| rng.vec_f32(moe_cfg(&config).num_experts as usize, -8.0, 8.0))
         .collect();
 
     let gate = QuantTensor {
@@ -1465,10 +1465,10 @@ fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
 
     let run_gemv = |t: usize| -> (Vec<f32>, Vec<i32>, Vec<f32>) {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
             block_size: BLOCK_SIZE,
             max_tokens: 1,
         };
@@ -1500,10 +1500,10 @@ fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
 
     let run_exact_batch = |width: usize| -> (Vec<f32>, Vec<i32>, Vec<f32>) {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
             block_size: BLOCK_SIZE,
             max_tokens: width,
         };
@@ -1552,7 +1552,7 @@ fn the_exact_regime_at_eight_tokens_matches_the_gemv_token_for_token() {
     }
 
     let (batch, batch_ids, _) = run_exact_batch(WIDTH);
-    let top_k = config.moe.experts_per_token as usize;
+    let top_k = moe_cfg(&config).experts_per_token as usize;
     let hidden_dim = config.hidden_size as usize;
     for t in 0..WIDTH {
         let (alone, alone_ids, _) = run_gemv(t);
@@ -1651,10 +1651,10 @@ fn shared_gemv_and_tiled_isolate_the_one_live_token_case() {
 
     let run = |max_tokens: usize, rows: &[Vec<f32>]| -> Vec<f32> {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe_cfg(&config).num_experts as usize,
+            experts_per_token: moe_cfg(&config).experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe_cfg(&config).expert_intermediate as usize,
             block_size: BLOCK_SIZE,
             max_tokens,
         };
@@ -1718,7 +1718,7 @@ fn router_t1_and_tiled_isolate_the_same_row() {
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema must resolve");
     let stream = ctx.default_stream();
-    let eps = MoeBlock::eps_from(&file);
+    let eps = MoeBlock::eps_from(&config, &file);
 
     let mut rng = Xorshift64Star::new(0x_5EED_BB04);
     let hidden = config.hidden_size as usize;
@@ -1728,7 +1728,7 @@ fn router_t1_and_tiled_isolate_the_same_row() {
     assert_carries_signal("residual", &row0);
 
     let run = |max_tokens: usize, rows: &[Vec<f32>]| -> Vec<f32> {
-        let g = MoeBlock::geometry_for(&config, BLOCK_SIZE, max_tokens);
+        let g = MoeBlock::geometry_for(&config, BLOCK_SIZE, max_tokens).expect("the routed model");
         let mut block = MoeBlock::new(&ctx, &stream, g, eps).expect("block builds");
         block.disable_tensor_cores();
         let weights =
@@ -1778,4 +1778,12 @@ fn router_t1_and_tiled_isolate_the_same_row() {
         "router t1 and the TT=8 tile disagree on the same row -- they are \
          engineered for bit-identity and are not",
     );
+}
+
+/// The routed geometry of the model these differential tests target.
+///
+/// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture
+/// landed; everything in this file is about the routed one.
+fn moe_cfg(c: &ModelConfig) -> xabe_model::MoeConfig {
+    c.moe().expect("these tests target the routed model")
 }

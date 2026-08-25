@@ -147,7 +147,7 @@ const ROUTER_TT_N3: u32 = 3;
 /// 128 is where it stops costing anything. Also gates the repack itself, so a
 /// decode-shaped pass does not pay 3.5 MB per layer for weights it will never
 /// read.
-const SHARED_MMA_MIN_TOKENS: usize = 128;
+pub(crate) const SHARED_MMA_MIN_TOKENS: usize = 128;
 /// Experts one router block covers. Mirrors `ROUTER_ET`.
 ///
 /// The router GEMM is deeply L2-bound: a block moves
@@ -178,8 +178,12 @@ const ROUTER_JC: u32 = THREADS;
 /// the Qwen3 family's value.
 pub const DEFAULT_RMS_EPS: f32 = 1e-6;
 
-/// The GGUF key llama.cpp reads the RMS epsilon from.
-const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
+/// The architecture-scoped GGUF key suffix llama.cpp reads the RMS epsilon
+/// from.
+///
+/// Both `qwen35moe` and `qwen35` carry it under their own prefix, so the full
+/// key comes from [`ModelConfig::hparam_key`] rather than from a literal.
+pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
 
 /// The three operations the MoE block needs that no landed kernel provides.
 ///
@@ -481,7 +485,11 @@ __global__ void moe_block_gate_and_combine(
 }
 "#;
 
-/// Something went wrong building or running the MoE block.
+/// Something went wrong building or running a feed-forward block.
+///
+/// Shared with [`crate::block::dense_ffn`], which runs on the same kernels
+/// and can fail in the same ways; splitting it would have produced a second
+/// enum whose variants were all the same.
 #[derive(Debug)]
 pub enum MoeBlockError {
     /// A MoE kernel failed.
@@ -518,6 +526,24 @@ pub enum MoeBlockError {
     },
     /// More tokens were presented than the block was sized for.
     TooManyTokens { tokens: usize, max_tokens: usize },
+    /// A dense layer is resident as the integer repack but the block's
+    /// tensor cores were disabled after it was uploaded.
+    ///
+    /// Reachable only through `Forward::disable_tensor_cores`, which exists
+    /// for `tests/int8_forward.rs` and targets the routed model. Reported
+    /// rather than silently falling back, because there is nothing to fall
+    /// back *to*: the Q8_0 upload was dropped when the repack replaced it.
+    Int8WeightsWithoutTensorCores { layer: u32 },
+    /// A feed-forward block was handed the other architecture's weights.
+    ///
+    /// Structurally unreachable once a pass is built — both come from the
+    /// same [`xabe_model::config::ModelConfig`] — but checked rather than
+    /// asserted, because the alternative failure is a shape error three
+    /// launches deep that says nothing about which model was loaded.
+    FfnKindMismatch {
+        block: &'static str,
+        weights: &'static str,
+    },
 }
 
 impl std::fmt::Display for MoeBlockError {
@@ -564,6 +590,15 @@ impl std::fmt::Display for MoeBlockError {
             Self::TooManyTokens { tokens, max_tokens } => write!(
                 f,
                 "{tokens} tokens exceeds the {max_tokens} this block was sized for",
+            ),
+            Self::Int8WeightsWithoutTensorCores { layer } => write!(
+                f,
+                "block {layer}'s dense FFN is resident as the integer repack, which needs \
+                 the tensor cores this block was told to stop using",
+            ),
+            Self::FfnKindMismatch { block, weights } => write!(
+                f,
+                "a `{block}` feed-forward block was handed `{weights}` weights",
             ),
         }
     }
@@ -637,8 +672,8 @@ impl MoeLayerWeights {
         let one_expert = geometry.intermediate * hidden;
         let stack = geometry.stack_elements();
 
-        let (post_norm, _) = dense(file, directory, Role::PostMixerNorm, layer, hidden)?;
-        let (router, router_type) = dense(
+        let (post_norm, _) = dense_tensor(file, directory, Role::PostMixerNorm, layer, hidden)?;
+        let (router, router_type) = dense_tensor(
             file,
             directory,
             Role::MoeRouter,
@@ -646,18 +681,21 @@ impl MoeLayerWeights {
             geometry.num_experts * hidden,
         )?;
         let (shared_gate_inp, shared_gate_inp_type) =
-            dense(file, directory, Role::MoeSharedGateInp, layer, hidden)?;
+            dense_tensor(file, directory, Role::MoeSharedGateInp, layer, hidden)?;
 
-        let (gate_bytes, gate_quant) = quantized(file, directory, Role::MoeGateExps, layer, stack)?;
-        let (up_bytes, up_quant) = quantized(file, directory, Role::MoeUpExps, layer, stack)?;
-        let (down_bytes, down_quant) = quantized(file, directory, Role::MoeDownExps, layer, stack)?;
+        let (gate_bytes, gate_quant) =
+            quantized_tensor(file, directory, Role::MoeGateExps, layer, stack)?;
+        let (up_bytes, up_quant) =
+            quantized_tensor(file, directory, Role::MoeUpExps, layer, stack)?;
+        let (down_bytes, down_quant) =
+            quantized_tensor(file, directory, Role::MoeDownExps, layer, stack)?;
 
         let (sgate_bytes, shared_gate_quant) =
-            quantized(file, directory, Role::MoeSharedGate, layer, one_expert)?;
+            quantized_tensor(file, directory, Role::MoeSharedGate, layer, one_expert)?;
         let (sup_bytes, shared_up_quant) =
-            quantized(file, directory, Role::MoeSharedUp, layer, one_expert)?;
+            quantized_tensor(file, directory, Role::MoeSharedUp, layer, one_expert)?;
         let (sdown_bytes, shared_down_quant) =
-            quantized(file, directory, Role::MoeSharedDown, layer, one_expert)?;
+            quantized_tensor(file, directory, Role::MoeSharedDown, layer, one_expert)?;
 
         let shared_gate = stream.clone_htod(&*to_device_layout(shared_gate_quant, sgate_bytes))?;
         let shared_up = stream.clone_htod(&*to_device_layout(shared_up_quant, sup_bytes))?;
@@ -782,7 +820,7 @@ fn raw<'f>(
 ///
 /// `bf16` is a truncated `f32`, so the widening is exact — a shift, not a
 /// conversion. Any other dense type is rejected by name.
-fn dense(
+pub(crate) fn dense_tensor(
     file: &GgufFile,
     directory: &Directory<'_>,
     role: Role,
@@ -821,7 +859,7 @@ fn dense(
 /// Nothing is dequantized on the host: one layer's routed experts are 268 M
 /// elements per projection, which is 3.1 GiB in fp32 against 725 MiB packed.
 /// The GEMM unpacks the element it is about to multiply.
-fn quantized<'f>(
+pub(crate) fn quantized_tensor<'f>(
     file: &'f GgufFile,
     directory: &Directory<'_>,
     role: Role,
@@ -869,25 +907,34 @@ impl MoeBlock {
     ///
     /// llama.cpp reads this key with the non-optional `get_key`, so a file
     /// without it would not load there at all; the fallback exists for
-    /// synthetic files, not for the real one.
-    pub fn eps_from(file: &GgufFile) -> f32 {
-        file.get_f32(RMS_EPS_KEY).unwrap_or(DEFAULT_RMS_EPS)
+    /// synthetic files, not for the real one. The key is scoped to
+    /// `config`'s architecture: reading `qwen35moe.*` out of a `qwen35` file
+    /// would silently take the fallback.
+    pub fn eps_from(config: &ModelConfig, file: &GgufFile) -> f32 {
+        file.get_f32(&config.hparam_key(RMS_EPS_SUFFIX))
+            .unwrap_or(DEFAULT_RMS_EPS)
     }
 
     /// The real Qwen3.6 MoE geometry, for `max_tokens` per step.
     ///
     /// Derived from [`ModelConfig`] rather than written out, so a config that
     /// disagrees with the file cannot silently produce a block of the wrong
-    /// shape.
-    pub fn geometry_for(config: &ModelConfig, block_size: usize, max_tokens: usize) -> MoeGeometry {
-        MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+    /// shape. `None` for a model whose layers carry a dense FFN instead — see
+    /// [`crate::block::dense_ffn::DenseFfnBlock::geometry_for`].
+    pub fn geometry_for(
+        config: &ModelConfig,
+        block_size: usize,
+        max_tokens: usize,
+    ) -> Option<MoeGeometry> {
+        let m = config.moe()?;
+        Some(MoeGeometry {
+            num_experts: m.num_experts as usize,
+            experts_per_token: m.experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: m.expert_intermediate as usize,
             block_size,
             max_tokens,
-        }
+        })
     }
 
     /// Compile every kernel the block needs and allocate every buffer, once.
@@ -1237,7 +1284,11 @@ impl MoeBlock {
     }
 }
 
-fn check_len(what: &'static str, expected: usize, found: usize) -> Result<(), MoeBlockError> {
+pub(crate) fn check_len(
+    what: &'static str,
+    expected: usize,
+    found: usize,
+) -> Result<(), MoeBlockError> {
     if found == expected {
         Ok(())
     } else {
@@ -1283,7 +1334,7 @@ mod tests {
 
     #[test]
     fn the_geometry_is_derived_from_the_model_config_not_written_out() {
-        let g = MoeBlock::geometry_for(&config(), 16, 32);
+        let g = MoeBlock::geometry_for(&config(), 16, 32).expect("qwen35moe is routed");
         assert_eq!(g.num_experts, 256);
         assert_eq!(g.experts_per_token, 8);
         assert_eq!(g.hidden, 2048);

@@ -3379,6 +3379,8 @@ pub enum MoeError {
     },
     /// More tokens were presented than the buffers were sized for.
     TooManyTokens { tokens: usize, max_tokens: usize },
+    /// A routed entry point was handed [`BufferScope::SharedOnly`] buffers.
+    SharedOnlyBuffers { entry: &'static str },
 }
 
 impl std::fmt::Display for MoeError {
@@ -3387,6 +3389,11 @@ impl std::fmt::Display for MoeError {
             Self::Compile(m) => write!(f, "kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Mma(e) => write!(f, "{e}"),
+            Self::SharedOnlyBuffers { entry } => write!(
+                f,
+                "`{entry}` needs the routed dispatch tables, but these buffers \
+                 were allocated for the shared-expert path only"
+            ),
             Self::UnsupportedGeometry { geometry, reason } => {
                 write!(f, "unsupported MoE geometry {geometry:?}: {reason}")
             }
@@ -3422,6 +3429,28 @@ impl From<DriverError> for MoeError {
     }
 }
 
+/// Which half of the MoE path a [`MoeBuffers`] was allocated for.
+///
+/// The dense `qwen35` FFN runs on [`MoeKernels::shared_expert`] and
+/// [`MoeKernels::shared_expert_mma`] — the same computation the shared expert
+/// is, at 34x the intermediate width — and touches none of the routing,
+/// sorting, or dispatch buffers. Allocating them anyway would cost about
+/// 445 MiB per worker at a 4,096-token prefill and 17,408-wide FFN, for
+/// tables no launch would ever read.
+///
+/// So the scope is recorded rather than assumed, and the routed entry points
+/// reject a shared-only set by name. A zero-length `sorted_token_ids` handed
+/// to `moe_align_block_size` would not fail; it would silently dispatch
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferScope {
+    /// Every buffer: routing, dispatch, the routed GEMM, and the shared
+    /// expert.
+    Routed,
+    /// The shared-expert path only.
+    SharedOnly,
+}
+
 /// Every buffer the MoE path touches, allocated once.
 ///
 /// Nothing here is sized by a per-step value. `valid_tokens` is the device
@@ -3429,6 +3458,8 @@ impl From<DriverError> for MoeError {
 /// data-dependent size the dispatch kernel produces — held in device memory
 /// so no launch shape ever has to wait for it.
 pub struct MoeBuffers {
+    /// Which half of the path this set was allocated for.
+    scope: BufferScope,
     topk_ids: CudaSlice<i32>,
     topk_weights: CudaSlice<f32>,
     sorted_token_ids: CudaSlice<i32>,
@@ -3482,6 +3513,18 @@ pub struct MoeBuffers {
 }
 
 impl MoeBuffers {
+    /// Which half of the path this set was allocated for.
+    pub fn scope(&self) -> BufferScope {
+        self.scope
+    }
+
+    fn require_routed(&self, entry: &'static str) -> Result<(), MoeError> {
+        match self.scope {
+            BufferScope::Routed => Ok(()),
+            BufferScope::SharedOnly => Err(MoeError::SharedOnlyBuffers { entry }),
+        }
+    }
+
     /// Selected expert ids, `[max_tokens][experts_per_token]`.
     pub fn topk_ids(&self) -> &CudaSlice<i32> {
         &self.topk_ids
@@ -3531,6 +3574,11 @@ impl MoeBuffers {
     }
 
     /// Total device bytes held.
+    ///
+    /// Every allocation, including the int8 staging buffers. Those used to be
+    /// left out, which was noise at the MoE model's 512-wide expert and is
+    /// not at the dense model's 17,408-wide FFN: `siq` and `iq` alone are
+    /// 143 MiB at a 4,096-token prefill there.
     pub fn bytes(&self) -> usize {
         (self.topk_ids.len()
             + self.sorted_token_ids.len()
@@ -3543,8 +3591,16 @@ impl MoeBuffers {
             + (self.topk_weights.len()
                 + self.inter.len()
                 + self.partial.len()
-                + self.shared_inter.len())
+                + self.shared_inter.len()
+                + self.xq_scales.len()
+                + self.iq_scales.len()
+                + self.shared_gate_out.len()
+                + self.shared_swiglu.len()
+                + self.siq_scales.len())
                 * size_of::<f32>()
+            + self.xq.len()
+            + self.iq.len()
+            + self.siq.len()
     }
 }
 
@@ -3612,6 +3668,26 @@ impl SharedExpertInt8 {
             down_q,
             down_s,
         })
+    }
+
+    /// The gate projection's quants and its per-32 scales.
+    ///
+    /// Exposed so a caller with its own kernel over this layout — the dense
+    /// FFN's narrow-batch GEMV — can read it without going through
+    /// [`MoeKernels::shared_expert_mma`], which is a GEMM and wastes 63/64 of
+    /// its tile at one token.
+    pub fn gate(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+        (&self.gate_q, &self.gate_s)
+    }
+
+    /// The up projection's quants and scales. See [`Self::gate`].
+    pub fn up(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+        (&self.up_q, &self.up_s)
+    }
+
+    /// The down projection's quants and scales. See [`Self::gate`].
+    pub fn down(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+        (&self.down_q, &self.down_s)
     }
 
     /// Device bytes held.
@@ -3828,28 +3904,69 @@ impl MoeKernels {
 
     /// Allocate every buffer, once.
     pub fn buffers(&self, stream: &Arc<CudaStream>) -> Result<MoeBuffers, MoeError> {
+        self.alloc_buffers(stream, BufferScope::Routed, true)
+    }
+
+    /// Allocate only what [`Self::shared_expert`] and
+    /// [`Self::shared_expert_mma`] read.
+    ///
+    /// For the dense `qwen35` FFN, which is the shared expert's computation
+    /// at the model's full intermediate width and has no routed half at all.
+    /// The routing and dispatch tables come back zero-length and every routed
+    /// entry point rejects the result — see [`BufferScope`].
+    /// `mma` selects whether the integer tensor-core staging buffers are
+    /// allocated. They are four more `max_tokens * intermediate` arrays —
+    /// 613 MiB at the dense model's 17,408-wide FFN and a 2,048-token
+    /// prefill — and only [`Self::shared_expert_mma`] reads them, so a block
+    /// that will not take that path should not pay for them.
+    pub fn shared_only_buffers(
+        &self,
+        stream: &Arc<CudaStream>,
+        mma: bool,
+    ) -> Result<MoeBuffers, MoeError> {
+        self.alloc_buffers(stream, BufferScope::SharedOnly, mma)
+    }
+
+    fn alloc_buffers(
+        &self,
+        stream: &Arc<CudaStream>,
+        scope: BufferScope,
+        mma: bool,
+    ) -> Result<MoeBuffers, MoeError> {
         let g = self.geometry;
+        // Sized to zero rather than to one: a length of zero is what makes a
+        // routed launch fail loudly if the `require_routed` guard is ever
+        // bypassed, where a length of one would index in bounds and be wrong.
+        let routed = |n: usize| match scope {
+            BufferScope::Routed => n,
+            BufferScope::SharedOnly => 0,
+        };
+        // The tensor-core staging arrays, likewise zero-length when the block
+        // will not take that path.
+        let staged = |n: usize| if mma { n } else { 0 };
         Ok(MoeBuffers {
-            topk_ids: stream.alloc_zeros::<i32>(g.max_flat_pairs())?,
-            topk_weights: stream.alloc_zeros::<f32>(g.max_flat_pairs())?,
-            sorted_token_ids: stream.alloc_zeros::<i32>(g.sorted_capacity())?,
-            expert_ids: stream.alloc_zeros::<i32>(g.expert_block_capacity())?,
-            bucket_live: stream.alloc_zeros::<i32>(g.expert_block_capacity())?,
-            expert_counts: stream.alloc_zeros::<i32>(g.num_experts)?,
-            num_tokens_post_pad: stream.alloc_zeros::<i32>(1)?,
+            scope,
+            topk_ids: stream.alloc_zeros::<i32>(routed(g.max_flat_pairs()))?,
+            topk_weights: stream.alloc_zeros::<f32>(routed(g.max_flat_pairs()))?,
+            sorted_token_ids: stream.alloc_zeros::<i32>(routed(g.sorted_capacity()))?,
+            expert_ids: stream.alloc_zeros::<i32>(routed(g.expert_block_capacity()))?,
+            bucket_live: stream.alloc_zeros::<i32>(routed(g.expert_block_capacity()))?,
+            expert_counts: stream.alloc_zeros::<i32>(routed(g.num_experts))?,
+            num_tokens_post_pad: stream.alloc_zeros::<i32>(routed(1))?,
             valid_tokens: stream.alloc_zeros::<i32>(1)?,
             valid_published: 0,
-            inter: stream.alloc_zeros::<f32>(g.sorted_capacity() * g.intermediate)?,
-            partial: stream.alloc_zeros::<f32>(g.max_flat_pairs() * g.hidden)?,
+            inter: stream.alloc_zeros::<f32>(routed(g.sorted_capacity() * g.intermediate))?,
+            partial: stream.alloc_zeros::<f32>(routed(g.max_flat_pairs() * g.hidden))?,
             shared_inter: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
-            xq: stream.alloc_zeros::<i8>(g.max_tokens * g.hidden)?,
-            xq_scales: stream.alloc_zeros::<f32>(g.max_tokens * g.hidden / 32)?,
-            iq: stream.alloc_zeros::<i8>(g.sorted_capacity() * g.intermediate)?,
-            iq_scales: stream.alloc_zeros::<f32>(g.sorted_capacity() * g.intermediate / 32)?,
-            shared_gate_out: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
-            shared_swiglu: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate)?,
-            siq: stream.alloc_zeros::<i8>(g.max_tokens * g.intermediate)?,
-            siq_scales: stream.alloc_zeros::<f32>(g.max_tokens * g.intermediate / 32)?,
+            xq: stream.alloc_zeros::<i8>(staged(g.max_tokens * g.hidden))?,
+            xq_scales: stream.alloc_zeros::<f32>(staged(g.max_tokens * g.hidden / 32))?,
+            iq: stream.alloc_zeros::<i8>(routed(g.sorted_capacity() * g.intermediate))?,
+            iq_scales: stream
+                .alloc_zeros::<f32>(routed(g.sorted_capacity() * g.intermediate / 32))?,
+            shared_gate_out: stream.alloc_zeros::<f32>(staged(g.max_tokens * g.intermediate))?,
+            shared_swiglu: stream.alloc_zeros::<f32>(staged(g.max_tokens * g.intermediate))?,
+            siq: stream.alloc_zeros::<i8>(staged(g.max_tokens * g.intermediate))?,
+            siq_scales: stream.alloc_zeros::<f32>(staged(g.max_tokens * g.intermediate / 32))?,
         })
     }
 
@@ -3936,6 +4053,7 @@ impl MoeKernels {
         buffers: &mut MoeBuffers,
         logits: &CudaSlice<f32>,
     ) -> Result<(), MoeError> {
+        buffers.require_routed("route_and_dispatch")?;
         let g = self.geometry;
         if g.max_tokens != 1 {
             self.route(stream, buffers, logits)?;
@@ -4003,6 +4121,7 @@ impl MoeKernels {
         buffers: &mut MoeBuffers,
         logits: &CudaSlice<f32>,
     ) -> Result<(), MoeError> {
+        buffers.require_routed("route")?;
         let g = self.geometry;
         // The top-k selection holds every expert in one warp's registers.
         if g.num_experts > 32 * ROUTE_LANE_EXPERTS {
@@ -4057,6 +4176,7 @@ impl MoeKernels {
         stream: &Arc<CudaStream>,
         buffers: &mut MoeBuffers,
     ) -> Result<(), MoeError> {
+        buffers.require_routed("build_dispatch")?;
         let g = self.geometry;
         let top_k = g.experts_per_token as i32;
         let num_experts = g.num_experts as i32;
@@ -4162,6 +4282,7 @@ impl MoeKernels {
         down: QuantTensor<'_>,
         hidden_states: &CudaSlice<f32>,
     ) -> Result<(), MoeError> {
+        buffers.require_routed("grouped_forward_partial")?;
         let g = self.geometry;
         check_stack("gate", gate, g.stack_elements())?;
         check_stack("up", up, g.stack_elements())?;
@@ -4542,6 +4663,7 @@ impl MoeKernels {
         hidden_states: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
     ) -> Result<(), MoeError> {
+        buffers.require_routed("grouped_forward")?;
         self.grouped_forward_partial(stream, buffers, gate, up, down, hidden_states)?;
         let g = self.geometry;
         let top_k = g.experts_per_token as i32;

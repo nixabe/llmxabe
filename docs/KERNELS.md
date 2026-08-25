@@ -241,10 +241,92 @@ Corrections to the plan above, kept because the reasoning is what misleads:
   roofline, which is why two separate attempts to give them better loads
   measured flat or worse.
 
+## The dense feed-forward block (`qwen35`)
+
+Qwen3.8-27B replaces the routed block with one SwiGLU MLP per layer,
+`down(silu(gate·x) * (up·x))`, 5120 → 17,408 → 5120. That is *the same
+computation the MoE block's shared expert performs*, and
+`MoeKernels::shared_expert` / `shared_expert_mma` take their widths as runtime
+arguments rather than baking Qwen3.6's 512 into the kernel — so the dense FFN
+is those entry points at a 34× wider intermediate plus one residual-add glue
+kernel, not a second SwiGLU implementation.
+
+Two things had to change around them rather than inside them:
+
+- **The routed buffers had to become optional.** A dense block allocated with
+  `MoeKernels::buffers` carries dispatch tables, a routed `partial`, and an
+  `inter` sized by the dispatch-slot count — about 445 MiB per worker at a
+  4,096-token prefill and this FFN width, for tables no launch reads.
+  `BufferScope::SharedOnly` allocates the shared path and leaves the routed
+  tables **zero-length**, and every routed entry point rejects such a set by
+  name. Zero rather than one: a length-one `sorted_token_ids` handed to
+  `moe_align_block_size` would not fail, it would silently dispatch nothing.
+- **The integer repack becomes exclusive.** For the MoE model the repack
+  covers the shared expert alone — 3.5 MB against 725 MB of routed experts —
+  and sits *beside* the arena's Q8_0 copy. Here it covers the whole FFN:
+  one layer's three matrices are 267 M elements, 271 MiB as Q8_0 and 287 MiB
+  as split int8, so across 64 layers holding both is 16.9 + 17.9 GiB on a card
+  already carrying 11.8 GiB of arena. It does not fit, and the first attempt
+  died on exactly that `CUDA_ERROR_OUT_OF_MEMORY`. So `DenseFfnMatrices` holds
+  one or the other: `upload` repacks and then drops the Q8_0 slices, and the
+  block dispatches on which residency it has rather than on width.
+  `DENSE_REPACK_INT8` picks between them at compile time.
+- **Which means decode needs its own kernel, from the residency it is given.**
+  `shared_expert_mma` is a GEMM; at one token it stages a 64-token tile and
+  discards 63/64 of it, and measured 109.0 ms against a GEMV's 63.5 on the
+  same weight bytes. `GdnBlock`'s `gdn_proj_split_rows` already reads the
+  split int8 layout at these widths, so `dense_ffn.rs` carries a copy of it as
+  `dense_proj_split_rows` and takes it at ≤ 4 tokens. A copy rather than a
+  shared kernel, deliberately: the GDN path is the measured one on the model
+  the benchmark record is about, and moving its codegen to serve a second
+  caller buys nothing. See [BENCHMARKS.md](BENCHMARKS.md) for the three-way
+  measurement that chose this.
+
+## bf16 weights
+
+53 of Qwen3.8-27B's 866 tensors are bf16, and they are among its largest:
+`output.weight` (2.54 GiB), every attention `attn_q`/`attn_k`/`attn_v`, and
+`nextn.eh_proj`. All of them go through the LM-head GEMV, which read Q8_0 only.
+
+The two alternatives were rejected on arithmetic before anything was built.
+Widening on the host puts 5.1 GiB on the card for the head alone and doubles
+the per-token read of the model's most bandwidth-expensive tensor;
+requantizing to Q8_0 changes the model. So the kernel reads them where they
+are: `lm_head_rows_bf16<BT, RT>` beside the Q8_0 body, with the format
+travelling next to the pointer in `HeadTensor` and read out of each file's own
+tensor directory.
+
+The bf16 body is the *simpler* of the two. bf16 is a truncated fp32, so
+widening is `bits << 16` — exact, with no conversion instruction — and a bf16
+row is dense, so there is no staging pass and no alignment prologue. The Q8_0
+body needs those only because a 34-byte block stride puts useful bytes across
+sector boundaries; that problem does not exist here. Each lane takes eight
+consecutive elements as one `uint4`, the widest load there is, so `hidden` must
+be a multiple of 256 — implied by the existing multiple-of-512 requirement.
+
+What the bf16 body does *not* do is reach the integer tensor cores, and that
+is the expensive half of this format difference. `AttentionBlock` takes its
+int8 repack only when `ProjectionFormats::all_q8_0()` holds, so three bf16
+tensors per layer put the entire attention block on the fp32 path at prefill
+width — worth 2× prefill on this model, measured in
+[BENCHMARKS.md](BENCHMARKS.md). Per-tensor gating, or an int8 repack of the
+bf16 tensors at load, is the obvious follow-up; neither is implemented.
+
+`ssm_alpha` / `ssm_beta` are the other format difference: f32 in Qwen3.6, Q8_0
+here. Those get a second instantiation of the fused gate kernel rather than a
+host-side widening, because the forward path *aliases* the weight arena and an
+owned widened copy inside a `ManuallyDrop<GdnLayerWeights>` would leak once per
+pass shape. The Q8_0 body is a separate macro rather than a templating of the
+f32 one, deliberately: the f32 kernel is the measured path on the model this
+project's whole benchmark record is about, and templating its body would move
+its codegen for no reason.
+
 ## The LM head
 
 One matrix, 2048 × 248,320, and it costs **540 MB per decoded token** — roughly
 58% of what all forty MoE layers read combined. See [MODEL.md](MODEL.md).
+(Qwen3.8-27B's is 5120 × 248,320 at bf16: **2.54 GB per decoded token**, and
+the same argument applies with more force.)
 
 It deserves its own optimization for that reason alone, and it gets one: a row
 tile gives one warp `RT` adjacent vocabulary rows so the activation `float4`

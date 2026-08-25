@@ -25,6 +25,13 @@ RTX 8000, written in Rust.
 > `--mmproj` it takes inline images in all three as well. See
 > [docs/API.md](docs/API.md) for what the endpoints accept and refuse, and
 > [docs/MILESTONES.md](docs/MILESTONES.md) for the engine milestones.
+>
+> It also serves **`Qwen3.8-27B`**, the dense sibling (`general.architecture`
+> `qwen35`): 64 layers, one SwiGLU MLP per layer instead of a 256-expert
+> mixture, 5120 wide. Point `--model` at the file and the engine picks the
+> architecture out of it. Qwen3.6-35B-A3B remains the tuned target — the
+> standing above is about it — and the dense model's own first measurements
+> are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Why this exists
 

@@ -74,7 +74,7 @@ use cudarc::driver::{
 };
 
 use super::compile;
-use super::moe::{ExpertQuant, QuantTensor};
+use super::moe::ExpertQuant;
 
 /// Elements per Q8_0 block, and serialized bytes per block.
 ///
@@ -132,6 +132,12 @@ const WARPS_PER_SM: usize = 32;
 /// memory (sm_75 has 64 KiB of shared per SM; four 256-thread blocks want
 /// 17 KiB of it).
 const STAGE_BLOCKS: usize = 16;
+
+/// Weight elements one warp of the bf16 body covers per iteration: 32 lanes
+/// times the 8 elements a 16-byte load carries. `hidden` must be a multiple
+/// of this for the loop to have no ragged tail. Mirrors the `32 * 8` in
+/// `lm_head_rows_bf16`.
+const BF16_WARP_STEP: usize = 256;
 
 /// Threads per block in both argmax passes.
 const ARGMAX_THREADS: u32 = 256;
@@ -430,6 +436,133 @@ LM_HEAD_ENTRY_RT(lm_head_gemv_b3r2, 3, 2)
 LM_HEAD_ENTRY_RT(lm_head_gemv_b3r4, 3, 4)
 
 // ---------------------------------------------------------------------------
+// The same GEMV over a bf16 weight tensor.
+// ---------------------------------------------------------------------------
+//
+// `Qwen3.8-27B-UD-Q8_K_XL` stores `output.weight`, every attention `attn_q` /
+// `attn_k` / `attn_v`, and `nextn.eh_proj` as bf16 — 53 of its 866 tensors,
+// and the only ones this kernel family is asked for that are not Q8_0. They
+// are also the *largest* ones it is asked for: the head alone is 2.54 GiB.
+// Widening them to fp32 on the host would cost 5.1 GiB on the card and double
+// the per-token read of the single most bandwidth-expensive tensor in the
+// model, and requantizing them to Q8_0 would change the model. So the kernel
+// reads them where they are.
+//
+// bf16 is a truncated fp32, so widening is `bits << 16` — exact, and with no
+// hardware conversion instruction needed. That is also why there is no
+// staging buffer here and no alignment prologue: a bf16 row is dense, every
+// byte of a fetched sector is used, and a row starts at `v * hidden * 2` with
+// `hidden` a multiple of 512, so every load below is naturally aligned. The
+// Q8_0 path needs its staging pass only because a 34-byte block stride puts
+// useful bytes across sector boundaries; that problem does not exist here.
+//
+// Each lane takes 8 consecutive elements — one `uint4`, 16 bytes, which is
+// the widest load there is and matches what the Q8_0 path's staging pass
+// achieves. A warp therefore covers 256 elements per iteration, and
+// `hidden_dim` must be a multiple of 256 for the loop to have no ragged
+// tail. `LmHeadKernels::with_row_tile` already requires a multiple of 512.
+__device__ __forceinline__ float widen_bf16(unsigned int bits) {
+    return __int_as_float((int)(bits << 16));
+}
+
+template <int BT, int RT>
+__device__ __forceinline__ void lm_head_rows_bf16(
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ hidden_states,
+    int hidden_dim,
+    int vocab,
+    int token_base,
+    float* __restrict__ logits
+) {
+    int row = (blockIdx.x * blockDim.y + threadIdx.y) * RT;
+    int lane = threadIdx.x;
+    if (row >= vocab) return;
+
+    const uint4* g4[RT];
+    #pragma unroll
+    for (int rt = 0; rt < RT; ++rt) {
+        g4[rt] = (const uint4*)(weight + (long long)(row + rt) * hidden_dim * 2);
+    }
+    const float* x = hidden_states + (long long)token_base * hidden_dim;
+
+    float acc[RT * BT];
+    #pragma unroll
+    for (int t = 0; t < RT * BT; ++t) acc[t] = 0.0f;
+
+    for (int base = 0; base < hidden_dim; base += 32 * 8) {
+        int j = base + lane * 8;
+        // Two `float4` per token, loaded before the row loop so all RT rows'
+        // FMAs feed from the same registers — the row tile's whole purpose,
+        // as in the Q8_0 body above.
+        float4 xa[BT];
+        float4 xb[BT];
+        #pragma unroll
+        for (int t = 0; t < BT; ++t) {
+            const float* xt = x + (long long)t * hidden_dim + j;
+            xa[t] = *(const float4*)xt;
+            xb[t] = *(const float4*)(xt + 4);
+        }
+        #pragma unroll
+        for (int rt = 0; rt < RT; ++rt) {
+            uint4 p = g4[rt][(base >> 3) + lane];
+            float w0 = widen_bf16(p.x & 0xFFFFu);
+            float w1 = widen_bf16(p.x >> 16);
+            float w2 = widen_bf16(p.y & 0xFFFFu);
+            float w3 = widen_bf16(p.y >> 16);
+            float w4 = widen_bf16(p.z & 0xFFFFu);
+            float w5 = widen_bf16(p.z >> 16);
+            float w6 = widen_bf16(p.w & 0xFFFFu);
+            float w7 = widen_bf16(p.w >> 16);
+            #pragma unroll
+            for (int t = 0; t < BT; ++t) {
+                acc[rt * BT + t] += w0 * xa[t].x + w1 * xa[t].y
+                                  + w2 * xa[t].z + w3 * xa[t].w
+                                  + w4 * xb[t].x + w5 * xb[t].y
+                                  + w6 * xb[t].z + w7 * xb[t].w;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int rt = 0; rt < RT; ++rt) {
+        #pragma unroll
+        for (int t = 0; t < BT; ++t) {
+            float v = acc[rt * BT + t];
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_down_sync(0xffffffff, v, off);
+            }
+            if (lane == 0) {
+                logits[(long long)(token_base + t) * vocab + row + rt] = v;
+            }
+        }
+    }
+}
+
+#define LM_HEAD_BF16_ENTRY(NAME, BT, RT)                                    \
+extern "C" __global__ void NAME(                                            \
+    const unsigned char* __restrict__ weight,                               \
+    const float* __restrict__ hidden_states,                                \
+    int hidden_dim,                                                         \
+    int vocab,                                                              \
+    int token_base,                                                         \
+    float* __restrict__ logits                                              \
+) {                                                                         \
+    lm_head_rows_bf16<BT, RT>(weight, hidden_states, hidden_dim, vocab,     \
+                              token_base, logits);                          \
+}
+
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b1, 1, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b2, 2, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b3, 3, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b4, 4, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b5, 5, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b6, 6, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b7, 7, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b8, 8, 1)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b3r2, 3, 2)
+LM_HEAD_BF16_ENTRY(lm_head_bf16_b3r4, 3, 4)
+
+// ---------------------------------------------------------------------------
 // Greatest logit, lowest index on a tie: `xabe_kernels::gemv::argmax`.
 // ---------------------------------------------------------------------------
 //
@@ -554,6 +687,72 @@ extern "C" __global__ void argmax_prob(
 }
 "#;
 
+/// How a tensor this kernel family reads is stored in the GGUF.
+///
+/// Both models put their per-layer projections and their LM head through this
+/// same GEMV, and the two files do not agree on the format:
+/// `Qwen3.6-35B-A3B-UD-Q6_K_XL` stores all of them Q8_0, while
+/// `Qwen3.8-27B-UD-Q8_K_XL` stores `output.weight`, every `attn_q`/`attn_k`/
+/// `attn_v` and `nextn.eh_proj` as bf16 and everything else Q8_0. So the
+/// format travels with the pointer, read out of the file's own tensor
+/// directory, rather than being a property of the kernel or of the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadFormat {
+    /// 32 quants and one fp16 delta per 34-byte block.
+    Q8_0,
+    /// A dense 2-byte truncated fp32. Widening is a shift, so it is exact.
+    Bf16,
+}
+
+impl HeadFormat {
+    /// Serialized bytes per weight element.
+    pub const fn bytes_per_element(self) -> f64 {
+        match self {
+            Self::Q8_0 => BLOCK_Q8_0_BYTES as f64 / QK8_0 as f64,
+            Self::Bf16 => 2.0,
+        }
+    }
+
+    /// The format a GGUF type code names, or `None` if this kernel family
+    /// does not read it.
+    pub const fn from_ggml(name: &str) -> Option<Self> {
+        // `GgmlType` lives in `xabe-gguf`, which `xabe-cuda` does not depend
+        // on, so the mapping is by name at the one call site that has both.
+        match name.as_bytes() {
+            b"q8_0" => Some(Self::Q8_0),
+            b"bf16" => Some(Self::Bf16),
+            _ => None,
+        }
+    }
+}
+
+/// A weight tensor for [`LmHeadKernels::forward`], with its storage format.
+#[derive(Clone, Copy)]
+pub struct HeadTensor<'a> {
+    /// The tensor exactly as it appears in the file.
+    pub bytes: &'a CudaSlice<u8>,
+    /// How to unpack it.
+    pub format: HeadFormat,
+}
+
+impl<'a> HeadTensor<'a> {
+    /// A Q8_0 tensor — the common case, and what every `qwen35moe` tensor is.
+    pub fn q8_0(bytes: &'a CudaSlice<u8>) -> Self {
+        Self {
+            bytes,
+            format: HeadFormat::Q8_0,
+        }
+    }
+
+    /// A bf16 tensor.
+    pub fn bf16(bytes: &'a CudaSlice<u8>) -> Self {
+        Self {
+            bytes,
+            format: HeadFormat::Bf16,
+        }
+    }
+}
+
 /// The LM head shape this instance is compiled and sized for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LmHeadGeometry {
@@ -578,14 +777,34 @@ impl LmHeadGeometry {
         }
     }
 
-    /// Serialized bytes per vocabulary row (2,176 at the real geometry).
+    /// Serialized bytes per vocabulary row **at Q8_0** (2,176 at the real
+    /// geometry).
+    ///
+    /// Qwen3.6's head is Q8_0; Qwen3.8's is bf16, for which the figure is
+    /// `hidden * 2`. Use [`Self::row_bytes_for`] where the format is not
+    /// already known to be Q8_0 — a GB/s number computed with the wrong one
+    /// is off by 1.88x.
     pub const fn row_bytes(&self) -> usize {
         self.hidden / QK8_0 * BLOCK_Q8_0_BYTES
     }
 
-    /// Serialized bytes of the whole head (540,344,320 at the real geometry).
+    /// Serialized bytes per vocabulary row at `format`.
+    pub const fn row_bytes_for(&self, format: HeadFormat) -> usize {
+        match format {
+            HeadFormat::Q8_0 => self.row_bytes(),
+            HeadFormat::Bf16 => self.hidden * 2,
+        }
+    }
+
+    /// Serialized bytes of the whole head at Q8_0 (540,344,320 at the real
+    /// geometry). See [`Self::row_bytes`].
     pub const fn weight_bytes(&self) -> usize {
         self.vocab * self.row_bytes()
+    }
+
+    /// Serialized bytes of the whole head at `format`.
+    pub const fn weight_bytes_for(&self, format: HeadFormat) -> usize {
+        self.vocab * self.row_bytes_for(format)
     }
 
     /// Weight elements (508,559,360 at the real geometry).
@@ -648,14 +867,19 @@ pub enum LmHeadError {
     },
     /// A weight format this kernel does not unpack.
     ///
-    /// Only Q8_0 is implemented, because `output.weight` in
-    /// `Qwen3.6-35B-A3B-UD-Q6_K_XL` is Q8_0 — verified against the file's
-    /// tensor directory. `docs/KERNELS.md` proposes re-quantizing the head
-    /// to Q6_K to cut its 540 MB/token; that would slot [`super::moe`]'s
-    /// `q6k_element` into the prologue unchanged, but shipping an untested
-    /// second path ahead of that decision would be worse than rejecting it
-    /// here.
+    /// Q8_0 and bf16 are implemented, because those are the two formats the
+    /// two model files actually use for these tensors — verified against
+    /// each file's own tensor directory. `docs/KERNELS.md` proposes
+    /// re-quantizing the head to Q6_K to cut its 540 MB/token; that would
+    /// slot [`super::moe`]'s `q6k_element` into the prologue unchanged, but
+    /// shipping an untested third path ahead of that decision would be worse
+    /// than rejecting it here.
     UnsupportedQuant(ExpertQuant),
+    /// `hidden` is not a whole number of the bf16 body's 256-element warp
+    /// steps. Structurally unreachable behind the multiple-of-512 geometry
+    /// check, and kept because that check is about the Q8_0 staging pass and
+    /// could reasonably be relaxed for a format that does not stage.
+    Bf16RaggedContraction { hidden: usize },
     /// The weight tensor is not a whole number of Q8_0 blocks.
     ///
     /// Rejected rather than truncated: a partial trailing block would make
@@ -684,6 +908,11 @@ impl std::fmt::Display for LmHeadError {
             Self::UnsupportedQuant(q) => write!(
                 f,
                 "the LM head kernel unpacks Q8_0 only, not {q:?}; see LmHeadError::UnsupportedQuant",
+            ),
+            Self::Bf16RaggedContraction { hidden } => write!(
+                f,
+                "the bf16 GEMV covers 256 elements per warp step, so `hidden` must be a \
+                 multiple of 256, not {hidden}",
             ),
             Self::RaggedWeights { bytes, block_bytes } => write!(
                 f,
@@ -718,6 +947,11 @@ impl From<DriverError> for LmHeadError {
 pub struct LmHeadKernels {
     /// Indexed by `tile - 1`, for tiles `1..=MAX_BATCH_TILE`.
     tiles: [CudaFunction; MAX_BATCH_TILE],
+    /// The same, over a bf16 weight tensor.
+    bf16_tiles: [CudaFunction; MAX_BATCH_TILE],
+    /// The bf16 row-tiled three-token entry point, paired with
+    /// [`Self::b3_row_tile`]'s row count.
+    bf16_b3_row_tile: Option<CudaFunction>,
     /// The row-tiled three-token entry point and its row count, or `None`
     /// for the untiled path.
     ///
@@ -804,6 +1038,11 @@ impl LmHeadKernels {
             }
             _ => None,
         };
+        let bf16_b3_row_tile = match &b3_row_tile {
+            Some((_, 4)) => Some(module.load_function("lm_head_bf16_b3r4")?),
+            Some((_, _)) => Some(module.load_function("lm_head_bf16_b3r2")?),
+            None => None,
+        };
         Ok(Self {
             tiles: [
                 module.load_function("lm_head_gemv_b1")?,
@@ -815,6 +1054,17 @@ impl LmHeadKernels {
                 module.load_function("lm_head_gemv_b7")?,
                 module.load_function("lm_head_gemv_b8")?,
             ],
+            bf16_tiles: [
+                module.load_function("lm_head_bf16_b1")?,
+                module.load_function("lm_head_bf16_b2")?,
+                module.load_function("lm_head_bf16_b3")?,
+                module.load_function("lm_head_bf16_b4")?,
+                module.load_function("lm_head_bf16_b5")?,
+                module.load_function("lm_head_bf16_b6")?,
+                module.load_function("lm_head_bf16_b7")?,
+                module.load_function("lm_head_bf16_b8")?,
+            ],
+            bf16_b3_row_tile,
             b3_row_tile,
             argmax_partial: module.load_function("argmax_partial")?,
             argmax_final: module.load_function("argmax_final")?,
@@ -830,7 +1080,8 @@ impl LmHeadKernels {
 
     /// `logits[t][v] = sum_h weight[v][h] * hidden_states[t][h]`.
     ///
-    /// `weight` is the raw Q8_0 tensor from the GGUF file, `hidden_states`
+    /// `weight` is the raw tensor from the GGUF file in whichever of the two
+    /// formats [`HeadFormat`] names, `hidden_states`
     /// is `[max_tokens][hidden]` and `logits` is `[max_tokens][vocab]`; rows
     /// past `tokens` in either are neither read nor written.
     ///
@@ -839,22 +1090,35 @@ impl LmHeadKernels {
     pub fn forward(
         &self,
         stream: &Arc<CudaStream>,
-        weight: QuantTensor<'_>,
+        weight: HeadTensor<'_>,
         hidden_states: &CudaSlice<f32>,
         tokens: usize,
         logits: &mut CudaSlice<f32>,
     ) -> Result<(), LmHeadError> {
         let g = self.geometry;
-        if weight.quant != ExpertQuant::Q8_0 {
-            return Err(LmHeadError::UnsupportedQuant(weight.quant));
-        }
-        if !weight.bytes.len().is_multiple_of(BLOCK_Q8_0_BYTES) {
-            return Err(LmHeadError::RaggedWeights {
-                bytes: weight.bytes.len(),
-                block_bytes: BLOCK_Q8_0_BYTES,
-            });
-        }
-        let found = weight.bytes.len() / BLOCK_Q8_0_BYTES * QK8_0;
+        let found = match weight.format {
+            HeadFormat::Q8_0 => {
+                if !weight.bytes.len().is_multiple_of(BLOCK_Q8_0_BYTES) {
+                    return Err(LmHeadError::RaggedWeights {
+                        bytes: weight.bytes.len(),
+                        block_bytes: BLOCK_Q8_0_BYTES,
+                    });
+                }
+                weight.bytes.len() / BLOCK_Q8_0_BYTES * QK8_0
+            }
+            HeadFormat::Bf16 => {
+                if !g.hidden.is_multiple_of(BF16_WARP_STEP) {
+                    return Err(LmHeadError::Bf16RaggedContraction { hidden: g.hidden });
+                }
+                if !weight.bytes.len().is_multiple_of(2) {
+                    return Err(LmHeadError::RaggedWeights {
+                        bytes: weight.bytes.len(),
+                        block_bytes: 2,
+                    });
+                }
+                weight.bytes.len() / 2
+            }
+        };
         if found != g.elements() {
             return Err(LmHeadError::WrongElementCount {
                 expected: g.elements(),
@@ -896,20 +1160,42 @@ impl LmHeadKernels {
             // module docs name against the activation-pipe cost that scales
             // with BT. Row arithmetic is identical, so the logits are
             // bit-identical to the untiled path.
-            let (func, cfg) = match &self.b3_row_tile {
-                Some((f, rt)) if tile == 3 => {
+            let bf16 = weight.format == HeadFormat::Bf16;
+            // The bf16 body stages nothing, so its shared request is zero;
+            // asking for the Q8_0 staging buffer anyway would cost occupancy
+            // for a buffer no lane touches.
+            let cfg = if bf16 {
+                LaunchConfig {
+                    shared_mem_bytes: 0,
+                    ..cfg
+                }
+            } else {
+                cfg
+            };
+            let row_tiled = self.b3_row_tile.as_ref().filter(|_| tile == 3);
+            let (func, cfg) = match row_tiled {
+                Some((f, rt)) => {
                     let rows_per_block = WARPS_PER_BLOCK as usize * rt;
                     let rt_cfg = LaunchConfig {
                         grid_dim: (g.vocab.div_ceil(rows_per_block) as u32, 1, 1),
                         block_dim: (WARP, WARPS_PER_BLOCK, 1),
-                        shared_mem_bytes: (WARPS_PER_BLOCK as usize
-                            * rt
-                            * STAGE_BLOCKS
-                            * BLOCK_Q8_0_BYTES) as u32,
+                        shared_mem_bytes: if bf16 {
+                            0
+                        } else {
+                            (WARPS_PER_BLOCK as usize * rt * STAGE_BLOCKS * BLOCK_Q8_0_BYTES) as u32
+                        },
                     };
-                    (f, rt_cfg)
+                    let func = match (bf16, self.bf16_b3_row_tile.as_ref()) {
+                        (true, Some(b)) => b,
+                        (true, None) => {
+                            unreachable!("the bf16 row tile is loaded exactly when the Q8_0 one is")
+                        }
+                        (false, _) => f,
+                    };
+                    (func, rt_cfg)
                 }
-                _ => (&self.tiles[tile - 1], cfg),
+                None if bf16 => (&self.bf16_tiles[tile - 1], cfg),
+                None => (&self.tiles[tile - 1], cfg),
             };
             let mut builder = stream.launch_builder(func);
             builder

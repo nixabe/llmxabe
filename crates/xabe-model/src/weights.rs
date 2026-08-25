@@ -24,13 +24,17 @@
 //!   Splitting it down the middle is a silent, plausible-looking corruption.
 //! - The GDN `attn_qkv` tensor is `n_embd x (key_dim*2 + value_dim)`, where
 //!   `key_dim = qk_heads * head_dim` and `value_dim = value_heads * head_dim`.
-//! - Every layer, GDN included, carries a full 256-expert MoE block.
+//! - Every layer, GDN included, carries a full 256-expert MoE block — on
+//!   `qwen35moe`. On `qwen35` every layer instead carries one dense SwiGLU
+//!   MLP (`ffn_gate` / `ffn_up` / `ffn_down`), with no router and no shared
+//!   expert; which set of names a schema expects comes from
+//!   [`ModelConfig::ffn`], so the two cannot be confused for one another.
 
 use core::fmt;
 
 use xabe_gguf::{GgmlType, GgufFile, TensorInfo};
 
-use crate::config::{LayerKind, ModelConfig};
+use crate::config::{FfnConfig, LayerKind, ModelConfig};
 
 /// What a tensor is used for.
 ///
@@ -103,6 +107,13 @@ pub enum Role {
     /// `blk.N.ffn_down_shexp.weight`.
     MoeSharedDown,
 
+    /// `blk.N.ffn_gate.weight` — dense FFN gate projection.
+    FfnGate,
+    /// `blk.N.ffn_up.weight` — dense FFN up projection.
+    FfnUp,
+    /// `blk.N.ffn_down.weight` — dense FFN down projection.
+    FfnDown,
+
     /// `blk.N.nextn.eh_proj.weight` — MTP head input projection.
     MtpEhProj,
     /// `blk.N.nextn.enorm.weight`.
@@ -123,8 +134,15 @@ pub enum Section {
     Embedding,
     /// Untied LM head.
     LmHead,
-    /// Stacked per-expert MoE matrices — the bulk of the model.
+    /// Stacked per-expert MoE matrices — the bulk of a `qwen35moe` model.
     Experts,
+    /// The dense FFN's three matrices — the bulk of a `qwen35` model.
+    ///
+    /// Kept apart from [`Self::Experts`] rather than folded into it: the two
+    /// are the same accounting bucket only in the sense that both are "the
+    /// FFN", and a report that summed them would hide which architecture it
+    /// was describing.
+    DenseFfn,
     /// Everything else with a matrix in it: mixers, shared expert, router.
     Projections,
     /// Norm vectors and per-head scalars.
@@ -141,6 +159,7 @@ impl Role {
             TokenEmbedding => Section::Embedding,
             LmHead => Section::LmHead,
             MoeGateExps | MoeUpExps | MoeDownExps => Section::Experts,
+            FfnGate | FfnUp | FfnDown => Section::DenseFfn,
             OutputNorm | InputNorm | PostMixerNorm | AttnQNorm | AttnKNorm | GdnNorm | GdnA
             | GdnDtBias => Section::Norms,
             MtpEhProj | MtpENorm | MtpHNorm | MtpSharedHeadNorm => Section::Mtp,
@@ -182,6 +201,9 @@ impl Role {
             MoeSharedGate => "ffn_gate_shexp.weight",
             MoeSharedUp => "ffn_up_shexp.weight",
             MoeSharedDown => "ffn_down_shexp.weight",
+            FfnGate => "ffn_gate.weight",
+            FfnUp => "ffn_up.weight",
+            FfnDown => "ffn_down.weight",
             MtpEhProj => "nextn.eh_proj.weight",
             MtpENorm => "nextn.enorm.weight",
             MtpHNorm => "nextn.hnorm.weight",
@@ -265,14 +287,22 @@ impl fmt::Display for WeightError {
 
 impl std::error::Error for WeightError {}
 
-/// The GGUF `general.architecture` value this schema is written against.
-pub const EXPECTED_ARCHITECTURE: &str = "qwen35moe";
+/// The GGUF `general.architecture` value the MoE schema is written against.
+///
+/// Retained as a named constant because several tests and the oracle capture
+/// refer to it directly; [`WeightSchema`] takes the architecture from the
+/// [`ModelConfig`] it was built for, so a dense schema checks for `qwen35`.
+pub const MOE_ARCHITECTURE: &str = "qwen35moe";
+
+/// The GGUF `general.architecture` value the dense schema is written against.
+pub const DENSE_ARCHITECTURE: &str = "qwen35";
 
 /// Every tensor the model needs, derived from a [`ModelConfig`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightSchema {
     specs: Vec<TensorSpec>,
     includes_mtp: bool,
+    architecture: &'static str,
 }
 
 impl WeightSchema {
@@ -323,9 +353,7 @@ impl WeightSchema {
         let q_dim = u64::from(a.q_heads) * head_dim;
         let kv_dim = u64::from(a.kv_heads) * head_dim;
 
-        let m = &config.moe;
-        let experts = u64::from(m.num_experts);
-        let ff = u64::from(m.expert_intermediate);
+        let ff = u64::from(config.ffn.intermediate());
 
         let mtp_blocks = if includes_mtp { config.mtp_layers() } else { 0 };
         for layer in 0..config.num_layers + mtp_blocks {
@@ -372,14 +400,24 @@ impl WeightSchema {
                 }
             }
 
-            push(Role::MoeRouter, l, vec![hidden, experts]);
-            push(Role::MoeGateExps, l, vec![hidden, ff, experts]);
-            push(Role::MoeUpExps, l, vec![hidden, ff, experts]);
-            push(Role::MoeDownExps, l, vec![ff, hidden, experts]);
-            push(Role::MoeSharedGateInp, l, vec![hidden]);
-            push(Role::MoeSharedGate, l, vec![hidden, ff]);
-            push(Role::MoeSharedUp, l, vec![hidden, ff]);
-            push(Role::MoeSharedDown, l, vec![ff, hidden]);
+            match config.ffn {
+                FfnConfig::Moe(m) => {
+                    let experts = u64::from(m.num_experts);
+                    push(Role::MoeRouter, l, vec![hidden, experts]);
+                    push(Role::MoeGateExps, l, vec![hidden, ff, experts]);
+                    push(Role::MoeUpExps, l, vec![hidden, ff, experts]);
+                    push(Role::MoeDownExps, l, vec![ff, hidden, experts]);
+                    push(Role::MoeSharedGateInp, l, vec![hidden]);
+                    push(Role::MoeSharedGate, l, vec![hidden, ff]);
+                    push(Role::MoeSharedUp, l, vec![hidden, ff]);
+                    push(Role::MoeSharedDown, l, vec![ff, hidden]);
+                }
+                FfnConfig::Dense(_) => {
+                    push(Role::FfnGate, l, vec![hidden, ff]);
+                    push(Role::FfnUp, l, vec![hidden, ff]);
+                    push(Role::FfnDown, l, vec![ff, hidden]);
+                }
+            }
 
             if is_mtp {
                 push(Role::MtpEhProj, l, vec![hidden * 2, hidden]);
@@ -392,7 +430,13 @@ impl WeightSchema {
         Self {
             specs,
             includes_mtp,
+            architecture: config.architecture,
         }
+    }
+
+    /// The `general.architecture` a file must declare to satisfy this schema.
+    pub fn architecture(&self) -> &'static str {
+        self.architecture
     }
 
     /// Every tensor in the schema, in block order.
@@ -421,12 +465,12 @@ impl WeightSchema {
     pub fn resolve<'a>(&'a self, file: &'a GgufFile) -> Result<Directory<'a>, Vec<WeightError>> {
         let mut errors = Vec::new();
 
-        match file.get_str("general.architecture") {
-            Some(EXPECTED_ARCHITECTURE) => {}
-            found => errors.push(WeightError::ArchitectureMismatch {
-                expected: EXPECTED_ARCHITECTURE.to_string(),
-                found: found.unwrap_or("<absent>").to_string(),
-            }),
+        let declared = file.get_str("general.architecture");
+        if declared != Some(self.architecture) {
+            errors.push(WeightError::ArchitectureMismatch {
+                expected: self.architecture.to_string(),
+                found: declared.unwrap_or("<absent>").to_string(),
+            });
         }
 
         let mut entries = Vec::with_capacity(self.specs.len());

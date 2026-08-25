@@ -147,8 +147,8 @@ pub fn vram_budget(
 /// [`Self::observed_in_target_file`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WeightBytesPerParam {
-    /// Applies to [`ModelConfig::active_expert_params`].
-    pub active_experts: f64,
+    /// Applies to [`ModelConfig::active_ffn_params`].
+    pub active_ffn: f64,
     /// Applies to [`ModelConfig::lm_head_params`].
     pub lm_head: f64,
     /// Applies to [`ModelConfig::projection_params`].
@@ -192,7 +192,7 @@ impl WeightBytesPerParam {
     /// corrected to match.
     pub const fn observed_in_target_file() -> Self {
         Self {
-            active_experts: Self::Q6_K,
+            active_ffn: Self::Q6_K,
             lm_head: Self::Q8_0,
             projections: Self::Q8_0,
         }
@@ -227,7 +227,7 @@ pub fn decode_bandwidth(
     weight_bpp: WeightBytesPerParam,
     gpu_bandwidth_bytes_per_sec: f64,
 ) -> DecodeBandwidth {
-    let weight_bytes = (cfg.active_expert_params() as f64 * weight_bpp.active_experts
+    let weight_bytes = (cfg.active_ffn_params() as f64 * weight_bpp.active_ffn
         + cfg.lm_head_params() as f64 * weight_bpp.lm_head
         + cfg.projection_params() as f64 * weight_bpp.projections)
         .round() as u64;
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn active_expert_bytes_match_the_plans_reference_within_1_percent() {
-        let expert_mb = cfg().active_expert_params() as f64 * WeightBytesPerParam::Q6_K / 1e6;
+        let expert_mb = cfg().active_ffn_params() as f64 * WeightBytesPerParam::Q6_K / 1e6;
         assert!(
             relative_error(expert_mb, 929.0) < 0.01,
             "active expert traffic {expert_mb:.1} MB should be within 1% of the plan's 929 MB"
@@ -362,7 +362,7 @@ mod tests {
     fn lm_head_exceeds_half_of_active_expert_moe_traffic() {
         let c = cfg();
         let lm_head_bytes = c.lm_head_params() as f64 * WeightBytesPerParam::Q8_0;
-        let expert_bytes = c.active_expert_params() as f64 * WeightBytesPerParam::Q6_K;
+        let expert_bytes = c.active_ffn_params() as f64 * WeightBytesPerParam::Q6_K;
         assert!(
             lm_head_bytes > expert_bytes / 2.0,
             "LM head ({lm_head_bytes:.0} B) should exceed half of active-expert \
@@ -382,7 +382,7 @@ mod tests {
         // the crossover lands somewhere in the tens-of-hundred-K region,
         // not at 10K and not at 1M.
         let c = cfg();
-        let weight_bytes = (c.active_expert_params() as f64 * WeightBytesPerParam::Q6_K
+        let weight_bytes = (c.active_ffn_params() as f64 * WeightBytesPerParam::Q6_K
             + c.lm_head_params() as f64 * WeightBytesPerParam::Q8_0
             + c.projection_params() as f64 * WeightBytesPerParam::Q8_0)
             .round() as u64;

@@ -151,7 +151,9 @@ mod tests {
 
     #[test]
     fn routing_matches_qwen3_6_top8_of_256_shape() {
-        let moe = xabe_model::ModelConfig::qwen3_6_35b_a3b().moe;
+        let moe = xabe_model::ModelConfig::qwen3_6_35b_a3b()
+            .moe()
+            .expect("the routed model");
         let num_experts = moe.num_experts as usize;
         let k = moe.experts_per_token as usize;
 

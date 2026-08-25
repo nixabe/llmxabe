@@ -102,9 +102,10 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DriverError,
 use xabe_cuda::arena::ArenaError;
 use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
 use xabe_cuda::kernels::layer_ops::{GateShape, LayerOpsError, LayerOpsKernels};
-use xabe_cuda::kernels::lm_head::{LmHeadError, LmHeadGeometry, LmHeadKernels};
+use xabe_cuda::kernels::lm_head::{
+    HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
+};
 use xabe_cuda::kernels::mma::{MMA_SPLIT_TOKENS, MmaError, MmaKernels};
-use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
 use xabe_gguf::GgmlType;
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::Role;
@@ -180,8 +181,8 @@ impl std::fmt::Display for AttentionBlockError {
             }
             Self::WrongQuant { role, layer, found } => write!(
                 f,
-                "blk.{layer} `{role}` is {found:?}; this block unpacks Q8_0 projections \
-                 and f32 norms only",
+                "blk.{layer} `{role}` is {found:?}; this block unpacks Q8_0 and bf16 \
+                 projections and f32 norms only",
             ),
             Self::WrongShape {
                 role,
@@ -525,7 +526,56 @@ pub(crate) struct AttentionLayerWeights {
     w_k: CudaSlice<u8>,
     w_v: CudaSlice<u8>,
     w_out: CudaSlice<u8>,
+    formats: ProjectionFormats,
     int8: Mutex<Option<Arc<AttnInt8>>>,
+}
+
+/// How each of the four projections is stored, read from the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectionFormats {
+    qgate: HeadFormat,
+    k: HeadFormat,
+    v: HeadFormat,
+    out: HeadFormat,
+}
+
+impl ProjectionFormats {
+    /// Whether *any* of the four is Q8_0, which is what makes a repack worth
+    /// building at all.
+    ///
+    /// `AttnInt8::repack` reads Q8_0 blocks and splits them into int8 quants
+    /// and fp32 scales; there is nothing for it to split in a bf16 tensor,
+    /// and converting one *would* be a weight requantization — a change to
+    /// the model, not a change to its layout. So a bf16 projection stays on
+    /// the GEMV path.
+    ///
+    /// What it does **not** do any more is take its neighbours with it. This
+    /// predicate used to be `all`, and the difference was expensive: the
+    /// `qwen35` file stores `attn_q`/`attn_k`/`attn_v` as bf16 and
+    /// `attn_output` as Q8_0, so one `all` put the whole attention block on
+    /// the fp32 path at prefill width. `qwen35moe` stores all four Q8_0 and
+    /// is unaffected either way — every projection was on the integer path
+    /// before and still is. See `docs/BENCHMARKS.md`.
+    fn any_q8_0(self) -> bool {
+        if all_or_nothing_int8() {
+            return [self.qgate, self.k, self.v, self.out]
+                .iter()
+                .all(|f| *f == HeadFormat::Q8_0);
+        }
+        [self.qgate, self.k, self.v, self.out].contains(&HeadFormat::Q8_0)
+    }
+}
+
+/// `LLMXABE_ATTN_INT8_ALL_OR_NOTHING=1` restores the predicate this block used
+/// before per-projection gating: the integer path is taken only when all four
+/// projections are Q8_0, and one bf16 tensor puts the whole layer on the GEMV.
+///
+/// It exists to A/B the change on a mixed-format file. On `qwen35moe`, where
+/// every projection is Q8_0, the two predicates agree and the flag is a
+/// no-op — which is the property this knob is there to let you verify rather
+/// than assert. Read once per layer at construction, never on a forward pass.
+fn all_or_nothing_int8() -> bool {
+    std::env::var_os("LLMXABE_ATTN_INT8_ALL_OR_NOTHING").is_some()
 }
 
 /// The per-pass buffers every Gated Attention layer needs, owned once.
@@ -689,14 +739,24 @@ impl AttnScratch {
 /// int8 plus one fp32 scale per 32, against Q8_0's fp16 scale per 32.
 struct AttnInt8 {
     mma: MmaKernels,
-    qgate_q: CudaSlice<i8>,
-    qgate_s: CudaSlice<f32>,
-    k_q: CudaSlice<i8>,
-    k_s: CudaSlice<f32>,
-    v_q: CudaSlice<i8>,
-    v_s: CudaSlice<f32>,
-    out_q: CudaSlice<i8>,
-    out_s: CudaSlice<f32>,
+    qgate: Option<Int8Projection>,
+    k: Option<Int8Projection>,
+    v: Option<Int8Projection>,
+    out: Option<Int8Projection>,
+}
+
+/// One projection repacked into split int8 quants and fp32 scales.
+type Int8Projection = (CudaSlice<i8>, CudaSlice<f32>);
+
+impl AttnInt8 {
+    /// Whether any projection reading `normed` is on the integer path.
+    ///
+    /// Steps 2 and 5 share one quantization of the RMSNormed residual
+    /// stream, so it is worth paying for if *any* of the three takes it and
+    /// wasted if none do.
+    fn any_from_normed(&self) -> bool {
+        self.qgate.is_some() || self.k.is_some() || self.v.is_some()
+    }
 }
 
 fn shared_or_try_init<T, E>(
@@ -737,6 +797,7 @@ impl AttnInt8 {
     fn repack(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
+        formats: ProjectionFormats,
         w_qgate: &CudaSlice<u8>,
         w_k: &CudaSlice<u8>,
         w_v: &CudaSlice<u8>,
@@ -746,26 +807,29 @@ impl AttnInt8 {
         out_elems: usize,
     ) -> Result<Self, AttentionBlockError> {
         let mma = MmaKernels::new(ctx)?;
-        let one = |src: &CudaSlice<u8>, elements: usize| -> Result<_, AttentionBlockError> {
+        // Per projection, not per layer. A tensor this repack cannot read
+        // stays `None` and its projection runs the GEMV; the ones beside it
+        // keep the tensor cores. Every tensor that reached the integer path
+        // before reaches it still, through the same call with the same
+        // arguments, so this is a change to *coverage* and not to arithmetic.
+        let one = |format: HeadFormat,
+                   src: &CudaSlice<u8>,
+                   elements: usize|
+         -> Result<Option<Int8Projection>, AttentionBlockError> {
+            if format != HeadFormat::Q8_0 {
+                return Ok(None);
+            }
             let mut q = stream.alloc_zeros::<i8>(elements)?;
             let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
             mma.repack_q8_0(stream, src, &mut q, &mut sc, elements)?;
-            Ok((q, sc))
+            Ok(Some((q, sc)))
         };
-        let (qgate_q, qgate_s) = one(w_qgate, qgate_elems)?;
-        let (k_q, k_s) = one(w_k, kv_elems)?;
-        let (v_q, v_s) = one(w_v, kv_elems)?;
-        let (out_q, out_s) = one(w_out, out_elems)?;
         Ok(Self {
+            qgate: one(formats.qgate, w_qgate, qgate_elems)?,
+            k: one(formats.k, w_k, kv_elems)?,
+            v: one(formats.v, w_v, kv_elems)?,
+            out: one(formats.out, w_out, out_elems)?,
             mma,
-            qgate_q,
-            qgate_s,
-            k_q,
-            k_s,
-            v_q,
-            v_s,
-            out_q,
-            out_s,
         })
     }
 }
@@ -803,9 +867,57 @@ impl GatedAttentionBlock {
         self.int8 = None;
     }
 
-    /// Whether this block has its repacked int8 weights resident.
+    /// Whether this block has any repacked int8 weight resident.
+    ///
+    /// Per-projection since the `qwen35` file arrived: this is true when at
+    /// least one of the four is on the integer path, not when all are. For
+    /// `qwen35moe`, where every projection is Q8_0, the two readings agree.
     pub fn tensor_cores_enabled(&self) -> bool {
         self.int8.is_some()
+    }
+
+    /// This layer's repacked `w_qgate`, if that tensor is Q8_0 and this shape
+    /// wants the tensor cores. `None` puts step 2 on the GEMV without
+    /// touching the projections beside it.
+    fn int8_qgate(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+        let i8w = self.int8.as_ref()?;
+        let (q, s) = i8w.qgate.as_ref()?;
+        Some((&i8w.mma, q, s))
+    }
+
+    /// This layer's repacked `w_k`. See [`Self::int8_qgate`].
+    fn int8_k(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+        let i8w = self.int8.as_ref()?;
+        let (q, s) = i8w.k.as_ref()?;
+        Some((&i8w.mma, q, s))
+    }
+
+    /// This layer's repacked `w_v`. See [`Self::int8_qgate`].
+    fn int8_v(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+        let i8w = self.int8.as_ref()?;
+        let (q, s) = i8w.v.as_ref()?;
+        Some((&i8w.mma, q, s))
+    }
+
+    /// This layer's repacked `w_out`. See [`Self::int8_qgate`].
+    fn int8_out(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+        let i8w = self.int8.as_ref()?;
+        let (q, s) = i8w.out.as_ref()?;
+        Some((&i8w.mma, q, s))
+    }
+
+    /// Whether quantizing `normed` will be read by anything.
+    ///
+    /// Steps 2 and 5 share one quantization, so it is paid when any of
+    /// qgate/k/v is on the integer path and skipped — along with its `xq`
+    /// allocation — when none is.
+    fn quantizes_normed(&self) -> bool {
+        self.int8.as_ref().is_some_and(|i8w| i8w.any_from_normed())
+    }
+
+    /// Whether quantizing `gated` will be read by anything: step 11 alone.
+    fn quantizes_gated(&self) -> bool {
+        self.int8.as_ref().is_some_and(|i8w| i8w.out.is_some())
     }
 
     /// Force this block's decode step off the tensor-core split-precision
@@ -904,16 +1016,19 @@ impl GatedAttentionBlock {
         let w_input_norm = f32_weight(weights, stream, Role::InputNorm, layer, &[h])?;
         let w_q_norm = f32_weight(weights, stream, Role::AttnQNorm, layer, &[head_dim as u64])?;
         let w_k_norm = f32_weight(weights, stream, Role::AttnKNorm, layer, &[head_dim as u64])?;
-        let w_qgate = q8_0_weight(
+        let (w_qgate, f_qgate) = projection_weight(
             weights,
             stream,
             Role::AttnQGate,
             layer,
             &[h, 2 * q_dim as u64],
         )?;
-        let w_k = q8_0_weight(weights, stream, Role::AttnK, layer, &[h, kv_dim as u64])?;
-        let w_v = q8_0_weight(weights, stream, Role::AttnV, layer, &[h, kv_dim as u64])?;
-        let w_out = q8_0_weight(weights, stream, Role::AttnOut, layer, &[q_dim as u64, h])?;
+        let (w_k, f_k) =
+            projection_weight(weights, stream, Role::AttnK, layer, &[h, kv_dim as u64])?;
+        let (w_v, f_v) =
+            projection_weight(weights, stream, Role::AttnV, layer, &[h, kv_dim as u64])?;
+        let (w_out, f_out) =
+            projection_weight(weights, stream, Role::AttnOut, layer, &[q_dim as u64, h])?;
 
         Ok(AttentionLayerWeights {
             w_input_norm,
@@ -923,6 +1038,12 @@ impl GatedAttentionBlock {
             w_k,
             w_v,
             w_out,
+            formats: ProjectionFormats {
+                qgate: f_qgate,
+                k: f_k,
+                v: f_v,
+                out: f_out,
+            },
             int8: Mutex::new(None),
         })
     }
@@ -948,11 +1069,12 @@ impl GatedAttentionBlock {
 
         // Build on demand at shape construction, not on the hot path. The
         // mutex makes concurrent reshape construction share the same repack.
-        let int8 = if Self::uses_tensor_cores(tokens) {
+        let int8 = if Self::uses_tensor_cores(tokens) && weights.formats.any_q8_0() {
             Some(shared_or_try_init(&weights.int8, || {
                 let repacked = AttnInt8::repack(
                     stream.context(),
                     stream,
+                    weights.formats,
                     &weights.w_qgate,
                     &weights.w_k,
                     &weights.w_v,
@@ -1081,15 +1203,15 @@ impl GatedAttentionBlock {
         //
         // Steps 2 and 5 all read `normed` and all contract over `hidden`, so
         // one quantization serves three projections.
-        if self.int8.is_some() {
+        if self.quantizes_normed() {
             self.quantize_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
         }
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_qgate() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.qgate_q,
-                &i8w.qgate_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.packed,
@@ -1100,9 +1222,9 @@ impl GatedAttentionBlock {
         } else {
             k.qgate.forward(
                 stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_qgate,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.qgate,
                 },
                 &sc.normed,
                 t,
@@ -1128,23 +1250,27 @@ impl GatedAttentionBlock {
 
         // 5. Key and value projections, off the same normed input — and off
         //    the same quantization of it that step 2 already paid for.
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_k() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
+        } else {
+            k.kv.forward(
                 stream,
-                &i8w.k_q,
-                &i8w.k_s,
-                xq,
-                xs,
-                &mut sc.key,
-                self.hidden,
-                kv_dim,
+                HeadTensor {
+                    bytes: &self.weights.w_k,
+                    format: self.weights.formats.k,
+                },
+                &sc.normed,
                 t,
+                &mut sc.key,
             )?;
-            i8w.mma.q8_0_proj_split(
+        }
+        if let Some((mma, wq, ws)) = self.int8_v() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.v_q,
-                &i8w.v_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.value,
@@ -1155,19 +1281,9 @@ impl GatedAttentionBlock {
         } else {
             k.kv.forward(
                 stream,
-                QuantTensor {
-                    bytes: &self.weights.w_k,
-                    quant: ExpertQuant::Q8_0,
-                },
-                &sc.normed,
-                t,
-                &mut sc.key,
-            )?;
-            k.kv.forward(
-                stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_v,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.v,
                 },
                 &sc.normed,
                 t,
@@ -1265,15 +1381,15 @@ impl GatedAttentionBlock {
         // 11. Output projection. Contracts over `q_dim`, not `hidden`, and
         //     reads the gated core output — so it re-quantizes rather than
         //     reusing what step 2 produced.
-        if self.int8.is_some() {
+        if self.quantizes_gated() {
             self.quantize_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
         }
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_out() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.out_q,
-                &i8w.out_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.projected,
@@ -1284,9 +1400,9 @@ impl GatedAttentionBlock {
         } else {
             k.out.forward(
                 stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_out,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.out,
                 },
                 &sc.gated,
                 t,
@@ -1400,15 +1516,15 @@ impl GatedAttentionBlock {
 
         // 2. The packed query+gate projection. See the method docs: this is
         //    the weight read batching exists to amortize.
-        if self.int8.is_some() {
+        if self.quantizes_normed() {
             self.quantize_activations(stream, sc, ScratchPick::Normed, t, self.hidden)?;
         }
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_qgate() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.qgate_q,
-                &i8w.qgate_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.packed,
@@ -1419,9 +1535,9 @@ impl GatedAttentionBlock {
         } else {
             k.qgate.forward(
                 stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_qgate,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.qgate,
                 },
                 &sc.normed,
                 t,
@@ -1446,23 +1562,27 @@ impl GatedAttentionBlock {
 
         // 5. Key and value projections. The other half of the weight read
         //    batching exists to amortize.
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_k() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
+        } else {
+            k.kv.forward(
                 stream,
-                &i8w.k_q,
-                &i8w.k_s,
-                xq,
-                xs,
-                &mut sc.key,
-                self.hidden,
-                kv_dim,
+                HeadTensor {
+                    bytes: &self.weights.w_k,
+                    format: self.weights.formats.k,
+                },
+                &sc.normed,
                 t,
+                &mut sc.key,
             )?;
-            i8w.mma.q8_0_proj_split(
+        }
+        if let Some((mma, wq, ws)) = self.int8_v() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.v_q,
-                &i8w.v_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.value,
@@ -1473,19 +1593,9 @@ impl GatedAttentionBlock {
         } else {
             k.kv.forward(
                 stream,
-                QuantTensor {
-                    bytes: &self.weights.w_k,
-                    quant: ExpertQuant::Q8_0,
-                },
-                &sc.normed,
-                t,
-                &mut sc.key,
-            )?;
-            k.kv.forward(
-                stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_v,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.v,
                 },
                 &sc.normed,
                 t,
@@ -1611,15 +1721,15 @@ impl GatedAttentionBlock {
         )?;
 
         // 11. Output projection. The third weight read batching amortizes.
-        if self.int8.is_some() {
+        if self.quantizes_gated() {
             self.quantize_activations(stream, sc, ScratchPick::Gated, t, q_dim)?;
         }
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_out() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.out_q,
-                &i8w.out_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.projected,
@@ -1630,9 +1740,9 @@ impl GatedAttentionBlock {
         } else {
             k.out.forward(
                 stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_out,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.out,
                 },
                 &sc.gated,
                 t,
@@ -1706,15 +1816,15 @@ impl GatedAttentionBlock {
             self.hidden,
             self.rms_eps,
         )?;
-        if self.int8.is_some() {
+        if self.quantizes_normed() {
             self.quantize_activations(stream, sc, ScratchPick::Normed, total, self.hidden)?;
         }
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_qgate() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.qgate_q,
-                &i8w.qgate_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.packed,
@@ -1725,9 +1835,9 @@ impl GatedAttentionBlock {
         } else {
             k.qgate.forward(
                 stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_qgate,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.qgate,
                 },
                 &sc.normed,
                 total,
@@ -1745,12 +1855,12 @@ impl GatedAttentionBlock {
             self.head_dim,
             self.rms_eps,
         )?;
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_k() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.k_q,
-                &i8w.k_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.key,
@@ -1758,10 +1868,24 @@ impl GatedAttentionBlock {
                 kv_dim,
                 total,
             )?;
-            i8w.mma.q8_0_proj_split(
+        } else {
+            k.kv.forward(
                 stream,
-                &i8w.v_q,
-                &i8w.v_s,
+                HeadTensor {
+                    bytes: &self.weights.w_k,
+                    format: self.weights.formats.k,
+                },
+                &sc.normed,
+                total,
+                &mut sc.key,
+            )?;
+        }
+        if let Some((mma, wq, ws)) = self.int8_v() {
+            let (xq, xs) = sc.xq.as_ref().expect("quantized above");
+            mma.q8_0_proj_split(
+                stream,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.value,
@@ -1772,19 +1896,9 @@ impl GatedAttentionBlock {
         } else {
             k.kv.forward(
                 stream,
-                QuantTensor {
-                    bytes: &self.weights.w_k,
-                    quant: ExpertQuant::Q8_0,
-                },
-                &sc.normed,
-                total,
-                &mut sc.key,
-            )?;
-            k.kv.forward(
-                stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_v,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.v,
                 },
                 &sc.normed,
                 total,
@@ -1923,15 +2037,15 @@ impl GatedAttentionBlock {
             q_dim,
             GateShape::Elementwise,
         )?;
-        if self.int8.is_some() {
+        if self.quantizes_gated() {
             self.quantize_activations(stream, sc, ScratchPick::Gated, total, q_dim)?;
         }
-        if let Some(i8w) = self.int8.as_ref() {
+        if let Some((mma, wq, ws)) = self.int8_out() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            i8w.mma.q8_0_proj_split(
+            mma.q8_0_proj_split(
                 stream,
-                &i8w.out_q,
-                &i8w.out_s,
+                wq,
+                ws,
                 xq,
                 xs,
                 &mut sc.projected,
@@ -1942,9 +2056,9 @@ impl GatedAttentionBlock {
         } else {
             k.out.forward(
                 stream,
-                QuantTensor {
+                HeadTensor {
                     bytes: &self.weights.w_out,
-                    quant: ExpertQuant::Q8_0,
+                    format: self.weights.formats.out,
                 },
                 &sc.gated,
                 total,
@@ -1959,7 +2073,7 @@ impl GatedAttentionBlock {
 
 /// Copy a resident Q8_0 tensor into a buffer of its own.
 ///
-/// [`QuantTensor`] carries a whole `CudaSlice`, and its element count is
+/// [`HeadTensor`] carries a whole `CudaSlice`, and its element count is
 /// checked against the declared geometry, so a sub-range of the weight arena
 /// cannot be passed directly — the arena is one 29.6 GiB slab. The copy is a
 /// device-to-host-to-device round trip of at most 17.8 MiB (`attn_q`), paid
@@ -1967,23 +2081,31 @@ impl GatedAttentionBlock {
 /// device view that `xabe-cuda` does not expose yet — `cudarc` 0.19 can make a
 /// `CudaView` of a sub-range but not an owned `CudaSlice`, and every kernel
 /// entry point takes the latter.
-fn q8_0_weight(
+/// Copy a resident projection into a typed buffer, keeping its format.
+///
+/// The two model files do not agree on that format: `qwen35moe` stores all
+/// four projections Q8_0, while `qwen35` stores `attn_q`, `attn_k` and
+/// `attn_v` as bf16 and only `attn_output` as Q8_0. Reading it out of the
+/// placement rather than assuming it is what lets one block serve both — and
+/// what makes a third format fail by name instead of being unpacked as
+/// something it is not.
+fn projection_weight(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
     role: Role,
     layer: u32,
     dims: &[u64],
-) -> Result<CudaSlice<u8>, AttentionBlockError> {
+) -> Result<(CudaSlice<u8>, HeadFormat), AttentionBlockError> {
     let placement = weights
         .find(role, Some(layer))
         .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
-    if placement.ggml_type != GgmlType::Q8_0 {
-        return Err(AttentionBlockError::WrongQuant {
-            role,
-            layer,
-            found: placement.ggml_type,
-        });
-    }
+    let format = match placement.ggml_type {
+        GgmlType::Q8_0 => HeadFormat::Q8_0,
+        GgmlType::Bf16 => HeadFormat::Bf16,
+        found => {
+            return Err(AttentionBlockError::WrongQuant { role, layer, found });
+        }
+    };
     if placement.dims != dims {
         return Err(AttentionBlockError::WrongShape {
             role,
@@ -1993,7 +2115,7 @@ fn q8_0_weight(
         });
     }
     let bytes = weights.arena().read(stream, &placement.alloc)?;
-    Ok(stream.clone_htod(bytes.as_slice())?)
+    Ok((stream.clone_htod(bytes.as_slice())?, format))
 }
 
 /// Copy a resident f32 norm vector into a typed buffer.

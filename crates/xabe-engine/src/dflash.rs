@@ -49,8 +49,9 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DriverErr
 use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
-use xabe_cuda::kernels::lm_head::{ARGMAX_BLOCKS, LmHeadError, LmHeadGeometry, LmHeadKernels};
-use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
+use xabe_cuda::kernels::lm_head::{
+    ARGMAX_BLOCKS, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
+};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::dflash::{DFlashConfig, DFlashRole, DFlashWeightSchema};
 use xabe_model::weights::Role;
@@ -635,10 +636,7 @@ impl DFlashForward {
         // fc, then the post-fc RMSNorm (llama.cpp's `output_norm_enc`).
         self.fc_proj.forward(
             stream,
-            QuantTensor {
-                bytes: &self.weights.fc,
-                quant: ExpertQuant::Q8_0,
-            },
+            HeadTensor::q8_0(&self.weights.fc),
             &fused,
             c,
             &mut self.ctx_g,
@@ -664,20 +662,14 @@ impl DFlashForward {
             let layer = &self.weights.layers[l];
             self.kv_proj_ctx.forward(
                 stream,
-                QuantTensor {
-                    bytes: &layer.wk,
-                    quant: ExpertQuant::Q8_0,
-                },
+                HeadTensor::q8_0(&layer.wk),
                 &self.ctx_g_normed,
                 c,
                 &mut self.ctx_k,
             )?;
             self.kv_proj_ctx.forward(
                 stream,
-                QuantTensor {
-                    bytes: &layer.wv,
-                    quant: ExpertQuant::Q8_0,
-                },
+                HeadTensor::q8_0(&layer.wv),
                 &self.ctx_g_normed,
                 c,
                 &mut self.ctx_v,
@@ -815,30 +807,21 @@ impl DFlashForward {
 
             self.q_proj.forward(
                 stream,
-                QuantTensor {
-                    bytes: &layer.wq,
-                    quant: ExpertQuant::Q8_0,
-                },
+                HeadTensor::q8_0(&layer.wq),
                 &self.normed,
                 t,
                 &mut self.q_buf,
             )?;
             self.kv_proj_q.forward(
                 stream,
-                QuantTensor {
-                    bytes: &layer.wk,
-                    quant: ExpertQuant::Q8_0,
-                },
+                HeadTensor::q8_0(&layer.wk),
                 &self.normed,
                 t,
                 &mut self.k_buf,
             )?;
             self.kv_proj_q.forward(
                 stream,
-                QuantTensor {
-                    bytes: &layer.wv,
-                    quant: ExpertQuant::Q8_0,
-                },
+                HeadTensor::q8_0(&layer.wv),
                 &self.normed,
                 t,
                 &mut self.v_buf,
@@ -962,10 +945,7 @@ impl DFlashForward {
             {
                 self.o_proj.forward(
                     stream,
-                    QuantTensor {
-                        bytes: &layer.wo,
-                        quant: ExpertQuant::Q8_0,
-                    },
+                    HeadTensor::q8_0(&layer.wo),
                     &self.attn_out,
                     t,
                     &mut self.proj_out,
@@ -986,20 +966,14 @@ impl DFlashForward {
             {
                 self.gu_proj.forward(
                     stream,
-                    QuantTensor {
-                        bytes: &layer.w_gate,
-                        quant: ExpertQuant::Q8_0,
-                    },
+                    HeadTensor::q8_0(&layer.w_gate),
                     &self.normed,
                     t,
                     &mut self.gate,
                 )?;
                 self.gu_proj.forward(
                     stream,
-                    QuantTensor {
-                        bytes: &layer.w_up,
-                        quant: ExpertQuant::Q8_0,
-                    },
+                    HeadTensor::q8_0(&layer.w_up),
                     &self.normed,
                     t,
                     &mut self.up,
@@ -1012,10 +986,7 @@ impl DFlashForward {
             {
                 self.down_proj.forward(
                     stream,
-                    QuantTensor {
-                        bytes: &layer.w_down,
-                        quant: ExpertQuant::Q8_0,
-                    },
+                    HeadTensor::q8_0(&layer.w_down),
                     &self.act,
                     t,
                     &mut self.proj_out,
@@ -1049,10 +1020,7 @@ impl DFlashForward {
         let vocab = self.lm_head.geometry().vocab;
         self.lm_head.forward(
             stream,
-            QuantTensor {
-                bytes: &self.w_lm_head,
-                quant: ExpertQuant::Q8_0,
-            },
+            HeadTensor::q8_0(&self.w_lm_head),
             &self.normed,
             t,
             &mut self.logits,

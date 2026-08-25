@@ -465,7 +465,9 @@ GDN_PROJ_TILED(gdn_proj_q8_0_t16, 16, 4)
 
 // out[t][n] = sum_k weight[n][k] * x[t][k], with `weight` an f32 GGUF tensor.
 //
-// `ssm_alpha.weight` and `ssm_beta.weight` are f32 in this file, and are only
+// `ssm_alpha.weight` and `ssm_beta.weight` reach this kernel as f32 — they
+// are f32 in Qwen3.6's file and widened from Q8_0 in Qwen3.8's, see
+// `GdnLayerWeights::load` — and are only
 // [2048, 32], so they get the simple strided form rather than the block-wise
 // one above.
 // alpha-N / beta-N and the three gate quantities they feed, in one launch.
@@ -563,6 +565,93 @@ __global__ void NAME(                                                           
 // same trap the flash kernel's query tile set.
 GDN_GATES(gdn_alpha_beta_gates,    8)
 GDN_GATES(gdn_alpha_beta_gates_t1, 1)
+
+// The same kernel over Q8_0 `ssm_alpha` / `ssm_beta`.
+//
+// `Qwen3.6-35B-A3B-UD-Q6_K_XL` stores these two f32; `Qwen3.8-27B-UD-Q8_K_XL`
+// stores them Q8_0. They cannot simply be widened on the host: the forward
+// path *aliases* the weight arena rather than copying it, so a widened copy
+// would be an owned allocation inside a `ManuallyDrop<GdnLayerWeights>` and
+// would leak once per pass shape.
+//
+// Written as a second macro rather than by making the f32 one generic. The
+// f32 kernel is the measured path on the model this engine's whole benchmark
+// record is about, and templating its body would move its codegen for no
+// reason — see the SASS-oracle note in `docs/KERNELS.md`. The duplication is
+// 40 lines and the arithmetic is the same arithmetic, which is what the
+// differential test checks.
+//
+// The summation order is deliberately identical to the f32 body's. There,
+// lane `l` accumulates elements `l, l+32, l+64, ...`; here block `m` supplies
+// element `m*32 + lane` to lane `lane`, which is the same sequence in the
+// same order, so the two agree in the last bits on weights that agree.
+#define GDN_GATES_Q8(NAME, TT)                                                  \
+__global__ void NAME(                                                           \
+    const unsigned char* __restrict__ w_alpha,                                  \
+    const unsigned char* __restrict__ w_beta,                                   \
+    const float* __restrict__ x,                                                \
+    const float* __restrict__ dt_bias,                                          \
+    const float* __restrict__ ssm_a,                                            \
+    float* __restrict__ alpha,                                                  \
+    float* __restrict__ beta_raw,                                               \
+    float* __restrict__ a_softplus,                                             \
+    float* __restrict__ log_decay,                                              \
+    float* __restrict__ beta,                                                   \
+    int k_dim,                                                                  \
+    int heads,                                                                  \
+    int tokens                                                                  \
+) {                                                                             \
+    int lane = threadIdx.x;                                                     \
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;                           \
+    if (n >= heads) return;                                                     \
+    int t0 = blockIdx.y * TT;                                                   \
+    int nblocks = k_dim >> 5;                                                   \
+                                                                                \
+    const unsigned char* ra = w_alpha + (long long)n * nblocks * 34;             \
+    const unsigned char* rb = w_beta  + (long long)n * nblocks * 34;             \
+                                                                                \
+    float aa[TT];                                                               \
+    float bb[TT];                                                               \
+    _Pragma("unroll")                                                           \
+    for (int u = 0; u < TT; ++u) { aa[u] = 0.0f; bb[u] = 0.0f; }                \
+                                                                                \
+    for (int m = 0; m < nblocks; ++m) {                                         \
+        const unsigned char* ba = ra + m * 34;                                  \
+        const unsigned char* bb_ = rb + m * 34;                                 \
+        /* `(float)q * d`, the operand order every other Q8_0 unpack in this */ \
+        /* project uses; `d * q` rounds differently. */                         \
+        float av = (float)(signed char)ba[2 + lane] * load_half_le(ba);          \
+        float bv = (float)(signed char)bb_[2 + lane] * load_half_le(bb_);        \
+        int i = (m << 5) + lane;                                                \
+        _Pragma("unroll")                                                       \
+        for (int u = 0; u < TT; ++u) {                                          \
+            int t = t0 + u;                                                     \
+            float xv = t < tokens ? x[(long long)t * k_dim + i] : 0.0f;         \
+            aa[u] += av * xv;                                                   \
+            bb[u] += bv * xv;                                                   \
+        }                                                                       \
+    }                                                                           \
+                                                                                \
+    _Pragma("unroll")                                                           \
+    for (int u = 0; u < TT; ++u) {                                              \
+        float a_sum = warp_reduce_sum(aa[u]);                                   \
+        float b_sum = warp_reduce_sum(bb[u]);                                   \
+        int t = t0 + u;                                                         \
+        if (lane == 0 && t < tokens) {                                          \
+            long long i = (long long)t * heads + n;                             \
+            alpha[i] = a_sum;                                                   \
+            beta_raw[i] = b_sum;                                                \
+            float a = a_sum + dt_bias[n];                                       \
+            float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));                  \
+            a_softplus[i] = sp;                                                 \
+            log_decay[i] = sp * ssm_a[n];                                       \
+            beta[i] = 1.0f / (1.0f + expf(-b_sum));                             \
+        }                                                                       \
+    }                                                                           \
+}
+
+GDN_GATES_Q8(gdn_alpha_beta_gates_q8,    8)
+GDN_GATES_Q8(gdn_alpha_beta_gates_q8_t1, 1)
 
 __global__ void gdn_proj_f32(
     const float* __restrict__ weight,
@@ -1140,9 +1229,9 @@ pub struct GdnLayerWeights {
     /// `conv_kernel` taps, which is what [`LayerOpsKernels::conv1d`] wants.
     pub conv1d: CudaSlice<f32>,
     /// `ssm_alpha.weight`, `[hidden, value_heads]`.
-    pub alpha: CudaSlice<f32>,
+    pub alpha: GateProjection,
     /// `ssm_beta.weight`, `[hidden, value_heads]`.
-    pub beta: CudaSlice<f32>,
+    pub beta: GateProjection,
     /// `ssm_dt.bias`, `[value_heads]`.
     pub dt_bias: CudaSlice<f32>,
     /// `ssm_a`, `[value_heads]`, **already negated in the file**.
@@ -1151,6 +1240,46 @@ pub struct GdnLayerWeights {
     pub ssm_norm: CudaSlice<f32>,
     /// `ssm_out.weight`, Q8_0 `[value_dim, hidden]`.
     pub out: CudaSlice<u8>,
+}
+
+/// `ssm_alpha` / `ssm_beta` in whichever format the file stores them.
+///
+/// `Qwen3.6-35B-A3B-UD-Q6_K_XL` has them f32 and `Qwen3.8-27B-UD-Q8_K_XL` has
+/// them Q8_0. Both are `[hidden, value_heads]` — the two smallest matrices in
+/// the layer — and both reach the same fused gate kernel, which has an
+/// instantiation per format; see `GDN_GATES_Q8`.
+pub enum GateProjection {
+    /// Stored f32, read as-is.
+    F32(CudaSlice<f32>),
+    /// Stored Q8_0, unpacked in the kernel's inner loop.
+    Q8_0(CudaSlice<u8>),
+}
+
+impl GateProjection {
+    /// Elements the tensor holds.
+    pub fn elements(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::Q8_0(v) => v.len() / 34 * 32,
+        }
+    }
+
+    /// Whether this is the Q8_0 form.
+    pub fn is_q8_0(&self) -> bool {
+        matches!(self, Self::Q8_0(_))
+    }
+
+    /// Borrow it as a [`Projection`], for the generic projection path.
+    ///
+    /// `alpha_beta_gates` does not go through this — it dispatches on the
+    /// *pair* so both gates share one launch — but anything projecting a
+    /// single gate does.
+    pub fn as_projection(&self) -> Projection<'_> {
+        match self {
+            Self::F32(v) => Projection::F32(v),
+            Self::Q8_0(v) => Projection::Q8_0(v),
+        }
+    }
 }
 
 /// One layer's Q8_0 projections, repacked for the integer tensor cores.
@@ -1254,13 +1383,28 @@ impl GdnLayerWeights {
             Ok(stream.clone_htod(&values)?)
         };
 
+        // The per-head gate projections, in whichever format the file has.
+        // `qwen35moe` stores them f32 and `qwen35` stores them Q8_0.
+        let gate_proj = |role: Role| -> Result<GateProjection, GdnBlockError> {
+            let (_, ty) = raw(role)?;
+            match ty {
+                GgmlType::F32 => Ok(GateProjection::F32(floats(role)?)),
+                GgmlType::Q8_0 => Ok(GateProjection::Q8_0(quantized(role)?)),
+                found => Err(GdnBlockError::UnsupportedQuant {
+                    role,
+                    found,
+                    expected: GgmlType::F32,
+                }),
+            }
+        };
+
         Ok(Self {
             input_norm: floats(Role::InputNorm)?,
             qkv: quantized(Role::GdnQkv)?,
             gate: quantized(Role::GdnGate)?,
             conv1d: floats(Role::GdnConv1d)?,
-            alpha: floats(Role::GdnAlpha)?,
-            beta: floats(Role::GdnBeta)?,
+            alpha: gate_proj(Role::GdnAlpha)?,
+            beta: gate_proj(Role::GdnBeta)?,
             dt_bias: floats(Role::GdnDtBias)?,
             a: floats(Role::GdnA)?,
             ssm_norm: floats(Role::GdnNorm)?,
@@ -1430,6 +1574,8 @@ pub struct GdnBlock {
     proj_f32: CudaFunction,
     alpha_beta_gates: CudaFunction,
     alpha_beta_gates_t1: CudaFunction,
+    alpha_beta_gates_q8: CudaFunction,
+    alpha_beta_gates_q8_t1: CudaFunction,
     silu: CudaFunction,
     split: CudaFunction,
     silu_split: CudaFunction,
@@ -1503,6 +1649,8 @@ impl GdnBlock {
             proj_f32: module.load_function("gdn_proj_f32")?,
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
             alpha_beta_gates_t1: module.load_function("gdn_alpha_beta_gates_t1")?,
+            alpha_beta_gates_q8: module.load_function("gdn_alpha_beta_gates_q8")?,
+            alpha_beta_gates_q8_t1: module.load_function("gdn_alpha_beta_gates_q8_t1")?,
             silu: module.load_function("gdn_silu")?,
             split: module.load_function("gdn_split_qkv")?,
             silu_split: module.load_function("gdn_silu_split_qkv")?,
@@ -3182,8 +3330,8 @@ impl GdnBlock {
     pub fn alpha_beta_gates(
         &self,
         stream: &Arc<CudaStream>,
-        w_alpha: &CudaSlice<f32>,
-        w_beta: &CudaSlice<f32>,
+        w_alpha: &GateProjection,
+        w_beta: &GateProjection,
         x: &CudaSlice<f32>,
         dt_bias: &CudaSlice<f32>,
         a: &CudaSlice<f32>,
@@ -3197,8 +3345,15 @@ impl GdnBlock {
         let g = self.geometry;
         let heads = g.value_heads;
         let n = tokens * heads;
-        check_len("alpha weight", heads * g.hidden, w_alpha.len())?;
-        check_len("beta weight", heads * g.hidden, w_beta.len())?;
+        check_len("alpha weight", heads * g.hidden, w_alpha.elements())?;
+        check_len("beta weight", heads * g.hidden, w_beta.elements())?;
+        if w_alpha.is_q8_0() != w_beta.is_q8_0() {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "alpha and beta must be stored in the same format",
+                expected: usize::from(w_alpha.is_q8_0()),
+                got: usize::from(w_beta.is_q8_0()),
+            });
+        }
         check_len("alpha-beta x", tokens * g.hidden, x.len())?;
         check_len("gates dt_bias", heads, dt_bias.len())?;
         check_len("gates ssm_a", heads, a.len())?;
@@ -3213,10 +3368,11 @@ impl GdnBlock {
 
         // A partial token band costs its empty lanes in full, so below a whole
         // band the one-token instantiation is launched instead. See the kernel.
-        let (f, tt) = if tokens < GATE_TT as usize {
-            (&self.alpha_beta_gates_t1, 1)
-        } else {
-            (&self.alpha_beta_gates, GATE_TT)
+        let (f, tt) = match (w_alpha.is_q8_0(), tokens < GATE_TT as usize) {
+            (false, true) => (&self.alpha_beta_gates_t1, 1),
+            (false, false) => (&self.alpha_beta_gates, GATE_TT),
+            (true, true) => (&self.alpha_beta_gates_q8_t1, 1),
+            (true, false) => (&self.alpha_beta_gates_q8, GATE_TT),
         };
         let cfg = LaunchConfig {
             grid_dim: (
@@ -3229,9 +3385,17 @@ impl GdnBlock {
         };
         let (k_i32, h_i32, t_i32) = (g.hidden as i32, heads as i32, tokens as i32);
         let mut builder = stream.launch_builder(f);
+        match (w_alpha, w_beta) {
+            (GateProjection::F32(a), GateProjection::F32(b)) => {
+                builder.arg(a).arg(b);
+            }
+            (GateProjection::Q8_0(a), GateProjection::Q8_0(b)) => {
+                builder.arg(a).arg(b);
+            }
+            // Rejected above.
+            _ => unreachable!("alpha and beta formats were checked to agree"),
+        }
         builder
-            .arg(w_alpha)
-            .arg(w_beta)
             .arg(x)
             .arg(dt_bias)
             .arg(a)

@@ -9,6 +9,15 @@ less prescription.
 `llmxabe` is a single-process, three-worker CUDA inference engine for
 `Qwen3.6-35B-A3B` on 3× Quadro RTX 8000 (sm_75, 48 GB, 672 GB/s each).
 
+It also serves `Qwen3.8-27B`, the dense sibling — same hybrid layer pattern,
+one SwiGLU MLP per layer instead of a 256-expert mixture, every width
+different. The architecture is chosen from the file's own
+`general.architecture` (`qwen35moe` or `qwen35`); there is no default and no
+inference from tensor shapes. **Qwen3.6-35B-A3B remains the target**: the
+standing in `docs/BENCHMARKS.md`, every kernel-level measurement, and the
+`forward_pass` golden are all about it, and a change that helps the dense
+model at its expense is a regression. `docs/MODEL.md` has the delta.
+
 Its one *structural* advantage over running three `llama-server` processes is
 that the prefix cache lives in one address space. Every other claim — fused MoE
 dispatch, CUDA graph capture, compile-time shape specialization — is a

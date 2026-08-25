@@ -80,6 +80,25 @@ impl VisionConfig {
         }
     }
 
+    /// The tower shipped beside `config`'s weights.
+    ///
+    /// The two `mmproj-F16.gguf` files this engine serves are the same tower:
+    /// dumping both and diffing their `clip.*` metadata leaves exactly one
+    /// differing key, `clip.vision.projection_dim`, which is 2048 for
+    /// Qwen3.6-35B-A3B and 5120 for Qwen3.8-27B — the language model's hidden
+    /// size in each case, since the projector's job is to land in it. Every
+    /// other field (27 layers, 1152 wide, 16 heads, 4304 FFN, patch 16,
+    /// spatial merge 2) is identical, and both files hold 334 tensors.
+    ///
+    /// So this is the shared transcription with the one dependent field
+    /// derived, rather than a second near-copy that could drift from it.
+    pub const fn for_model(config: &crate::config::ModelConfig) -> Self {
+        Self {
+            projection_dim: config.hidden_size,
+            ..Self::qwen3_6_35b_a3b()
+        }
+    }
+
     /// Dimension of each attention head.
     pub const fn head_dim(&self) -> u32 {
         self.hidden_size / self.num_heads
@@ -419,6 +438,23 @@ mod tests {
         assert_eq!(
             cfg().projection_dim,
             ModelConfig::qwen3_6_35b_a3b().hidden_size
+        );
+    }
+
+    #[test]
+    fn the_tower_differs_between_the_two_models_only_in_its_projection_width() {
+        use crate::ModelConfig;
+        let moe = VisionConfig::for_model(&ModelConfig::qwen3_6_35b_a3b());
+        let dense = VisionConfig::for_model(&ModelConfig::qwen3_8_27b());
+        assert_eq!(moe, VisionConfig::qwen3_6_35b_a3b());
+        assert_eq!(dense.projection_dim, 5120);
+        assert_eq!(
+            VisionConfig {
+                projection_dim: moe.projection_dim,
+                ..dense
+            },
+            moe,
+            "the two mmproj files agree on every `clip.*` key but projection_dim"
         );
     }
 

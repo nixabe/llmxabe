@@ -571,8 +571,8 @@ fn the_mtp_blocks_bf16_routers_load_and_run_but_nothing_here_verifies_their_numb
         "this test exists to exercise the bf16 path; block {mtp}'s routers are not bf16",
     );
 
-    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS);
-    let eps = MoeBlock::eps_from(&file);
+    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS).expect("the routed model");
+    let eps = MoeBlock::eps_from(&config, &file);
     let mut block = MoeBlock::new(&ctx, &stream, geom, eps).expect("block compiles");
     let run = run_block_on(
         &stream,
@@ -650,8 +650,8 @@ fn the_moe_block_matches_llama_cpp_at_every_captured_waypoint() {
     let directory = schema.resolve(&file).expect("schema resolves");
     let stream = ctx.default_stream();
 
-    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS);
-    let eps = MoeBlock::eps_from(&file);
+    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS).expect("the routed model");
+    let eps = MoeBlock::eps_from(&config, &file);
     let mut block = MoeBlock::new(&ctx, &stream, geom, eps).expect("block compiles for sm_75");
 
     let n_tokens = g.n_tokens();
@@ -822,8 +822,8 @@ fn the_shared_experts_gate_recovered_from_the_golden_is_a_per_token_sigmoid() {
     let directory = schema.resolve(&file).expect("schema resolves");
     let stream = ctx.default_stream();
 
-    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS);
-    let eps = MoeBlock::eps_from(&file);
+    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS).expect("the routed model");
+    let eps = MoeBlock::eps_from(&config, &file);
     let mut block = MoeBlock::new(&ctx, &stream, geom, eps).expect("block compiles");
     let n_tokens = g.n_tokens();
     let hidden = geom.hidden;
@@ -998,8 +998,8 @@ fn the_routed_path_agrees_with_the_cpu_reference_which_separates_routing_from_th
     let directory = schema.resolve(&file).expect("schema resolves");
     let stream = ctx.default_stream();
 
-    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS);
-    let eps = MoeBlock::eps_from(&file);
+    let geom = MoeBlock::geometry_for(&config, BLOCK_SIZE, MAX_TOKENS).expect("the routed model");
+    let eps = MoeBlock::eps_from(&config, &file);
     let mut block = MoeBlock::new(&ctx, &stream, geom, eps).expect("block compiles");
     let n_tokens = g.n_tokens();
     let hidden = geom.hidden;

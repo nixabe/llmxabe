@@ -29,9 +29,9 @@ pub enum ConfigError {
     RopeDimExceedsHeadDim { rope_dim: u32, head_dim: u32 },
     /// More experts activated per token than exist.
     MoreExpertsActiveThanExist { active: u32, total: u32 },
-    /// The derived parameter count is outside the plausible band for the
+    /// The derived parameter count is outside the plausible band around the
     /// advertised model size — the signature of a transcription error.
-    ParamCountImplausible { derived: u64 },
+    ParamCountImplausible { derived: u64, advertised: u64 },
 }
 
 impl core::fmt::Display for ConfigError {
@@ -60,10 +60,13 @@ impl core::fmt::Display for ConfigError {
                 f,
                 "{active} experts activated per token but only {total} routed experts exist"
             ),
-            Self::ParamCountImplausible { derived } => write!(
+            Self::ParamCountImplausible {
+                derived,
+                advertised,
+            } => write!(
                 f,
-                "derived parameter count {derived} is outside the plausible band; \
-                 a config field is likely mistyped"
+                "derived parameter count {derived} is outside the plausible band \
+                 around the advertised {advertised}; a config field is likely mistyped"
             ),
         }
     }
@@ -71,10 +74,15 @@ impl core::fmt::Display for ConfigError {
 
 impl core::error::Error for ConfigError {}
 
-/// Lower bound of the plausible parameter band, in parameters.
-const MIN_PLAUSIBLE_PARAMS: u64 = 33_500_000_000;
-/// Upper bound of the plausible parameter band, in parameters.
-const MAX_PLAUSIBLE_PARAMS: u64 = 35_500_000_000;
+/// How far the structural decomposition may fall from the advertised
+/// parameter count before the configuration is treated as mistyped.
+///
+/// Wide enough to absorb the rounding in a marketing figure — Qwen3.6-35B-A3B
+/// derives 34.2B against an advertised 35B, and Qwen3.8-27B derives 26.9B
+/// against 27B — and narrow enough that a single wrong width lands outside
+/// it: dropping `hidden_size` from 5120 to 4096 moves the dense model to
+/// 21.5B.
+const PARAM_BAND: f64 = 0.05;
 
 /// Check a configuration for internal consistency.
 ///
@@ -93,13 +101,22 @@ pub fn check_config(c: &ModelConfig) -> Result<(), ConfigError> {
         ("attention.q_heads", c.attention.q_heads),
         ("attention.kv_heads", c.attention.kv_heads),
         ("attention.head_dim", c.attention.head_dim),
-        ("moe.num_experts", c.moe.num_experts),
-        ("moe.experts_per_token", c.moe.experts_per_token),
-        ("moe.expert_intermediate", c.moe.expert_intermediate),
+        ("ffn.intermediate", c.ffn.intermediate()),
     ];
     for (name, value) in nonzero {
         if value == 0 {
             return Err(ConfigError::Zero(name));
+        }
+    }
+
+    if let Some(m) = c.moe() {
+        for (name, value) in [
+            ("moe.num_experts", m.num_experts),
+            ("moe.experts_per_token", m.experts_per_token),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Zero(name));
+            }
         }
     }
 
@@ -131,16 +148,23 @@ pub fn check_config(c: &ModelConfig) -> Result<(), ConfigError> {
         });
     }
 
-    if c.moe.experts_per_token > c.moe.num_experts {
+    if let Some(m) = c.moe()
+        && m.experts_per_token > m.num_experts
+    {
         return Err(ConfigError::MoreExpertsActiveThanExist {
-            active: c.moe.experts_per_token,
-            total: c.moe.num_experts,
+            active: m.experts_per_token,
+            total: m.num_experts,
         });
     }
 
+    let advertised = c.advertised_params;
     let derived = c.total_params();
-    if !(MIN_PLAUSIBLE_PARAMS..=MAX_PLAUSIBLE_PARAMS).contains(&derived) {
-        return Err(ConfigError::ParamCountImplausible { derived });
+    let slack = advertised as f64 * PARAM_BAND;
+    if (derived as f64 - advertised as f64).abs() > slack {
+        return Err(ConfigError::ParamCountImplausible {
+            derived,
+            advertised,
+        });
     }
 
     Ok(())
@@ -157,11 +181,28 @@ pub fn layer_layout(c: &ModelConfig) -> Vec<LayerKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DenseFfnConfig, FfnConfig, MoeConfig};
 
     #[test]
-    fn the_shipped_config_is_self_consistent() {
-        let c = ModelConfig::qwen3_6_35b_a3b();
-        assert_eq!(check_config(&c), Ok(()));
+    fn every_shipped_config_is_self_consistent() {
+        for build in ModelConfig::KNOWN {
+            let c = build();
+            assert_eq!(check_config(&c), Ok(()), "{}", c.name);
+        }
+    }
+
+    #[test]
+    fn the_dense_layout_is_48_gdn_layers_and_16_attention_layers() {
+        let c = ModelConfig::qwen3_8_27b();
+        let layout = layer_layout(&c);
+        assert_eq!(layout.len(), 64);
+        assert_eq!(
+            layout
+                .iter()
+                .filter(|k| **k == LayerKind::GatedAttention)
+                .count(),
+            16
+        );
     }
 
     #[test]
@@ -181,12 +222,22 @@ mod tests {
     #[test]
     fn a_zeroed_field_is_rejected() {
         let mut c = ModelConfig::qwen3_6_35b_a3b();
-        c.moe.num_experts = 0;
+        c.ffn = FfnConfig::Moe(MoeConfig {
+            num_experts: 0,
+            ..c.moe().unwrap()
+        });
         assert_eq!(
             check_config(&c),
             Err(ConfigError::Zero("moe.num_experts")),
             "a zeroed field must not slip through into budget arithmetic"
         );
+    }
+
+    #[test]
+    fn a_zeroed_dense_width_is_rejected() {
+        let mut c = ModelConfig::qwen3_8_27b();
+        c.ffn = FfnConfig::Dense(DenseFfnConfig { intermediate: 0 });
+        assert_eq!(check_config(&c), Err(ConfigError::Zero("ffn.intermediate")));
     }
 
     #[test]

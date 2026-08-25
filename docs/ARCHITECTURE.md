@@ -197,6 +197,16 @@ steady state.
 
 ## Scope
 
+**Two model architectures.** The engine serves `qwen35moe`
+(Qwen3.6-35B-A3B) and `qwen35` (Qwen3.8-27B), chosen at startup from the
+file's own `general.architecture`. They share the hybrid
+Gated-DeltaNet/Gated-Attention layer pattern, the tokenizer, the two-group
+cache geometry and the vision tower; they differ in the feed-forward block —
+routed 256-expert MoE against one dense SwiGLU MLP — and in every width. See
+[MODEL.md](MODEL.md). Everything in this document that says "40 layers" or
+"2048 wide" is describing the routed model; the shape of the engine is the
+same either way.
+
 **Text, and images behind `--mmproj`.** The model's vision tower (the
 `mmproj-F16.gguf` shipped beside the weights) is implemented: a SigLIP
 encoder plus merger runs per worker on the device, image embeddings are

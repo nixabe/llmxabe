@@ -44,8 +44,9 @@ use cudarc::driver::{
 
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
-use xabe_cuda::kernels::lm_head::{ARGMAX_BLOCKS, LmHeadError, LmHeadGeometry, LmHeadKernels};
-use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
+use xabe_cuda::kernels::lm_head::{
+    ARGMAX_BLOCKS, HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
+};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::{Directory, Role};
@@ -53,7 +54,8 @@ use xabe_model::weights::{Directory, Role};
 use crate::block::attention::{
     AttentionBlockError, AttentionKernelSet, AttnScratch, GatedAttentionBlock, KvCache,
 };
-use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
+use crate::block::ffn::{FfnBlock, FfnLayerWeights};
+use crate::block::moe::MoeBlockError;
 use crate::weights::DeviceWeights;
 
 const EMBED_THREADS: u32 = 256;
@@ -143,11 +145,17 @@ pub enum MtpBlockError {
     },
     /// The batch is not the size this instance was built for.
     WrongTokenCount { expected: usize, got: usize },
+    /// The model config names an architecture no feed-forward block serves.
+    UnsupportedArchitecture { architecture: &'static str },
 }
 
 impl std::fmt::Display for MtpBlockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedArchitecture { architecture } => write!(
+                f,
+                "no feed-forward block is implemented for architecture `{architecture}`",
+            ),
             Self::Compile(m) => write!(f, "MTP glue kernel compilation failed: {m}"),
             Self::Driver(e) => write!(f, "CUDA driver error: {e}"),
             Self::Attention(e) => write!(f, "{e}"),
@@ -222,8 +230,8 @@ pub struct MtpBlock {
     /// run serially on the main stream (no side lanes) — the event is
     /// required by the signature, recorded and never waited on.
     batch_fork: CudaEvent,
-    moe: MoeBlock,
-    moe_weights: Arc<MoeLayerWeights>,
+    moe: FfnBlock,
+    moe_weights: Arc<FfnLayerWeights>,
     eh_proj: LmHeadKernels,
 
     /// `None` for the wide catch-up geometry: nothing samples during
@@ -234,6 +242,10 @@ pub struct MtpBlock {
     w_token_embd: ManuallyDrop<CudaSlice<u8>>,
     w_lm_head: ManuallyDrop<CudaSlice<u8>>,
     w_eh_proj: ManuallyDrop<CudaSlice<u8>>,
+    /// How the file stored the two projections this block reads through the
+    /// LM-head GEMV. Both are Q8_0 on `qwen35moe` and bf16 on `qwen35`.
+    eh_proj_format: HeadFormat,
+    lm_head_format: HeadFormat,
     w_enorm: ManuallyDrop<CudaSlice<f32>>,
     w_hnorm: ManuallyDrop<CudaSlice<f32>>,
     w_shared_head_norm: ManuallyDrop<CudaSlice<f32>>,
@@ -280,12 +292,17 @@ impl MtpBlock {
     ) -> Result<Self, MtpBlockError> {
         let mtp_layer = config.num_layers;
         let moe_geometry =
-            MoeBlock::geometry_for(config, crate::forward::moe_block_size(tokens), tokens);
-        let moe_weights = Arc::new(MoeLayerWeights::upload(
+            FfnBlock::geometry_for(config, crate::forward::moe_block_size(tokens), tokens).ok_or(
+                MtpBlockError::UnsupportedArchitecture {
+                    architecture: config.architecture,
+                },
+            )?;
+        let moe_weights = Arc::new(FfnLayerWeights::upload(
             stream,
             file,
             directory,
             mtp_layer,
+            config,
             &moe_geometry,
         )?);
         Self::build(
@@ -339,7 +356,7 @@ impl MtpBlock {
         rms_eps: f32,
         rope_theta: f32,
         needs_lm_head: bool,
-        moe_weights: Arc<MoeLayerWeights>,
+        moe_weights: Arc<FfnLayerWeights>,
     ) -> Result<Self, MtpBlockError> {
         let hidden = config.hidden_size as usize;
         let vocab = config.vocab_size as usize;
@@ -366,12 +383,17 @@ impl MtpBlock {
         let attn_scratch = AttnScratch::new(stream, config, tokens)?;
 
         let moe_geometry =
-            MoeBlock::geometry_for(config, crate::forward::moe_block_size(tokens), tokens);
-        let moe = MoeBlock::new(ctx, stream, moe_geometry, rms_eps)?;
+            FfnBlock::geometry_for(config, crate::forward::moe_block_size(tokens), tokens).ok_or(
+                MtpBlockError::UnsupportedArchitecture {
+                    architecture: config.architecture,
+                },
+            )?;
+        let moe = FfnBlock::new(ctx, stream, config, moe_geometry, rms_eps)?;
 
-        let w_token_embd = alias_q8_0(weights, stream, Role::TokenEmbedding, None)?;
-        let w_lm_head = alias_q8_0(weights, stream, Role::LmHead, None)?;
-        let w_eh_proj = alias_q8_0(weights, stream, Role::MtpEhProj, Some(mtp_layer))?;
+        let (w_token_embd, _) = alias_projection(weights, stream, Role::TokenEmbedding, None)?;
+        let (w_lm_head, lm_head_format) = alias_projection(weights, stream, Role::LmHead, None)?;
+        let (w_eh_proj, eh_proj_format) =
+            alias_projection(weights, stream, Role::MtpEhProj, Some(mtp_layer))?;
         let w_enorm = alias_f32(weights, stream, Role::MtpENorm, Some(mtp_layer))?;
         let w_hnorm = alias_f32(weights, stream, Role::MtpHNorm, Some(mtp_layer))?;
         let w_shared_head_norm =
@@ -425,6 +447,8 @@ impl MtpBlock {
             w_token_embd,
             w_lm_head,
             w_eh_proj,
+            eh_proj_format,
+            lm_head_format,
             w_enorm,
             w_hnorm,
             w_shared_head_norm,
@@ -683,9 +707,9 @@ impl MtpBlock {
         // 4. `mtp_eh_proj`.
         self.eh_proj.forward(
             stream,
-            QuantTensor {
+            HeadTensor {
                 bytes: &self.w_eh_proj,
-                quant: ExpertQuant::Q8_0,
+                format: self.eh_proj_format,
             },
             &self.concat,
             t,
@@ -730,9 +754,9 @@ impl MtpBlock {
         let logits = self.logits.as_mut().expect("built with lm_head");
         lm_head.forward(
             stream,
-            QuantTensor {
+            HeadTensor {
                 bytes: &self.w_lm_head,
-                quant: ExpertQuant::Q8_0,
+                format: self.lm_head_format,
             },
             &self.h_nextn,
             t,
@@ -779,29 +803,32 @@ impl MtpBlock {
 /// Mirrors `forward.rs`'s private `alias_q8_0` — duplicated rather than
 /// shared because that one is private to `Forward` and returns a
 /// `ForwardError`, not an `MtpBlockError`.
-fn alias_q8_0(
+fn alias_projection(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
     role: Role,
     layer: Option<u32>,
-) -> Result<ManuallyDrop<CudaSlice<u8>>, MtpBlockError> {
+) -> Result<(ManuallyDrop<CudaSlice<u8>>, HeadFormat), MtpBlockError> {
     let placement = weights
         .find(role, layer)
         .ok_or(MtpBlockError::MissingWeight { role, layer })?;
-    if placement.ggml_type != GgmlType::Q8_0 {
-        return Err(MtpBlockError::WrongQuant {
-            role,
-            layer,
-            found: placement.ggml_type,
-        });
-    }
+    let format = match placement.ggml_type {
+        GgmlType::Q8_0 => HeadFormat::Q8_0,
+        GgmlType::Bf16 => HeadFormat::Bf16,
+        found => {
+            return Err(MtpBlockError::WrongQuant { role, layer, found });
+        }
+    };
     let alias = weights
         .bytes_of(stream, role, layer)
         .ok_or(MtpBlockError::MissingWeight { role, layer })?;
     // SAFETY: the result is sealed in a `ManuallyDrop` that the caller stores
     // in `MtpBlock` and never takes out of, and `MtpBlock` is used only while
     // the `DeviceWeights` it was built from is alive.
-    Ok(ManuallyDrop::new(unsafe { alias.into_aliasing_slice() }))
+    Ok((
+        ManuallyDrop::new(unsafe { alias.into_aliasing_slice() }),
+        format,
+    ))
 }
 
 /// Alias one resident f32 tensor, rejecting any other stored format.

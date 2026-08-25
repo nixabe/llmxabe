@@ -481,7 +481,9 @@ fn device_swiglu_matches_the_reference() {
     // One token's worth of routed-expert activation for a whole batch:
     // expert_intermediate 512 x 8 experts x 256 tokens.
     let config = ModelConfig::qwen3_6_35b_a3b();
-    let n = config.moe.expert_intermediate as usize * config.moe.experts_per_token as usize * 256;
+    let n = moe_cfg(&config).expert_intermediate as usize
+        * moe_cfg(&config).experts_per_token as usize
+        * 256;
 
     // Wide enough to cover both saturating limbs of the sigmoid: at -12 the
     // silu output is ~-7e-5 and at +12 it is ~12, so a kernel that got the
@@ -1178,4 +1180,12 @@ fn a_shape_that_does_not_match_the_declared_geometry_is_rejected_not_run() {
         .softplus(&stream, &d_x, &mut d_out, 99)
         .expect_err("a length that matches neither buffer must be rejected");
     println!("rejected as expected: {err}");
+}
+
+/// The routed geometry of the model these differential tests target.
+///
+/// `ModelConfig::ffn` became an enum when the dense `qwen35` architecture
+/// landed; everything in this file is about the routed one.
+fn moe_cfg(c: &ModelConfig) -> xabe_model::MoeConfig {
+    c.moe().expect("these tests target the routed model")
 }

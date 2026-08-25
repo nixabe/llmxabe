@@ -8,6 +8,31 @@ tables yourself:
 cargo run -p xabe-model --example budget
 ```
 
+## Two architectures
+
+The engine serves two models. They share the hybrid layer pattern, the
+tokenizer, the partial rotary geometry and the vision tower, and differ in the
+feed-forward block and in every width:
+
+| | `qwen35moe` | `qwen35` |
+| --- | --- | --- |
+| Model | Qwen3.6-35B-A3B | Qwen3.8-27B |
+| Feed-forward | 256 experts, 8 routed + 1 gated shared | one dense SwiGLU MLP |
+| Layers (+ MTP) | 40 (+1) | 64 (+1) |
+| Hidden | 2048 | 5120 |
+| GDN heads | 32 V, 16 QK, head dim 128 | 48 V, 16 QK, head dim 128 |
+| Attention heads | 16 Q, 2 KV, head dim 256 | 24 Q, 4 KV, head dim 256 |
+| FFN intermediate | 512 per expert | 17,408 |
+| Total / active params | 35 B / ~3 B | 27 B / 27 B |
+| KV per token, f16 | 20 KiB (10 layers) | 64 KiB (16 layers) |
+| GDN state per sequence | ~60 MiB (30 layers) | ~144 MiB (48 layers) |
+
+Which one a file is comes from its own `general.architecture`, read at
+startup; `ModelConfig::for_architecture` has no fallback, because inferring
+hyperparameters from tensor shapes would produce a model that loads and is
+wrong. The rest of this document describes `qwen35moe` unless it says
+otherwise; the dense model has its own section at the end.
+
 ## Structure
 
 | Property | Value |
@@ -220,3 +245,96 @@ falls short of them.
    larger than the active experts. That is a direct consequence of their being
    Q8_0, and it makes requantizing them the most obvious available bandwidth
    win. Unmeasured.
+
+---
+
+# Qwen3.8-27B (`qwen35`)
+
+The dense sibling. Everything above describes `qwen35moe`; this section is the
+delta, and only the delta — the layer pattern, the partial rotary, the
+tokenizer, the two-group cache geometry and the vision tower are the same
+design at different widths.
+
+## Structure
+
+| Property | Value |
+| --- | --- |
+| Total / active params | 27 B / 27 B (26.90 B derived) |
+| Layers | 64 (+ 1 MTP block, `block_count` 65) |
+| Hidden layout | 16 × ( 3 × (Gated DeltaNet → FFN) + 1 × (Gated Attention → FFN) ) |
+| Gated DeltaNet layers | 48 |
+| Gated Attention layers | 16 |
+| Hidden dimension | 5120 |
+| GDN heads | 48 V, 16 QK — head dim 128 |
+| Attention heads | 24 Q, 4 KV — head dim 256, RoPE dim 64 (25%) |
+| Feed-forward | one dense SwiGLU MLP, intermediate 17,408 |
+| Vocabulary (untied) | 248,320 in and out — byte-identical to Qwen3.6's |
+| MTP | trained multi-step |
+| Context | 262,144 native |
+
+The GDN head split is **derived, not stated**. The file gives
+`ssm.inner_size 6144`, `ssm.time_step_rank 48`, `ssm.group_count 16` and
+`ssm.state_size 128`; llama.cpp's `qwen35.cpp` reads `n_v_heads` from
+`ssm_dt_rank` and `n_k_heads` from `ssm_n_group`, with both head dimensions
+equal to `ssm_d_state`. That gives 48 value heads and 16 q/k heads of 128, and
+it is checked against the file's own tensor shapes rather than trusted:
+`attn_qkv.weight` is `[5120, 10240]` and `2·16·128 + 48·128 = 10240`.
+`crates/xabe-model/tests/real_dense_model_weights.rs` asserts all of it.
+
+## Verified against the real file
+
+`Qwen3.8-27B-UD-Q8_K_XL.gguf` — 29.29 GiB, **866 tensors**, 51 metadata keys.
+`WeightSchema::with_mtp(&ModelConfig::qwen3_8_27b())` resolves against it with
+zero mismatches and nothing left unclaimed.
+
+Tensor type histogram: `q8_0` 453 tensors / 24.49 GiB, `bf16` 53 / 4.79 GiB,
+`f32` 360 / 0.01 GiB.
+
+**The bf16 tensors are the interesting part**, and they are not a curiosity:
+they are 53 of the file's largest.
+
+| Tensor | Count | Format |
+| --- | ---: | --- |
+| `output.weight` | 1 | **bf16**, 2.54 GiB |
+| `blk.N.attn_q` / `attn_k` / `attn_v` | 51 | **bf16** |
+| `blk.64.nextn.eh_proj.weight` | 1 | **bf16** |
+| `blk.N.ffn_gate` / `ffn_up` / `ffn_down` | 195 | `q8_0` |
+| `blk.N.attn_output`, `attn_qkv`, `attn_gate`, `ssm_out` | — | `q8_0` |
+| `blk.N.ssm_alpha` / `ssm_beta` | 96 | **`q8_0`** (f32 in Qwen3.6) |
+| norms, `ssm_a`, `ssm_dt.bias`, `ssm_conv1d` | 360 | `f32` |
+
+Two of those rows cost kernel work rather than a config field:
+
+- The LM head and the attention q/k/v projections go through the *same*
+  GEMV (`xabe_cuda::kernels::lm_head`), which read Q8_0 only. It now has a
+  bf16 body as well, selected per tensor from the file's directory — see
+  [KERNELS.md](KERNELS.md). Widening those on the host was rejected on
+  arithmetic: it would put 5.1 GiB on the card for the head alone and double
+  the per-token read of the most bandwidth-expensive tensor in the model.
+  Reading them where they are is correct, but it is not free: because the
+  attention int8 repack is gated on *all* projections being Q8_0, these three
+  bf16 tensors take the whole attention block off the integer tensor cores at
+  prefill width. Requantizing the file to plain Q8_0 doubles prefill with no
+  engine change — measured, in [BENCHMARKS.md](BENCHMARKS.md).
+- `ssm_alpha` / `ssm_beta` are f32 in Qwen3.6 and Q8_0 here. The fused gate
+  kernel has a Q8_0 instantiation rather than a host-side widening, because
+  the forward path *aliases* the weight arena and an owned widened copy inside
+  a `ManuallyDrop<GdnLayerWeights>` would leak once per pass shape.
+
+## Per-token cost, and why the smaller model is the expensive one
+
+This is the number to carry away, and it is the opposite of what the parameter
+counts suggest:
+
+| | Qwen3.6-35B-A3B | Qwen3.8-27B |
+| --- | ---: | ---: |
+| File | 30.36 GiB | **29.29 GiB** |
+| FFN params read per token | 1.13 B | **17.11 B** |
+| KV read per token per 1K context, f16 | 20 MiB | **64 MiB** |
+| GDN state per slot | 60 MiB | **144 MiB** |
+
+The dense model is the smaller file and reads **15× the feed-forward weight
+per token**. That is the entire point of an A3B mixture, seen from the other
+side, and it means no decode expectation may be carried across: a roofline
+built for 2.86 GB/token does not describe a model that reads roughly ten times
+that.

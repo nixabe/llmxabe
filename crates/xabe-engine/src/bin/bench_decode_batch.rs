@@ -47,7 +47,7 @@ use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::DeviceWeights;
 use xabe_engine::SequenceState;
-use xabe_engine::forward::{Forward, arena_holds};
+use xabe_engine::forward::{Forward, arena_holds_for};
 use xabe_gguf::GgufFile;
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::WeightSchema;
@@ -157,7 +157,6 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let config = ModelConfig::qwen3_6_35b_a3b();
     // A stream of its own: the single-stream baseline captures a step, and
     // `cuStreamBeginCapture` rejects the legacy default stream.
     let stream = ctx.new_stream().expect("create stream");
@@ -167,6 +166,7 @@ fn main() -> ExitCode {
     // the first allocation.
     unsafe { ctx.disable_event_tracking() };
     let file = GgufFile::open(&path).expect("valid GGUF v3");
+    let config = ModelConfig::from_gguf(&file).expect("a supported architecture");
     let (free_at_start, total) = memory_info(&ctx).expect("memory info");
 
     info!(
@@ -179,8 +179,10 @@ fn main() -> ExitCode {
 
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema resolves");
-    let (weights, load) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
-        .expect("weight load");
+    let (weights, load) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, |role| {
+        arena_holds_for(config.ffn, role)
+    })
+    .expect("weight load");
     info!(
         "arena {:.3} GiB in {:.1} s",
         load.bytes as f64 / (1u64 << 30) as f64,

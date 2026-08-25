@@ -242,7 +242,10 @@ impl WeightBytes {
             })
         };
         let (all_experts, all_expert_params) = sum(&MOE_EXPERT_ROLES, 0);
-        let n_experts = config.moe.num_experts as u64;
+        let moe = config
+            .moe()
+            .expect("profile_forward's MoE cost model targets the routed model");
+        let n_experts = moe.num_experts as u64;
         let (embed_bytes, _) = role_cost(dir, Role::TokenEmbedding, None);
         let (head_bytes, head_params) = role_cost(dir, Role::LmHead, None);
         Self {
@@ -269,9 +272,12 @@ impl WeightBytes {
     /// token picks the same 8), the high bound assumes no sharing up to the
     /// 256 available.
     fn moe_layer(&self, tokens: usize, config: &ModelConfig) -> (u64, u64) {
-        let per_token = config.moe.experts_per_token as u64;
+        let moe = config
+            .moe()
+            .expect("profile_forward's MoE cost model targets the routed model");
+        let per_token = moe.experts_per_token as u64;
         let low = self.moe_fixed + self.moe_per_expert * per_token;
-        let touched = (per_token * tokens as u64).min(config.moe.num_experts as u64);
+        let touched = (per_token * tokens as u64).min(moe.num_experts as u64);
         let high = self.moe_fixed + self.moe_per_expert * touched;
         (low, high)
     }
@@ -390,7 +396,12 @@ fn main() {
     );
     info!(
         "  MoE per expert    {:>12} B ({} experts = {} B)",
-        bytes.moe_per_expert, config.moe.num_experts, bytes.moe_all_experts
+        bytes.moe_per_expert,
+        config
+            .moe()
+            .expect("profile_forward targets the routed model")
+            .num_experts,
+        bytes.moe_all_experts
     );
     info!("  LM head           {:>12} B\n", bytes.lm_head);
 
@@ -554,7 +565,11 @@ fn main() {
         let mean_of = |b: Bucket| totals.get(&b).map(|v| stats(v).0).unwrap_or(0.0);
         let (moe_low, moe_high) = bytes.moe_layer(n, &config);
         let rows = n as u64;
-        let pairs = rows * config.moe.experts_per_token as u64;
+        let pairs = rows
+            * config
+                .moe()
+                .expect("profile_forward targets the routed model")
+                .experts_per_token as u64;
         let moe_ms = mean_of(Bucket::MoeOnGdn) + mean_of(Bucket::MoeOnAttn);
 
         info!("\nagainst both rooflines ({PEAK_GB_S} GB/s, {PEAK_TFLOP_S} TFLOP/s fp32):");
@@ -624,7 +639,8 @@ fn main() {
         // replayable from a captured graph (AGENTS.md rule 5). Only the slots
         // holding a live `(token, expert)` pair do any work; the rest read two
         // integers and return. This is the fraction that matters.
-        let geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, n);
+        let geometry = MoeBlock::geometry_for(&config, MOE_BLOCK_SIZE, n)
+            .expect("profile_forward targets the routed model");
         let capacity = geometry.sorted_capacity();
         info!(
             "\nMoE grouped-GEMM grid.y = sorted_capacity = {capacity} slots, of which \

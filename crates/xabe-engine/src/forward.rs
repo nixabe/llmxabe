@@ -94,24 +94,26 @@ use cudarc::driver::{
 use xabe_cuda::kernels::attention::AttentionError;
 use xabe_cuda::kernels::compile;
 use xabe_cuda::kernels::layer_ops::{LayerOpsError, LayerOpsKernels};
-use xabe_cuda::kernels::lm_head::{ARGMAX_BLOCKS, LmHeadError, LmHeadGeometry, LmHeadKernels};
-use xabe_cuda::kernels::moe::{ExpertQuant, QuantTensor};
+use xabe_cuda::kernels::lm_head::{
+    ARGMAX_BLOCKS, HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
+};
 use xabe_gguf::{GgmlType, GgufFile};
-use xabe_model::config::{LayerKind, ModelConfig};
+use xabe_model::config::{FfnConfig, LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role};
 
 use crate::block::attention::{
     AttentionBlockError, AttentionKernelSet, AttentionLayerWeights, AttnScratch,
     GatedAttentionBlock, KvCache,
 };
+use crate::block::ffn::{FfnBlock, FfnLayerWeights};
 use crate::block::gdn::{
-    GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
+    GateProjection, GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
 };
 use crate::block::gdn_verify::{
     GdnSnapshotRing, GdnVerifyError, GdnVerifyScratch, run_layer_with_snapshots,
     run_layer_with_snapshots_batch,
 };
-use crate::block::moe::{MoeBlock, MoeBlockError, MoeLayerWeights};
+use crate::block::moe::MoeBlockError;
 use crate::state::{SequenceState, StateError};
 use crate::weights::DeviceWeights;
 
@@ -150,8 +152,8 @@ pub fn moe_block_size(tokens: usize) -> usize {
 }
 
 /// The GGUF keys that are not in [`ModelConfig`] and must not be guessed.
-pub(crate) const RMS_EPS_KEY: &str = "qwen35moe.attention.layer_norm_rms_epsilon";
-pub(crate) const ROPE_FREQ_BASE_KEY: &str = "qwen35moe.rope.freq_base";
+pub(crate) const RMS_EPS_SUFFIX: &str = "attention.layer_norm_rms_epsilon";
+pub(crate) const ROPE_FREQ_BASE_SUFFIX: &str = "rope.freq_base";
 
 const EMBED_SRC: &str = r#"
 extern "C" {
@@ -251,7 +253,9 @@ pub enum ForwardError {
         got: usize,
     },
     /// The file does not declare a hyperparameter that must not be guessed.
-    MissingMetadata { key: &'static str },
+    MissingMetadata { key: String },
+    /// The model config names an architecture no feed-forward block serves.
+    UnsupportedArchitecture { architecture: &'static str },
     /// The batch is not the size this instance was built for.
     ///
     /// Every block validates its buffer lengths exactly rather than accepting
@@ -354,6 +358,10 @@ impl std::fmt::Display for ForwardError {
                 f,
                 "the model file does not declare `{key}`, and guessing it would produce \
                  a finite, wrong forward pass",
+            ),
+            Self::UnsupportedArchitecture { architecture } => write!(
+                f,
+                "no feed-forward block is implemented for architecture `{architecture}`",
             ),
             Self::WrongTokenCount { expected, got } => write!(
                 f,
@@ -462,13 +470,15 @@ impl ForwardReport {
     }
 }
 
-/// Roles the MoE block uploads for itself.
+/// Roles the routed MoE block uploads for itself.
 ///
 /// Filtered out of the weight arena so the model is resident exactly once.
-/// Every entry is a role [`MoeLayerWeights::upload`] reads; if that list ever
-/// changes, `the_moe_role_filter_is_exactly_what_the_moe_block_uploads`
-/// notices, because the arena would then hold a tensor nothing reads or omit
-/// one something does.
+/// Every entry is a role
+/// [`MoeLayerWeights::upload`](crate::block::moe::MoeLayerWeights::upload)
+/// reads; if that list ever changes,
+/// `the_moe_role_filter_is_exactly_what_the_moe_block_uploads` notices,
+/// because the arena would then hold a tensor nothing reads or omit one
+/// something does.
 pub const MOE_OWNED_ROLES: [Role; 9] = [
     Role::PostMixerNorm,
     Role::MoeRouter,
@@ -481,12 +491,37 @@ pub const MOE_OWNED_ROLES: [Role; 9] = [
     Role::MoeSharedDown,
 ];
 
-/// Whether the weight arena should hold `role`.
+/// Roles the dense feed-forward block uploads for itself.
+///
+/// The same arrangement at the other architecture: 17.1B parameters of
+/// `ffn_{gate,up,down}` are the majority of a `qwen35` file, and loading them
+/// into the arena as well would need a second copy of them on the card.
+pub const DENSE_FFN_OWNED_ROLES: [Role; 4] = [
+    Role::PostMixerNorm,
+    Role::FfnGate,
+    Role::FfnUp,
+    Role::FfnDown,
+];
+
+/// Whether the weight arena should hold `role`, for a model with `ffn`.
 ///
 /// Pass this to [`DeviceWeights::load_where`] before constructing a
 /// [`Forward`]: it is the other half of the arrangement the module docs
 /// describe, and loading the full model instead would put 28.3 GiB of expert
-/// weights on the card that nothing ever reads.
+/// weights (or 17.1B parameters of dense FFN) on the card that nothing ever
+/// reads.
+///
+/// Taking the FFN kind rather than defaulting to the MoE list is what stops a
+/// dense model from resident-loading its whole FFN twice: `FfnGate` is not in
+/// `MOE_OWNED_ROLES`, so the old filter would have kept it.
+pub fn arena_holds_for(ffn: FfnConfig, role: Role) -> bool {
+    match ffn {
+        FfnConfig::Moe(_) => !MOE_OWNED_ROLES.contains(&role),
+        FfnConfig::Dense(_) => !DENSE_FFN_OWNED_ROLES.contains(&role),
+    }
+}
+
+/// [`arena_holds_for`] at the routed architecture.
 pub fn arena_holds(role: Role) -> bool {
     !MOE_OWNED_ROLES.contains(&role)
 }
@@ -646,7 +681,7 @@ pub struct Forward {
     /// sequence and nothing crosses a layer boundary, so ten private copies
     /// were ten times the per-token VRAM for no benefit. See [`AttnScratch`].
     attn_scratch: AttnScratch,
-    moe: MoeBlock,
+    moe: FfnBlock,
     lm_head: LmHeadKernels,
 
     /// Zero-copy aliases into the weight arena. Never dropped — see
@@ -654,6 +689,9 @@ pub struct Forward {
     w_token_embd: ManuallyDrop<CudaSlice<u8>>,
     w_output_norm: ManuallyDrop<CudaSlice<f32>>,
     w_lm_head: ManuallyDrop<CudaSlice<u8>>,
+    /// How the file stored `output.weight`: Q8_0 on `qwen35moe`, bf16 on
+    /// `qwen35`.
+    lm_head_format: HeadFormat,
     gdn_weights: Vec<ManuallyDrop<GdnLayerWeights>>,
     /// The Q8_0 projections in the split layout, one per Gated DeltaNet
     /// layer — empty only after [`Self::disable_tensor_cores`].
@@ -675,7 +713,7 @@ pub struct Forward {
     /// for a different token count must borrow them rather than upload again;
     /// two copies do not fit on a 48 GiB device, which is why this is an
     /// `Arc` rather than a `Vec`. See [`Forward::reshape`].
-    moe_weights: Arc<Vec<MoeLayerWeights>>,
+    moe_weights: Arc<Vec<FfnLayerWeights>>,
 
     d_tokens: CudaSlice<i32>,
     hidden_state: CudaSlice<f32>,
@@ -860,7 +898,7 @@ impl Forward {
         weights: &DeviceWeights,
         config: ModelConfig,
         tokens: usize,
-        shared_moe: Option<Arc<Vec<MoeLayerWeights>>>,
+        shared_moe: Option<Arc<Vec<FfnLayerWeights>>>,
         gdn_int8: Option<Arc<Vec<GdnLayerInt8>>>,
         shared_attention: Option<Arc<Vec<Arc<AttentionLayerWeights>>>>,
     ) -> Result<Self, ForwardError> {
@@ -869,14 +907,20 @@ impl Forward {
         let vocab = config.vocab_size as usize;
         let (free_before, _) = xabe_cuda::arena::memory_info(ctx)?;
 
+        // Scoped to the file's own architecture. `qwen35moe.rope.freq_base`
+        // does not exist in a `qwen35` file and vice versa, and reading the
+        // wrong one is not an error, it is an absent key — which is why this
+        // is derived rather than spelled.
+        let rms_eps_key = config.hparam_key(RMS_EPS_SUFFIX);
+        let rope_key = config.hparam_key(ROPE_FREQ_BASE_SUFFIX);
         let rms_eps = file
-            .get_f32(RMS_EPS_KEY)
-            .ok_or(ForwardError::MissingMetadata { key: RMS_EPS_KEY })?;
-        let rope_theta = file
-            .get_f32(ROPE_FREQ_BASE_KEY)
-            .ok_or(ForwardError::MissingMetadata {
-                key: ROPE_FREQ_BASE_KEY,
+            .get_f32(&rms_eps_key)
+            .ok_or_else(|| ForwardError::MissingMetadata {
+                key: rms_eps_key.clone(),
             })?;
+        let rope_theta = file
+            .get_f32(&rope_key)
+            .ok_or(ForwardError::MissingMetadata { key: rope_key })?;
 
         let ptx = compile(EMBED_SRC, "forward_embed").map_err(ForwardError::Compile)?;
         let module = ctx.load_module(ptx)?;
@@ -886,21 +930,31 @@ impl Forward {
 
         // --- the three global tensors, by alias ---------------------------
         //
-        // The two Q8_0 tables are checked against `vocab * hidden` here rather
-        // than trusted, because the embedding gather below indexes by a token
-        // id and has no other bound to check against: a short table would read
+        // Both tables are checked against `vocab * hidden` here rather than
+        // trusted, because the embedding gather below indexes by a token id
+        // and has no other bound to check against: a short table would read
         // past its own end for a high-numbered token.
+        //
+        // Their *sizes* differ by format, though, and only by format: the
+        // embedding table is Q8_0 in both files, while `output.weight` is
+        // Q8_0 in `qwen35moe` and bf16 in `qwen35`. Checking the head against
+        // the Q8_0 figure would reject the dense model for holding exactly
+        // the bytes it should.
         let w_token_embd = alias_q8_0(weights, stream, Role::TokenEmbedding, None)?;
-        let w_lm_head = alias_q8_0(weights, stream, Role::LmHead, None)?;
-        let table_bytes = vocab * hidden / QK8_0 * BLOCK_Q8_0_BYTES;
-        for (role, len) in [
-            (Role::TokenEmbedding, w_token_embd.len()),
-            (Role::LmHead, w_lm_head.len()),
+        let (w_lm_head, lm_head_format) = alias_projection(weights, stream, Role::LmHead, None)?;
+        let q8_0_table_bytes = vocab * hidden / QK8_0 * BLOCK_Q8_0_BYTES;
+        let head_bytes = match lm_head_format {
+            HeadFormat::Q8_0 => q8_0_table_bytes,
+            HeadFormat::Bf16 => vocab * hidden * 2,
+        };
+        for (role, len, expected) in [
+            (Role::TokenEmbedding, w_token_embd.len(), q8_0_table_bytes),
+            (Role::LmHead, w_lm_head.len(), head_bytes),
         ] {
-            if len != table_bytes {
+            if len != expected {
                 return Err(ForwardError::WrongTableSize {
                     role,
-                    expected: table_bytes,
+                    expected,
                     got: len,
                 });
             }
@@ -1026,9 +1080,13 @@ impl Forward {
         // per token of context against this one's 0.17 MB.
         let attn_scratch = AttnScratch::new(stream, &config, tokens)?;
 
-        // --- the MoE, on every block ---------------------------------------
-        let moe_geometry = MoeBlock::geometry_for(&config, moe_block_size(tokens), tokens);
-        let moe = MoeBlock::new(ctx, stream, moe_geometry, rms_eps)?;
+        // --- the feed-forward block, on every block -------------------------
+        let moe_geometry = FfnBlock::geometry_for(&config, moe_block_size(tokens), tokens).ok_or(
+            ForwardError::UnsupportedArchitecture {
+                architecture: config.architecture,
+            },
+        )?;
+        let moe = FfnBlock::new(ctx, stream, &config, moe_geometry, rms_eps)?;
         let (moe_weights, moe_bytes) = match shared_moe {
             // Already on the card, uploaded by the pass this one was reshaped
             // from. Reported as zero bytes because they are not this pass's to
@@ -1038,7 +1096,14 @@ impl Forward {
                 let mut uploaded = Vec::with_capacity(config.num_layers as usize);
                 let mut bytes = 0u64;
                 for layer in 0..config.num_layers {
-                    let w = MoeLayerWeights::upload(stream, file, directory, layer, &moe_geometry)?;
+                    let w = FfnLayerWeights::upload(
+                        stream,
+                        file,
+                        directory,
+                        layer,
+                        &config,
+                        &moe_geometry,
+                    )?;
                     bytes += w.bytes() as u64;
                     uploaded.push(w);
                 }
@@ -1083,6 +1148,7 @@ impl Forward {
             w_token_embd,
             w_output_norm,
             w_lm_head,
+            lm_head_format,
             gdn_weights,
             gdn_int8,
             moe_weights,
@@ -1765,9 +1831,9 @@ impl Forward {
             unsafe { crate::viewslice::subslice(stream, &self.mixer_out, 0, n * self.hidden) };
         lm_head.forward(
             stream,
-            QuantTensor {
+            HeadTensor {
                 bytes: &self.w_lm_head,
-                quant: ExpertQuant::Q8_0,
+                format: self.lm_head_format,
             },
             &last_rows,
             n,
@@ -2215,9 +2281,9 @@ impl Forward {
             lm_head
                 .forward(
                     stream,
-                    QuantTensor {
+                    HeadTensor {
                         bytes: &self.w_lm_head,
-                        quant: ExpertQuant::Q8_0,
+                        format: self.lm_head_format,
                     },
                     &self.final_norm,
                     n,
@@ -2542,9 +2608,9 @@ impl Forward {
             lm_head
                 .forward(
                     stream,
-                    QuantTensor {
+                    HeadTensor {
                         bytes: &self.w_lm_head,
-                        quant: ExpertQuant::Q8_0,
+                        format: self.lm_head_format,
                     },
                     &self.final_norm,
                     n,
@@ -2845,9 +2911,9 @@ impl Forward {
             lm_head
                 .forward(
                     stream,
-                    QuantTensor {
+                    HeadTensor {
                         bytes: &self.w_lm_head,
-                        quant: ExpertQuant::Q8_0,
+                        format: self.lm_head_format,
                     },
                     &self.final_norm,
                     rows,
@@ -3275,9 +3341,9 @@ impl Forward {
         stream.memcpy_dtod(&row, &mut self.last_hidden)?;
         self.lm_head.forward(
             stream,
-            QuantTensor {
+            HeadTensor {
                 bytes: &self.w_lm_head,
-                quant: ExpertQuant::Q8_0,
+                format: self.lm_head_format,
             },
             &self.last_hidden,
             1,
@@ -3322,24 +3388,47 @@ fn alias_q8_0(
     role: Role,
     layer: Option<u32>,
 ) -> Result<ManuallyDrop<CudaSlice<u8>>, ForwardError> {
+    Ok(alias_projection(weights, stream, role, layer)?.0)
+}
+
+/// Alias one resident projection, keeping the format the file stored it in.
+///
+/// `output.weight` is Q8_0 in `Qwen3.6-35B-A3B-UD-Q6_K_XL` and bf16 in
+/// `Qwen3.8-27B-UD-Q8_K_XL`, and it is the single most bandwidth-expensive
+/// tensor in either model — 540 MB or 2.54 GiB per pass. Widening the bf16
+/// one on the host would double that read *and* need 5.1 GiB on the card, so
+/// the format travels to the kernel instead.
+fn alias_projection(
+    weights: &DeviceWeights,
+    stream: &Arc<CudaStream>,
+    role: Role,
+    layer: Option<u32>,
+) -> Result<(ManuallyDrop<CudaSlice<u8>>, HeadFormat), ForwardError> {
     let placement = weights
         .find(role, layer)
         .ok_or(ForwardError::MissingWeight { role, layer })?;
-    if placement.ggml_type != GgmlType::Q8_0 {
-        return Err(ForwardError::WrongQuant {
-            role,
-            layer,
-            found: placement.ggml_type,
-            expected: GgmlType::Q8_0,
-        });
-    }
+    let format = match placement.ggml_type {
+        GgmlType::Q8_0 => HeadFormat::Q8_0,
+        GgmlType::Bf16 => HeadFormat::Bf16,
+        found => {
+            return Err(ForwardError::WrongQuant {
+                role,
+                layer,
+                found,
+                expected: GgmlType::Q8_0,
+            });
+        }
+    };
     let alias = weights
         .bytes_of(stream, role, layer)
         .ok_or(ForwardError::MissingWeight { role, layer })?;
     // SAFETY: the result is sealed in a `ManuallyDrop` that the caller stores
     // in `Forward` and never takes out of, and `Forward` is used only while
     // the `DeviceWeights` it was built from is alive.
-    Ok(ManuallyDrop::new(unsafe { alias.into_aliasing_slice() }))
+    Ok((
+        ManuallyDrop::new(unsafe { alias.into_aliasing_slice() }),
+        format,
+    ))
 }
 
 /// Alias one resident f32 tensor, rejecting any other stored format.
@@ -3397,13 +3486,50 @@ fn alias_gdn_layer(
         qkv: q8(Role::GdnQkv)?,
         gate: q8(Role::GdnGate)?,
         conv1d: alias_f32(weights, stream, Role::GdnConv1d, layer)?,
-        alpha: alias_f32(weights, stream, Role::GdnAlpha, layer)?,
-        beta: alias_f32(weights, stream, Role::GdnBeta, layer)?,
+        alpha: alias_gate_proj(weights, stream, Role::GdnAlpha, layer)?,
+        beta: alias_gate_proj(weights, stream, Role::GdnBeta, layer)?,
         dt_bias: alias_f32(weights, stream, Role::GdnDtBias, layer)?,
         a: alias_f32(weights, stream, Role::GdnA, layer)?,
         ssm_norm: alias_f32(weights, stream, Role::GdnNorm, layer)?,
         out: q8(Role::GdnOut)?,
     })
+}
+
+/// Alias one resident `ssm_alpha` / `ssm_beta` in its stored format.
+///
+/// f32 on `qwen35moe`, Q8_0 on `qwen35`. Both stay aliases into the arena
+/// rather than widened copies: `GdnLayerWeights` is held in a `ManuallyDrop`
+/// precisely because nothing in it owns its bytes, and an owned buffer in
+/// there would leak once per pass shape.
+fn alias_gate_proj(
+    weights: &DeviceWeights,
+    stream: &Arc<CudaStream>,
+    role: Role,
+    layer: u32,
+) -> Result<GateProjection, ForwardError> {
+    let placement = weights
+        .find(role, Some(layer))
+        .ok_or(ForwardError::MissingWeight {
+            role,
+            layer: Some(layer),
+        })?;
+    match placement.ggml_type {
+        GgmlType::F32 => Ok(GateProjection::F32(alias_f32(
+            weights, stream, role, layer,
+        )?)),
+        GgmlType::Q8_0 => Ok(GateProjection::Q8_0(ManuallyDrop::into_inner(alias_q8_0(
+            weights,
+            stream,
+            role,
+            Some(layer),
+        )?))),
+        found => Err(ForwardError::WrongQuant {
+            role,
+            layer: Some(layer),
+            found,
+            expected: GgmlType::F32,
+        }),
+    }
 }
 
 /// Bytes the Gated Attention blocks hold on top of the arena's own copy.
@@ -3567,7 +3693,7 @@ mod tests {
         assert!(text.contains("blk.4."), "{text}");
         assert!(text.contains("q6_K"), "{text}");
         let e = ForwardError::MissingMetadata {
-            key: ROPE_FREQ_BASE_KEY,
+            key: format!("qwen35moe.{ROPE_FREQ_BASE_SUFFIX}"),
         };
         assert!(e.to_string().contains("rope.freq_base"));
         let e = ForwardError::WrongTokenCount {

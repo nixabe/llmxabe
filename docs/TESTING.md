@@ -160,6 +160,61 @@ reference's exact tanh form. Text-side M-RoPE (`mrope`) is ported from
 that scalar positions collapse to `rope::apply_rope` — the same reduction
 `xabe-engine`'s text path depends on.
 
+## The dense architecture (`qwen35`)
+
+Qwen3.8-27B shares every kernel with Qwen3.6-35B-A3B except the feed-forward
+block, and the shared ones are gated by the tests above at Qwen3.6's widths.
+What is new is gated by two files:
+
+| Test | What it asserts | Needs |
+| --- | --- | --- |
+| `xabe-model/tests/real_dense_model_weights.rs` | `WeightSchema` resolves against all 866 tensors of the real file with none left unclaimed; every derived hyperparameter (the GDN head split above all) agrees with the file's own metadata; the file carries no routed tensor; and the *routed* schema refuses it by architecture rather than by a wall of shapes | the file |
+| `xabe-engine/tests/dense_ffn_differential.rs` | The whole dense block against `expert_mlp` + `rms_norm` on real Q8_0 weights, at all three of its kernel paths | the file, a device |
+
+The differential is the interesting one, because the dense block runs on the
+MoE crate's shared-expert kernels and so what is genuinely new is the *block*:
+that the post-mixer RMSNorm feeds the MLP, that the MLP has no gate of its
+own, and that the residual added back is the block's input rather than its
+normalized form. Each of those three has a wrong version that still generates
+fluent text.
+
+It also gates all three residency/width combinations against one reference,
+which is what says they are the same computation rather than three:
+
+| Path | `max_tokens` | `max_abs` | cosine |
+| --- | ---: | ---: | ---: |
+| Q8_0, fp32 `moe_shared_ffn` | 16 | 3.20e-4 | 1.000000 |
+| split int8, `shared_expert_mma` | 128 | 6.45e-2 | 0.999997 |
+| split int8, `dense_proj_split_t3` | 3 | 3.36e-4 | 1.000000 |
+
+On a tensor whose own max magnitude is 82.3. The middle row is looser because
+it is the only one that quantizes *activations* to int8; the GEMV dequantizes
+the weights and multiplies in fp32, which is why the decode path is the
+accurate one and the prefill path is the fast one.
+
+`max_rel_error` is excluded from both gates for the floor reason the routed
+MoE differential records, and the test asserts the element driving it really
+is small against the tensor's own scale — so the exclusion fails loudly if it
+stops being justified.
+
+### End to end, against llama.cpp
+
+The `forward_pass` golden is a Qwen3.6 capture and there is no dense
+equivalent, so the end-to-end check is greedy agreement with
+`llama-completion` at `--temp 0 --top-k 1` on the same file. Measured:
+
+| Prompt | Q8_0 residency | int8 residency (shipped) |
+| --- | --- | --- |
+| "The capital of France is", 160 tokens | identical, 717/717 chars | identical, 690/690 chars |
+| B-tree explanation, 160 tokens | identical, 717/717 chars | diverges at char 596 of 710 |
+
+The divergence is the price of int8 activations in prefill and is stated
+rather than smoothed over: with the fp32 residency the same prompt matches
+llama.cpp character for character, and it is one constant
+(`DENSE_REPACK_INT8`) away. What it buys is in [BENCHMARKS.md](BENCHMARKS.md).
+The two continuations at the divergence are both correct English about
+B-trees, i.e. a near-tie flipped, not a trajectory drifting.
+
 ## Serving acceptance status
 
 Stated plainly, because a gap you know about is manageable and one you assume

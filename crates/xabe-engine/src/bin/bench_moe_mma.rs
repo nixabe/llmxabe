@@ -176,12 +176,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("{:>7}  {:>10}  {:>10}", "tokens", "ms", "TOP/s");
     info!("{:->7}--{:->10}--{:->10}", "", "", "");
 
+    let moe = config
+        .moe()
+        .expect("bench_moe_mma benchmarks the routed expert GEMM");
     for &tokens in &TOKEN_COUNTS {
         let g = MoeGeometry {
-            num_experts: config.moe.num_experts as usize,
-            experts_per_token: config.moe.experts_per_token as usize,
+            num_experts: moe.num_experts as usize,
+            experts_per_token: moe.experts_per_token as usize,
             hidden: config.hidden_size as usize,
-            intermediate: config.moe.expert_intermediate as usize,
+            intermediate: moe.expert_intermediate as usize,
             block_size: xabe_engine::forward::moe_block_size(tokens),
             max_tokens: tokens,
         };
