@@ -159,15 +159,41 @@ must; the batched read is what makes the aggregate grow anyway.
 
 | depth | 3 sessions | 6 sessions | 9 sessions |
 | :--- | ---: | ---: | ---: |
-| 16K prefill | 5,854 agg / 1,951 slot | 6,093 / 1,016 | 5,433 / 604 |
-| 64K prefill | 5,211 / 1,737 | 5,249 / 875 | 4,820 / 536 |
-| 16K decode | 187.4 / 64.2 | 265.7 / 47.2 | 329.3 / 39.0 |
-| 64K decode | 185.0 / 63.1 | 228.7 / 41.5 | 271.1 / 32.8 |
+| 16K prefill | 6,803 agg / 2,268 slot | 7,029 / 1,171 | 6,101 / 678 |
+| 64K prefill | 5,290 / 1,764 | 5,281 / 880 | 5,071 / 564 |
+| 16K decode | 202.3 / 68.4 | 297.4 / 52.2 | 368.6 / 42.5 |
+| 64K decode | 193.7 / 66.8 | 244.4 / 44.0 | 304.0 / 35.0 |
 
-Nine sessions at 64K reach 4,820 tok/s of prefill against one card's
-three-session 1,709 — **2.82x for 3x the cards**, and every session makes
-progress throughout: first tokens land at [99.8, 111.9 x4, 116.8 x4], grouped
-by card rather than staggered one prompt at a time.
+The nine-session cells are the noisiest on this host: their two trials spread
+6.1% on 16K prefill and 3.9% on 64K decode, against 0.7% or better everywhere
+else. Read them as the pair, not the digit.
+
+Nine sessions at 64K reach 5,071 tok/s of prefill against one card's
+three-session 1,709 — **2.97x for 3x the cards**, and every session makes
+progress throughout: first tokens land at [93.9, 99.3, 108.5 x5, 110.7 x2],
+grouped by card rather than staggered one prompt at a time.
+
+### A session beside busy neighbours
+
+Aggregate throughput says nothing about what one session feels while the other
+cards are working, and that is the number a person actually notices. One
+session decodes 200 tokens while two 64K prompts prefill on the *other* two
+cards; its inter-token latency is the measurement, and its own baseline on an
+idle fleet is measured in the same run.
+
+| decoding session | mean | median | p90 | p99 | max | wall spent stalled |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fleet stepped in lockstep | 146.0 ms | 12.1 | 958 | 1,579 | 2,959 | 92% |
+| workers on their own loops | 11.8 ms | 11.6 | 12.1 | 14.2 | 21.1 | 0% |
+| the same fleet, idle | 11.7 ms | 11.6 | 11.8 | 12.4 | 19.8 | — |
+
+The median is the trap: it is 12.1 ms in every row, and a probe that reported
+it concluded the fleet cost a decoding session 1.3x. The cost was entirely in
+the tail — 21 of 199 tokens absorbed 26.9 s of the 29.0 s that session took,
+each stall the length of one 2048-token prefill chunk on a card that session
+was not running on. Decoding beside two busy cards is now indistinguishable
+from decoding on an idle fleet, and the prefills alongside it finished no
+slower.
 
 ### Prefix cache: coverage decides whether it hits at all
 
@@ -533,15 +559,16 @@ obvious next lever and is not built.
 
 ## Concurrency is a lock property before it is a scheduler property
 
-Nine sessions across three cards were not concurrent for two reasons, and
-neither lived in `xabe-sched`. Both presented identically — as a scheduler
-that refused to share — and both were diagnosed only once a step logged what
-it actually carried, which is why that log is in the tree.
+Nine sessions across three cards were not concurrent for four reasons, and
+not one of them lived in `xabe-sched`. They all presented identically — as a
+scheduler that refused to share — and each was diagnosed only once a step
+logged what it actually carried, which is why that log is in the tree.
 
-**The driver loop must yield the engine lock.** `scheduler_loop` takes it,
-holds it for a whole GPU step, releases it and takes it straight back.
-`std::sync::Mutex` is not fair, so a handler blocked in `place_tokens` loses
-that race indefinitely. Two symptoms, one fault. A client is registered
+**The driver loop must yield the lock it steps under.** A driver loop takes
+it, holds it for a whole GPU step, releases it and takes it straight back, so
+a handler blocked in `place_tokens` loses that race indefinitely. This was
+first found when that lock was one `Mutex<Engine>`; it survives the split into
+per-worker locks, because a submission still has to score every worker. Two symptoms, one fault. A client is registered
 *before* its request reaches the engine, so between those two moments there is
 nothing to run and the loop span on empty steps — 20,636 of them in a 27 s
 run against 15 in a run that happened to win the race. And while a long prompt
@@ -566,9 +593,33 @@ when the budget covers fewer slices than there are sessions. Worth +3.0% at
 16K and +3.4% at 64K on aggregate prefill, with worst-case time to first token
 3.5% lower.
 
+**The fleet must not step in lockstep.** One driver thread spawned all three
+workers every step and joined them before starting the next, so every card ran
+at the speed of the slowest card *in that step*. A card with one decode token
+to emit finished in 12 ms and then sat at the join for the rest of a 2048-token
+prefill chunk on somebody else's card. The engine is now one lock per worker
+with a driver thread each, taking only its own worker's lock and releasing it
+before the step's cache bookkeeping; `step_devices` survives for the smoke
+binary and the tests, which do want one bounded unit of fleet-wide progress.
+Worth 4.7–12.1% on aggregate decode and 0.6–16.2% on aggregate prefill across
+the nine-session table, and it is what makes a session beside busy neighbours
+cost nothing rather than 12x.
+
+**Routing is the one decision that must stay atomic.** Scoring reads every
+worker's load and then admits to the cheapest one, and that pair was atomic
+only because one `Mutex<Engine>` happened to make it so. Per-worker locks took
+that away, and concurrent handlers all scored the same idle fleet and all
+chose the same card: nine simultaneous 64K sessions placed 4/2/3, and the
+fourth session on the oversubscribed card waited for a free slot — 150 s to
+its first token against 113 s for its neighbours, and 269 s on a worse split,
+which read as the barrier not being fixed at all. A routing lock held across
+score-and-admit restores it. It never covers a GPU step, so the driver loops
+never wait on it, and placements are exact thirds again.
+
 The order matters for anyone reading the history: the scheduler change was
 measured as a 3% *regression* until the locks were fixed, because it could not
-get sessions to schedule.
+get sessions to schedule. The routing race is the same lesson one level up —
+removing a lock removed an invariant nothing had written down.
 
 ## Speculative decode: exact by construction, priced by the verify step
 
@@ -768,6 +819,14 @@ proposed twice.
 
 Recorded because the *reasoning* is what misleads, not the number.
 
+- **"The fleet-wide step barrier costs a neighbouring session almost
+  nothing."** The probe reported **1.3x** and it was believed long enough to
+  nearly abandon the fix. It had taken the *median* inter-token latency, which
+  is 12.1 ms whether the other cards are busy or idle, because the barrier
+  does not slow tokens down — it freezes them, 21 times out of 199, for the
+  length of somebody else's prefill chunk. The mean was **12.1x**. Summary
+  statistics choose which failures they can see: report the mean and the tail
+  for anything whose cost arrives in stalls.
 - **"The MoE dispatch kernel is single-block."** True, and worth **0.12%** of
   runtime. Parallelized anyway because it was cheap.
 - **"The LM head computes logits for all positions."** It never did; it already
