@@ -345,16 +345,25 @@ impl Generation {
             .lock()
             .expect("client map poisoned")
             .insert(id, sender);
-        let placement = state.engine.lock().expect("engine poisoned").place_tokens(
-            NewRequest {
-                id,
-                prompt_tokens,
-                max_output_tokens: spec.max_tokens,
-            },
-            tokens,
-            spec.images,
-            spec.sampling,
-        );
+        // Announce the wait before blocking on the lock, so the driver loop
+        // knows to stand aside rather than reacquire it the instant it
+        // finishes a step. Decremented as soon as the lock is held — the
+        // count is "handlers queueing", not "handlers submitting".
+        state.submit_waiters.fetch_add(1, Ordering::AcqRel);
+        let placement = {
+            let mut engine = state.engine.lock().expect("engine poisoned");
+            state.submit_waiters.fetch_sub(1, Ordering::AcqRel);
+            engine.place_tokens(
+                NewRequest {
+                    id,
+                    prompt_tokens,
+                    max_output_tokens: spec.max_tokens,
+                },
+                tokens,
+                spec.images,
+                spec.sampling,
+            )
+        };
         let placement = match placement {
             Ok(placement) => placement,
             Err(failure) => {

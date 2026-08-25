@@ -26,7 +26,7 @@ mod tools;
 mod vision;
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -93,6 +93,11 @@ struct AppState {
     sampling_defaults: SamplingDefaults,
     /// The vision serving state, with the pad token already resolved.
     vision: Option<Arc<vision::VisionServing>>,
+    /// Handlers currently blocked trying to take the engine lock to submit a
+    /// request. The driver loop holds that lock for a whole GPU step and
+    /// would otherwise reacquire it immediately; this is how it learns to
+    /// stand aside. See `scheduler_loop`.
+    submit_waiters: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -202,6 +207,47 @@ fn scheduler_loop(state: AppState) {
         let result = state.engine.lock().expect("engine poisoned").step_devices();
         match result {
             Ok(steps) => {
+                // A client is registered *before* its request reaches the
+                // engine (see `generate.rs`), so a non-empty client map does
+                // not mean there is work to do. Between those two moments
+                // this loop would otherwise spin on the engine lock — and
+                // `std::sync::Mutex` is not fair, so a spinner that
+                // reacquires immediately after releasing starves the very
+                // handler trying to submit the next request.
+                //
+                // Measured on three concurrent sessions: 20,636 steps that
+                // scheduled nothing in a 27 s run, against 15 in the run that
+                // happened to win the lock race. The sessions behind the
+                // first one could not be admitted until the prompt in flight
+                // finished, which read as a scheduler that refused to share.
+                // A 1 ms back-off on an empty step costs nothing when there
+                // is work — the branch is never taken then — and hands the
+                // lock over when there is not.
+                let idle = steps
+                    .iter()
+                    .all(|(_, step)| step.decode_items == 0 && step.prefill_items == 0);
+                if idle {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // Hand the lock to anybody waiting to submit.
+                //
+                // The idle back-off above is not enough on its own: while a
+                // long prompt is prefilling, every step is productive, so
+                // the loop takes the lock, holds it for the whole GPU step —
+                // over a second at 64K — releases it and takes it straight
+                // back. `std::sync::Mutex` is not fair, so a handler blocked
+                // in `place_tokens` can wait out an entire prompt.
+                //
+                // Measured at 64K with three sessions dispatched 2 ms apart:
+                // `running=1, waiting=0` for the first 22 steps, the other
+                // two sessions not merely unscheduled but never submitted.
+                // It reads as a scheduler that will not share; it is a lock
+                // that will not yield. One millisecond against a step of a
+                // second or more is not a throughput cost, and it only
+                // applies when somebody is actually waiting.
+                if state.submit_waiters.load(Ordering::Acquire) > 0 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 let mut clients = state.clients.lock().expect("client map poisoned");
                 let mut disconnected_ids = Vec::new();
                 for (_, step) in steps {
@@ -302,6 +348,7 @@ pub async fn serve(
         tokenizer: Arc::new(tokenizer),
         clients: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
+        submit_waiters: Arc::new(AtomicUsize::new(0)),
         api_key: config.api_key.map(Arc::from),
         think_close_token,
         model: Arc::from(config.model.as_str()),
