@@ -727,7 +727,7 @@ fn main() -> std::process::ExitCode {
     let attention_blocks = args.total_context / cache.attention_block_size();
     let retention_interval = cache.gdn_retention_interval() as usize;
     let ordinals: Vec<usize> = devices.iter().map(|d| d.ordinal).collect();
-    let mut engine = Engine::new(
+    let engine = Engine::new(
         &ordinals,
         cache,
         sched,

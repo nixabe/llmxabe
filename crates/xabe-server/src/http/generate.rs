@@ -7,8 +7,8 @@
 
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, Hasher, RandomState};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use axum::http::StatusCode;
 use tokenizers::Tokenizer;
@@ -155,12 +155,12 @@ pub(crate) fn resolve_sampling(
 /// stream body owns the [`Generation`], which owns this.
 struct RequestGuard {
     id: RequestId,
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Engine>,
     armed: bool,
 }
 
 impl RequestGuard {
-    fn new(id: RequestId, engine: Arc<Mutex<Engine>>) -> Self {
+    fn new(id: RequestId, engine: Arc<Engine>) -> Self {
         Self {
             id,
             engine,
@@ -176,7 +176,7 @@ impl RequestGuard {
     /// ends the response while the engine would happily keep going.
     fn cancel_now(&mut self) {
         if self.armed {
-            self.engine.lock().expect("engine poisoned").cancel(self.id);
+            self.engine.cancel(self.id);
             self.armed = false;
         }
     }
@@ -185,7 +185,7 @@ impl RequestGuard {
 impl Drop for RequestGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.engine.lock().expect("engine poisoned").cancel(self.id);
+            self.engine.cancel(self.id);
         }
     }
 }
@@ -350,20 +350,20 @@ impl Generation {
         // finishes a step. Decremented as soon as the lock is held — the
         // count is "handlers queueing", not "handlers submitting".
         state.submit_waiters.fetch_add(1, Ordering::AcqRel);
-        let placement = {
-            let mut engine = state.engine.lock().expect("engine poisoned");
-            state.submit_waiters.fetch_sub(1, Ordering::AcqRel);
-            engine.place_tokens(
-                NewRequest {
-                    id,
-                    prompt_tokens,
-                    max_output_tokens: spec.max_tokens,
-                },
-                tokens,
-                spec.images,
-                spec.sampling,
-            )
-        };
+        let placement = state.engine.place_tokens(
+            NewRequest {
+                id,
+                prompt_tokens,
+                max_output_tokens: spec.max_tokens,
+            },
+            tokens,
+            spec.images,
+            spec.sampling,
+        );
+        // Cleared once the submission is through, not once a lock is held:
+        // `place_tokens` takes each worker's lock in turn to score it and
+        // then the chosen worker's to admit, so "queueing" spans the call.
+        state.submit_waiters.fetch_sub(1, Ordering::AcqRel);
         let placement = match placement {
             Ok(placement) => placement,
             Err(failure) => {

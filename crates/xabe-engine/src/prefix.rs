@@ -50,6 +50,12 @@ use crate::worker::WorkerId;
 /// hash — instead of the token id. Same content, same name (cross-request
 /// prefix sharing keeps working); different content, a different name in
 /// every overlapping block.
+/// Cloned, cheaply, when a step installs a snapshot: the alternative is to
+/// hold the chain map's lock across `install_snapshot`, which would put all
+/// three workers' bookkeeping in single file behind one prefix-tree insert.
+/// The three vectors are a block hash per 256 tokens, a sub-block tail, and
+/// the prompt's image spans.
+#[derive(Clone)]
 pub(crate) struct SequenceChain {
     block_size: usize,
     hashes: Vec<BlockHash>,

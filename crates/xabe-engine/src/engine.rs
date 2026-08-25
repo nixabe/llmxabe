@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use smallvec::SmallVec;
 use tracing::{debug, warn};
 
@@ -102,7 +102,17 @@ pub struct Placement {
 
 /// Three workers, one router, one shared prefix cache.
 pub struct Engine {
-    workers: Vec<Worker>,
+    /// One lock per worker, which is what lets the three of them run at
+    /// their own pace.
+    ///
+    /// The engine used to be one `Mutex<Engine>` stepped by one driver
+    /// thread that joined all three workers every step, so every card ran at
+    /// the speed of the slowest. Measured on a decode beside two prefills on
+    /// *other* cards: mean inter-token latency 12.1 ms → 146.0 ms, with 21 of
+    /// 199 tokens absorbing 26.9 s of the 29.0 s the session took. The median
+    /// was unchanged at 12.1 ms, which is why this went unnoticed for so
+    /// long — the cost is entirely in the tail. See `docs/BENCHMARKS.md`.
+    workers: Vec<Mutex<Worker>>,
     /// The shared prefix cache.
     ///
     /// This is the project's one structural advantage over three separate
@@ -113,8 +123,27 @@ pub struct Engine {
     router: RouterConfig,
     snapshots: RwLock<SharedSnapshots>,
     /// What names each live sequence's blocks, extended as it generates.
-    request_chains: HashMap<(WorkerId, RequestId), SequenceChain>,
-    request_refs: HashMap<(WorkerId, RequestId), Vec<BlockHash>>,
+    ///
+    /// Keyed by worker as well as request, so a driver thread only ever
+    /// touches its own rows; the lock is held for a map operation, never
+    /// across a GPU step.
+    request_chains: Mutex<HashMap<(WorkerId, RequestId), SequenceChain>>,
+    request_refs: Mutex<HashMap<(WorkerId, RequestId), Vec<BlockHash>>>,
+    /// Serializes the route-and-admit decision.
+    ///
+    /// Scoring reads every worker's load and then admits to the cheapest
+    /// one, which is only correct if no other handler admits in between.
+    /// One `Mutex<Engine>` used to provide that for free; per-worker locks
+    /// do not, and concurrent scorers all see the same least-loaded card and
+    /// all pile onto it. Measured with nine simultaneous 64K sessions on
+    /// three cards: placements came out 4/2/3 rather than 3/3/3, and the
+    /// fourth session on the oversubscribed card waited for a slot — a
+    /// 150 s first token against 113 s for its neighbours, and 269 s on a
+    /// worse split.
+    ///
+    /// This is held across scoring and admission only. It never covers a GPU
+    /// step, so the driver loops never wait on it.
+    placement: Mutex<()>,
     max_prefix_nodes: usize,
     block_size: u32,
     /// Snapshot slots each worker must keep free for its own live sequences.
@@ -144,14 +173,14 @@ impl Engine {
             .iter()
             .enumerate()
             .map(|(i, &ordinal)| {
-                Worker::new(
+                Mutex::new(Worker::new(
                     WorkerId(i as u32),
                     ordinal,
                     cache.clone(),
                     sched,
                     attention_blocks_per_worker,
                     gdn_slots_per_worker,
-                )
+                ))
             })
             .collect();
 
@@ -160,8 +189,9 @@ impl Engine {
             prefix_tree,
             router,
             snapshots: RwLock::new(SharedSnapshots::default()),
-            request_chains: HashMap::new(),
-            request_refs: HashMap::new(),
+            request_chains: Mutex::new(HashMap::new()),
+            request_refs: Mutex::new(HashMap::new()),
+            placement: Mutex::new(()),
             max_prefix_nodes: attention_blocks_per_worker as usize,
             block_size: cache.attention_block_size(),
             slot_reserve: gdn_slots_per_worker as usize,
@@ -178,14 +208,13 @@ impl Engine {
         &self.prefix_tree
     }
 
-    /// Read-only access to a worker.
-    pub fn worker(&self, id: WorkerId) -> Option<&Worker> {
-        self.workers.get(id.0 as usize)
-    }
-
-    /// Mutable access to a worker.
-    pub fn worker_mut(&mut self, id: WorkerId) -> Option<&mut Worker> {
-        self.workers.get_mut(id.0 as usize)
+    /// Lock one worker.
+    ///
+    /// Hold the guard for as short a span as the work allows: a driver
+    /// thread takes it for a whole GPU step, so anything that blocks on it
+    /// waits out that step.
+    pub fn worker(&self, id: WorkerId) -> Option<MutexGuard<'_, Worker>> {
+        self.workers.get(id.0 as usize).map(|worker| worker.lock())
     }
 
     /// Score every worker against an incoming request.
@@ -207,7 +236,7 @@ impl Engine {
             .map_or(0, |_| matched.gdn_matched_tokens);
         self.workers
             .iter()
-            .map(|w| w.load_for(usable, req))
+            .map(|worker| worker.lock().load_for(usable, req))
             .collect()
     }
 
@@ -216,16 +245,17 @@ impl Engine {
     /// `block_hashes` are the chained block hashes of the request's prompt,
     /// as produced by [`xabe_cache::radix::hash_block`].
     pub fn place(
-        &mut self,
+        &self,
         req: NewRequest,
         block_hashes: &[BlockHash],
     ) -> Result<Placement, PlacementError> {
         let budget = self
             .workers
             .first()
-            .map(|w| w.scheduler().config().token_budget())
+            .map(|worker| worker.lock().scheduler().config().token_budget())
             .unwrap_or(0);
 
+        let _routing = self.placement.lock();
         let loads = self.score_workers(&req, block_hashes);
         let Routed {
             worker,
@@ -235,7 +265,7 @@ impl Engine {
             .map_err(PlacementError::Routing)?;
 
         let request = self
-            .worker_mut(worker)
+            .worker(worker)
             .expect("router returned a worker that exists")
             .admit(req)
             .map_err(PlacementError::Admission)?;
@@ -266,7 +296,7 @@ impl Engine {
     /// the first error, because the scope must join them all regardless; the
     /// lowest-numbered failing worker is the one named.
     pub fn bind_devices(
-        &mut self,
+        &self,
         model_path: &Path,
         model: ModelConfig,
         serving: ServingConfig,
@@ -274,11 +304,12 @@ impl Engine {
         let outcomes: Vec<(WorkerId, Result<(), RuntimeError>)> = std::thread::scope(|scope| {
             let threads: Vec<_> = self
                 .workers
-                .iter_mut()
+                .iter()
                 .map(|worker| {
                     let model = model.clone();
                     let serving = serving.clone();
                     scope.spawn(move || {
+                        let mut worker = worker.lock();
                         let id = worker.id();
                         (id, worker.bind_device(model_path, model, serving))
                     })
@@ -303,7 +334,7 @@ impl Engine {
     /// tokens would publish a snapshot under a prefix it does not describe.
     /// See `SequenceChain`.
     pub fn place_tokens(
-        &mut self,
+        &self,
         req: NewRequest,
         prompt: Vec<i32>,
         images: Vec<crate::image::SequenceImage>,
@@ -318,9 +349,13 @@ impl Engine {
         let budget = self
             .workers
             .first()
-            .map(|worker| worker.scheduler().config().token_budget())
+            .map(|worker| worker.lock().scheduler().config().token_budget())
             .unwrap_or(0);
         let chain = SequenceChain::new(self.block_size, &prompt, &placements);
+        // Claiming a snapshot for reuse is part of the same decision as
+        // choosing a worker, so it is inside the routing lock too: two
+        // handlers that both matched the same prefix must not both take it.
+        let _routing = self.placement.lock();
         let matched = self.prefix_tree.match_prefix(chain.hashes());
         let snapshot = matched
             .gdn_snapshot_hash
@@ -342,23 +377,24 @@ impl Engine {
             matched_tokens,
         } = route(&self.router, &loads, req.prompt_tokens, budget)
             .map_err(|error| EngineExecutionError::Placement(PlacementError::Routing(error)))?;
-        let request = if let Some(snapshot) = snapshot {
-            self.worker_mut(worker)
-                .expect("router returned an existing worker")
-                .admit_tokens_restored(req, prompt, images, snapshot, sampling)
-        } else {
-            self.worker_mut(worker)
-                .expect("router returned an existing worker")
-                .admit_tokens(req, prompt, images, sampling)
+        let request = {
+            let mut target = self
+                .worker(worker)
+                .expect("router returned an existing worker");
+            if let Some(snapshot) = snapshot {
+                target.admit_tokens_restored(req, prompt, images, snapshot, sampling)
+            } else {
+                target.admit_tokens(req, prompt, images, sampling)
+            }
         }
         .map_err(|source| EngineExecutionError::Worker { worker, source })?;
         let referenced = matched_tokens as usize / self.block_size as usize;
         if referenced > 0 {
             let hashes = chain.hashes()[..referenced].to_vec();
             self.prefix_tree.incr_ref_chain(&hashes);
-            self.request_refs.insert((worker, request), hashes);
+            self.request_refs.lock().insert((worker, request), hashes);
         }
-        self.request_chains.insert((worker, request), chain);
+        self.request_chains.lock().insert((worker, request), chain);
         Ok(Placement {
             worker,
             request,
@@ -369,19 +405,20 @@ impl Engine {
 
     /// Cancel a live request and release its scheduler, runtime, and cache
     /// bookkeeping regardless of whether it is waiting or running.
-    pub fn cancel(&mut self, request: RequestId) -> bool {
+    pub fn cancel(&self, request: RequestId) -> bool {
         let Some(worker) = self.workers.iter().find_map(|worker| {
+            let worker = worker.lock();
             (worker.scheduler().is_waiting(request) || worker.scheduler().is_running(request))
                 .then_some(worker.id())
         }) else {
             return false;
         };
-        self.request_chains.remove(&(worker, request));
-        if let Some(hashes) = self.request_refs.remove(&(worker, request)) {
+        self.request_chains.lock().remove(&(worker, request));
+        if let Some(hashes) = self.request_refs.lock().remove(&(worker, request)) {
             self.prefix_tree.decr_ref_chain(&hashes);
         }
-        self.worker_mut(worker)
-            .is_some_and(|worker| worker.cancel(request))
+        self.worker(worker)
+            .is_some_and(|mut worker| worker.cancel(request))
     }
 
     /// Publish a snapshot into the shared prefix tree, named by the chain of
@@ -398,11 +435,22 @@ impl Engine {
         snapshot: Arc<SequenceSnapshot>,
         chain: &SequenceChain,
     ) -> Result<bool, EngineExecutionError> {
-        let source = self
-            .worker(worker)
-            .ok_or(EngineExecutionError::MissingWorker(worker))?;
+        // Take what this needs from the worker and drop the guard, rather
+        // than reading through it further down. Everything below touches the
+        // shared prefix tree and snapshot map, and holding a worker lock
+        // across those would be the one place in the engine where two locks
+        // are held at once — an ordering constraint to get right later for
+        // no gain, since both values are `Copy` or cheaply cloned.
+        let (interval, slots) = {
+            let source = self
+                .worker(worker)
+                .ok_or(EngineExecutionError::MissingWorker(worker))?;
+            (
+                source.cache_config().gdn_retention_interval(),
+                source.snapshot_slots().cloned(),
+            )
+        };
         let position = snapshot.position();
-        let interval = source.cache_config().gdn_retention_interval();
         if position == 0 || !(position as u32).is_multiple_of(interval) {
             return Err(EngineExecutionError::SnapshotNotRetained { position, interval });
         }
@@ -440,8 +488,7 @@ impl Engine {
         // slots until it is dropped. Yield before publishing rather than let
         // a live sequence hit `SnapshotArenaExhausted`, which would switch
         // that sequence's retention off permanently.
-        if let Some(slots) = source.snapshot_slots() {
-            let slots = slots.clone();
+        if let Some(slots) = slots {
             let reserve = self.slot_reserve;
             if !self
                 .snapshots
@@ -476,58 +523,107 @@ impl Engine {
         Ok(true)
     }
 
-    /// Execute one scheduler step on every device-bound worker concurrently.
+    /// Execute one scheduler step on a single worker.
+    ///
+    /// This is the unit the server drives: one thread per worker, each
+    /// looping at its own pace. Only that worker's lock is taken, and it is
+    /// released before the step's cache bookkeeping runs, so a card that is
+    /// prefilling holds nothing another card's decode needs.
+    ///
+    /// `Ok(None)` means the worker has no device bound and there was nothing
+    /// to step.
+    pub fn step_worker(
+        &self,
+        worker: WorkerId,
+    ) -> Result<Option<DeviceStep>, EngineExecutionError> {
+        let mut step = {
+            let Some(mut guard) = self.worker(worker) else {
+                return Err(EngineExecutionError::MissingWorker(worker));
+            };
+            if !guard.is_device_bound() {
+                return Ok(None);
+            }
+            guard
+                .step_device()
+                .map_err(|source| EngineExecutionError::Worker { worker, source })?
+        };
+        self.apply_step(worker, &mut step)?;
+        Ok(Some(step))
+    }
+
+    /// Fold one worker's completed step into the shared cache bookkeeping.
+    ///
+    /// Runs with no worker lock held. The maps are keyed by worker, so
+    /// concurrent callers for different workers never touch the same rows.
+    fn apply_step(
+        &self,
+        worker: WorkerId,
+        step: &mut DeviceStep,
+    ) -> Result<(), EngineExecutionError> {
+        // Extend the chains *before* installing this step's snapshots,
+        // and the order is load-bearing rather than incidental.
+        //
+        // Within a step the runtime interleaves the two: a speculative
+        // round retains at position p and then emits the token at p, and
+        // the next round does the same at p+1. Taking the generated
+        // tokens first means every chain has reached at least the deepest
+        // position this step retained, and `hashes_for` reads only the
+        // blocks below that — so no snapshot is ever named by a chain
+        // that has not yet caught up to it.
+        {
+            let mut chains = self.request_chains.lock();
+            for (request, token) in &step.generated {
+                if let Some(chain) = chains.get_mut(&(worker, *request)) {
+                    chain.push(*token);
+                }
+            }
+        }
+        for (request, snapshot) in std::mem::take(&mut step.retained) {
+            // Clone the chain rather than install through the map guard:
+            // `install_snapshot` reaches for the prefix tree and the shared
+            // snapshot map, and holding the chain lock across that would
+            // stall every other worker's bookkeeping behind this one.
+            let chain = self.request_chains.lock().get(&(worker, request)).cloned();
+            if let Some(chain) = chain {
+                self.install_snapshot(worker, snapshot, &chain)?;
+            }
+        }
+        for request in &step.completed {
+            self.request_chains.lock().remove(&(worker, *request));
+            let hashes = self.request_refs.lock().remove(&(worker, *request));
+            if let Some(hashes) = hashes {
+                self.prefix_tree.decr_ref_chain(&hashes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Step every device-bound worker once, concurrently, and join them.
+    ///
+    /// Retained for the smoke binary and the tests, which want one bounded
+    /// unit of fleet-wide progress. The server does *not* drive the engine
+    /// this way — the join is exactly the barrier that made every card run
+    /// at the speed of the slowest. See [`Self::step_worker`].
     pub fn step_devices(
-        &mut self,
+        &self,
     ) -> Result<SmallVec<[(WorkerId, DeviceStep); 3]>, EngineExecutionError> {
-        let mut steps: SmallVec<[(WorkerId, DeviceStep); 3]> = std::thread::scope(|scope| {
-            let handles: SmallVec<[_; 3]> = self
-                .workers
-                .iter_mut()
-                .filter(|worker| worker.is_device_bound())
-                .map(|worker| {
-                    let id = worker.id();
-                    (id, scope.spawn(move || worker.step_device()))
+        std::thread::scope(|scope| {
+            let handles: SmallVec<[_; 3]> = (0..self.workers.len())
+                .map(|index| {
+                    let worker = WorkerId(index as u32);
+                    (worker, scope.spawn(move || self.step_worker(worker)))
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|(worker, handle)| match handle.join() {
-                    Ok(Ok(step)) => Ok((worker, step)),
-                    Ok(Err(source)) => Err(EngineExecutionError::Worker { worker, source }),
-                    Err(_) => Err(EngineExecutionError::WorkerPanicked(worker)),
+                .filter_map(|(worker, handle)| match handle.join() {
+                    Ok(Ok(Some(step))) => Some(Ok((worker, step))),
+                    Ok(Ok(None)) => None,
+                    Ok(Err(error)) => Some(Err(error)),
+                    Err(_) => Some(Err(EngineExecutionError::WorkerPanicked(worker))),
                 })
-                .collect::<Result<SmallVec<[_; 3]>, _>>()
-        })?;
-        for (worker, step) in &mut steps {
-            // Extend the chains *before* installing this step's snapshots,
-            // and the order is load-bearing rather than incidental.
-            //
-            // Within a step the runtime interleaves the two: a speculative
-            // round retains at position p and then emits the token at p, and
-            // the next round does the same at p+1. Taking the generated
-            // tokens first means every chain has reached at least the deepest
-            // position this step retained, and `hashes_for` reads only the
-            // blocks below that — so no snapshot is ever named by a chain
-            // that has not yet caught up to it.
-            for (request, token) in &step.generated {
-                if let Some(chain) = self.request_chains.get_mut(&(*worker, *request)) {
-                    chain.push(*token);
-                }
-            }
-            for (request, snapshot) in std::mem::take(&mut step.retained) {
-                if let Some(chain) = self.request_chains.get(&(*worker, request)) {
-                    self.install_snapshot(*worker, snapshot, chain)?;
-                }
-            }
-            for request in &step.completed {
-                self.request_chains.remove(&(*worker, *request));
-                if let Some(hashes) = self.request_refs.remove(&(*worker, *request)) {
-                    self.prefix_tree.decr_ref_chain(&hashes);
-                }
-            }
-        }
-        Ok(steps)
+                .collect()
+        })
     }
 }
 
@@ -582,16 +678,52 @@ mod tests {
     }
 
     #[test]
+    fn nine_sessions_arriving_at_once_still_spread_evenly() {
+        // Routing reads every worker's load and then admits to the cheapest
+        // one. Once the engine stopped being one lock, nothing made that
+        // pair atomic, and concurrent handlers all scored the same idle
+        // fleet and all chose the same card. On hardware that showed up as
+        // 4/2/3 placements for nine simultaneous 64K sessions, the fourth
+        // session on the oversubscribed card waiting for a free slot: a
+        // 150 s first token against 113 s for its neighbours, and 269 s on a
+        // worse split.
+        //
+        // The barrier is what gives this teeth. Nine threads spawned in a
+        // loop finish microseconds apart and never overlap, so the race
+        // needs them released together; repeating the round then turns a
+        // possible interleaving into a near-certain one. Without the
+        // routing lock this fails in the first round or two.
+        for round in 0..256 {
+            let e = engine(4096);
+            let gate = std::sync::Barrier::new(9);
+            std::thread::scope(|scope| {
+                for id in 0..9u64 {
+                    let (e, gate) = (&e, &gate);
+                    scope.spawn(move || {
+                        gate.wait();
+                        e.place(req(id, 256, 16), &[])
+                            .expect("nine small sessions fit three workers")
+                    });
+                }
+            });
+            let placed: Vec<usize> = (0..3)
+                .map(|i| e.worker(WorkerId(i)).unwrap().scheduler().waiting_len())
+                .collect();
+            assert_eq!(placed, vec![3, 3, 3], "round {round}: placements piled up");
+        }
+    }
+
+    #[test]
     fn workers_are_independent_apart_from_the_shared_tree() {
         // Admitting on one worker must not consume another's capacity. This
         // is the property that makes routing a cost decision rather than a
         // correctness one.
-        let mut e = engine(1024);
+        let e = engine(1024);
         let before: Vec<_> = (0..3)
             .map(|i| e.worker(WorkerId(i)).unwrap().kv_utilization())
             .collect();
 
-        e.worker_mut(WorkerId(0))
+        e.worker(WorkerId(0))
             .unwrap()
             .admit(req(1, 2048, 256))
             .unwrap();
@@ -606,7 +738,7 @@ mod tests {
     #[test]
     fn a_request_larger_than_any_pool_is_refused_rather_than_placed() {
         // Every worker refuses, so this is saturation, not a routing bug.
-        let mut e = engine(4); // 4 blocks * 256 = 1024 tokens total
+        let e = engine(4); // 4 blocks * 256 = 1024 tokens total
         let err = e.place(req(1, 100_000, 1024), &[]).unwrap_err();
         assert_eq!(
             err,
@@ -618,7 +750,7 @@ mod tests {
 
     #[test]
     fn placement_reports_where_it_went_and_why() {
-        let mut e = engine(1024);
+        let e = engine(1024);
         let p = e.place(req(1, 2048, 256), &[]).unwrap();
         assert_eq!(p.request, RequestId(1));
         assert!(p.score.is_finite());
@@ -635,7 +767,7 @@ mod tests {
     #[test]
     fn an_empty_prefix_tree_still_routes() {
         // Cold start must work: with no cache anywhere, the load terms decide.
-        let mut e = engine(1024);
+        let e = engine(1024);
         for i in 0..3 {
             assert!(e.place(req(i, 512, 128), &[]).is_ok());
         }
@@ -678,7 +810,7 @@ mod tests {
 
     #[test]
     fn cancellation_removes_a_waiting_request_from_its_worker() {
-        let mut e = engine(1024);
+        let e = engine(1024);
         let hash = 11;
         e.prefix_tree.insert(&[PrefixBlock {
             hash,
@@ -688,6 +820,7 @@ mod tests {
         let placement = e.place(req(77, 2048, 16), &[]).unwrap();
         e.prefix_tree.incr_ref_chain(&[hash]);
         e.request_refs
+            .lock()
             .insert((placement.worker, placement.request), vec![hash]);
         assert_eq!(e.prefix_tree.ref_count(hash), 1);
         assert!(

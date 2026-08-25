@@ -37,7 +37,7 @@ use serde::Serialize;
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use xabe_engine::Engine;
+use xabe_engine::{Engine, WorkerId};
 use xabe_sched::request::RequestId;
 
 pub use generate::SamplingDefaults;
@@ -79,7 +79,7 @@ pub struct ServerConfig {
 
 #[derive(Clone)]
 struct AppState {
-    engine: Arc<Mutex<Engine>>,
+    engine: Arc<Engine>,
     tokenizer: Arc<Tokenizer>,
     clients: ClientMap,
     next_id: Arc<AtomicU64>,
@@ -93,10 +93,10 @@ struct AppState {
     sampling_defaults: SamplingDefaults,
     /// The vision serving state, with the pad token already resolved.
     vision: Option<Arc<vision::VisionServing>>,
-    /// Handlers currently blocked trying to take the engine lock to submit a
-    /// request. The driver loop holds that lock for a whole GPU step and
-    /// would otherwise reacquire it immediately; this is how it learns to
-    /// stand aside. See `scheduler_loop`.
+    /// Handlers currently blocked trying to take a worker lock to submit a
+    /// request. A driver loop holds its worker's lock for a whole GPU step
+    /// and would otherwise reacquire it immediately; this is how it learns
+    /// to stand aside. See `worker_loop`.
     submit_waiters: Arc<AtomicUsize>,
 }
 
@@ -188,12 +188,19 @@ async fn models(
     })
 }
 
-/// Drive the engine and fan its output out to waiting clients.
+/// Drive one worker and fan its output out to waiting clients.
 ///
-/// This runs on its own thread rather than a task because a step is a
-/// blocking, GPU-bound call that holds the engine lock for its whole
-/// duration.
-fn scheduler_loop(state: AppState) {
+/// One of these runs per worker, on its own thread rather than a task
+/// because a step is a blocking, GPU-bound call.
+///
+/// The three loops are deliberately not synchronized. The engine used to be
+/// stepped by a single thread that spawned all three workers and joined them
+/// every step, which made every card run at the speed of the slowest one in
+/// that step: a decode had to wait out whatever prefill chunk another card
+/// happened to be grinding through. Each loop now takes only its own
+/// worker's lock, so the cards interleave at whatever rate their own work
+/// allows. See `docs/BENCHMARKS.md`.
+fn worker_loop(state: AppState, worker: WorkerId) {
     loop {
         if state
             .clients
@@ -204,16 +211,19 @@ fn scheduler_loop(state: AppState) {
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
-        let result = state.engine.lock().expect("engine poisoned").step_devices();
-        match result {
-            Ok(steps) => {
+        match state.engine.step_worker(worker) {
+            // No device bound: nothing for this loop to drive, ever. Sleep
+            // rather than spin — the worker count comes from the engine, so
+            // this is only reachable in a partially bound fleet.
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Ok(Some(step)) => {
                 // A client is registered *before* its request reaches the
                 // engine (see `generate.rs`), so a non-empty client map does
                 // not mean there is work to do. Between those two moments
-                // this loop would otherwise spin on the engine lock — and
-                // `std::sync::Mutex` is not fair, so a spinner that
-                // reacquires immediately after releasing starves the very
-                // handler trying to submit the next request.
+                // this loop would otherwise spin on the worker lock — and
+                // `parking_lot::Mutex` hands off eagerly, but a loop that
+                // reacquires immediately still crowds out the handler trying
+                // to submit the next request.
                 //
                 // Measured on three concurrent sessions: 20,636 steps that
                 // scheduled nothing in a 27 s run, against 15 in the run that
@@ -223,10 +233,7 @@ fn scheduler_loop(state: AppState) {
                 // A 1 ms back-off on an empty step costs nothing when there
                 // is work — the branch is never taken then — and hands the
                 // lock over when there is not.
-                let idle = steps
-                    .iter()
-                    .all(|(_, step)| step.decode_items == 0 && step.prefill_items == 0);
-                if idle {
+                if step.decode_items == 0 && step.prefill_items == 0 {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 // Hand the lock to anybody waiting to submit.
@@ -235,8 +242,8 @@ fn scheduler_loop(state: AppState) {
                 // long prompt is prefilling, every step is productive, so
                 // the loop takes the lock, holds it for the whole GPU step —
                 // over a second at 64K — releases it and takes it straight
-                // back. `std::sync::Mutex` is not fair, so a handler blocked
-                // in `place_tokens` can wait out an entire prompt.
+                // back. A handler blocked in `place_tokens` scores every
+                // worker, so it can be made to wait out an entire prompt.
                 //
                 // Measured at 64K with three sessions dispatched 2 ms apart:
                 // `running=1, waiting=0` for the first 22 steps, the other
@@ -250,36 +257,37 @@ fn scheduler_loop(state: AppState) {
                 }
                 let mut clients = state.clients.lock().expect("client map poisoned");
                 let mut disconnected_ids = Vec::new();
-                for (_, step) in steps {
-                    let stopped = &step.stopped;
-                    for (id, token) in step.generated {
-                        let disconnected = clients
-                            .get(&id)
-                            .is_some_and(|client| client.send(ClientEvent::Token(token)).is_err());
-                        if disconnected {
-                            clients.remove(&id);
-                            disconnected_ids.push(id);
-                        }
+                let stopped = &step.stopped;
+                for (id, token) in step.generated {
+                    let disconnected = clients
+                        .get(&id)
+                        .is_some_and(|client| client.send(ClientEvent::Token(token)).is_err());
+                    if disconnected {
+                        clients.remove(&id);
+                        disconnected_ids.push(id);
                     }
-                    for id in step.completed {
-                        if let Some(client) = clients.remove(&id) {
-                            let reason = if stopped.contains(&id) {
-                                EngineFinish::Eos
-                            } else {
-                                EngineFinish::Length
-                            };
-                            let _ = client.send(ClientEvent::Done(reason));
-                        }
+                }
+                for id in step.completed {
+                    if let Some(client) = clients.remove(&id) {
+                        let reason = if stopped.contains(&id) {
+                            EngineFinish::Eos
+                        } else {
+                            EngineFinish::Length
+                        };
+                        let _ = client.send(ClientEvent::Done(reason));
                     }
                 }
                 drop(clients);
-                let mut engine = state.engine.lock().expect("engine poisoned");
                 for id in disconnected_ids {
-                    engine.cancel(id);
+                    state.engine.cancel(id);
                 }
             }
             Err(failure) => {
-                error!("device scheduler failed: {failure}");
+                // A step failure is not attributable to one client, so every
+                // client this worker could have been serving is told. The
+                // other workers' loops are untouched: their sessions are on
+                // different cards and are still being served.
+                error!(worker = worker.0, "device scheduler failed: {failure}");
                 let mut clients = state.clients.lock().expect("client map poisoned");
                 let failed = clients
                     .drain()
@@ -289,9 +297,8 @@ fn scheduler_loop(state: AppState) {
                     })
                     .collect::<Vec<_>>();
                 drop(clients);
-                let mut engine = state.engine.lock().expect("engine poisoned");
                 for id in failed {
-                    engine.cancel(id);
+                    state.engine.cancel(id);
                 }
             }
         }
@@ -344,7 +351,7 @@ pub async fn serve(
         })
         .transpose()?;
     let state = AppState {
-        engine: Arc::new(Mutex::new(engine)),
+        engine: Arc::new(engine),
         tokenizer: Arc::new(tokenizer),
         clients: Arc::new(Mutex::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
@@ -357,11 +364,17 @@ pub async fn serve(
         sampling_defaults: config.sampling_defaults,
         vision,
     };
-    let scheduler_state = state.clone();
-    std::thread::Builder::new()
-        .name("xabe-scheduler".to_owned())
-        .spawn(move || scheduler_loop(scheduler_state))
-        .map_err(|error| error.to_string())?;
+    // One driver thread per worker. They share nothing but the client map
+    // and the engine's shared prefix cache, so a card that is prefilling no
+    // longer holds up a card that only has a decode token to emit.
+    for index in 0..state.engine.worker_count() {
+        let worker_state = state.clone();
+        let worker = WorkerId(index as u32);
+        std::thread::Builder::new()
+            .name(format!("xabe-worker-{index}"))
+            .spawn(move || worker_loop(worker_state, worker))
+            .map_err(|error| error.to_string())?;
+    }
 
     // `/health` stays outside the authenticated routes so a load balancer can
     // probe the server without holding a key.
