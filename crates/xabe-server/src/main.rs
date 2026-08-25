@@ -124,6 +124,13 @@ struct Args {
     #[arg(long, default_value_t = 4096)]
     prefill_chunk: usize,
 
+    /// Most prefill tokens one session may be granted per step, so several
+    /// sessions share a step instead of queueing behind the first; 0 gives
+    /// the whole step to one session. Defaults to the snapshot retention
+    /// interval, which is the widest pass the engine can issue.
+    #[arg(long)]
+    prefill_slice: Option<u32>,
+
     /// Host RAM for the prefix cache's pinned snapshots, across all workers
     /// (e.g. 8GiB); 0 disables snapshot retention and prefix sharing
     #[arg(long, env = "LLMXABE_CACHE_RAM", value_parser = size::parse_bytes)]
@@ -545,12 +552,33 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // Cap each session's per-step prefill grant at the snapshot retention
+    // interval. That is the widest pass the engine can issue anyway — a pass
+    // may not straddle a snapshot boundary — so the cap costs no throughput,
+    // and it is what stops one long prompt from owning every step while the
+    // other slots sit admitted and idle.
+    let sched = sched.with_prefill_slice(
+        args.prefill_slice
+            .unwrap_or_else(|| cache.gdn_retention_interval()),
+    );
     info!(
         "\nscheduler        token budget {} > block {} + decodes {} — accepted",
         sched.token_budget(),
         sched.block_size(),
         sched.max_concurrent_decodes()
     );
+    if sched.prefill_slice() == 0 {
+        warn!(
+            "                 prefill slice 0 — one session takes the whole step and the \
+             others wait for it to finish"
+        );
+    } else {
+        info!(
+            "                 up to {} prefill tokens per session per step — {} sessions share a step",
+            sched.prefill_slice(),
+            args.slots_per_worker
+        );
+    }
     info!(
         "                 {} tokens charged per decode step ({})",
         sched.tokens_per_decode_step(),

@@ -46,6 +46,21 @@ pub struct SchedulerConfig {
     /// Maximum requests held in the waiting queue; running requests are not
     /// counted because their memory is already reserved.
     max_waiting_requests: u32,
+    /// Most prefill tokens one sequence may be granted in a single step.
+    ///
+    /// This is what keeps concurrent sessions concurrent. Without a cap the
+    /// first prompt that does not fit in one step takes the whole budget
+    /// every step until it finishes, and every other admitted session gets
+    /// nothing — measured on one card with four sessions, first tokens
+    /// arrived at 34, 71, 136 and 203 seconds, which is one prompt at a time
+    /// dressed up as four slots.
+    ///
+    /// Set it to the cache's snapshot retention interval. A prefill pass may
+    /// not straddle a snapshot boundary, so that interval is the widest pass
+    /// the engine can issue, and slicing on it costs no throughput: the same
+    /// tokens move at the same width, spread across sessions instead of
+    /// stacked behind one. Zero means no cap, which is the old behaviour.
+    prefill_slice: u32,
 }
 
 impl SchedulerConfig {
@@ -90,6 +105,7 @@ impl SchedulerConfig {
             draft_tokens_per_step,
             max_waiting_requests: max_concurrent_decodes
                 .saturating_mul(DEFAULT_WAITING_REQUESTS_MULTIPLIER),
+            prefill_slice: 0,
         })
     }
 
@@ -107,6 +123,20 @@ impl SchedulerConfig {
             DEFAULT_WATERMARK_FRACTION,
             DEFAULT_DRAFT_TOKENS_PER_STEP,
         )
+    }
+
+    /// Most prefill tokens one sequence may be granted in a step; 0 means
+    /// no cap. See the field for why this is the retention interval.
+    pub fn prefill_slice(&self) -> u32 {
+        self.prefill_slice
+    }
+
+    /// Cap each sequence's per-step prefill grant, so several sessions share
+    /// a step rather than queueing behind the first.
+    #[must_use]
+    pub fn with_prefill_slice(mut self, prefill_slice: u32) -> Self {
+        self.prefill_slice = prefill_slice;
+        self
     }
 
     pub fn token_budget(&self) -> u32 {

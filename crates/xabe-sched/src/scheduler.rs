@@ -62,6 +62,9 @@ pub struct Scheduler {
     free_attention_blocks: u32,
     waiting: VecDeque<TrackedRequest>,
     running: Vec<TrackedRequest>,
+    /// Rotating start for phase 2, so a step that cannot cover every
+    /// prefilling session shorts a different one each time.
+    prefill_cursor: usize,
 }
 
 /// How much of a step's token budget is held back for admission while a long
@@ -91,6 +94,7 @@ impl Scheduler {
             free_attention_blocks: total_attention_blocks,
             waiting: VecDeque::new(),
             running: Vec::new(),
+            prefill_cursor: 0,
         }
     }
 
@@ -359,8 +363,6 @@ impl Scheduler {
             budget -= cost;
         }
 
-        let mut chunked_this_step = false;
-
         // How much of this step to hold back so a waiting request can start.
         //
         // Zero unless phase 3 can actually spend it, and that is the whole
@@ -381,37 +383,83 @@ impl Scheduler {
             0
         };
 
-        // Phase 2: running requests still mid-prefill continue first.
-        for req in self.running.iter_mut().filter(|r| !r.is_decode_ready()) {
-            if chunked_this_step || budget == 0 {
-                break;
+        // Phase 2: every request still mid-prefill shares the step.
+        //
+        // "Shares" is the whole point, and it used to say "first". The old
+        // loop stopped at the first request whose prompt did not fit in one
+        // step, so that request took the entire budget every step until it
+        // finished and every other admitted session got nothing. On one card
+        // with four sessions that produced first tokens at 34, 71, 136 and
+        // 203 seconds: one prompt at a time wearing three slots. A session
+        // that is merely *admitted* is not a session that is running.
+        //
+        // Two things make sharing free rather than a trade. The grant is
+        // capped at `prefill_slice`, which the server sets to the snapshot
+        // retention interval — the widest pass the engine can issue anyway,
+        // since a pass may not straddle a boundary — so the same tokens move
+        // at the same width, merely spread across sessions. And the start
+        // rotates, so when the budget covers fewer slices than there are
+        // sessions, the shortfall lands on a different session each step
+        // instead of always the last one.
+        //
+        // What it does change is the shape of latency: mean time-to-first-
+        // token rises and the worst case falls. That is the right trade for
+        // an interactive harness, where a session frozen for three minutes
+        // reads as a hung engine.
+        // Rotating, allocation-free walk over the running set. Indices
+        // rather than a collected list because `step_into` is the
+        // allocation-free path (rule 6) and three workers contending on the
+        // host allocator produce latency spikes that read like GPU stalls.
+        if !self.running.is_empty() {
+            let slice = match self.config.prefill_slice() {
+                0 => u32::MAX,
+                slice => slice,
+            };
+            let count = self.running.len();
+            let start = self.prefill_cursor % count;
+            let mut granted = false;
+            for offset in 0..count {
+                if budget == 0 {
+                    break;
+                }
+                let spendable = budget.saturating_sub(admission_reserve);
+                if spendable == 0 {
+                    // The reserve is all that is left. Leave it for phase 3
+                    // rather than spend it here; these requests continue next
+                    // step, one step later than they would have.
+                    break;
+                }
+                let req = &mut self.running[(start + offset) % count];
+                if req.is_decode_ready() {
+                    continue;
+                }
+                let remaining = req.prompt_tokens - req.computed_tokens;
+                let chunk = remaining.min(slice).min(spendable);
+                if chunk == 0 {
+                    continue;
+                }
+                batch.prefills.push(PrefillItem {
+                    id: req.id,
+                    tokens: chunk,
+                });
+                req.computed_tokens += chunk;
+                budget -= chunk;
+                granted = true;
             }
-            let remaining = req.prompt_tokens - req.computed_tokens;
-            let chunk = remaining.min(budget.saturating_sub(admission_reserve));
-            if chunk == 0 {
-                // The reserve is all that is left. Leave it for phase 3
-                // rather than spend it here; this request continues next
-                // step, one step later than it would have.
-                break;
-            }
-            batch.prefills.push(PrefillItem {
-                id: req.id,
-                tokens: chunk,
-            });
-            req.computed_tokens += chunk;
-            budget -= chunk;
-            if chunk < remaining {
-                chunked_this_step = true;
+            if granted {
+                // Advance by one so the session that went first this step
+                // goes last next step.
+                self.prefill_cursor = self.prefill_cursor.wrapping_add(1);
             }
         }
 
         // Phase 3: admit from the waiting queue, watermark-gated.
         //
-        // Deliberately not gated on `chunked_this_step`. In the old
-        // accounting that flag was redundant — a truncated chunk had taken
-        // the whole budget, so `budget > 0` already ended the loop — and it
-        // is precisely what would stop the reserve above from ever being
-        // spent. One truncated admission still ends the loop, below.
+        // Reached whatever phase 2 left, which under the sharing loop above
+        // is the admission reserve plus anything the running sessions could
+        // not use. It is deliberately not gated on whether phase 2 truncated
+        // somebody: that gate is what kept the reserve from ever being
+        // spent, which was the starvation this reserve exists to prevent.
         while budget > 0 && self.running.len() < self.config.max_concurrent_decodes() as usize {
             let Some(candidate) = self.waiting.front() else {
                 break;
@@ -433,7 +481,14 @@ impl Scheduler {
             req.blocks_reserved = needed_blocks;
 
             let remaining = req.prompt_tokens - req.computed_tokens;
-            let chunk = remaining.min(budget);
+            // Capped by the same slice the running sessions get, so a
+            // newcomer's first chunk is one aligned pass rather than a grant
+            // whose remainder the runtime has to spend 256 tokens at a time.
+            let slice = match self.config.prefill_slice() {
+                0 => u32::MAX,
+                slice => slice,
+            };
+            let chunk = remaining.min(slice).min(budget);
             batch.prefills.push(PrefillItem {
                 id: req.id,
                 tokens: chunk,
@@ -900,6 +955,103 @@ mod tests {
         assert_eq!(
             spent, 1024,
             "a request the watermark will refuse must not reserve budget"
+        );
+    }
+
+    /// The point of the whole engine: sessions admitted together must run
+    /// together.
+    #[test]
+    fn several_prefilling_sessions_share_a_step_and_take_turns() {
+        // Three long prompts, a 4096 budget and a 2048 slice: two sessions
+        // fit in a step, so the third is shorted — but a *different* third
+        // each step, which is what the rotating cursor is for.
+        let config = SchedulerConfig::new(4096, 256, 3, 0.0, 0)
+            .unwrap()
+            .with_prefill_slice(2048);
+        let mut s = Scheduler::new(config, 100_000);
+        for id in 1..=3 {
+            s.admit(NewRequest {
+                id: RequestId(id),
+                prompt_tokens: 60_000,
+                max_output_tokens: 16,
+            })
+            .expect("admitted");
+        }
+        let mut batch = BatchDescription::default();
+        // One truncated admission per step, so three steps to get them all
+        // running.
+        for _ in 0..3 {
+            batch.prefills.clear();
+            s.step_into(&mut batch);
+        }
+        assert_eq!(s.running_len(), 3, "all three sessions running");
+
+        let mut served: [u32; 4] = [0; 4];
+        for _ in 0..3 {
+            batch.prefills.clear();
+            s.step_into(&mut batch);
+            assert!(
+                batch.prefills.len() > 1,
+                "a step must be shared, not handed to one session: {:?}",
+                batch.prefills
+            );
+            for item in &batch.prefills {
+                assert!(
+                    item.tokens <= 2048,
+                    "no session may exceed its slice: {item:?}"
+                );
+                served[item.id.0 as usize] += item.tokens;
+            }
+        }
+        for id in 1..=3 {
+            assert!(
+                served[id] > 0,
+                "session {id} got nothing across three steps: {served:?}"
+            );
+        }
+    }
+
+    /// The regression this replaced: one long prompt must not own every step.
+    #[test]
+    fn a_long_prompt_no_longer_starves_the_sessions_beside_it() {
+        let config = SchedulerConfig::new(4096, 256, 3, 0.0, 0)
+            .unwrap()
+            .with_prefill_slice(2048);
+        let mut s = Scheduler::new(config, 100_000);
+        s.admit(NewRequest {
+            id: RequestId(1),
+            prompt_tokens: 200_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+        let mut batch = BatchDescription::default();
+        s.step_into(&mut batch);
+        s.admit(NewRequest {
+            id: RequestId(2),
+            prompt_tokens: 60_000,
+            max_output_tokens: 16,
+        })
+        .expect("admitted");
+
+        // Step once to admit the newcomer. Admission alone proves nothing —
+        // the old serial loop admitted it too, then never served it again —
+        // so the assertion is about the steps *after* it is running.
+        batch.prefills.clear();
+        s.step_into(&mut batch);
+        assert!(s.is_running(RequestId(2)), "newcomer admitted");
+
+        let mut served_while_running = 0;
+        for _ in 0..4 {
+            batch.prefills.clear();
+            s.step_into(&mut batch);
+            if batch.prefills.iter().any(|p| p.id == RequestId(2)) {
+                served_while_running += 1;
+            }
+        }
+        assert_eq!(
+            served_while_running, 4,
+            "an admitted session must keep progressing while the 200K prompt \
+             beside it is still prefilling, not merely be admitted and parked"
         );
     }
 
