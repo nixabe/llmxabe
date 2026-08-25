@@ -193,6 +193,22 @@ Reuse is quantised to the retention interval — 43,008 of 49,879 tokens is
 conversation never shows this: 40K tokens needs ~20 snapshots and even the old
 default held 24. It takes concurrent sessions to exceed the arena.
 
+A larger arena than the context needs buys nothing, and the preflight says so.
+Measured on three cards at `--cache-ram 64GiB`: 63.86 GiB pinned, 212
+snapshots per worker, **106% of the context** covered, 60 s to healthy against
+34 s at 19.88 GiB — and reuse identical to full coverage, 73% → 85% over six
+turns. Host memory was fully released on shutdown. `RLIMIT_MEMLOCK` does not
+bind: 63.86 GiB pinned against a 15.72 GiB soft *and hard* limit, because the
+NVIDIA driver pins outside it.
+
+The plateau at ~85% is not a shortfall. Each of these turns adds 6,179 tokens
+that did not previously exist, and against the *reusable* prefix the cache
+takes 97.1% → 98.4%. What is left is the partial retention interval below the
+last snapshot boundary — 552 to 692 tokens per turn, bounded by `R` and
+averaging about `R/2`. Only token-granular reuse would recover it; see the WHY
+entry on what llama.cpp does with in-place slots.
+
+
 ### What this cost to get right
 
 Two lock faults in the driver loop, not the scheduler, dominated everything

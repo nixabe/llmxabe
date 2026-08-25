@@ -77,6 +77,16 @@ services:
       LLMXABE_MMPROJ: /models/${LLMXABE_MMPROJ_REL:-Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf}
       # Model id reported by /v1/models and echoed back in responses.
       LLMXABE_SERVED_MODEL_NAME: ${LLMXABE_SERVED_MODEL_NAME:-qwen3.6-35b-a3b}
+      # Enough pinned snapshots that every slot can restore anywhere in its
+      # context — 198 per worker, 59.64 GiB across three cards. Set explicitly
+      # because the unset default caps itself at a quarter of MemAvailable,
+      # which on a 125 GiB host is ~98 per worker (~49% coverage) and leaves
+      # deep conversations re-prefilling. Measured at 64GiB on this host:
+      # pinned fine, released fine, startup 60 s against 34 s at 19.88 GiB.
+      # Lower it if the host shares RAM with anything substantial; an
+      # undersized arena is worse than a small one, so read the coverage line
+      # preflight prints rather than guessing. See docs/CLI.md#--cache-ram.
+      LLMXABE_CACHE_RAM: ${LLMXABE_CACHE_RAM:-full}
       RUST_BACKTRACE: "1"
 
     # Listed without values on purpose: compose passes these through only when
@@ -85,15 +95,6 @@ services:
     # present an empty one.
     #
     #   LLMXABE_API_KEY   require Authorization: Bearer / x-api-key
-    #   LLMXABE_CACHE_RAM host RAM for pinned prefix snapshots, e.g. 8GiB, or
-    #                     `full` for enough that every slot can restore
-    #                     anywhere in its context. Unset already defaults to
-    #                     full coverage capped at a quarter of MemAvailable;
-    #                     `full` lifts the cap, which across three cards at
-    #                     this -c/-s is ~59.6 GiB pinned. Worth it for agent
-    #                     workloads — an undersized arena publishes nothing at
-    #                     all rather than less, and every turn re-prefills
-    #                     from zero. See docs/CLI.md#--cache-ram.
     #   LLMXABE_DFLASH    path to a DFlash drafter GGUF (--spec-type spec-dflash)
     env_file:
       - path: .env
