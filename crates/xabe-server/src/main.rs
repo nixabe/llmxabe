@@ -65,6 +65,27 @@ enum SpecType {
 }
 
 /// `--help` addendum for the flag clap never sees (see [`Args`] docs).
+/// Fraction of the host's *available* memory the prefix cache may claim when
+/// no `--cache-ram` is given: a quarter. The arena is page-locked, so it does
+/// not page out, and the weights still need the page cache — 63.86 GiB pinned
+/// on this host once squeezed a 32 GB model out of it and turned every
+/// restart into a cold read.
+const DEFAULT_CACHE_RAM_SHARE: u64 = 4;
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes.
+///
+/// Deliberately `MemAvailable` rather than `MemFree`: the page cache holding
+/// the weights is reclaimable and should not read as unavailable, while the
+/// arena that would displace it should not read as free.
+fn host_available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemAvailable:")?;
+        let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        Some(kib * 1024)
+    })
+}
+
 fn log_flag_help() -> String {
     format!("Logging:\n{}", xabe_log::FLAG_HELP)
 }
@@ -132,7 +153,8 @@ struct Args {
     prefill_slice: Option<u32>,
 
     /// Host RAM for the prefix cache's pinned snapshots, across all workers
-    /// (e.g. 8GiB); 0 disables snapshot retention and prefix sharing
+    /// (e.g. 8GiB); `full` sizes it so every slot can restore anywhere in its
+    /// context; 0 disables snapshot retention and prefix sharing
     #[arg(long, env = "LLMXABE_CACHE_RAM", value_parser = size::parse_bytes)]
     cache_ram: Option<u64>,
 
@@ -723,10 +745,41 @@ fn main() -> std::process::ExitCode {
     //    preflight can say what the budget actually bought — a slot count is
     //    the quantity that matters and a byte figure is what was asked for.
     let bytes_per_slot = snapshot_bytes_per_slot(&model, retention_interval) as u64;
+    let workers = engine.worker_count().max(1) as u64;
+
+    // What "the cache always hits" actually costs. A snapshot covers one
+    // retention interval, so a slot serving `per_slot_context` tokens needs
+    // that many intervals to keep a restore point everywhere in its context,
+    // and a worker needs that for every slot it serves.
+    //
+    // Below this the arena does not degrade gracefully: `reclaim_for` yields
+    // rather than publish when slots are scarce, so a worker that cannot hold
+    // its sessions' retention points publishes *nothing* and every turn
+    // re-prefills from zero. Measured with three growing conversations on one
+    // card: 24 slots gave 0% prefix reuse on every request and 319 s of wall
+    // clock; 119 slots gave 73-86% and 133 s.
+    let per_slot_context = (args.total_context / args.slots_per_worker.max(1)) as usize;
+    let full_coverage_slots =
+        args.slots_per_worker as usize * per_slot_context.div_ceil(retention_interval.max(1));
+
     let slots_per_worker = match args.cache_ram {
-        Some(budget) => budget / engine.worker_count().max(1) as u64 / bytes_per_slot.max(1),
-        None => DEFAULT_SNAPSHOT_SLOTS_PER_WORKER as u64,
-    } as usize;
+        Some(size::FULL_COVERAGE) => full_coverage_slots,
+        Some(budget) => (budget / workers / bytes_per_slot.max(1)) as usize,
+        // Default to full coverage, bounded by a share of what the host can
+        // spare. The old fixed 24 was chosen against the locked-memory limit
+        // and covers 16K per slot, which is under a single agent turn at this
+        // context; scaling with the configuration is what makes the shipped
+        // `-c 405504 -s 3` work rather than silently miss.
+        None => {
+            let budget = host_available_bytes()
+                .map(|available| available / DEFAULT_CACHE_RAM_SHARE)
+                .unwrap_or(DEFAULT_SNAPSHOT_SLOTS_PER_WORKER as u64 * bytes_per_slot * workers);
+            let affordable = (budget / workers / bytes_per_slot.max(1)) as usize;
+            full_coverage_slots
+                .min(affordable)
+                .max(DEFAULT_SNAPSHOT_SLOTS_PER_WORKER)
+        }
+    };
     let cache_ram = slots_per_worker as u64 * bytes_per_slot * engine.worker_count() as u64;
     info!(
         "\ncache ram        {:.2} GiB pinned — {} snapshots per worker at {:.2} MiB each",
@@ -734,9 +787,32 @@ fn main() -> std::process::ExitCode {
         slots_per_worker,
         bytes_per_slot as f64 / (1024.0 * 1024.0)
     );
+    // Coverage is the number that predicts whether a conversation keeps
+    // hitting: a slot can restore anywhere inside this many tokens, and
+    // re-prefills from zero beyond it.
+    let coverage_per_slot =
+        slots_per_worker / args.slots_per_worker.max(1) as usize * retention_interval;
+    info!(
+        "                 {} tokens of restore coverage per slot, of {} served ({:.0}% of the context)",
+        coverage_per_slot,
+        per_slot_context,
+        100.0 * coverage_per_slot as f64 / per_slot_context.max(1) as f64,
+    );
     if slots_per_worker == 0 {
         warn!("                 no snapshots retained — prefix sharing is off");
-    } else if slots_per_worker < args.slots_per_worker as usize {
+    } else if slots_per_worker < full_coverage_slots {
+        let full_bytes = full_coverage_slots as u64 * bytes_per_slot * workers;
+        warn!(
+            "                 below full coverage — a conversation deeper than {} tokens re-prefills from zero on every turn",
+            coverage_per_slot
+        );
+        warn!(
+            "                 `--cache-ram full` would take {} snapshots per worker ({:.2} GiB total)",
+            full_coverage_slots,
+            size::gib(full_bytes),
+        );
+    }
+    if slots_per_worker < args.slots_per_worker as usize {
         // The engine keeps one slot per concurrent sequence free before it
         // will publish anything, so below that line it publishes nothing at
         // all — and whichever sequence loses the race for the remaining slots

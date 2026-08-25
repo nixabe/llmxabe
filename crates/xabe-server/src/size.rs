@@ -12,10 +12,20 @@
 /// `KB`/`MB`/`GB` spellings of the same. All units are powers of 1024 —
 /// there is no decimal-megabyte reading here, since the quantity being sized
 /// is memory.
+/// `--cache-ram full` / `-1`: size the arena from the serving configuration
+/// rather than a byte budget, so every slot can keep a retention point at
+/// every interval across its whole context. llama.cpp spells the same idea
+/// `-cram -1` ("no limit"); the value is a sentinel, not a size.
+pub const FULL_COVERAGE: u64 = u64::MAX;
+
 pub fn parse_bytes(text: &str) -> Result<u64, String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("expected a byte size, for example `8GiB`".to_owned());
+    }
+    match text.to_ascii_lowercase().as_str() {
+        "full" | "max" | "-1" => return Ok(FULL_COVERAGE),
+        _ => {}
     }
     let digits = text
         .find(|c: char| !c.is_ascii_digit())
@@ -79,6 +89,17 @@ mod tests {
         assert!(parse_bytes("8GG").is_err());
         assert!(parse_bytes("8 gigs").is_err());
         assert!(parse_bytes("lots").is_err());
+    }
+
+    #[test]
+    fn full_coverage_is_a_sentinel_not_a_size() {
+        // Spelled three ways because llama.cpp uses `-1` for the same idea
+        // and a reader coming from there will try it.
+        for text in ["full", "FULL", "max", "-1"] {
+            assert_eq!(parse_bytes(text), Ok(FULL_COVERAGE), "{text}");
+        }
+        // And it must not collide with a real size.
+        assert_ne!(parse_bytes("8GiB"), Ok(FULL_COVERAGE));
         assert!(parse_bytes("").is_err());
     }
 
