@@ -34,6 +34,7 @@ use crate::router::WorkerLoad;
 use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeConfig, RuntimeError};
 use crate::sampling::SamplingParams;
 use crate::state::{SequenceSnapshot, SnapshotSlots};
+use tracing::debug;
 
 /// Which speculative decoder a worker runs.
 ///
@@ -584,6 +585,32 @@ impl Worker {
         }
         let decode_items = step.scheduled.decodes.len();
         let prefill_items = step.scheduled.prefills.len();
+        // What the step actually carried. The scheduler's intent and the
+        // engine's behaviour diverged more than once while this was being
+        // tuned, and without this the only way to tell a shared step from a
+        // serialized one was to infer it from client-side timings.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                device = self.device_ordinal,
+                decodes = decode_items,
+                prefills = prefill_items,
+                prefill_tokens = step
+                    .scheduled
+                    .prefills
+                    .iter()
+                    .map(|p| p.tokens)
+                    .sum::<u32>(),
+                grants = ?step
+                    .scheduled
+                    .prefills
+                    .iter()
+                    .map(|p| (p.id.0, p.tokens))
+                    .collect::<Vec<_>>(),
+                running = self.scheduler.running_len(),
+                waiting = self.scheduler.waiting_len(),
+                "step"
+            );
+        }
         self.batch_scratch = std::mem::take(&mut step.scheduled);
         Ok(DeviceStep {
             decode_items,
