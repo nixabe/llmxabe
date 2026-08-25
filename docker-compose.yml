@@ -34,6 +34,14 @@ services:
     # checks the whole sequence length, not the first chunk — refuses a
     # literal 128K prompt rather than truncating it.
     #
+    # -pc matches the snapshot retention interval on purpose. A prefill pass
+    # may not straddle a retention boundary, so at R=2048 the widest pass the
+    # engine can issue is 2048 and a -pc of 4096 only builds a shape nothing
+    # ever selects: measured 36,019 MiB against 2048's 34,607, so 1.38 GiB of
+    # VRAM and its NVRTC compile at load, for nothing. (The preflight's own
+    # vram line reads 40.21 GiB either way — it budgets, it does not weigh the
+    # prebuilt passes.)
+    #
     # --spec-type none is the measured choice at this shape, not an omission:
     # every drafter loses at three concurrent slots and this context depth,
     # and some do not fit in VRAM at all. See docs/BENCHMARKS.md.
@@ -47,7 +55,7 @@ services:
       - -tb
       - "4096"
       - -pc
-      - "4096"
+      - "2048"
       - --max-tokens
       - "4096"
       - --temp
