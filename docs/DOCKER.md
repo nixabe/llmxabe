@@ -103,7 +103,7 @@ Set these on the host or in a `.env` file beside `docker-compose.yml`.
 | `LLMXABE_HOST_PORT` | `8000` | Host port. The container always listens on 8000. |
 | `LLMXABE_GPU_COUNT` | `all` | How many cards to reserve. |
 | `LLMXABE_API_KEY` | unset | Key callers must present. Passed through only when set. |
-| `LLMXABE_CACHE_RAM` | unset (24 snapshots per worker) | Host RAM for pinned prefix snapshots, e.g. `8GiB`. |
+| `LLMXABE_CACHE_RAM` | unset (full coverage, capped at a quarter of host `MemAvailable`) | Host RAM for pinned prefix snapshots, e.g. `8GiB`, or `full`. Size it generously: below full coverage the arena publishes nothing at all rather than less — see [CLI.md](CLI.md#--cache-ram). Three cards at `-c 405504 -s 3` want ~59.6 GiB for `full`, so `memlock` must be unlimited (it already is in the compose file). |
 | `LLMXABE_DFLASH` | unset | Path *inside the container* to a DFlash drafter GGUF. |
 
 `LLMXABE_API_KEY` is passed through by `env_file` rather than named with a

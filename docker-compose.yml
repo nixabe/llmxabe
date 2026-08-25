@@ -85,7 +85,15 @@ services:
     # present an empty one.
     #
     #   LLMXABE_API_KEY   require Authorization: Bearer / x-api-key
-    #   LLMXABE_CACHE_RAM host RAM for pinned prefix snapshots, e.g. 8GiB
+    #   LLMXABE_CACHE_RAM host RAM for pinned prefix snapshots, e.g. 8GiB, or
+    #                     `full` for enough that every slot can restore
+    #                     anywhere in its context. Unset already defaults to
+    #                     full coverage capped at a quarter of MemAvailable;
+    #                     `full` lifts the cap, which across three cards at
+    #                     this -c/-s is ~59.6 GiB pinned. Worth it for agent
+    #                     workloads — an undersized arena publishes nothing at
+    #                     all rather than less, and every turn re-prefills
+    #                     from zero. See docs/CLI.md#--cache-ram.
     #   LLMXABE_DFLASH    path to a DFlash drafter GGUF (--spec-type spec-dflash)
     env_file:
       - path: .env

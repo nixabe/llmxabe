@@ -255,3 +255,18 @@ Tests needing the 32 GB model file or a GPU **skip and say so**. A skipped test
 is not a passing test — do not read a green run on a GPU-less machine as
 validation of device work. See
 [CONTRIBUTING.md](../CONTRIBUTING.md#reporting-results).
+
+The corollary bites on a machine where the cards *are* free: `cargo test
+--workspace --release` runs each integration binary concurrently, and the
+device ones each load the whole model, so `batch_decode` and `batch_prefill`
+together exhaust a 48 GiB card and fail with `CUDA_ERROR_OUT_OF_MEMORY`. That
+is contention, not a regression — the same tests pass serialized:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 cargo test --release -p xabe-engine --test batch_decode  -- --test-threads=1
+CUDA_VISIBLE_DEVICES=0 cargo test --release -p xabe-engine --test batch_prefill -- --test-threads=1
+cargo test --workspace --release --lib --bins
+```
+
+Read an OOM in a whole-workspace run as "run them one at a time", and check
+before concluding a device kernel broke.

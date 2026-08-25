@@ -55,7 +55,7 @@ the value nor the variable's contents appear in `--help` or in any log line.
 | `-s, --slots-per-worker <N>` | — | `3` | Concurrent request slots per worker. The default matches the llama.cpp baseline's `-np 3` (see [DEVELOPMENT.md](DEVELOPMENT.md)). |
 | `-c, --total-context <N>` | — | `393216` | Total context tokens across all slots, used to size the KV pool and the VRAM budget. The default matches the baseline's `-c 393216`. |
 | `-pc, --prefill-chunk <N>` | — | `4096` | Tokens per chunked-prefill step. |
-| `--cache-ram <SIZE>` | `LLMXABE_CACHE_RAM` | 24 snapshots per worker (≈7.2 GiB for three) | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
+| `--cache-ram <SIZE\|full>` | `LLMXABE_CACHE_RAM` | full coverage, capped at a quarter of host `MemAvailable` | Host RAM the prefix cache may pin for retained snapshots, across all workers. See below. |
 | `--spec-type <TYPE>` | — | `none` | Speculative decoder: `none`, `ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, or `spec-dflash`. See below. |
 | `--spec-ngram-n-max <N>` | — | `3` | `ngram`: most tokens proposed from one suffix match. |
 | `--spec-ngram-min <N>` | — | `2` | `ngram`: shortest suffix worth matching on. |
@@ -107,8 +107,25 @@ much of it the process may hold across all workers:
 
 ```sh
 llmxabe --cache-ram 8GiB      # also 8G, 8GB, 8192MiB, or a bare byte count
+llmxabe --cache-ram full      # every slot can restore anywhere in its context
 llmxabe --cache-ram 0         # retain nothing; no prefix sharing
 ```
+
+`full` (spelled `max` or `-1` too, the last because llama.cpp's `-cram -1`
+means the same thing) sizes the arena from the serving configuration instead
+of a byte budget: `--slots-per-worker` slots, each needing one snapshot per
+retention interval of its share of `--total-context`. That is what the
+default computes as well, capped at a quarter of the host's `MemAvailable`
+so the arena cannot displace the page cache the weights are read through.
+
+**Size this generously.** The arena does not degrade gracefully when it is
+too small: publishing yields rather than evicts, so a worker that cannot hold
+its sessions' retention points publishes *nothing at all* and every turn
+re-prefills from zero. Measured with three growing conversations on one card,
+the old fixed 24-snapshot default gave **0% prefix reuse on every request**
+and 319 s of wall clock, against 73–86% and 132 s once the arena covered the
+context. There is no partial-credit region between those: it is not "a bit
+less caching", it is none.
 
 Units are powers of 1024 (`B`, `KiB`, `MiB`, `GiB`, `TiB`, and the `K`/`KB`
 spellings of each). A number with an unrecognised unit is refused rather than
@@ -126,6 +143,16 @@ One snapshot is one GDN retention interval of KV plus the full recurrent
 state — 102.8125 MiB for this model at the default `R`. Sizing is per worker
 because the arenas are per worker; a snapshot pinned on one card's arena is no
 use to another.
+
+Preflight also states the number that predicts whether a conversation keeps
+hitting — how far into its context a slot can restore from:
+
+```
+                 135168 tokens of restore coverage per slot, of 135168 served (100% of the context)
+```
+
+Below full coverage it names the shortfall and what `full` would cost, rather
+than leaving the miss rate to be inferred from latency.
 
 Two warnings preflight will give you:
 

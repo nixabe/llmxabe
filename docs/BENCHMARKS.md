@@ -169,6 +169,30 @@ three-session 1,709 — **2.82x for 3x the cards**, and every session makes
 progress throughout: first tokens land at [99.8, 111.9 x4, 116.8 x4], grouped
 by card rather than staggered one prompt at a time.
 
+### Prefix cache: coverage decides whether it hits at all
+
+Six-turn conversations, each turn extending the last, three of them at once on
+one card. `reused_prefix_tokens` is the server's own admission telemetry, not
+inferred from latency.
+
+| arena | snapshots/worker | coverage per slot | prefix reuse | wall |
+| :--- | ---: | ---: | ---: | ---: |
+| old fixed default | 24 | 16,384 | **0% every request** | 319.1 s |
+| `--cache-ram 12GiB` | 119 | 79,872 | 73% → 86% | 133.2 s |
+| current default | 198 | 135,168 (100%) | 73% → 86% | 132.2 s |
+
+The 0% is the point. An undersized arena does not cache less — it caches
+*nothing*: publishing yields rather than evicts when slots are scarce, so a
+worker that cannot hold its sessions' retention points publishes nothing, the
+next turn has nothing to match, and every turn re-prefills from zero. There is
+no partial-credit region, which is why the default is now derived from the
+serving configuration rather than fixed.
+
+Reuse is quantised to the retention interval — 43,008 of 49,879 tokens is
+21 × 2048 — so the last partial interval is always re-prefilled. A single
+conversation never shows this: 40K tokens needs ~20 snapshots and even the old
+default held 24. It takes concurrent sessions to exceed the arena.
+
 ### What this cost to get right
 
 Two lock faults in the driver loop, not the scheduler, dominated everything
@@ -459,6 +483,37 @@ pairs on one card, nine prefill pairs including order-reversed ones on
 another): decode N=3 +0.5% with the new binary winning 2 of 3, prefill at
 parity once position-in-session drift (~0.8%, first runner wins regardless of
 binary) is controlled for. Numbers in the enabling commits.
+
+## The snapshot arena is all-or-nothing, so size it from the configuration
+
+A prefix cache that is too small is intuitively a cache that hits less often.
+This one hits *never*. Publishing a snapshot yields rather than evicts when
+slots are scarce (`Engine::publish` calls `reclaim_for` and returns without
+publishing if it cannot reserve), so a worker whose arena cannot hold its
+sessions' retention points publishes nothing at all — and with nothing
+published, the next turn has nothing to match, so it re-prefills from zero and
+publishes nothing in turn. Measured with three growing conversations on one
+card: 0% reuse on every request against 73–86% once the arena covered the
+context, 319 s of wall clock against 132.
+
+The fixed 24-slot default was sized against the host's locked-memory limit and
+covered 16,384 tokens per slot — under one agent turn at this context. It is
+now derived from what is being served: one snapshot per retention interval,
+per slot, across that slot's share of `--total-context`, capped at a quarter
+of the host's `MemAvailable` because the arena is page-locked and the weights
+still need the page cache to be read through. `--cache-ram full` lifts the
+cap.
+
+llama.cpp reaches the same place from the other side and is worth reading on
+this: `--cache-ram` defaults to 8192 MiB there against our former 2.41 GiB
+effective, and its `server_prompt_cache` is an LRU bounded in *bytes* rather
+than a fixed pool, so it degrades by evicting rather than by declining to
+publish. It also has a tier we do not: a slot keeps its KV in place between
+requests and takes the common prefix against what it already holds
+(`get_common_prefix` → `n_past`), so a continuing conversation that lands on
+its own slot costs nothing at all. Ours always pays a 102.81 MiB host round
+trip for the same continuation. Making same-slot continuation free is the
+obvious next lever and is not built.
 
 ## Concurrency is a lock property before it is a scheduler property
 
