@@ -108,6 +108,78 @@ a replacement claim.
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
 | Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default — a net win at N=1 only, see WHY and WHY NOT |
 
+## Serving concurrent sessions
+
+The numbers above are single-sequence kernel throughput against llama.cpp.
+These are the *server*: real HTTP requests through `/v1/chat/completions`,
+streamed, measured end to end. They are not comparable to the standing table
+and must not be quoted against llama.cpp.
+
+Measured with `bench_server.py` (see Reproducing): every prompt's length is
+read from the response's own `usage.prompt_tokens` rather than estimated, and
+each cell's prompts carry a unique leading token so nothing is served from the
+prefix cache. Both precautions exist because their absence produced wrong
+numbers here — see WHY NOT. Prefill rate is total prompt tokens over time to
+the *last* first-token; decode per-slot is the reciprocal of median
+inter-token latency. Trials agree to within 0.5% except where noted.
+
+`--spec-type none -c 405504 -s 3 -tb 4096 -pc 2048`, three slots per card.
+
+### One card, prefill
+
+Aggregate is the card's total; per-slot is what one session sees.
+
+| depth | 1 session | 2 sessions | 3 sessions |
+| :--- | ---: | ---: | ---: |
+| 16K | 2,409 agg / 2,409 slot | 2,350 / 1,175 | 2,290 / 763 |
+| 32K | 2,191 / 2,191 | 2,196 / 1,098 | 2,154 / 718 |
+| 64K | 1,785 / 1,785 | 1,784 / 892 | 1,709 / 570 |
+| 128K | 1,310 / 1,310 | — | 1,310 / 437 |
+
+Aggregate is flat across session count: adding sessions divides the card, it
+does not cost it. The one visible dip — 16K at three sessions, −4.9% — is the
+kernel's own price for interleaving three sequences (measured separately at
+2,795 → 2,656 tok/s, ratio 0.95), not scheduling overhead. At 128K the
+aggregate is identical to within 0.2% at one and three sessions.
+
+### One card, decode
+
+| depth | 1 session | 2 sessions | 3 sessions |
+| :--- | ---: | ---: | ---: |
+| 16K | 63.6 agg / 64.1 slot | 95.8 / 48.6 | 117.0 / 39.7 |
+| 32K | 69.8 / 70.5 | 94.9 / 48.4 | 113.4 / 38.7 |
+| 64K | 61.9 / 62.7 | 79.3 / 41.5 | 96.1 / 33.3 |
+| 128K | 51.6 / 52.4 | — | 71.5 / 26.1 |
+
+Decode aggregate *rises* with session count — 63.6 → 117.0 at 16K — because
+concurrent sequences share one weight read per step. Per-slot falls, as it
+must; the batched read is what makes the aggregate grow anyway.
+
+### Three cards, the nine-session target
+
+| depth | 3 sessions | 6 sessions | 9 sessions |
+| :--- | ---: | ---: | ---: |
+| 16K prefill | 5,854 agg / 1,951 slot | 6,093 / 1,016 | 5,433 / 604 |
+| 64K prefill | 5,211 / 1,737 | 5,249 / 875 | 4,820 / 536 |
+| 16K decode | 187.4 / 64.2 | 265.7 / 47.2 | 329.3 / 39.0 |
+| 64K decode | 185.0 / 63.1 | 228.7 / 41.5 | 271.1 / 32.8 |
+
+Nine sessions at 64K reach 4,820 tok/s of prefill against one card's
+three-session 1,709 — **2.82x for 3x the cards**, and every session makes
+progress throughout: first tokens land at [99.8, 111.9 x4, 116.8 x4], grouped
+by card rather than staggered one prompt at a time.
+
+### What this cost to get right
+
+Two lock faults in the driver loop, not the scheduler, dominated everything
+else. Before them, four sessions on one card produced first tokens at 34, 71,
+136 and 203 seconds — one prompt at a time wearing three slots — and three
+sessions at 64K were bimodal on a lock race, 1,734 tok/s or 826. Both are in
+WHY. The scheduler's own contribution, sharing each step across prefilling
+sessions, is worth +3.0% at 16K and +3.4% at 64K with worst-case time to
+first token 3.5% lower; it is small next to the locks and was unmeasurable
+until they were fixed.
+
 ## Correctness gates
 
 Throughput claims in this file were all taken with these green. They are hard
@@ -388,6 +460,45 @@ another): decode N=3 +0.5% with the new binary winning 2 of 3, prefill at
 parity once position-in-session drift (~0.8%, first runner wins regardless of
 binary) is controlled for. Numbers in the enabling commits.
 
+## Concurrency is a lock property before it is a scheduler property
+
+Nine sessions across three cards were not concurrent for two reasons, and
+neither lived in `xabe-sched`. Both presented identically — as a scheduler
+that refused to share — and both were diagnosed only once a step logged what
+it actually carried, which is why that log is in the tree.
+
+**The driver loop must yield the engine lock.** `scheduler_loop` takes it,
+holds it for a whole GPU step, releases it and takes it straight back.
+`std::sync::Mutex` is not fair, so a handler blocked in `place_tokens` loses
+that race indefinitely. Two symptoms, one fault. A client is registered
+*before* its request reaches the engine, so between those two moments there is
+nothing to run and the loop span on empty steps — 20,636 of them in a 27 s
+run against 15 in a run that happened to win the race. And while a long prompt
+is prefilling every step is productive, so no idle back-off can help: at 64K,
+sessions dispatched 2 ms apart were not merely unscheduled but never
+submitted, `running=1 waiting=0` for twenty-two consecutive steps while the
+first prompt had the card to itself. Handlers now raise an atomic before they
+block and the loop stands aside 1 ms when it is non-zero. Three sessions at
+64K went from bimodal — 1,734 tok/s at [36.5, 107, 110] or 826 at [36.5, 228,
+231] — to 1,635–1,708 with first tokens clustered at [105, 117, 117], spread
+2.2%.
+
+**A step is shared, capped at one retention interval per session.** Phase 2
+stopped at the first request whose prompt did not fit in one step, so that
+request took the whole budget every step until it finished. It now walks the
+running set from a rotating start, granting each prefilling session at most
+`--prefill-slice` tokens — the snapshot retention interval, which is already
+the widest pass the engine can issue because a pass may not straddle a
+boundary. The same tokens therefore move at the same width, spread across
+sessions rather than stacked behind one; the rotation decides who is short
+when the budget covers fewer slices than there are sessions. Worth +3.0% at
+16K and +3.4% at 64K on aggregate prefill, with worst-case time to first token
+3.5% lower.
+
+The order matters for anyone reading the history: the scheduler change was
+measured as a 3% *regression* until the locks were fixed, because it could not
+get sessions to schedule.
+
 ## Speculative decode: exact by construction, priced by the verify step
 
 Seven drafters — five model-free n-gram policies (`ngram`, and llama.cpp's
@@ -552,6 +663,9 @@ proposed twice.
 | A `KU` unroll hint on the GDN tiled projection | Byte-identical SASS at the width N=3 actually uses; −9% at N=2. `ptxas` already reached the same schedule. Whatever closes that kernel's 28%-of-roofline ceiling must change what ptxas schedules, not hint at a schedule it already finds. |
 | Speculative decode as the N=3 lever (n-gram, MTP, DFlash; serving A/B, four interleaved rounds with a reversal) | Every arm loses at N=3: 87.5 / 150.7 / 125.2 tok/s against plain 211.4, despite up to 10.3 accepted tokens per 12-row verify window. The batched verify's fixed cost (~4.8× a plain batch-3 step) outruns the tokens it saves, and the round-gated fallback at identical acceptance also loses (166 vs 211). The measured net wins are n-gram **+9%** and MTP **+1.5%**, both at N=1 only — see WHY. Making the verify pass ride decode's launch machinery instead of the prefill shape is the untried lever. |
 | Removing the routed-partial clear | Below run-to-run spread, and reversing. Deleting a defensive correctness aid for a result smaller than host drift is not justified. |
+| Grant alignment as a prefill lever (`ADMISSION_RESERVE_FRACTION` 4 → 2) | Predicted **+27%**, measured **+1.5%**. The width curve is real — 2,048-wide passes run at 2,760 tok/s against 256-wide at 1,510, and the ratio holds at depth (1,896 vs 1,050 at 64K) — and `choose_prefill_width` does decompose a 3,072-token grant into 2,048 + 4×256. `max_batch = 3`, the 256 tail ceiling, and the grant reaching `execute_prefill` intact were all verified. The penalty still does not appear end to end. The constant stays at 2 because it is never worse and an aligned grant is the honest default, but **do not rank work by that width arithmetic**; the mechanism is confirmed and its cost is not. |
+| Snapshot retention as the cause of the concurrent-session penalty | Nothing. `--cache-ram 0` (no snapshots) and `16GiB` (159 per worker) both land within noise of the 2.41 GiB default's 24, at 64K × 3 sessions. The arena arithmetic is seductive — a 64K prompt needs 31 snapshots at R=2048, three sessions ~93 against 24 — and wrong. Worse, it was first "ruled out" at 16K, where three sessions need exactly 24 and the arena *cannot* bind, which proved nothing in either direction. Test a capacity hypothesis at a depth where the capacity is actually exceeded. |
+| Inferring scheduler behaviour from client-side timings | Wrong three times: a lock-starvation fault was read as a scheduler refusing to share, an admission-pacing artefact as a race, and a 2x throughput collapse as a kernel concurrency limit (the kernel charges 5%, not 50%). All three fell out immediately once a step logged its own grants. Instrument the component before theorising about it. |
 
 ## Rejected on arithmetic, before building
 
@@ -676,6 +790,21 @@ CUDA_VISIBLE_DEVICES=1 llama-batched-bench \
   -ngl 99 -sm none -fa on -b 4096 -ub 4096 -ctk f16 -ctv f16 \
   -c 131072 -npp 32768 -ntg 32 -npl 3
 ```
+
+The serving tables come from a running server rather than a kernel harness:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 ./target/release/llmxabe \
+  --spec-type none -c 405504 -s 3 --token-budget 4096 --prefill-chunk 2048 &
+python3 tools/serving/bench_server.py http://127.0.0.1:8000 out.json \
+  '{"depths":[2800,5500,11000,22000],"sessions":[1,2,3],"trials":3,"max_tokens":48}'
+```
+
+`depths` are word counts, not tokens — the harness measures each prompt's real
+length through `usage.prompt_tokens` and reports against that. Drop
+`CUDA_VISIBLE_DEVICES` for the three-card fleet and raise `sessions` to 9.
+`--prefill-slice 0` restores whole-step prefill, which is how the sharing A/B
+was run.
 
 Narrow harnesses, for anything smaller than a whole-pass change:
 `bench_attention` (`LLMXABE_ATTN_CHUNK=1` for decode shape), `bench_moe`,
