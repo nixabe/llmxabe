@@ -198,8 +198,52 @@ impl Scheduler {
     /// `Self::attention_blocks_needed` against total capacity, so they
     /// cannot disagree.
     pub fn can_admit(&self, req: &NewRequest) -> bool {
-        (self.waiting.len() as u32) < self.config.max_waiting_requests()
-            && self.attention_blocks_needed(req.full_seq_len()) <= self.total_attention_blocks
+        self.refusal_for(req).is_none()
+    }
+
+    /// Why [`Self::can_admit`] says no, or `None` if it says yes.
+    ///
+    /// The same checks [`Self::admit`] runs, in the same order, so the
+    /// router can report the reason a request was turned away instead of
+    /// only that it was. Without this the caller sees "every worker refused
+    /// admission" and has to guess between a prompt that cannot fit and a
+    /// queue that is full.
+    pub fn refusal_for(&self, req: &NewRequest) -> Option<AdmissionError> {
+        let full_seq_len = req.full_seq_len();
+        let needed_blocks = self.attention_blocks_needed(full_seq_len);
+        if needed_blocks > self.total_attention_blocks {
+            return Some(AdmissionError::ExceedsTotalCapacity {
+                full_seq_len,
+                needed_blocks,
+                total_blocks: self.total_attention_blocks,
+            });
+        }
+        if (self.waiting.len() as u32) >= self.config.max_waiting_requests() {
+            return Some(AdmissionError::WaitingQueueFull {
+                capacity: self.config.max_waiting_requests(),
+            });
+        }
+        None
+    }
+
+    /// The longest sequence one slot may *speculatively* reserve: the pool
+    /// divided by the concurrent-decode width, less the drafting margin.
+    ///
+    /// A request reserves `prompt + max_output_tokens` of KV up front and
+    /// holds it for its whole life (rule 4), and the pool hands out real
+    /// pages for it — 5 MiB each on this model. `max_output_tokens` is a
+    /// caller's speculative ceiling, though, not a prediction: a client that
+    /// asks for 65,536 tokens "just in case" and then emits fifty has taken
+    /// 256 pages away from its neighbours for nothing. Capping what output
+    /// may reserve at one slot's share is what keeps every slot admissible
+    /// at once. It is a cap on the *reservation*, so a sequence that really
+    /// does run that long simply stops on it, the way llama.cpp stops when
+    /// a slot's context fills.
+    pub fn per_slot_token_ceiling(&self) -> u32 {
+        let slots = self.config.max_concurrent_decodes().max(1);
+        let share = self.total_attention_blocks / slots;
+        (share.saturating_mul(self.config.block_size()))
+            .saturating_sub(self.config.draft_tokens_per_step())
     }
 
     /// Admit a request into the waiting queue.
@@ -1175,5 +1219,80 @@ mod tests {
             s.admit_with_prefix(req(1, 10, 1), 11),
             Err(AdmissionError::InvalidReusablePrefix { .. })
         ));
+    }
+
+    #[test]
+    fn a_slot_may_only_speculatively_reserve_its_share_of_the_pool() {
+        // 12 blocks across 3 decode slots is 4 blocks each: 1024 tokens.
+        let s = sched(4096, 256, 3, 12);
+        assert_eq!(s.per_slot_token_ceiling(), 1024);
+        // One slot: the whole pool is its share.
+        let s = sched(4096, 256, 1, 12);
+        assert_eq!(s.per_slot_token_ceiling(), 12 * 256);
+    }
+
+    #[test]
+    fn a_refusal_names_itself() {
+        // `can_admit` is a bool, and a caller told only "no" cannot tell a
+        // prompt that will never fit from a queue that is momentarily full.
+        let mut s = sched(4096, 256, 3, 12);
+        let too_big = req(1, 100_000, 0);
+        assert!(!s.can_admit(&too_big));
+        match s.refusal_for(&too_big) {
+            Some(AdmissionError::ExceedsTotalCapacity { total_blocks, .. }) => {
+                assert_eq!(total_blocks, 12);
+            }
+            other => panic!("expected a capacity refusal, got {other:?}"),
+        }
+        // Fits, and nothing is queued yet.
+        let fits = req(2, 512, 128);
+        assert!(s.refusal_for(&fits).is_none());
+        // Fill the waiting queue and the reason changes.
+        while s.can_admit(&req(9, 256, 16)) {
+            if s.admit(req(100 + s.waiting_len() as u64, 256, 16)).is_err() {
+                break;
+            }
+        }
+        assert!(matches!(
+            s.refusal_for(&req(999, 256, 16)),
+            Some(AdmissionError::WaitingQueueFull { .. })
+        ));
+    }
+
+    #[test]
+    fn an_uncapped_output_ceiling_starves_the_slots_beside_it() {
+        // Why `Scheduler::per_slot_token_ceiling` exists. A running request
+        // reserves `prompt + max_output_tokens` of real pages for its whole
+        // life, so a caller's speculative ceiling is taken out of its
+        // neighbours' capacity whether or not it is ever reached.
+        //
+        // 1024 blocks, three decode slots, 256-token blocks: one slot's
+        // share is 341 blocks, or 87,296 tokens. Three sessions with a
+        // 20,000-token prompt each, asking for 200,000 output tokens, need
+        // 860 blocks apiece — so the pool runs out after the first.
+        let uncapped = |output| {
+            let config = SchedulerConfig::new(4096, 256, 3, 0.0, 0).unwrap();
+            let mut s = Scheduler::new(config, 1024);
+            for id in 1..=3 {
+                s.admit(NewRequest {
+                    id: RequestId(id),
+                    prompt_tokens: 20_000,
+                    max_output_tokens: output,
+                })
+                .expect("all three are feasible against the whole pool");
+            }
+            let mut batch = BatchDescription::default();
+            for _ in 0..6 {
+                batch.prefills.clear();
+                s.step_into(&mut batch);
+            }
+            s.running_len()
+        };
+        assert_eq!(uncapped(200_000), 1, "an uncapped ceiling takes the pool");
+
+        // Capped to what one slot may reserve, all three run at once.
+        let config = SchedulerConfig::new(4096, 256, 3, 0.0, 0).unwrap();
+        let ceiling = Scheduler::new(config, 1024).per_slot_token_ceiling();
+        assert_eq!(uncapped(ceiling - 20_000), 3, "capped, every slot fits");
     }
 }

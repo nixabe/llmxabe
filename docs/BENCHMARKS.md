@@ -557,6 +557,32 @@ its own slot costs nothing at all. Ours always pays a 102.81 MiB host round
 trip for the same continuation. Making same-slot continuation free is the
 obvious next lever and is not built.
 
+## A speculative output ceiling is not a prediction, so it is not a reservation
+
+Admission reserves `prompt + max_output_tokens` and the pool hands out real
+pages for all of it, held for the sequence's whole life — rule 4, and right
+about the prompt, because chunked prefill splits compute and not memory. It is
+wrong about the output. `max_output_tokens` is the caller's ceiling, not its
+estimate: an agent that asks for 65,536 tokens and emits fifty has taken 256
+blocks — 1.28 GiB at this model's 5 MiB pages — from its neighbours for
+nothing, and the arithmetic is unforgiving. Against one card's 1,584 blocks,
+three sessions on 100K prompts fit at `max_tokens` 4,096 and only two fit at
+65,536; at 150K prompts it is two against one.
+
+llama.cpp does not do this. It checks the prompt against the slot
+(`tools/server/server-context.cpp`, `slot.task->n_tokens() >= slot.n_ctx`) and
+treats `n_predict` purely as a stopping condition (`server_slot::n_remaining`,
+`has_budget`), allocating as the sequence grows.
+
+So the ceiling is capped at one slot's share of the pool rather than honoured
+in full, with a floor of one block so a prompt longer than the share can still
+generate. It caps the *reservation*: a sequence that genuinely runs that far
+stops there and reports `length`, which is what llama.cpp does when a slot's
+context fills. Capping is also what makes the refusal legible — a caller who
+asked for 410,000 output tokens used to get `503 every worker refused
+admission` and no way to tell an impossible prompt from a full queue, because
+`can_admit` was a bool. Refusals now carry the scheduler's own reason.
+
 ## Concurrency is a lock property before it is a scheduler property
 
 Nine sessions across three cards were not concurrent for four reasons, and

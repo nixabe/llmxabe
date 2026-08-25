@@ -240,15 +240,67 @@ impl Engine {
             .collect()
     }
 
+    /// Cap a caller's speculative output ceiling at one slot's share.
+    ///
+    /// Returns what `max_output_tokens` was, when it had to be lowered.
+    ///
+    /// `max_output_tokens` is reserved in full, up front, and backed by real
+    /// pages — so an agent that asks for 65,536 tokens and emits fifty holds
+    /// 1.28 GiB of this card hostage for its whole life, and two of them are
+    /// enough to make the third session queue behind them. The cap is on the
+    /// reservation only: a sequence that genuinely runs that long stops on
+    /// it and reports `length`, which is what llama.cpp does when a slot's
+    /// context fills — it checks the prompt against the slot and treats
+    /// `n_predict` purely as a stopping condition
+    /// (`tools/server/server-context.cpp`, `slot.task->n_tokens() >=
+    /// slot.n_ctx` and `server_slot::n_remaining`).
+    ///
+    /// A prompt that is already longer than the ceiling keeps a floor of one
+    /// block, so this only ever lowers a speculative ceiling and never turns
+    /// an admissible request into one that cannot generate at all.
+    fn cap_output_reservation(&self, req: &mut NewRequest) -> Option<u32> {
+        let worker = self.workers.first()?;
+        let (ceiling, floor) = {
+            let worker = worker.lock();
+            (
+                worker.scheduler().per_slot_token_ceiling(),
+                worker.scheduler().config().block_size(),
+            )
+        };
+        let headroom = ceiling.saturating_sub(req.prompt_tokens).max(floor);
+        (req.max_output_tokens > headroom).then(|| {
+            let requested = req.max_output_tokens;
+            req.max_output_tokens = headroom;
+            requested
+        })
+    }
+
+    /// Turn a routing refusal into the reason a worker actually gave.
+    ///
+    /// `AllWorkersSaturated` says only that every worker declined, which is
+    /// what a caller was left to guess from. The workers share a
+    /// configuration, so the first one's refusal is the answer for all of
+    /// them.
+    fn routing_failure(&self, error: RoutingError, req: &NewRequest) -> PlacementError {
+        if matches!(error, RoutingError::AllWorkersSaturated)
+            && let Some(worker) = self.workers.first()
+            && let Some(refusal) = worker.lock().scheduler().refusal_for(req)
+        {
+            return PlacementError::Admission(refusal);
+        }
+        PlacementError::Routing(error)
+    }
+
     /// Route a request and admit it onto the chosen worker.
     ///
     /// `block_hashes` are the chained block hashes of the request's prompt,
     /// as produced by [`xabe_cache::radix::hash_block`].
     pub fn place(
         &self,
-        req: NewRequest,
+        mut req: NewRequest,
         block_hashes: &[BlockHash],
     ) -> Result<Placement, PlacementError> {
+        self.cap_output_reservation(&mut req);
         let budget = self
             .workers
             .first()
@@ -262,7 +314,7 @@ impl Engine {
             score,
             matched_tokens,
         } = route(&self.router, &loads, req.prompt_tokens, budget)
-            .map_err(PlacementError::Routing)?;
+            .map_err(|error| self.routing_failure(error, &req))?;
 
         let request = self
             .worker(worker)
@@ -335,7 +387,7 @@ impl Engine {
     /// See `SequenceChain`.
     pub fn place_tokens(
         &self,
-        req: NewRequest,
+        mut req: NewRequest,
         prompt: Vec<i32>,
         images: Vec<crate::image::SequenceImage>,
         sampling: SamplingParams,
@@ -351,6 +403,15 @@ impl Engine {
             .first()
             .map(|worker| worker.lock().scheduler().config().token_budget())
             .unwrap_or(0);
+        if let Some(requested) = self.cap_output_reservation(&mut req) {
+            debug!(
+                request = req.id.0,
+                requested,
+                capped_to = req.max_output_tokens,
+                prompt_tokens = req.prompt_tokens,
+                "output ceiling exceeds one slot's share; capping the reservation"
+            );
+        }
         let chain = SequenceChain::new(self.block_size, &prompt, &placements);
         // Claiming a snapshot for reuse is part of the same decision as
         // choosing a worker, so it is inside the routing lock too: two
@@ -376,7 +437,7 @@ impl Engine {
             score,
             matched_tokens,
         } = route(&self.router, &loads, req.prompt_tokens, budget)
-            .map_err(|error| EngineExecutionError::Placement(PlacementError::Routing(error)))?;
+            .map_err(|error| EngineExecutionError::Placement(self.routing_failure(error, &req)))?;
         let request = {
             let mut target = self
                 .worker(worker)
@@ -737,14 +798,38 @@ mod tests {
 
     #[test]
     fn a_request_larger_than_any_pool_is_refused_rather_than_placed() {
-        // Every worker refuses, so this is saturation, not a routing bug.
+        // Every worker refuses, and the caller is told which of the
+        // scheduler's reasons applied. `AllWorkersSaturated` on its own sent
+        // a 503 saying only "every worker refused admission", which is what
+        // a person then has to reverse-engineer from the flags.
         let e = engine(4); // 4 blocks * 256 = 1024 tokens total
         let err = e.place(req(1, 100_000, 1024), &[]).unwrap_err();
-        assert_eq!(
-            err,
-            PlacementError::Routing(RoutingError::AllWorkersSaturated),
-            "an over-large request must be reported as saturation so the \
-             caller queues rather than crashes"
+        match err {
+            PlacementError::Admission(AdmissionError::ExceedsTotalCapacity {
+                total_blocks,
+                needed_blocks,
+                ..
+            }) => {
+                assert_eq!(total_blocks, 4);
+                assert!(needed_blocks > total_blocks);
+            }
+            other => panic!("a refusal must name its reason, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_speculative_output_ceiling_is_capped_rather_than_refused() {
+        // 1024 blocks across 3 slots is 341 blocks each, so one slot may
+        // reserve 87,296 tokens. A caller asking for 300,000 output tokens
+        // on a 1,000-token prompt used to be refused outright, because
+        // admission reserves prompt + max_output in full and 301,000 tokens
+        // needs 1,176 blocks of a 1,024-block pool. It is now capped to the
+        // slot's share and admitted; if it really generates that far it
+        // stops there and reports `length`.
+        let e = engine(1024);
+        assert!(
+            e.place(req(1, 1_000, 300_000), &[]).is_ok(),
+            "a speculative output ceiling must be capped, not refused"
         );
     }
 
