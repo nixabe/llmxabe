@@ -1761,6 +1761,15 @@ impl DeviceRuntime {
             let mut emit: SmallVec<[i32; 8]> = SmallVec::new();
             if let Some(sampler) = seq.sampler.as_mut() {
                 let pass = self.verify[width].as_ref().expect("checked above");
+                // Not a loop over `seq.draft`, which is why the range is
+                // inclusive: it runs one row *past* the last draft to draw
+                // the bonus token, and reaches `seq.draft[j]` only after
+                // `j >= d_real` has short-circuited. Clippy reads the index
+                // and proposes `seq.draft.iter().enumerate().take(d_real +
+                // 1)`, which yields `d_real` items, drops the bonus row and
+                // would make the verify step emit one token fewer than it
+                // accepted.
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..=d_real {
                     if let Err(error) =
                         pass.read_batch_logits_row_into(&stream, s * window + j, &mut host)
