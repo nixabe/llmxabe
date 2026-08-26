@@ -311,11 +311,13 @@ Two of those rows cost kernel work rather than a config field:
   [KERNELS.md](KERNELS.md). Widening those on the host was rejected on
   arithmetic: it would put 5.1 GiB on the card for the head alone and double
   the per-token read of the most bandwidth-expensive tensor in the model.
-  Reading them where they are is correct, but it is not free: because the
-  attention int8 repack is gated on *all* projections being Q8_0, these three
-  bf16 tensors take the whole attention block off the integer tensor cores at
-  prefill width. Requantizing the file to plain Q8_0 doubles prefill with no
-  engine change — measured, in [BENCHMARKS.md](BENCHMARKS.md).
+  Reading them where they are is correct, but it is not free: bf16 has no
+  integer tensor-core path, so those three projections stay on the fp32 GEMV
+  at prefill width. The repack is gated per tensor rather than per block, so
+  `attn_output` still reaches the tensor cores beside them; what remains is
+  the format itself. Requantizing the file to plain Q8_0 takes prefill from
+  360 to 661 tok/s with no engine change, and costs 6.5% of decode besides —
+  measured, in [BENCHMARKS.md](BENCHMARKS.md).
 - `ssm_alpha` / `ssm_beta` are f32 in Qwen3.6 and Q8_0 here. The fused gate
   kernel has a Q8_0 instantiation rather than a host-side widening, because
   the forward path *aliases* the weight arena and an owned widened copy inside

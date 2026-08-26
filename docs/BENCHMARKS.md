@@ -56,8 +56,12 @@ The discipline is the reason the standing can be trusted at all; several
 - **CUDA events, not `Instant`**, for anything inside a pass. Host clocks
   measure enqueue latency.
 - **Kernel-level first, then end to end.** `bench_attention` (~6 s per A/B)
-  exists because whole-forward A/Bs are expensive enough that the honest
-  response to a small change was to not measure it.
+  and `bench_dense_ffn` (~10 s, and it prints the card's measured streaming
+  ceiling beside every row) exist because whole-forward A/Bs are expensive
+  enough that the honest response to a small change was to not measure it.
+  **Then confirm in the model.** A narrow bench and a real step disagree about
+  cache state, and at least one change has won every interleaved pair of the
+  former while losing the latter — see `ld.global.cs` in the WHY NOT list.
 - **`ncu` does not work on this host** (`ERR_NVGPUCTRPERM`). The working
   substitutes are `nsys`/`nvprof` timelines, `nvcc -Xptxas -v` and
   `cuobjdump -sass` on an extracted kernel, roofline arithmetic from the GGUF
@@ -95,7 +99,7 @@ llama.cpp columns are the standing head-to-head rather than a same-hour
 re-run, so read those three margins with llama.cpp's ~1%/day drift in mind.
 
 Single sequence, same tree, for reference: **~87.5 tok/s** decode at 32K and
-~101 tok/s at 2K. Aggregate across three cards, one session each, is a
+103.2 tok/s at 2K. Aggregate across three cards, one session each, is a
 deployment figure and **not** the per-instance N=3 target — do not cite it as
 a replacement claim.
 
@@ -109,13 +113,12 @@ a replacement claim.
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
 | Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default — a net win at N=1 only, see WHY and WHY NOT |
 
-## Qwen3.8-27B (`qwen35`), first measurements
+## Qwen3.8-27B (`qwen35`)
 
 The dense sibling landed after the standing above was taken, and **nothing in
-this section is comparable to it**: a different model, a different arithmetic
-mix, and a first measurement rather than a tuned one. Its own baseline is the
-same `llama-batched-bench`, same card (GPU 1), alternating processes, three
-pairs.
+this section is comparable to it**: a different model and a different
+arithmetic mix. Its own baseline is the same `llama-batched-bench`, same card
+(GPU 1), alternating processes, three interleaved reps.
 
 The dense model is the smaller file and reads **15× the feed-forward weight
 per token** (17.11 B parameters against 35B-A3B's 1.13 B) and 3.2× the KV. No
@@ -124,18 +127,19 @@ expectation carries across from the table above — and none of it did.
 **Read the file column before the margin column.** On this model the
 quantization of the *file* moves the result more than anything either engine
 does, and a margin quoted without it is meaningless. Two files, both measured
-same-card, three interleaved reps:
+same-card, three interleaved reps, llmxabe's spread under 0.2% and
+llama.cpp's up to 3% at N=3:
 
 | cell | file | llmxabe agg | per slot | llama.cpp agg | per slot | margin |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| prefill 512, N=1 | UD-Q8_K_XL | 319.4 | 319.4 | 689.7 | 689.7 | −53.7% |
-| prefill 512, N=1 | all-Q8_0 | 655.4 | 655.4 | 779.0 | 779.0 | **−15.9%** |
-| prefill 512, N=3 | UD-Q8_K_XL | 326.3 | 108.8 | 746.2 | 248.7 | −56.3% |
-| prefill 512, N=3 | all-Q8_0 | 692.0 | 230.7 | 837.2 | 279.1 | **−17.3%** |
-| decode, N=1 | UD-Q8_K_XL | 17.2 | 17.2 | 18.11 | 18.11 | −5.0% |
-| decode, N=1 | all-Q8_0 | 18.4 | 18.4 | 19.41 | 19.41 | **−5.2%** |
-| decode, N=3 | UD-Q8_K_XL | 43.8 | 14.6 | 44.09 | 14.70 | −0.7% |
-| decode, N=3 | all-Q8_0 | 45.7 | 15.2 | 48.22 | 16.07 | **−5.2%** |
+| prefill 512, N=1 | UD-Q8_K_XL | 360.4 | 360.4 | 691.7 | 691.7 | −47.9% |
+| prefill 512, N=1 | all-Q8_0 | 660.7 | 660.7 | 789.8 | 789.8 | **−16.3%** |
+| prefill 512, N=3 | UD-Q8_K_XL | 368.8 | 122.9 | 754.2 | 251.4 | −51.1% |
+| prefill 512, N=3 | all-Q8_0 | 700.3 | 233.4 | 854.1 | 284.7 | **−18.0%** |
+| decode, N=1 | UD-Q8_K_XL | 17.84 | 17.84 | 18.06 | 18.06 | −1.2% |
+| decode, N=1 | all-Q8_0 | 19.08 | 19.08 | 19.38 | 19.38 | **−1.5%** |
+| decode, N=3 | UD-Q8_K_XL | 45.37 | 15.12 | 43.75 | 14.58 | **+3.7%** |
+| decode, N=3 | all-Q8_0 | 47.72 | 15.91 | 48.16 | 16.05 | **−0.9%** |
 
 `UD-Q8_K_XL` is the shipped Unsloth file: Q8_0 everywhere except
 `output.weight` and every `attn_q`/`attn_k`/`attn_v`, which are bf16.
@@ -152,23 +156,28 @@ answer "what does one user see while N are served", not "do the slots differ".
 The second question needs a running server under mixed arrival, which is the
 serving section below and is not comparable to this table.
 
-Three things the two rows of each pair say together:
+What the two rows of each pair say together:
 
-- **We lose every cell**, and the honest margin is the `all-Q8_0` one, because
-  that file is the better of the two for both engines. Prefill −16%,
-  decode −5%.
-- **The bf16 tensors cost us 2× prefill and cost llama.cpp ~12%.** Folding
-  them to Q8_0 takes us from 319 to 655 tok/s at N=1 and 326 to 692 at N=3.
-  The mechanism is ours, not the file's, and it is in WHY below: the int8
-  attention repack is gated on *every* projection being Q8_0, so one bf16
-  tensor switches the integer tensor cores off for the whole attention block.
-- **The N=3 decode parity was an artifact of that file and does not survive.**
-  At `UD-Q8_K_XL` we are 0.7% behind, inside drift; at `all-Q8_0` we are 5.2%
-  behind at both N=1 and N=3, because llama.cpp gains more from the requant
-  (+9.4% at N=3) than we do (+4.4%). An earlier revision of this section read
-  the −0.7% as parity. It was parity with a baseline the file was holding
-  back, which is this project's oldest documented mistake wearing a new hat —
-  last time it was llama.cpp's *flags*, this time its *file*.
+- **Decode is at parity and prefill is not.** Three of the four decode cells
+  are inside this host's own drift; the fourth is ahead. Every prefill cell
+  loses, by 16% on the file both engines read best and by half on the shipped
+  one. Prefill is where this model's remaining gap lives, and it is an
+  arithmetic gap rather than a bandwidth one — see "Where the dense decode
+  step goes" below for why decode has almost nothing left in it.
+- **The bf16 tensors still cost prefill, and no longer cost decode.** Folding
+  them to Q8_0 moves prefill 360 → 661 at N=1; the per-tensor int8 gate
+  recovered part of that in the engine, and the rest is `attn_q`/`k`/`v`
+  having no integer tensor-core path at bf16 at all. At decode the same
+  tensors cost 6.5%, which is the extra bytes and nothing else.
+- **The decode margins moved by 4-6 points and llama.cpp did not move.** The
+  earlier revision of this table read −5.0/−5.2% at N=1 and −5.2% at N=3 on
+  `all-Q8_0`. What changed is on this side: the split int8 layout stopped
+  widening the file's fp16 scales to fp32 (WHY, "Layout"), which is 1.01 GiB
+  of every decoded token and 1.4 GiB of resident VRAM, and the split GEMV's
+  row tile is now chosen per token width. llama.cpp's own numbers in this
+  table are same-hour re-runs and agree with the earlier ones to ~1%, except
+  its `UD-Q8_K_XL` N=3 cell, which drifted 44.09 → 42.4-43.8 across three
+  reps; the +3.7% above is against the best of those three, not the median.
 
 And llama.cpp's outright best on this model is neither file: see "What the
 quantization is worth" below. Do not quote any row here as a claim about the
@@ -179,8 +188,9 @@ or `-npl 3`, `-npp 512 -ntg 64`. Ours is `bench_forward`'s 512-token column (a
 cold full forward, comparable to `pp`), `bench_decode` at N=1 and
 `bench_decode_batch`'s `batch 3` row — which carries its own `single_stream`
 baseline in the same process, and it agrees with `bench_decode` to 0.3%. Peak
-VRAM 40.20 GiB of 47.27 at N=3 prefill on the shipped file, 38.79 on the
-requant.
+VRAM 39.39 GiB of 47.27 at N=3 prefill on the shipped file, 37.39 on the
+requant — 1.4 GiB below the earlier revision of this table, because the split
+int8 layout no longer widens the file's scales.
 
 ### `-ub` is not a knob on this workload
 
@@ -314,14 +324,59 @@ like-for-like margins at a file we can both read — not a claim about the
 fastest way to serve Qwen3.8-27B on this card. Today that is llama.cpp at
 Q4_K_M.
 
+### Where the dense decode step goes, and what the card can actually stream
+
+The dense model's decode step is one streaming problem with a small tail, and
+the only way to read the numbers below is against a measured ceiling rather
+than the pin rate. `bench_dense_ffn`'s calibration kernel — a fully coalesced
+`uint4` read of exactly the resident weight bytes, no arithmetic — streams
+**602.4 GB/s, 89.7% of the 672 GB/s pin rate** (sd 0.30%). That is the number
+a kernel on this card is allowed to be compared against.
+
+One `bench_decode` step on `all-Q8_0` at N=1, from an `nsys` capture with
+`--cuda-graph-trace=node` (decode replays a captured graph, and without that
+flag none of it is attributed):
+
+| stage | launches | ms | weight bytes | GB/s | of 602.4 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| dense FFN GEMVs | 192 | 31.76 | 18.20 GB | 573 | **95%** |
+| GDN projections | 144 | 10.96 | 5.89 GB | 537 | 89% |
+| attention projections + LM head | 65 | 5.55 | 3.13 GB | 565 | 94% |
+| GDN alpha/beta gates | 48 | 1.00 | 0.03 GB | 25 | 4% |
+| everything else | ~660 | 2.57 | — | — | — |
+| **step** | ~1,110 | **51.84** | 27.24 GB | 525 | **87%** |
+
+Two things follow, and they set what is left to win.
+
+- **The three big GEMV families are at 89–95% of what the card streams**, so
+  the headroom that reads as "13% off peak" is mostly not in them. Both
+  engines are against the same wall: llama.cpp's 19.42 tok/s on this file is
+  536 GB/s over the same 27.6 GB, which is 89% of the same ceiling.
+- **What is left is the tail** — 3.6 ms across 708 launches that move almost
+  no weight, which is 6.9% of the step. The gates are 1.0 ms of it for 25 MB,
+  because one warp per head is 48 warps on a 72-SM card. That is the largest
+  single piece of recoverable time in a dense decode step, and the WHY NOT
+  list records the attempt that collected it and what it cost.
+
+The `attention projections + LM head` row is one line because they share an
+entry point: `GatedAttentionBlock` runs its four projections through
+`LmHeadKernels::forward`, so `lm_head_gemv_b1` appears 65 times a step — 16
+layers x 4, plus the head itself.
+
 ### What the FFN residency is worth
 
 The one real decision in the dense port, measured rather than argued. One
-layer's three matrices are 267 M elements; Q8_0 stores them in 271 MiB and the
-split int8 layout in 287 MiB, and across 64 layers holding **both** is
-16.9 + 17.9 GiB on a card already carrying 11.8 GiB of arena. It does not fit
-— the first attempt died on `CUDA_ERROR_OUT_OF_MEMORY` — so it is one or the
-other, and then the kernel follows from the residency.
+layer's three matrices are 267 M elements and 271 MiB in *either* layout —
+the split form keeps the file's own fp16 scale, so it is a re-layout at the
+same 1.0625 bytes an element — and across 64 layers holding **both** is
+16.9 GiB twice over on a card already carrying 11.8 GiB of arena. It does not
+fit — the first attempt died on `CUDA_ERROR_OUT_OF_MEMORY` — so it is one or
+the other, and then the kernel follows from the residency.
+
+(The split layout used to be the larger of the two, at 287 MiB a layer,
+because the repack widened those scales to fp32 for no precision. That cost
+is gone; the rows below were measured before it was, and their *ranking* is
+what they are kept for.)
 
 | residency | prefill 512 | decode | note |
 | :--- | ---: | ---: | :--- |
@@ -560,14 +615,14 @@ This is why llama.cpp's MMQ, TurboMind and vLLM's Marlin all carry their own
 packed weight layouts instead of reading the on-disk format.
 
 And the corollary, which cost 2× prefill before it was measured: **a weight
-that is not an integer takes the whole block off the tensor cores.** The
-attention int8 repack is gated on `weights.formats.all_q8_0()` — every
+that is not an integer used to take the whole block off the tensor cores.**
+The attention int8 repack was gated on `weights.formats.all_q8_0()` — every
 projection in the layer, not each one on its own. Qwen3.8-27B's shipped
-`UD-Q8_K_XL` stores `attn_q`/`attn_k`/`attn_v` as bf16, so that predicate is
-false, and the entire attention block falls back to the fp32 GEMV path at
-prefill width. Requantizing the file to plain Q8_0 takes N=1 prefill from
-319.4 to 655.4 tok/s and N=3 from 326.3 to 692.0 — **2.05× and 2.12×**, with
-no engine change at all.
+`UD-Q8_K_XL` stores `attn_q`/`attn_k`/`attn_v` as bf16, so that predicate was
+false, and the entire attention block fell back to the fp32 GEMV path at
+prefill width. Measured in that state, requantizing the file to plain Q8_0
+took N=1 prefill from 319.4 to 655.4 tok/s and N=3 from 326.3 to 692.0 —
+**2.05× and 2.12×**, with no engine change at all.
 
 The gate was not *wrong* — an int8 repack of a bf16 tensor is a quantization
 decision, not a re-layout — but it was all-or-nothing where it could be
@@ -579,8 +634,12 @@ interleaved pairs, won 3/3) — not the 2x, because `attn_output` is ~30% of a
 layer's projection elements and only 16 of the 64 layers are attention layers.
 The other 70% needs the file to change, not the engine.
 
+(The current numbers for that same comparison are 360.4 → 660.7 and
+368.8 → 700.3, a 1.83× and 1.90×: the engine collected the part of the gap
+that was its own, and the rest belongs to the file.)
+
 Two costs, both measured, neither hidden: the repack is now built for a file
-that previously built none, so **+0.53 GiB** resident; and dense N=3 decode
+that previously built none, so **+0.50 GiB** resident; and dense N=3 decode
 went 43.87 → 43.63 tok/s, **−0.5%**, consistently across all three pairs. At
 three tokens `uses_tensor_cores` is false and the decode step's launches are
 unchanged, so that delta is *unexplained* — it is not the integer path being
@@ -654,6 +713,18 @@ up as bytes moved or instructions issued:
   and turns out to be worth having for its *alignment* even where the
   arithmetic stays fp32. Where the on-disk layout must be read directly, two
   aligned 16-bit loads recover four signed bytes without the misalignment.
+- **The split repack's scale width is traffic, not precision.** Splitting the
+  scales out of the quants said nothing about how wide to store them, and they
+  were stored fp32 — which widens a value that has no more precision to give,
+  because a Q8_0 block's scale *is* an fp16. The layout cost 1.125 bytes an
+  element against the on-disk 1.0625, so the repack that exists to make the
+  loads aligned was also making them 5.9% more numerous. Invisible where it
+  covers a MoE shared expert (0.1 MB in a layer of 725); on `qwen35`, where the
+  same struct holds a 17,408-wide dense FFN, it was **1.01 GiB of every decoded
+  token**. Keeping the file's own fp16 bits — moved, not converted, so the
+  values are identical to the last bit — is worth 4.2% of the dense FFN block
+  at one token and 1.4 GiB of resident VRAM, and every differential test is
+  unchanged because nothing about the arithmetic changed.
 
 Naming a load's width matters too: a runtime-derived stride and a per-element
 predicate both block vectorisation, and `cuobjdump -sass` counting
@@ -1087,6 +1158,11 @@ proposed twice.
 | Tiling `gdn_chunk_gram` over target tokens | Nothing. Its keys are 32 KiB per head and sit in L2 — the arithmetic that says a kernel re-reads its input does not say the re-read costs anything. |
 | Shared-memory staging on the GDN decode GEMV and the routed-expert GEMV | −3.6% and −0.8%. The re-reads staging removes were L1 hits; staging replaced a hit with a copy and a barrier, and cost a resident block. |
 | Shared-staged flat decode GEMVs (`int4` staging, as the LM head uses) | Bit-identical by construction and **1.3–2.4% slower**. These kernels are bound by the **integer pipe**, not by load issue: Q6_K unpack costs ~9 integer ops per element against a ~10-op budget at the streaming roofline. |
+| Shared-memory activation staging in the dense split GEMV | 0.528 ms against 0.512 at one token and 0.862 against 0.684 at four, losing every pair. The staged form reads activations coalesced once per *block* instead of half-used once per *warp* — 2x fewer sector requests, exactly what the address arithmetic predicts — and the two barriers a 512-element step needs cost more than the sectors save. Third time shared staging has lost to registers on a decode-width GEMV in this file. |
+| `ld.global.cs` (evict-first) on the dense split GEMV's weight loads | Wins every cell of the isolated bench — 0.508 against 0.512 at one token, 0.601 against 0.690 at four, three interleaved pairs — and **loses in the model**: `dense_proj_split_t1_r4` 166.6 -> 167.6 us and the GDN out projection 67.8 -> 71.9, for a net 52.28 -> 52.65 ms step. The hypothesis (streamed weights evicting the re-read activations from L1) is right about the isolated kernel and wrong about a step where twenty other kernels have already decided what is in cache. A narrow bench that wins is a candidate, not a result. |
+| `CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 0` on the dense split GEMV | Nothing, at any width. The kernel already requests zero shared memory, so the driver was already giving it the large-L1 split; the hint had nothing to ask for. |
+| Splitting the GDN gate contraction across eight warps | 20.9 -> 5.4 us on the kernel, 52.28 -> 51.57 ms on the step (**+1.3%**), and it moves the model's logits: `1 - cosine` against llama.cpp's own logits grows 2.64e-4 -> 2.94e-4 and `forward_pass` fails. The reduction is *more* accurate on the top-8 logits (max disagreement 0.309 -> 0.147) and less accurate in L2, which is the metric that gate is written on. One warp per head leaves 48 warps on a 72-SM card and the kernel at 25 GB/s; that is a real 1.9% of the decode step sitting behind a summation order the goldens are gated on, and any replacement has to be bit-identical to collect it. |
+| Unrolling the GDN gate loop for memory-level parallelism | Exactly nothing — 20.9 us before and after. `ptxas` was already issuing the loads ahead; the kernel is short of *warps*, not of in-flight loads per warp. |
 | I2F-free unpack (exact-mantissa trick) | Bit-exact, every gate green, **flat**. With both the load-issue and XU-pipe hypotheses dead, the flat decode GEMVs at 473–519 GB/s read as at their practical equilibrium for this quantization on this card. |
 | Even/odd MMA accumulator chains | −2% prefill, noise at decode. The compiler's schedule was not accumulator-stalled, and eight more registers on kernels already at ~230 costs more than the chain relief. |
 | Skipping the online-softmax rescale when the running max did not move | Bit-identical by construction and **2.8% slower** at 128K prefill. The identity multiplies hid under staged-load latency the schedule pays anyway; the vote-and-branch costs more than the work it skips. |
@@ -1124,7 +1200,7 @@ proposed twice.
   enough to need neither the staging pass nor the alignment prologue Q8_0's
   34-byte stride forces.
 - **Holding the dense FFN in both Q8_0 and the split int8 layout.** 16.9 GiB
-  and 17.9 GiB across 64 layers, on a card already carrying 11.8 GiB of arena.
+  twice over across 64 layers, on a card already carrying 11.8 GiB of arena.
   This one was not rejected on arithmetic in time — the first attempt at the
   dense model died on `CUDA_ERROR_OUT_OF_MEMORY`, which is what the arithmetic
   would have said. See "What the FFN residency is worth" above for what
@@ -1278,6 +1354,19 @@ LLMXABE_MODEL="$M" LLMXABE_BATCH_N=1,3 CUDA_VISIBLE_DEVICES=1 \
 CUDA_VISIBLE_DEVICES=1 llama-batched-bench -m "$M" \
   -ngl 99 -sm none -fa on -b 2048 -ub 2048 -ctk f16 -ctv f16 \
   -npl 1 -npp 512 -ntg 64        # -npl 3 for the N=3 rows
+
+# The dense FFN alone, at decode widths, with the card's measured streaming
+# ceiling printed above the table. ~10 s per A/B against `bench_decode`'s
+# ~90 s, which is what makes an inner-loop change measurable at all.
+LLMXABE_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_dense_ffn
+LLMXABE_DENSE_SPLIT_ROWS=8 ...                  # override the RT table
+
+# Per-kernel attribution of a decode step. `--cuda-graph-trace=node` is not
+# optional: decode replays a captured graph and without it nsys attributes one
+# pass and drops the rest.
+nsys profile -t cuda --cuda-graph-trace=node -s none -o d \
+  ./target/release/bench_decode 128 20
+nsys export --type sqlite -o d.sqlite d.nsys-rep
 ```
 
 The requantized files, and the two the engine cannot read:
@@ -1338,6 +1427,17 @@ batch-vs-single-stream divergence.
   source and measured for speed alone. The greedy-agreement table is about the
   shipped `UD-Q8_K_XL` file. Do not ship a requant on the strength of the
   throughput table.
-- Whether a per-tensor int8 gate (rather than `all_q8_0()`) would recover the
-  2× prefill on the shipped file without requantizing it. The requant proves
-  the size of the prize; it does not prove the engine can collect it.
+- **Narrowing the dense GEMV's activations.** The block reads them fp32, and
+  that is why its cost per extra token rises at fixed weight traffic: the
+  activation reads per weight byte are `4 * TT / RT`, and `RT` is already at
+  the register wall. fp16 activations would halve that ratio at every width
+  and cost the decode path the exactness the residency section credits it
+  with — the one place this engine is more accurate than llama.cpp, which
+  quantizes activations to Q8_1 here. Not built, not measured, and the trade
+  is a decision rather than a tuning question.
+- **k-quants anywhere but the dense FFN loader.** Q6_K halves the decode
+  budget and llama.cpp reaches 22.13 tok/s with it on this model; the
+  embedding gather, the LM-head GEMV family and the attention projections all
+  refuse it by name. What a Q6_K *GEMV* would achieve on this card is
+  unmeasured — llama.cpp's own Q6_K row streams 463 GB/s against Q8_0's 538,
+  so the win is smaller than the byte count suggests.

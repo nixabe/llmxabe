@@ -264,9 +264,10 @@ Two things had to change around them rather than inside them:
 - **The integer repack becomes exclusive.** For the MoE model the repack
   covers the shared expert alone — 3.5 MB against 725 MB of routed experts —
   and sits *beside* the arena's Q8_0 copy. Here it covers the whole FFN:
-  one layer's three matrices are 267 M elements, 271 MiB as Q8_0 and 287 MiB
-  as split int8, so across 64 layers holding both is 16.9 + 17.9 GiB on a card
-  already carrying 11.8 GiB of arena. It does not fit, and the first attempt
+  one layer's three matrices are 267 M elements and 271 MiB in *either*
+  layout — the split form keeps the file's own fp16 scale, so it is a
+  re-layout and not a widening — so across 64 layers holding both is 16.9 GiB
+  twice over on a card already carrying 11.8 GiB of arena. It does not fit, and the first attempt
   died on exactly that `CUDA_ERROR_OUT_OF_MEMORY`. So `DenseFfnMatrices` holds
   one or the other: `upload` repacks and then drops the Q8_0 slices, and the
   block dispatches on which residency it has rather than on width.
@@ -305,12 +306,16 @@ consecutive elements as one `uint4`, the widest load there is, so `hidden` must
 be a multiple of 256 — implied by the existing multiple-of-512 requirement.
 
 What the bf16 body does *not* do is reach the integer tensor cores, and that
-is the expensive half of this format difference. `AttentionBlock` takes its
-int8 repack only when `ProjectionFormats::all_q8_0()` holds, so three bf16
-tensors per layer put the entire attention block on the fp32 path at prefill
-width — worth 2× prefill on this model, measured in
-[BENCHMARKS.md](BENCHMARKS.md). Per-tensor gating, or an int8 repack of the
-bf16 tensors at load, is the obvious follow-up; neither is implemented.
+is the expensive half of this format difference. The gate is per tensor:
+`ProjectionFormats::any_q8_0()` builds the repack, and each of the four
+projections takes the integer path only if *it* is Q8_0. It used to be `all`,
+and on this file — three bf16 tensors and one Q8_0 per layer — that one word
+put the entire attention block on the fp32 path at prefill width. What is
+still unreachable is the bf16 tensors themselves, and no gating fixes that:
+prefill on the shipped file is 360 tok/s against 661 on the same weights
+requantized to Q8_0. An int8 repack of a bf16 tensor would be a *requantization*
+of the model, which is a different thing from a re-layout and is not on the
+table. See [BENCHMARKS.md](BENCHMARKS.md).
 
 `ssm_alpha` / `ssm_beta` are the other format difference: f32 in Qwen3.6, Q8_0
 here. Those get a second instantiation of the fused gate kernel rather than a
