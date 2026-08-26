@@ -1427,14 +1427,37 @@ batch-vs-single-stream divergence.
   source and measured for speed alone. The greedy-agreement table is about the
   shipped `UD-Q8_K_XL` file. Do not ship a requant on the strength of the
   throughput table.
-- **Narrowing the dense GEMV's activations.** The block reads them fp32, and
-  that is why its cost per extra token rises at fixed weight traffic: the
-  activation reads per weight byte are `4 * TT / RT`, and `RT` is already at
-  the register wall. fp16 activations would halve that ratio at every width
-  and cost the decode path the exactness the residency section credits it
-  with — the one place this engine is more accurate than llama.cpp, which
-  quantizes activations to Q8_1 here. Not built, not measured, and the trade
-  is a decision rather than a tuning question.
+- **Narrowing the activations, in the dense GEMV and the GDN gates alike.**
+  Both read them fp32 against int8 weights, so an activation costs four bytes
+  where the weight it multiplies costs one, and that ratio — not the weight
+  traffic — is what each kernel's remaining cost is made of.
+
+  In the dense split GEMV it is `4 * TT / RT` reads per weight byte, which is
+  why the block costs 0.51 ms at one token and 0.68 at four for *identical*
+  weight bytes, and why `RT` is worth raising until the register file stops
+  it. In the GDN gate kernel it is starker: per warp per 32-element step the
+  activations are 8 sectors against the quants' 4, so the misaligned Q8_0
+  read that the Layout section calls out is only 17% of that kernel's sector
+  budget. **Fixing the alignment there is not worth building** — it was
+  costed at 2x on the strength of the layout rule and is worth ~0.3% of the
+  step once the activation sectors are counted. This entry exists so the
+  next reader does not re-derive that the expensive way.
+
+  fp16 activations halve the ratio in both, and cost the decode path the
+  exactness the residency section credits it with — the one place this engine
+  is more accurate than llama.cpp, which quantizes activations to Q8_1 here.
+  Not built, not measured, and the trade is a decision rather than a tuning
+  question.
+- **Fusing the dense FFN's SwiGLU into the up projection and its residual add
+  into the down projection.** Both are arithmetically free — the ADD path is
+  already a template parameter the dense entry points do not instantiate — and
+  together they retire 128 launches of a 51.8 ms step, worth about 0.5%. Not
+  taken: the residual add is the only thing on that path gated on the device
+  `valid_tokens` scalar (AGENTS.md rule 5), and folding it into a GEMV that
+  writes every row of the buffer would put a plausible value on a slot the
+  pass never filled, which is exactly what `forward_pass` checks for. It is
+  recoverable by threading the scalar into the GEMV's epilogue; 0.5% did not
+  justify moving that gate.
 - **k-quants anywhere but the dense FFN loader.** Q6_K halves the decode
   budget and llama.cpp reaches 22.13 tok/s with it on this model; the
   embedding gather, the LM-head GEMV family and the attention projections all
