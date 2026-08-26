@@ -74,9 +74,55 @@ const THREADS: u32 = 256;
 /// Warps per block in the split GEMV. Mirrors `GdnBlock`'s `PROJ_WARPS`.
 const SPLIT_WARPS: u32 = 4;
 
-/// Rows one warp of the split GEMV owns. Mirrors the `RT` in every
-/// `DENSE_PROJ_SPLIT_ENTRY` below.
-const SPLIT_ROWS: u32 = 4;
+/// Rows one warp of the split GEMV owns, per token tile.
+///
+/// Indexed by `tokens - 1`. It falls as the token tile widens for the reason
+/// `GdnBlock`'s own table gives — the accumulator array is `RT * TT` floats
+/// and the staged weight words another `2 * RT` — but where that block was
+/// holding accumulators under a budget, this one is holding *occupancy*, and
+/// on this model the two are the same constraint read from opposite ends.
+/// ptxas puts `(TT, RT)` at, in registers per thread:
+///
+/// ```text
+///        RT=1   RT=2   RT=4
+/// TT=1     56     64     80
+/// TT=2     64     64     96
+/// TT=3     64     80    128
+/// TT=4     64     80    128
+/// ```
+///
+/// A Turing scheduler holds 16,384 registers, so 64 is the cliff: at or below
+/// it eight warps fit per scheduler and the SM runs at 32 warps, at 80 it
+/// runs 24 and at 128 it runs 16.
+///
+/// **The table is not the occupancy column.** `RT = 1` is the roomiest entry
+/// at every width and the slowest at every width — 2.19 ms against `RT = 4`'s
+/// 0.69 at four tokens, more than three times — because the activation
+/// `float4` a lane loads feeds `RT` rows, so the activation reads per weight
+/// byte are `4 * TT / RT` and that ratio, not the warp count, is what the
+/// measurement follows. `RT` rises until the registers stop it: at four
+/// tokens `RT = 8` runs a quarter of the warps and is still 10% faster.
+/// Numbers and method in `docs/BENCHMARKS.md`.
+///
+/// `LLMXABE_DENSE_SPLIT_ROWS` overrides every entry with one value, so the
+/// table can be re-measured in a single binary rather than argued about.
+const SPLIT_ROWS_FOR: [u32; SPLIT_GEMV_MAX_TOKENS] = [4, 4, 4, 8];
+
+/// Row tiles the kernel is compiled for, in the order the entry-point table
+/// below lists them.
+const SPLIT_ROW_TILES: [u32; 2] = [4, 8];
+
+/// Rows per warp for a `tokens`-wide pass, honouring the override.
+fn split_rows_for(tokens: usize) -> u32 {
+    let table = SPLIT_ROWS_FOR[tokens - 1];
+    match std::env::var("LLMXABE_DENSE_SPLIT_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        Some(r) if SPLIT_ROW_TILES.contains(&r) => r,
+        _ => table,
+    }
+}
 
 /// Widest pass the split GEMV serves.
 ///
@@ -94,18 +140,26 @@ const SPLIT_GEMV_MAX_TOKENS: usize = 4;
 /// the repack covers the shared expert alone — 3.5 MB against that layer's
 /// 725 MB of routed experts, noise. Here the repack would cover the whole
 /// feed-forward block, and holding both does not fit: one layer's three
-/// matrices are 267 M elements, which is 271 MiB of Q8_0 plus 287 MiB of
-/// split int8, and across 64 layers that is 16.9 + 17.9 GiB on a 47.27 GiB
-/// card already carrying 11.8 GiB of arena. The engine's first attempt at the
-/// dense model died on exactly that `CUDA_ERROR_OUT_OF_MEMORY`.
+/// matrices are 267 M elements, which is 271 MiB either way — the split
+/// layout keeps the file's own fp16 scale, so it is a re-layout at the same
+/// 1.0625 bytes an element and not a widening — and across 64 layers that is
+/// 16.9 GiB twice over on a 47.27 GiB card already carrying 11.8 GiB of
+/// arena. The engine's first attempt at the dense model died on exactly that
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
 ///
-/// So it is one or the other, and the measurement decides. With Q8_0 only,
+/// The scale width was not always free. Holding it as fp32 cost 1.125 bytes
+/// an element, which is 1.01 GiB of every decoded token on a model whose
+/// decode step is a streaming problem; narrowing it to the fp16 the file
+/// already stores was worth 4.2% of the block at one token and 1.4 GiB of
+/// resident VRAM. See `MmaKernels::repack_q8_0_half`.
+///
+/// So it is still one or the other — the two layouts are the same size, and
+/// two copies of 16.9 GiB do not fit beside the arena either. With Q8_0 only,
 /// every pass runs the fp32 `moe_shared_ffn` tile and prefill 512 measures
 /// **76.2 tok/s** against llama.cpp's 691.2 on the same card — 9.1x slower,
 /// which is the whole cost of not reaching the integer tensor cores on a
 /// model whose FFN is 85% of its arithmetic. With int8 only, prefill reaches
-/// **317.5 tok/s**, and the ~1.0 GiB the split layout costs over Q8_0 buys
-/// that back.
+/// **317.5 tok/s** for no extra byte at all.
 ///
 /// It does *not* follow that every pass should then run `shared_expert_mma`.
 /// Making the residency exclusive means the residency can no longer select
@@ -305,6 +359,7 @@ __device__ __forceinline__ void dense_proj_split_rows(
     }
 }
 
+
 #define DENSE_PROJ_SPLIT_ENTRY(NAME, TT, RT)                                 \
 extern "C" __global__ void NAME(                                             \
     const signed char* __restrict__ wq,                                      \
@@ -319,10 +374,14 @@ extern "C" __global__ void NAME(                                             \
         wq, ws, x, nullptr, out, nullptr, k_dim, n_rows, n_tokens);          \
 }
 
-DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t1, 1, 4)
-DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t2, 2, 4)
-DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t3, 3, 4)
-DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t4, 4, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t1_r4, 1, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t2_r4, 2, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t3_r4, 3, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t4_r4, 4, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t1_r8, 1, 8)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t2_r8, 2, 8)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t3_r8, 3, 8)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t4_r8, 4, 8)
 "#;
 
 /// One layer's dense FFN weights, resident on the device.
@@ -501,8 +560,11 @@ pub struct DenseFfnBlock {
 /// arrays would be at a 2,048-token prefill. That asymmetry is why the two
 /// paths do not both allocate.
 struct SplitGemv {
-    /// Indexed by `tokens - 1`, for `1..=SPLIT_GEMV_MAX_TOKENS`.
-    tiles: [CudaFunction; SPLIT_GEMV_MAX_TOKENS],
+    /// The one `(TT, RT)` entry point this geometry's width selects, and the
+    /// rows per warp it was compiled for — the launch grid is derived from
+    /// the same number, so the two cannot drift.
+    tile: CudaFunction,
+    rows_per_warp: u32,
     gate_out: CudaSlice<f32>,
     up_out: CudaSlice<f32>,
     activated: CudaSlice<f32>,
@@ -560,13 +622,12 @@ impl DenseFfnBlock {
 
         let split = if narrow {
             let n = geometry.max_tokens * geometry.intermediate;
+            let rows_per_warp = split_rows_for(geometry.max_tokens);
+            let tokens = geometry.max_tokens;
             Some(SplitGemv {
-                tiles: [
-                    module.load_function("dense_proj_split_t1")?,
-                    module.load_function("dense_proj_split_t2")?,
-                    module.load_function("dense_proj_split_t3")?,
-                    module.load_function("dense_proj_split_t4")?,
-                ],
+                tile: module
+                    .load_function(&format!("dense_proj_split_t{tokens}_r{rows_per_warp}"))?,
+                rows_per_warp,
                 gate_out: stream.alloc_zeros::<f32>(n)?,
                 up_out: stream.alloc_zeros::<f32>(n)?,
                 activated: stream.alloc_zeros::<f32>(n)?,
@@ -603,7 +664,8 @@ impl DenseFfnBlock {
     ) -> Result<(), MoeBlockError> {
         let g = self.geometry;
         let split = self.split.as_mut().expect("caller checked");
-        let f = &split.tiles[g.max_tokens - 1];
+        let f = &split.tile;
+        let rt = split.rows_per_warp;
 
         let (gate_q, gate_s) = w.gate();
         let (up_q, up_s) = w.up();
@@ -618,6 +680,7 @@ impl DenseFfnBlock {
             g.hidden,
             g.intermediate,
             g.max_tokens,
+            rt,
         )?;
         project_split(
             stream,
@@ -629,6 +692,7 @@ impl DenseFfnBlock {
             g.hidden,
             g.intermediate,
             g.max_tokens,
+            rt,
         )?;
         self.layer_ops.swiglu(
             stream,
@@ -647,6 +711,7 @@ impl DenseFfnBlock {
             g.intermediate,
             g.hidden,
             g.max_tokens,
+            rt,
         )
     }
 
@@ -829,9 +894,10 @@ fn project_split(
     k_dim: usize,
     n_rows: usize,
     tokens: usize,
+    rows_per_warp: u32,
 ) -> Result<(), MoeBlockError> {
     let cfg = LaunchConfig {
-        grid_dim: ((n_rows as u32).div_ceil(SPLIT_WARPS * SPLIT_ROWS), 1, 1),
+        grid_dim: ((n_rows as u32).div_ceil(SPLIT_WARPS * rows_per_warp), 1, 1),
         block_dim: (32, SPLIT_WARPS, 1),
         shared_mem_bytes: 0,
     };
@@ -845,9 +911,9 @@ fn project_split(
         .arg(&k_i32)
         .arg(&n_i32)
         .arg(&t_i32);
-    // SAFETY: one warp per group of `SPLIT_ROWS` adjacent output rows over a
+    // SAFETY: one warp per group of `rows_per_warp` adjacent output rows over a
     // grid that covers `n_rows` and returns above it. `k_dim` is a multiple of
-    // 512 and `n_rows` of `SPLIT_ROWS` — both hold at this model's widths and
+    // 512 and `n_rows` of `rows_per_warp` — both hold at this model's widths and
     // are asserted in the tests below — so no partially live warp group
     // exists. `wq` holds `n_rows * k_dim` quants and `ws` one scale per 32 of
     // them; `x` and `out` are `tokens` rows of `k_dim` and `n_rows`.
@@ -903,6 +969,27 @@ mod tests {
         // residual into `ffn_out` would still give the right `l_out` and
         // would fail the golden's intermediate waypoint.
         assert!(GLUE_SRC.contains("l_out[base + j] = ffn_out[base + j] + residual[base + j];"));
+    }
+
+    #[test]
+    fn every_row_tile_the_table_selects_is_a_compiled_entry_point() {
+        // `DenseFfnBlock::new` builds the entry-point name by formatting the
+        // table's value, so a value with no matching `DENSE_PROJ_SPLIT_ENTRY`
+        // is a runtime `load_function` failure at model load rather than a
+        // compile error. This is what turns it back into one.
+        for (i, &rt) in SPLIT_ROWS_FOR.iter().enumerate() {
+            assert!(
+                SPLIT_ROW_TILES.contains(&rt),
+                "the table asks for RT={rt} at {} token(s) and no entry point is compiled for it",
+                i + 1,
+            );
+            for tokens in 1..=SPLIT_GEMV_MAX_TOKENS {
+                assert!(
+                    GLUE_SRC.contains(&format!("dense_proj_split_t{tokens}_r{rt},")),
+                    "dense_proj_split_t{tokens}_r{rt} is not instantiated",
+                );
+            }
+        }
     }
 
     #[test]
