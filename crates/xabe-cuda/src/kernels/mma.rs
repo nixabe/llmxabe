@@ -273,12 +273,22 @@ __global__ void mma_q8_0_proj(
 // pass afterwards.
 //
 //   quants: int8  [n_rows][k]
-//   scales: fp32  [n_rows][k / 32]
-// Split a Q8_0 tensor into aligned quants and fp32 scales.
+//   scales: fp32  [n_rows][k / 32]   (`mma_repack_q8_0`)
+//   scales: fp16  [n_rows][k / 32]   (`mma_repack_q8_0_h`)
+// Split a Q8_0 tensor into aligned quants and per-32 scales.
 //
 // One warp per 32-element block: each lane moves one quant, lane 0 writes the
 // scale. Run once at load; see `mma_q8_0_proj_split` for why the on-disk
 // layout cannot be read directly at speed.
+//
+// **Which width the scales get is a bandwidth decision, not a numeric one.**
+// Q8_0 stores an fp16 scale per 32 quants, so the fp32 form widens a value
+// that has no more precision to give: 1.125 bytes an element against Q8_0's
+// own 1.0625, which is 5.9% more traffic for nothing. That is noise where the
+// repack covers a shared expert (3.5 MB in a layer of 725) and it is not
+// noise where it covers a 17,408-wide dense FFN -- there the same 5.9% is
+// 1.01 GiB of every decoded token. `_h` keeps the file's own fp16 bits
+// verbatim, so it is neither a requantization nor a rounding.
 __global__ void mma_repack_q8_0(
     const unsigned char* __restrict__ src,
     signed char* __restrict__ q,
@@ -291,6 +301,23 @@ __global__ void mma_repack_q8_0(
     const unsigned char* blk = src + b * 34;
     q[b * 32 + lane] = (signed char)blk[2 + lane];
     if (lane == 0) scales[b] = load_half_le_mma(blk);
+}
+
+__global__ void mma_repack_q8_0_h(
+    const unsigned char* __restrict__ src,
+    signed char* __restrict__ q,
+    unsigned short* __restrict__ scales,
+    long long n_blocks
+) {
+    long long b = (long long)blockIdx.x * blockDim.y + threadIdx.y;
+    if (b >= n_blocks) return;
+    int lane = threadIdx.x;
+    const unsigned char* blk = src + b * 34;
+    q[b * 32 + lane] = (signed char)blk[2 + lane];
+    // The two source bytes, moved rather than converted. GGUF is
+    // little-endian and so is the device, so this is the identity on the
+    // value as well as on the bits.
+    if (lane == 0) scales[b] = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
 }
 
 // Contraction the block stages per trip, and the padded row stride it stages
@@ -313,9 +340,26 @@ __global__ void mma_repack_q8_0(
 
 extern __shared__ signed char xabe_proj_shared[];
 
-__global__ void mma_q8_0_proj_split(
+}  // extern "C" -- a template cannot have C linkage, and the body below is
+   // one so that the two scale widths share it. The `extern "C" __global__`
+   // entry points that instantiate it are declared individually and keep
+   // their unmangled names; `extern "C" {` reopens after them.
+
+// One weight scale, from either width. The fp16 form is `mma_repack_q8_0_h`'s
+// output: the file's own bits, so this widens and does not round.
+__device__ __forceinline__ float xabe_proj_scale(const float* p, long long i) {
+    return p[i];
+}
+__device__ __forceinline__ float xabe_proj_scale(const unsigned short* p, long long i) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(p[i]));
+    return f;
+}
+
+template <typename ST>
+__device__ __forceinline__ void mma_q8_0_proj_split_body(
     const signed char* __restrict__ wq,
-    const float* __restrict__ ws,
+    const ST* __restrict__ ws,
     const signed char* __restrict__ xq,
     const float* __restrict__ xs,
     float* __restrict__ out,
@@ -390,7 +434,9 @@ __global__ void mma_q8_0_proj_split(
             // A row past `n_rows` stages a zero scale, which is enough to make
             // every product it feeds exactly zero without zeroing its quants.
             sws[r * (PROJ_KC / 32) + bb] =
-                wr < n_rows ? ws[(long long)wr * blocks + (kc >> 5) + bb] : 0.0f;
+                wr < n_rows
+                    ? xabe_proj_scale(ws, (long long)wr * blocks + (kc >> 5) + bb)
+                    : 0.0f;
         }
         __syncthreads();
 
@@ -453,6 +499,25 @@ __global__ void mma_q8_0_proj_split(
         }
     }
 }
+
+#define MMA_PROJ_SPLIT_ENTRY(NAME, ST)                                       \
+extern "C" __global__ void NAME(                                             \
+    const signed char* __restrict__ wq,                                      \
+    const ST* __restrict__ ws,                                               \
+    const signed char* __restrict__ xq,                                      \
+    const float* __restrict__ xs,                                            \
+    float* __restrict__ out,                                                 \
+    int k_dim,                                                               \
+    int n_rows,                                                              \
+    int n_tokens                                                             \
+) {                                                                          \
+    mma_q8_0_proj_split_body<ST>(wq, ws, xq, xs, out, k_dim, n_rows, n_tokens); \
+}
+
+MMA_PROJ_SPLIT_ENTRY(mma_q8_0_proj_split, float)
+MMA_PROJ_SPLIT_ENTRY(mma_q8_0_proj_split_h, unsigned short)
+
+extern "C" {
 
 __global__ void mma_int8_gemm(
     const signed char* __restrict__ a,
@@ -666,7 +731,9 @@ pub struct MmaKernels {
     quantize: CudaFunction,
     proj: CudaFunction,
     proj_split: CudaFunction,
+    proj_split_h: CudaFunction,
     repack: CudaFunction,
+    repack_h: CudaFunction,
 }
 
 impl MmaKernels {
@@ -682,7 +749,9 @@ impl MmaKernels {
             quantize: module.load_function("mma_quantize_rows_q8")?,
             proj: module.load_function("mma_q8_0_proj")?,
             proj_split: module.load_function("mma_q8_0_proj_split")?,
+            proj_split_h: module.load_function("mma_q8_0_proj_split_h")?,
             repack: module.load_function("mma_repack_q8_0")?,
+            repack_h: module.load_function("mma_repack_q8_0_h")?,
         })
     }
 
@@ -734,6 +803,9 @@ impl MmaKernels {
 
     /// Split a Q8_0 tensor into aligned quants and fp32 scales, on device.
     ///
+    /// Prefer [`Self::repack_q8_0_half`] for anything large: widening the
+    /// scale buys no precision and costs 5.9% more traffic on every read.
+    ///
     /// `src` is the GGUF byte stream, `q` is `[elements]` int8 and `scales` is
     /// `[elements / 32]` fp32. Run once at load: the repacked form is what
     /// [`Self::q8_0_proj_split`] reads, and the difference between the two
@@ -765,6 +837,52 @@ impl MmaKernels {
         };
         let n = blocks as i64;
         let mut builder = stream.launch_builder(&self.repack);
+        builder.arg(src).arg(&mut *q).arg(&mut *scales).arg(&n);
+        // SAFETY: one warp per 32-element block over a grid covering every
+        // block and returning above it; all three buffers were checked against
+        // the block count.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// As [`Self::repack_q8_0`], with the scales left at the width the file
+    /// stores them in.
+    ///
+    /// `scales` is `[elements / 32]` raw IEEE-half bits — the two bytes at the
+    /// head of each Q8_0 block, moved rather than converted, so this is the
+    /// identity on the value. Prefer it wherever the repacked tensor is large
+    /// enough for its scale array to be traffic: the fp32 form costs 1.125
+    /// bytes an element against Q8_0's own 1.0625 and buys no precision, which
+    /// is 5.9% of every read of a weight that is only ever read once per pass.
+    ///
+    /// [`Self::q8_0_proj_split_half`] is the matching consumer.
+    pub fn repack_q8_0_half(
+        &self,
+        stream: &Arc<CudaStream>,
+        src: &CudaSlice<u8>,
+        q: &mut CudaSlice<i8>,
+        scales: &mut CudaSlice<u16>,
+        elements: usize,
+    ) -> Result<(), MmaError> {
+        if !elements.is_multiple_of(32) {
+            return Err(MmaError::RaggedContraction { k: elements });
+        }
+        let blocks = elements / 32;
+        expect_len("repack src", src.len(), blocks * 34)?;
+        expect_len("repack q", q.len(), elements)?;
+        expect_len("repack scales", scales.len(), blocks)?;
+        if blocks == 0 {
+            return Ok(());
+        }
+
+        const WARPS: u32 = 4;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks.div_ceil(WARPS as usize) as u32, 1, 1),
+            block_dim: (32, WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let n = blocks as i64;
+        let mut builder = stream.launch_builder(&self.repack_h);
         builder.arg(src).arg(&mut *q).arg(&mut *scales).arg(&n);
         // SAFETY: one warp per 32-element block over a grid covering every
         // block and returning above it; all three buffers were checked against
@@ -830,6 +948,64 @@ impl MmaKernels {
         // SAFETY: as `q8_0_proj`, with both weight buffers checked against the
         // declared shape and every load and store guarded against `n_rows` and
         // `n_tokens`.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// As [`Self::q8_0_proj_split`], reading [`Self::repack_q8_0_half`]'s
+    /// narrower scales.
+    ///
+    /// Same kernel body, same shared-memory staging — the scales are widened
+    /// to fp32 on the way into shared, so only the global read differs and the
+    /// mainloop is identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_proj_split_half(
+        &self,
+        stream: &Arc<CudaStream>,
+        wq: &CudaSlice<i8>,
+        ws: &CudaSlice<u16>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        k: usize,
+        n_rows: usize,
+        tokens: usize,
+    ) -> Result<(), MmaError> {
+        if !k.is_multiple_of(PROJ_KC) {
+            return Err(MmaError::RaggedContraction { k });
+        }
+        expect_len("split wq", wq.len(), n_rows * k)?;
+        expect_len("split ws", ws.len(), n_rows * k / 32)?;
+        expect_at_least("split xq", xq.len(), tokens * k)?;
+        expect_at_least("split xs", xs.len(), tokens * k / 32)?;
+        expect_len("split out", out.len(), tokens * n_rows)?;
+        if tokens == 0 || n_rows == 0 {
+            return Ok(());
+        }
+
+        const WARPS: u32 = 4;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n_rows as u32).div_ceil(MMA_ROWS as u32),
+                (tokens as u32).div_ceil(WARPS * MMA_SPLIT_TOKS as u32),
+                1,
+            ),
+            block_dim: (32, WARPS, 1),
+            shared_mem_bytes: proj_shared_bytes(),
+        };
+        let (k_i, n_i, t_i) = (k as i32, n_rows as i32, tokens as i32);
+        let mut builder = stream.launch_builder(&self.proj_split_h);
+        builder
+            .arg(wq)
+            .arg(ws)
+            .arg(xq)
+            .arg(xs)
+            .arg(&mut *out)
+            .arg(&k_i)
+            .arg(&n_i)
+            .arg(&t_i);
+        // SAFETY: as `q8_0_proj_split`; the only difference is the width of
+        // the scale array, which was length-checked against the same shape.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }

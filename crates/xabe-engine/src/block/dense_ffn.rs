@@ -188,10 +188,21 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
+// One weight scale, widened from the fp16 the split layout stores.
+//
+// NVRTC compiles from a string with no include path, so <cuda_fp16.h> is
+// unreachable and the conversion is the same inline `cvt` every other kernel
+// in this workspace uses.
+__device__ __forceinline__ float dense_scale(const unsigned short* p, long long i) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(p[i]));
+    return f;
+}
+
 template <int TT, int RT, bool ADD>
 __device__ __forceinline__ void dense_proj_split_rows(
     const signed char* __restrict__ wq,
-    const float* __restrict__ ws,
+    const unsigned short* __restrict__ ws,
     const float* __restrict__ x,
     const float* __restrict__ residual,
     float* __restrict__ out,
@@ -208,7 +219,7 @@ __device__ __forceinline__ void dense_proj_split_rows(
     int live_t = n_tokens - t0; if (live_t > TT) live_t = TT;
 
     const signed char* row[RT];
-    const float* sc[RT];
+    const unsigned short* sc[RT];
     #pragma unroll
     for (int r = 0; r < RT; ++r) {
         row[r] = wq + (long long)(n0 + r) * k_dim;
@@ -228,7 +239,7 @@ __device__ __forceinline__ void dense_proj_split_rows(
     #pragma unroll
     for (int r = 0; r < RT; ++r) {
         cur[r]  = *(const uint4*)(row[r] + off);
-        dcur[r] = sc[r][off >> 5];
+        dcur[r] = dense_scale(sc[r], off >> 5);
     }
 
     for (int c = 0; c < k_dim; c += 512) {
@@ -239,7 +250,7 @@ __device__ __forceinline__ void dense_proj_split_rows(
             #pragma unroll
             for (int r = 0; r < RT; ++r) {
                 nxt[r]  = *(const uint4*)(row[r] + cn + off);
-                dnxt[r] = sc[r][(cn + off) >> 5];
+                dnxt[r] = dense_scale(sc[r], (cn + off) >> 5);
             }
         }
         #pragma unroll
@@ -297,7 +308,7 @@ __device__ __forceinline__ void dense_proj_split_rows(
 #define DENSE_PROJ_SPLIT_ENTRY(NAME, TT, RT)                                 \
 extern "C" __global__ void NAME(                                             \
     const signed char* __restrict__ wq,                                      \
-    const float* __restrict__ ws,                                            \
+    const unsigned short* __restrict__ ws,                                   \
     const float* __restrict__ x,                                             \
     float* __restrict__ out,                                                 \
     int k_dim,                                                               \
@@ -812,7 +823,7 @@ fn project_split(
     stream: &Arc<CudaStream>,
     f: &CudaFunction,
     wq: &CudaSlice<i8>,
-    ws: &CudaSlice<f32>,
+    ws: &CudaSlice<u16>,
     x: &CudaSlice<f32>,
     out: &mut CudaSlice<f32>,
     k_dim: usize,

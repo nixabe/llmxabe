@@ -3607,19 +3607,27 @@ impl MoeBuffers {
 /// Compiled MoE kernels for one fixed geometry.
 /// One layer's shared expert repacked for the integer tensor cores.
 ///
-/// About 3.5 MB per layer — three `intermediate * hidden` matrices as int8
-/// plus one fp32 scale per 32, against the Q8_0 the block already holds.
+/// About 3.4 MB per layer — three `intermediate * hidden` matrices as int8
+/// plus one fp16 scale per 32, against the Q8_0 the block already holds.
 /// Trivial beside the 692 MB of routed experts, which is why this one gets a
 /// repack where those get shared-memory staging: a second copy of the routed
 /// stacks would not fit beside the model, and a second copy of this one is
 /// noise.
+///
+/// **The scales stay at the width the file stores them in.** Widening them to
+/// fp32 is free of rounding and free of benefit — a Q8_0 block's scale *is* an
+/// fp16 — and it costs 1.125 bytes an element against 1.0625. On the routed
+/// model that is 0.1 MB in a layer of 725 and nobody would notice; on
+/// `qwen35`, where this same struct holds a 17,408-wide dense FFN and the
+/// decode step is a streaming problem, it was 1.01 GiB of every token read.
+/// See [`MmaKernels::repack_q8_0_half`].
 pub struct SharedExpertInt8 {
     gate_q: CudaSlice<i8>,
-    gate_s: CudaSlice<f32>,
+    gate_s: CudaSlice<u16>,
     up_q: CudaSlice<i8>,
-    up_s: CudaSlice<f32>,
+    up_s: CudaSlice<u16>,
     down_q: CudaSlice<i8>,
-    down_s: CudaSlice<f32>,
+    down_s: CudaSlice<u16>,
 }
 
 impl SharedExpertInt8 {
@@ -3650,10 +3658,10 @@ impl SharedExpertInt8 {
         // The source is already resident — `QuantTensor` carries a device
         // slice — so this repacks in place on the card rather than round
         // tripping through the host.
-        let one = |src: &CudaSlice<u8>| -> Result<(CudaSlice<i8>, CudaSlice<f32>), MoeError> {
+        let one = |src: &CudaSlice<u8>| -> Result<(CudaSlice<i8>, CudaSlice<u16>), MoeError> {
             let mut q = stream.alloc_zeros::<i8>(elements)?;
-            let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
-            mma.repack_q8_0(stream, src, &mut q, &mut sc, elements)
+            let mut sc = stream.alloc_zeros::<u16>(elements / 32)?;
+            mma.repack_q8_0_half(stream, src, &mut q, &mut sc, elements)
                 .map_err(MoeError::Mma)?;
             Ok((q, sc))
         };
@@ -3676,17 +3684,17 @@ impl SharedExpertInt8 {
     /// FFN's narrow-batch GEMV — can read it without going through
     /// [`MoeKernels::shared_expert_mma`], which is a GEMM and wastes 63/64 of
     /// its tile at one token.
-    pub fn gate(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+    pub fn gate(&self) -> (&CudaSlice<i8>, &CudaSlice<u16>) {
         (&self.gate_q, &self.gate_s)
     }
 
     /// The up projection's quants and scales. See [`Self::gate`].
-    pub fn up(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+    pub fn up(&self) -> (&CudaSlice<i8>, &CudaSlice<u16>) {
         (&self.up_q, &self.up_s)
     }
 
     /// The down projection's quants and scales. See [`Self::gate`].
-    pub fn down(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+    pub fn down(&self) -> (&CudaSlice<i8>, &CudaSlice<u16>) {
         (&self.down_q, &self.down_s)
     }
 
@@ -3695,7 +3703,7 @@ impl SharedExpertInt8 {
         self.gate_q.len()
             + self.up_q.len()
             + self.down_q.len()
-            + (self.gate_s.len() + self.up_s.len() + self.down_s.len()) * size_of::<f32>()
+            + (self.gate_s.len() + self.up_s.len() + self.down_s.len()) * size_of::<u16>()
     }
 }
 
@@ -4730,7 +4738,7 @@ impl MoeKernels {
             } else {
                 &mut buffers.shared_inter
             };
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -4771,7 +4779,7 @@ impl MoeKernels {
         )
         .map_err(MoeError::Mma)?;
 
-        mma.q8_0_proj_split(
+        mma.q8_0_proj_split_half(
             stream,
             &w.down_q,
             &w.down_s,

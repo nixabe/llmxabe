@@ -882,10 +882,21 @@ __global__ void gdn_gates(
 // Host guarantees `k_dim % 512 == 0` and `n_rows % RT == 0` (checked at
 // launch), so no partially-live warp group exists and the early returns
 // below are warp-uniform.
+// One weight scale, widened from the fp16 the split layout stores.
+//
+// NVRTC compiles from a string with no include path, so <cuda_fp16.h> is
+// unreachable and the conversion is the same inline `cvt` every other kernel
+// in this workspace uses.
+__device__ __forceinline__ float gdn_scale(const unsigned short* p, long long i) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(p[i]));
+    return f;
+}
+
 template <int TT, int RT, bool ADD>
 __device__ __forceinline__ void gdn_proj_split_rows(
     const signed char* __restrict__ wq,
-    const float* __restrict__ ws,
+    const unsigned short* __restrict__ ws,
     const float* __restrict__ x,
     const float* __restrict__ residual,
     float* __restrict__ out,
@@ -902,7 +913,7 @@ __device__ __forceinline__ void gdn_proj_split_rows(
     int live_t = n_tokens - t0; if (live_t > TT) live_t = TT;
 
     const signed char* row[RT];
-    const float* sc[RT];
+    const unsigned short* sc[RT];
     #pragma unroll
     for (int r = 0; r < RT; ++r) {
         row[r] = wq + (long long)(n0 + r) * k_dim;
@@ -922,7 +933,7 @@ __device__ __forceinline__ void gdn_proj_split_rows(
     #pragma unroll
     for (int r = 0; r < RT; ++r) {
         cur[r]  = *(const uint4*)(row[r] + off);
-        dcur[r] = sc[r][off >> 5];
+        dcur[r] = gdn_scale(sc[r], off >> 5);
     }
 
     for (int c = 0; c < k_dim; c += 512) {
@@ -933,7 +944,7 @@ __device__ __forceinline__ void gdn_proj_split_rows(
             #pragma unroll
             for (int r = 0; r < RT; ++r) {
                 nxt[r]  = *(const uint4*)(row[r] + cn + off);
-                dnxt[r] = sc[r][(cn + off) >> 5];
+                dnxt[r] = gdn_scale(sc[r], (cn + off) >> 5);
             }
         }
         #pragma unroll
@@ -991,7 +1002,7 @@ __device__ __forceinline__ void gdn_proj_split_rows(
 #define GDN_PROJ_SPLIT_ENTRY(NAME, TT, RT)                                   \
 extern "C" __global__ void NAME(                                             \
     const signed char* __restrict__ wq,                                      \
-    const float* __restrict__ ws,                                            \
+    const unsigned short* __restrict__ ws,                                   \
     const float* __restrict__ x,                                             \
     float* __restrict__ out,                                                 \
     int k_dim,                                                               \
@@ -1005,7 +1016,7 @@ extern "C" __global__ void NAME(                                             \
 #define GDN_PROJ_SPLIT_ADD_ENTRY(NAME, TT, RT)                               \
 extern "C" __global__ void NAME(                                             \
     const signed char* __restrict__ wq,                                      \
-    const float* __restrict__ ws,                                            \
+    const unsigned short* __restrict__ ws,                                   \
     const float* __restrict__ x,                                             \
     const float* __restrict__ residual,                                      \
     float* __restrict__ out,                                                 \
@@ -1296,11 +1307,11 @@ impl GateProjection {
 /// per pass.
 pub struct GdnLayerInt8 {
     qkv_q: CudaSlice<i8>,
-    qkv_s: CudaSlice<f32>,
+    qkv_s: CudaSlice<u16>,
     gate_q: CudaSlice<i8>,
-    gate_s: CudaSlice<f32>,
+    gate_s: CudaSlice<u16>,
     out_q: CudaSlice<i8>,
-    out_s: CudaSlice<f32>,
+    out_s: CudaSlice<u16>,
 }
 
 impl GdnLayerInt8 {
@@ -1308,24 +1319,26 @@ impl GdnLayerInt8 {
     pub fn bytes(&self) -> u64 {
         let q = self.qkv_q.len() + self.gate_q.len() + self.out_q.len();
         let s = self.qkv_s.len() + self.gate_s.len() + self.out_s.len();
-        (q + s * size_of::<f32>()) as u64
+        (q + s * size_of::<u16>()) as u64
     }
 
-    /// The repacked qkv projection: split-layout quants and one fp32 scale
-    /// per 32-element block. Exposed for differential tests that need to
-    /// drive [`GdnBlock::project_split_gemv`] directly, outside the
+    /// The repacked qkv projection: split-layout quants and one fp16 scale
+    /// per 32-element block — the file's own scale bits, moved rather than
+    /// widened, so the layout costs Q8_0's 1.0625 bytes an element and not
+    /// 1.125. Exposed for differential tests that need to drive
+    /// [`GdnBlock::project_split_gemv`] directly, outside the
     /// `run`/`run_batch_decode` dispatch that otherwise owns these buffers.
-    pub fn qkv(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+    pub fn qkv(&self) -> (&CudaSlice<i8>, &CudaSlice<u16>) {
         (&self.qkv_q, &self.qkv_s)
     }
 
     /// As [`Self::qkv`], for the output gate projection.
-    pub fn gate(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+    pub fn gate(&self) -> (&CudaSlice<i8>, &CudaSlice<u16>) {
         (&self.gate_q, &self.gate_s)
     }
 
     /// As [`Self::qkv`], for the output projection.
-    pub fn out(&self) -> (&CudaSlice<i8>, &CudaSlice<f32>) {
+    pub fn out(&self) -> (&CudaSlice<i8>, &CudaSlice<u16>) {
         (&self.out_q, &self.out_s)
     }
 }
@@ -1675,9 +1688,9 @@ impl GdnBlock {
         let g = self.geometry;
         let one = |src: &CudaSlice<u8>, elements: usize| -> Result<_, GdnBlockError> {
             let mut q = stream.alloc_zeros::<i8>(elements)?;
-            let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
+            let mut sc = stream.alloc_zeros::<u16>(elements / 32)?;
             self.mma
-                .repack_q8_0(stream, src, &mut q, &mut sc, elements)
+                .repack_q8_0_half(stream, src, &mut q, &mut sc, elements)
                 .map_err(GdnBlockError::Mma)?;
             Ok((q, sc))
         };
@@ -1993,7 +2006,7 @@ impl GdnBlock {
             self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.qkv_q,
                     &i8w.qkv_s,
@@ -2006,7 +2019,7 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.gate_q,
                     &i8w.gate_s,
@@ -2207,7 +2220,7 @@ impl GdnBlock {
             self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.out_q,
                     &i8w.out_s,
@@ -2314,7 +2327,7 @@ impl GdnBlock {
             self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.qkv_q,
                     &i8w.qkv_s,
@@ -2327,7 +2340,7 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.gate_q,
                     &i8w.gate_s,
@@ -2564,7 +2577,7 @@ impl GdnBlock {
             self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.out_q,
                     &i8w.out_s,
@@ -2663,7 +2676,7 @@ impl GdnBlock {
             self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.qkv_q,
                     &i8w.qkv_s,
@@ -2676,7 +2689,7 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.gate_q,
                     &i8w.gate_s,
@@ -2809,7 +2822,7 @@ impl GdnBlock {
             self.quantize_activations(stream, &s.final_output, tokens, g.value_dim())?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
             self.mma
-                .q8_0_proj_split(
+                .q8_0_proj_split_half(
                     stream,
                     &i8w.out_q,
                     &i8w.out_s,
@@ -2907,7 +2920,7 @@ impl GdnBlock {
         &self,
         stream: &Arc<CudaStream>,
         wq: &CudaSlice<i8>,
-        ws: &CudaSlice<f32>,
+        ws: &CudaSlice<u16>,
         x: &CudaSlice<f32>,
         residual: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
@@ -2941,7 +2954,7 @@ impl GdnBlock {
         &self,
         stream: &Arc<CudaStream>,
         wq: &CudaSlice<i8>,
-        ws: &CudaSlice<f32>,
+        ws: &CudaSlice<u16>,
         x: &CudaSlice<f32>,
         residual: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
@@ -2963,7 +2976,7 @@ impl GdnBlock {
         &self,
         stream: &Arc<CudaStream>,
         wq: &CudaSlice<i8>,
-        ws: &CudaSlice<f32>,
+        ws: &CudaSlice<u16>,
         x: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         k_dim: usize,
@@ -2984,7 +2997,7 @@ impl GdnBlock {
         &self,
         stream: &Arc<CudaStream>,
         wq: &CudaSlice<i8>,
-        ws: &CudaSlice<f32>,
+        ws: &CudaSlice<u16>,
         x: &CudaSlice<f32>,
         out: &mut CudaSlice<f32>,
         k_dim: usize,
@@ -3006,7 +3019,7 @@ impl GdnBlock {
         &self,
         stream: &Arc<CudaStream>,
         wq: &CudaSlice<i8>,
-        ws: &CudaSlice<f32>,
+        ws: &CudaSlice<u16>,
         x: &CudaSlice<f32>,
         add: Option<(&CudaSlice<f32>, &mut CudaSlice<f32>)>,
         out: &mut CudaSlice<f32>,

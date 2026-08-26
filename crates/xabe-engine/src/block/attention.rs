@@ -544,7 +544,7 @@ impl ProjectionFormats {
     /// building at all.
     ///
     /// `AttnInt8::repack` reads Q8_0 blocks and splits them into int8 quants
-    /// and fp32 scales; there is nothing for it to split in a bf16 tensor,
+    /// and fp16 scales; there is nothing for it to split in a bf16 tensor,
     /// and converting one *would* be a weight requantization — a change to
     /// the model, not a change to its layout. So a bf16 projection stays on
     /// the GEMV path.
@@ -735,8 +735,11 @@ impl AttnScratch {
 /// makes the load legal, and it is worth about 12x over assembling the
 /// operands byte by byte in place.
 ///
-/// Costs about 30.7 MB per layer on top of the Q8_0 the block already holds —
-/// int8 plus one fp32 scale per 32, against Q8_0's fp16 scale per 32.
+/// Costs about 29.0 MB per layer on top of the Q8_0 the block already holds —
+/// the same quants and the same fp16 scale per 32, moved into two aligned
+/// arrays. The repack is a re-layout at Q8_0's own 1.0625 bytes an element,
+/// not a widening; see [`MmaKernels::repack_q8_0_half`] for what widening it
+/// used to cost.
 struct AttnInt8 {
     mma: MmaKernels,
     qgate: Option<Int8Projection>,
@@ -745,8 +748,8 @@ struct AttnInt8 {
     out: Option<Int8Projection>,
 }
 
-/// One projection repacked into split int8 quants and fp32 scales.
-type Int8Projection = (CudaSlice<i8>, CudaSlice<f32>);
+/// One projection repacked into split int8 quants and fp16 scales.
+type Int8Projection = (CudaSlice<i8>, CudaSlice<u16>);
 
 impl AttnInt8 {
     /// Whether any projection reading `normed` is on the integer path.
@@ -820,8 +823,8 @@ impl AttnInt8 {
                 return Ok(None);
             }
             let mut q = stream.alloc_zeros::<i8>(elements)?;
-            let mut sc = stream.alloc_zeros::<f32>(elements / 32)?;
-            mma.repack_q8_0(stream, src, &mut q, &mut sc, elements)?;
+            let mut sc = stream.alloc_zeros::<u16>(elements / 32)?;
+            mma.repack_q8_0_half(stream, src, &mut q, &mut sc, elements)?;
             Ok(Some((q, sc)))
         };
         Ok(Self {
@@ -879,28 +882,28 @@ impl GatedAttentionBlock {
     /// This layer's repacked `w_qgate`, if that tensor is Q8_0 and this shape
     /// wants the tensor cores. `None` puts step 2 on the GEMV without
     /// touching the projections beside it.
-    fn int8_qgate(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+    fn int8_qgate(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<u16>)> {
         let i8w = self.int8.as_ref()?;
         let (q, s) = i8w.qgate.as_ref()?;
         Some((&i8w.mma, q, s))
     }
 
     /// This layer's repacked `w_k`. See [`Self::int8_qgate`].
-    fn int8_k(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+    fn int8_k(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<u16>)> {
         let i8w = self.int8.as_ref()?;
         let (q, s) = i8w.k.as_ref()?;
         Some((&i8w.mma, q, s))
     }
 
     /// This layer's repacked `w_v`. See [`Self::int8_qgate`].
-    fn int8_v(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+    fn int8_v(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<u16>)> {
         let i8w = self.int8.as_ref()?;
         let (q, s) = i8w.v.as_ref()?;
         Some((&i8w.mma, q, s))
     }
 
     /// This layer's repacked `w_out`. See [`Self::int8_qgate`].
-    fn int8_out(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<f32>)> {
+    fn int8_out(&self) -> Option<(&MmaKernels, &CudaSlice<i8>, &CudaSlice<u16>)> {
         let i8w = self.int8.as_ref()?;
         let (q, s) = i8w.out.as_ref()?;
         Some((&i8w.mma, q, s))
@@ -1208,7 +1211,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_qgate() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1252,7 +1255,7 @@ impl GatedAttentionBlock {
         //    the same quantization of it that step 2 already paid for.
         if let Some((mma, wq, ws)) = self.int8_k() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
+            mma.q8_0_proj_split_half(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
         } else {
             k.kv.forward(
                 stream,
@@ -1267,7 +1270,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_v() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1386,7 +1389,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_out() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1521,7 +1524,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_qgate() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1564,7 +1567,7 @@ impl GatedAttentionBlock {
         //    batching exists to amortize.
         if let Some((mma, wq, ws)) = self.int8_k() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
+            mma.q8_0_proj_split_half(stream, wq, ws, xq, xs, &mut sc.key, self.hidden, kv_dim, t)?;
         } else {
             k.kv.forward(
                 stream,
@@ -1579,7 +1582,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_v() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized at step 2");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1726,7 +1729,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_out() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1821,7 +1824,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_qgate() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1857,7 +1860,7 @@ impl GatedAttentionBlock {
         )?;
         if let Some((mma, wq, ws)) = self.int8_k() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -1882,7 +1885,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_v() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
@@ -2042,7 +2045,7 @@ impl GatedAttentionBlock {
         }
         if let Some((mma, wq, ws)) = self.int8_out() {
             let (xq, xs) = sc.xq.as_ref().expect("quantized above");
-            mma.q8_0_proj_split(
+            mma.q8_0_proj_split_half(
                 stream,
                 wq,
                 ws,
