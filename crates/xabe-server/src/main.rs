@@ -251,9 +251,10 @@ struct Args {
     #[arg(long, env = "LLMXABE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
 
-    /// Model name reported by /v1/models and echoed in responses
-    #[arg(short, long, env = "LLMXABE_SERVED_MODEL_NAME", default_value = http::DEFAULT_MODEL)]
-    alias: String,
+    /// Model name reported by /v1/models and echoed in responses; defaults
+    /// to the GGUF's own `general.name`
+    #[arg(short, long, env = "LLMXABE_SERVED_MODEL_NAME")]
+    alias: Option<String>,
 
     /// Output token limit for requests that do not set one
     #[arg(long, default_value_t = 16)]
@@ -470,12 +471,18 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
 /// Opening the GGUF here costs an mmap and a header parse; the alternative —
 /// defaulting to one architecture and letting `WeightSchema::resolve` object
 /// — produces a hundred shape mismatches for what is one fact.
-fn model_config_for(path: &std::path::Path) -> Result<ModelConfig, String> {
+fn model_config_for(path: &std::path::Path) -> Result<(ModelConfig, Option<String>), String> {
     if !path.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
     let file = xabe_gguf::GgufFile::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    ModelConfig::from_gguf(&file).map_err(|e| format!("{}: {e}", path.display()))
+    let config = ModelConfig::from_gguf(&file).map_err(|e| format!("{}: {e}", path.display()))?;
+    // The file's own name, for `/v1/models`. `ModelConfig::name` is the name
+    // of the *architecture's* transcribed configuration, which is the right
+    // thing for a shape check and the wrong thing to serve: a second
+    // checkpoint of the same architecture would advertise itself as the
+    // first. See the `qwen35moe` note in docs/MODEL.md.
+    Ok((config, file.get_str("general.name").map(str::to_owned)))
 }
 
 fn main() -> std::process::ExitCode {
@@ -534,13 +541,20 @@ fn main() -> std::process::ExitCode {
     //    engine serves have the same tensor *names* for the mixer and would
     //    otherwise fail deep in the weight resolver with a wall of shape
     //    mismatches instead of one line naming the architecture.
-    let model = match model_config_for(&args.model) {
+    let (model, file_name) = match model_config_for(&args.model) {
         Ok(m) => m,
         Err(e) => {
             error!("model            FAIL — {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    // `--alias`, else what the file calls itself, else the architecture's
+    // configuration name.
+    let served_name = args
+        .alias
+        .clone()
+        .or(file_name)
+        .unwrap_or_else(|| model.name.to_owned());
     match verify::check_config(&model) {
         Ok(()) => info!(
             "model            {} ({}) — config self-consistent",
@@ -889,7 +903,7 @@ fn main() -> std::process::ExitCode {
     };
     let server = http::ServerConfig {
         api_key: args.api_key,
-        model: args.alias,
+        model: served_name,
         default_max_tokens: args.max_tokens,
         default_reasoning: !args.no_reasoning,
         sampling_defaults: http::SamplingDefaults {
@@ -937,12 +951,12 @@ mod tests {
         // both must land on the same fields as the long forms.
         let long = Args::parse_from(["--temperature", "0.5", "--alias", "m", "--max-tokens", "64"]);
         assert_eq!(long.temperature, 0.5);
-        assert_eq!(long.alias, "m");
+        assert_eq!(long.alias.as_deref(), Some("m"));
         assert_eq!(long.max_tokens, 64);
 
         let aliased = Args::parse_from(["--temp", "0.5", "-a", "m"]);
         assert_eq!(aliased.temperature, 0.5);
-        assert_eq!(aliased.alias, "m");
+        assert_eq!(aliased.alias.as_deref(), Some("m"));
 
         let joined = Args::parse_from(["--temp=0"]);
         assert_eq!(joined.temperature, 0.0);

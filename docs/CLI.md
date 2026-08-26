@@ -86,7 +86,7 @@ can set its own without every client having to.
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `-a, --alias <NAME>` | `LLMXABE_SERVED_MODEL_NAME` | `Qwen3.6-35B-A3B` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. |
+| `-a, --alias <NAME>` | `LLMXABE_SERVED_MODEL_NAME` | the file's `general.name` | The name `/v1/models` reports and responses echo. The engine serves one model per process; this is a label, not a selector. Unset, it is what the GGUF calls itself — *not* the architecture's configuration name, which would advertise a second `qwen35moe` checkpoint as Qwen3.6-35B-A3B. Falls back to the configuration name only if the file has no `general.name`. |
 | `--max-tokens <N>` | — | `16` | Output limit for a request that sets none. OpenAI's historical 16 truncates most chat replies, so raise it if your clients rely on the default. Raise it with the *reservation* in mind: a request holds `prompt + max output` of KV for its whole life, so a large ceiling here — or from a client that sends one — is taken out of the other slots whether or not it is reached. Anything above one slot's share of the pool is capped to it, and a sequence that reaches the cap stops with `length`. |
 | `--no-reasoning` | — | off | Answer without extended thinking unless a request asks for it. A request that names a mode still wins, either way. See [API.md](API.md#reasoning). |
 | `--temperature <T>` (alias `--temp`) | — | `1.0` | Sampling temperature for a request that sets none; `0` makes silent requests greedy, which is what this server always did before it had a sampler. See [API.md](API.md#sampling). |

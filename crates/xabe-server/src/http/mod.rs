@@ -48,9 +48,6 @@ use generate::{ClientEvent, EngineFinish};
 type ClientSender = mpsc::UnboundedSender<ClientEvent>;
 type ClientMap = Arc<Mutex<HashMap<RequestId, ClientSender>>>;
 
-/// The model identifier reported to clients that do not name one.
-pub const DEFAULT_MODEL: &str = "Qwen3.6-35B-A3B";
-
 /// The vocabulary entry that closes the model's reasoning span.
 const THINK_CLOSE: &str = "</think>";
 
