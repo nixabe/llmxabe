@@ -256,7 +256,14 @@ fn split_tile_for(tokens: usize) -> (usize, u32, u32) {
 /// Threads per block for the elementwise kernels.
 const ELEMENTWISE_BLOCK: u32 = 256;
 
-const GDN_BLOCK_SRC: &str = r#"
+/// The block's CUDA source.
+///
+/// `pub(crate)` for one reason: [`crate::block::dense_ffn`] carries a copy of
+/// the split-layout projection GEMV's template body, deliberately rather than
+/// sharing the translation unit, and
+/// `the_split_gemv_body_matches_the_gdn_blocks` is what keeps the two copies
+/// from drifting. That test has to be able to read this string.
+pub(crate) const GDN_BLOCK_SRC: &str = r#"
 extern "C" {
 
 // Sum across one warp, leaving the total in every lane.

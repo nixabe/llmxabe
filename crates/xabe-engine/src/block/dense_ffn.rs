@@ -971,6 +971,42 @@ mod tests {
         assert!(GLUE_SRC.contains("l_out[base + j] = ffn_out[base + j] + residual[base + j];"));
     }
 
+    /// The two copies of the split-layout projection GEMV must not drift.
+    ///
+    /// `dense_proj_split_rows` is a copy of `GdnBlock`'s
+    /// `gdn_proj_split_rows`, and the module comment above says why it is a
+    /// copy rather than a shared translation unit. A copy that is allowed to
+    /// drift is worse than either, and the drift that matters is silent:
+    /// the two bodies would still compile, still run, and quietly disagree on
+    /// a summation order or a scale width. This compares them token for token
+    /// after erasing the two prefixes that are *supposed* to differ.
+    #[test]
+    fn the_split_gemv_body_matches_the_gdn_blocks() {
+        fn body(src: &str, prefix: &str) -> String {
+            let open = format!(
+                "template <int TT, int RT, bool ADD>\n__device__ __forceinline__ void {prefix}_proj_split_rows("
+            );
+            let at = src
+                .find(&open)
+                .unwrap_or_else(|| panic!("{prefix}_proj_split_rows is missing"));
+            let end = src[at..]
+                .find("\n#define ")
+                .unwrap_or_else(|| panic!("{prefix} body has no terminating macro"));
+            src[at..at + end]
+                .replace(&format!("{prefix}_"), "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let dense = body(GLUE_SRC, "dense");
+        let gdn = body(crate::block::gdn::GDN_BLOCK_SRC, "gdn");
+        assert_eq!(
+            dense, gdn,
+            "the dense FFN's split GEMV has drifted from GdnBlock's; they are \
+             kept identical on purpose -- see the comment above `GLUE_SRC`"
+        );
+    }
+
     #[test]
     fn every_row_tile_the_table_selects_is_a_compiled_entry_point() {
         // `DenseFfnBlock::new` builds the entry-point name by formatting the
