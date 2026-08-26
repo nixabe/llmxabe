@@ -106,32 +106,64 @@ const SPLIT_WARPS: u32 = 4;
 ///
 /// `LLMXABE_DENSE_SPLIT_ROWS` overrides every entry with one value, so the
 /// table can be re-measured in a single binary rather than argued about.
-const SPLIT_ROWS_FOR: [u32; SPLIT_GEMV_MAX_TOKENS] = [4, 4, 8, 8];
+/// The compiled `(TT, RT)` pairs, in increasing width.
+///
+/// Not every width has an entry point: past four tokens the pass is a
+/// speculative verify rather than a decode step, its width is
+/// `(drafts + 1) * sequences` and lands on a handful of values, and each
+/// extra instantiation is NVRTC time at every model load. A pass takes the
+/// narrowest entry that covers it and masks the rest — the kernel already
+/// gates every token on `n_tokens`, so a four-token pass through the
+/// six-wide entry is correct, just two rows' worth of arithmetic wasted.
+///
+/// `RT` is 8 only where the activations are staged (`TT <= 4`). Above that
+/// the weights are, and eight rows' worth of them do not fit — see the
+/// staging note in `dense_proj_split_rows`.
+const SPLIT_GEMV_ENTRIES: [(usize, u32); 8] = [
+    (1, 4),
+    (2, 4),
+    (3, 8),
+    (4, 8),
+    (6, 4),
+    (8, 4),
+    (12, 4),
+    (16, 4),
+];
 
-/// Row tiles the kernel is compiled for, in the order the entry-point table
-/// below lists them.
-const SPLIT_ROW_TILES: [u32; 2] = [4, 8];
-
-/// Rows per warp for a `tokens`-wide pass, honouring the override.
-fn split_rows_for(tokens: usize) -> u32 {
-    let table = SPLIT_ROWS_FOR[tokens - 1];
-    match std::env::var("LLMXABE_DENSE_SPLIT_ROWS")
+/// The narrowest compiled entry that covers a `tokens`-wide pass.
+///
+/// `LLMXABE_DENSE_SPLIT_ROWS` overrides the row tile, so the table can be
+/// re-measured in a single binary rather than argued about; it is ignored
+/// where the chosen width has no entry point at that tile.
+fn split_entry_for(tokens: usize) -> (usize, u32) {
+    let (tt, rt) = SPLIT_GEMV_ENTRIES
+        .into_iter()
+        .find(|&(tt, _)| tt >= tokens)
+        .expect("caller checked tokens <= SPLIT_GEMV_MAX_TOKENS");
+    let rt = match std::env::var("LLMXABE_DENSE_SPLIT_ROWS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
     {
-        Some(r) if SPLIT_ROW_TILES.contains(&r) => r,
-        _ => table,
-    }
+        Some(r) if SPLIT_GEMV_ENTRIES.contains(&(tt, r)) => r,
+        _ => rt,
+    };
+    (tt, rt)
 }
 
 /// Widest pass the split GEMV serves.
 ///
 /// Above this the pass is a prefill chunk and `shared_expert_mma`'s GEMM tile
 /// is the right shape; at or below it the tile is mostly empty and the GEMV
-/// wins — 63.5 ms against 109.0 ms on a one-token Qwen3.8-27B step. Four is
-/// the widest compiled entry point, and also the serving target's batched
-/// decode width plus one.
-const SPLIT_GEMV_MAX_TOKENS: usize = 4;
+/// wins — 63.5 ms against 109.0 ms on a one-token Qwen3.8-27B step.
+///
+/// Sixteen, not four, because of the speculative verify pass. That pass is
+/// `(drafts + 1) * sequences` wide — twelve at the serving target — and the
+/// GEMM tile is no less empty there: measured, the block costs 1.374 ms a
+/// layer at twelve tokens against 0.569 at four, a step that buys nothing
+/// because the weight traffic is identical. Sixteen is the widest entry the
+/// register budget reaches; above it the staged weights and `RT * TT`
+/// accumulators stop fitting and the GEMM is the right shape again.
+const SPLIT_GEMV_MAX_TOKENS: usize = 16;
 
 /// The dense FFN's weight residency, and the one real design decision in this
 /// module.
@@ -381,6 +413,30 @@ __device__ __forceinline__ void dense_half2(unsigned int packed, float& a, float
 #define DENSE_EP_PLAIN  0
 #define DENSE_EP_ADD    2
 
+// Eight quants of block `U` of `CUR`, dequantized by `D` into `W[0..8]`.
+//
+// Low byte first: the split repack keeps quants in element order, and
+// narrowing through `unsigned char` first makes the int8 sign-extend rather
+// than taking an implementation-defined conversion from a value above 127 —
+// the same idiom as `lm_head.rs`. `GdnBlock`'s copy of this GEMV writes the
+// same eight lines out longhand; they are compared by
+// `both_split_gemvs_sign_extend_their_quants_the_same_way`.
+#define DENSE_UNPACK_EIGHT(W, CUR, D, U)                                     \
+    do {                                                                     \
+        const unsigned int* q_ = (const unsigned int*)&(CUR);                \
+        unsigned int lo_ = q_[2 * (U)];                                      \
+        unsigned int hi_ = q_[2 * (U) + 1];                                  \
+        float d_ = (D);                                                      \
+        (W)[0] = (float)(signed char)(unsigned char)(lo_)       * d_;        \
+        (W)[1] = (float)(signed char)(unsigned char)(lo_ >> 8)  * d_;        \
+        (W)[2] = (float)(signed char)(unsigned char)(lo_ >> 16) * d_;        \
+        (W)[3] = (float)(signed char)(unsigned char)(lo_ >> 24) * d_;        \
+        (W)[4] = (float)(signed char)(unsigned char)(hi_)       * d_;        \
+        (W)[5] = (float)(signed char)(unsigned char)(hi_ >> 8)  * d_;        \
+        (W)[6] = (float)(signed char)(unsigned char)(hi_ >> 16) * d_;        \
+        (W)[7] = (float)(signed char)(unsigned char)(hi_ >> 24) * d_;        \
+    } while (0)
+
 template <int TT, int RT>
 __device__ __forceinline__ void dense_proj_split_rows(
     const signed char* __restrict__ wq,
@@ -443,46 +499,71 @@ __device__ __forceinline__ void dense_proj_split_rows(
         // chain is unchanged** — element `off+0` through `off+15` in
         // sequence, then the next 512-element step — which is what keeps
         // this a change of activation *precision* and not of summation.
+        //
+        // Which operand is staged is chosen by `TT`, and both branches
+        // accumulate in that same order, so they agree to the last bit.
+        //
+        //   TT <= 4   stage the tokens' activations, `TT * 8` live, and
+        //             dequantize one row's weights at a time. This is the
+        //             narrow decode shape, where `RT` is 8 and the other
+        //             staging would hold 64 weights live.
+        //   TT >  4   stage all `RT` rows' weights, `RT * 8` live, and take
+        //             the tokens one at a time. `RT` is 4 here, so the live
+        //             set stops growing with `TT` and a verify pass twelve
+        //             wide fits where `TT * 8` activations would spill.
+        //
+        // Measured, not assumed: the wide staging costs 3% at three tokens
+        // and 22% at four, which is why it is not simply used everywhere.
         #pragma unroll
         for (int u = 0; u < 2; ++u) {
             int e0 = c + off + 8 * u;
-            float xv[TT][8];
-            #pragma unroll
-            for (int i = 0; i < TT; ++i) {
-                int t = t0 + i;
-                uint4 h = (t < n_tokens)
-                    ? *(const uint4*)(x + (long long)t * k_dim + e0)
-                    : make_uint4(0u, 0u, 0u, 0u);
-                const unsigned int* hw = (const unsigned int*)&h;
-                #pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    dense_half2(hw[e], xv[i][2 * e], xv[i][2 * e + 1]);
-                }
-            }
-            #pragma unroll
-            for (int r = 0; r < RT; ++r) {
-                const unsigned int* q = (const unsigned int*)&cur[r];
-                unsigned int lo = q[2 * u];
-                unsigned int hi = q[2 * u + 1];
-                float d = dcur[r];
-                // Low byte first: the split repack keeps quants in element
-                // order, and narrowing through `unsigned char` first makes
-                // the int8 sign-extend rather than taking an
-                // implementation-defined conversion from a value above 127
-                // — the same idiom as `lm_head.rs`.
-                float w[8];
-                w[0] = (float)(signed char)(unsigned char)(lo)       * d;
-                w[1] = (float)(signed char)(unsigned char)(lo >> 8)  * d;
-                w[2] = (float)(signed char)(unsigned char)(lo >> 16) * d;
-                w[3] = (float)(signed char)(unsigned char)(lo >> 24) * d;
-                w[4] = (float)(signed char)(unsigned char)(hi)       * d;
-                w[5] = (float)(signed char)(unsigned char)(hi >> 8)  * d;
-                w[6] = (float)(signed char)(unsigned char)(hi >> 16) * d;
-                w[7] = (float)(signed char)(unsigned char)(hi >> 24) * d;
+            if (TT <= 4) {
+                float xv[TT][8];
                 #pragma unroll
                 for (int i = 0; i < TT; ++i) {
+                    int t = t0 + i;
+                    uint4 h = (t < n_tokens)
+                        ? *(const uint4*)(x + (long long)t * k_dim + e0)
+                        : make_uint4(0u, 0u, 0u, 0u);
+                    const unsigned int* hw = (const unsigned int*)&h;
                     #pragma unroll
-                    for (int e = 0; e < 8; ++e) acc[r][i] += w[e] * xv[i][e];
+                    for (int e = 0; e < 4; ++e) {
+                        dense_half2(hw[e], xv[i][2 * e], xv[i][2 * e + 1]);
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < RT; ++r) {
+                    float w[8];
+                    DENSE_UNPACK_EIGHT(w, cur[r], dcur[r], u);
+                    #pragma unroll
+                    for (int i = 0; i < TT; ++i) {
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[r][i] += w[e] * xv[i][e];
+                    }
+                }
+            } else {
+                float ww[RT][8];
+                #pragma unroll
+                for (int r = 0; r < RT; ++r) {
+                    DENSE_UNPACK_EIGHT(ww[r], cur[r], dcur[r], u);
+                }
+                #pragma unroll
+                for (int i = 0; i < TT; ++i) {
+                    int t = t0 + i;
+                    uint4 h = (t < n_tokens)
+                        ? *(const uint4*)(x + (long long)t * k_dim + e0)
+                        : make_uint4(0u, 0u, 0u, 0u);
+                    const unsigned int* hw = (const unsigned int*)&h;
+                    float xv[8];
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        dense_half2(hw[e], xv[2 * e], xv[2 * e + 1]);
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < RT; ++r) {
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) acc[r][i] += ww[r][e] * xv[e];
+                    }
                 }
             }
         }
@@ -535,6 +616,10 @@ DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t1_r8, 1, 8)
 DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t2_r8, 2, 8)
 DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t3_r8, 3, 8)
 DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t4_r8, 4, 8)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t6_r4,   6, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t8_r4,   8, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t12_r4, 12, 4)
+DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t16_r4, 16, 4)
 "#;
 
 /// One layer's dense FFN weights, resident on the device.
@@ -788,11 +873,11 @@ impl DenseFfnBlock {
 
         let split = if narrow {
             let n = geometry.max_tokens * geometry.intermediate;
-            let rows_per_warp = split_rows_for(geometry.max_tokens);
+            let (tile_tokens, rows_per_warp) = split_entry_for(geometry.max_tokens);
             let tokens = geometry.max_tokens;
             Some(SplitGemv {
                 tile: module
-                    .load_function(&format!("dense_proj_split_t{tokens}_r{rows_per_warp}"))?,
+                    .load_function(&format!("dense_proj_split_t{tile_tokens}_r{rows_per_warp}"))?,
                 rows_per_warp,
                 rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
                 swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
@@ -1426,19 +1511,29 @@ mod tests {
         // table's value, so a value with no matching `DENSE_PROJ_SPLIT_ENTRY`
         // is a runtime `load_function` failure at model load rather than a
         // compile error. This is what turns it back into one.
-        for (i, &rt) in SPLIT_ROWS_FOR.iter().enumerate() {
+        for (tt, rt) in SPLIT_GEMV_ENTRIES {
             assert!(
-                SPLIT_ROW_TILES.contains(&rt),
-                "the table asks for RT={rt} at {} token(s) and no entry point is compiled for it",
-                i + 1,
+                GLUE_SRC.contains(&format!("dense_proj_split_t{tt}_r{rt},")),
+                "dense_proj_split_t{tt}_r{rt} is not instantiated",
             );
-            for tokens in 1..=SPLIT_GEMV_MAX_TOKENS {
-                assert!(
-                    GLUE_SRC.contains(&format!("dense_proj_split_t{tokens}_r{rt},")),
-                    "dense_proj_split_t{tokens}_r{rt} is not instantiated",
-                );
-            }
         }
+        // Every width the block will accept has to land on one of them.
+        for tokens in 1..=SPLIT_GEMV_MAX_TOKENS {
+            let (tt, rt) = split_entry_for(tokens);
+            assert!(
+                tt >= tokens,
+                "a {tokens}-token pass would take a {tt}-wide entry"
+            );
+            assert!(
+                SPLIT_GEMV_ENTRIES.contains(&(tt, rt)),
+                "a {tokens}-token pass selects ({tt}, {rt}), which is not a compiled entry",
+            );
+        }
+        assert_eq!(
+            SPLIT_GEMV_ENTRIES.last().expect("non-empty").0,
+            SPLIT_GEMV_MAX_TOKENS,
+            "the widest entry and the width gate have drifted apart",
+        );
     }
 
     #[test]
