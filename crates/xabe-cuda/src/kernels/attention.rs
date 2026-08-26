@@ -2418,6 +2418,23 @@ __global__ void attn_flash_causal_t1(
 // the copies are independent, so splitting them would only cost a launch.
 //
 // grid: (ceil(2 * span / ATTN_APPEND_THREADS),). block: ATTN_APPEND_THREADS.
+// out[i] = position[0] + i, for i < n.
+//
+// A caller that wants to run one query row at a time needs each row's own
+// absolute position as a *device* pointer, because that is the only form the
+// attention kernels take one in (see the note on `key_offset` above: a host
+// position cannot be baked into a captured launch). One thread, `n` of them,
+// off the base the caller already holds.
+__global__ void attn_row_positions(
+    const int* __restrict__ position,
+    int* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = position[0] + i;
+}
+
 __global__ void attn_kv_append(
     const float* __restrict__ key,
     const float* __restrict__ value,
@@ -2575,6 +2592,8 @@ pub struct AttentionKernels {
     rope_imrope: CudaFunction,
     flash: CudaFunction,
     flash_gqa: CudaFunction,
+    /// `attn_row_positions`, for the row-at-a-time decode path.
+    row_positions: CudaFunction,
     flash_mma: CudaFunction,
     decode_split: CudaFunction,
     decode_warp: CudaFunction,
@@ -2657,6 +2676,7 @@ impl AttentionKernels {
             rope_imrope: module.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,
+            row_positions: module.load_function("attn_row_positions")?,
             flash_mma: {
                 let f = module.load_function("attn_flash_causal_mma")?;
                 // Ask for the >48 KiB carveout before the first launch. Turing
@@ -2959,7 +2979,7 @@ impl AttentionKernels {
             && self.head_dim / 32 <= ATTN_MAXD
     }
 
-    fn decode_split_is_available(&self) -> bool {
+    pub fn decode_split_is_available(&self) -> bool {
         self.gqa_ratio() >= 2
             && self.gqa_ratio() * 32 <= 1024
             && self.shared_bytes_decode() <= 48 * 1024
@@ -3506,6 +3526,41 @@ impl AttentionKernels {
         // write covers `out` exactly once — `out` is `q_heads * head_dim` at
         // `n_query == 1`, which the caller checked.
         unsafe { builder.launch(combine_cfg) }?;
+        Ok(())
+    }
+
+    /// Materialize `n` consecutive absolute positions from a base.
+    ///
+    /// The attention kernels each read one `positions[0]`, so a caller that
+    /// wants to run query rows one at a time — which is what the flash-decode
+    /// split shape needs, and what a speculative verify pass wants instead of
+    /// a two-block prefill launch — has to hand each row its own device
+    /// scalar. This writes them once for the whole pass; the caller then
+    /// slices `out` a row at a time.
+    pub fn row_positions(
+        &self,
+        stream: &Arc<CudaStream>,
+        base: &CudaSlice<i32>,
+        out: &mut CudaSlice<i32>,
+        n: usize,
+    ) -> Result<(), AttentionError> {
+        Self::expect_len("row position base", base.len(), 1)?;
+        Self::expect_at_least("row positions", out.len(), n)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(APPEND_THREADS), 1, 1),
+            block_dim: (APPEND_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let mut builder = stream.launch_builder(&self.row_positions);
+        builder.arg(base).arg(&mut *out).arg(&n_i);
+        // SAFETY: one thread per element over a grid that covers `n` and
+        // returns above it; `base` holds one int and `out` at least `n`,
+        // both checked above.
+        unsafe { builder.launch(cfg) }?;
         Ok(())
     }
 

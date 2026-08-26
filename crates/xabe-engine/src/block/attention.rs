@@ -592,6 +592,16 @@ fn all_or_nothing_int8() -> bool {
 /// in the engine, larger than the Gated DeltaNet block and the MoE dispatch
 /// put together. `GdnBlock` was already shared across its thirty layers; this
 /// is the same arrangement for the other ten.
+/// Query rows below this run one at a time through the flash-decode split.
+///
+/// Sixteen because that is the widest speculative verify pass the serving
+/// target builds — `(drafts + 1) * sequences`, four times three, with room —
+/// and because the crossover is well above it: the row loop costs `t` decode
+/// launches of about 13 us against the GQA-shared kernel's flat ~433 us, so
+/// it stays ahead until roughly thirty rows. A real prefill chunk is 512 and
+/// never takes this path.
+const ROW_DECODE_MAX_QUERY: usize = 16;
+
 pub struct AttnScratch {
     tokens: usize,
     normed: CudaSlice<f32>,
@@ -616,6 +626,8 @@ pub struct AttnScratch {
     /// held here because this is the struct with a stream to allocate from and
     /// the one already shared by all ten attention layers.
     decode: Vec<AttnDecodeScratch>,
+    /// One absolute position per row, for [`ROW_DECODE_MAX_QUERY`].
+    row_positions: CudaSlice<i32>,
 }
 
 impl AttnScratch {
@@ -655,6 +667,7 @@ impl AttnScratch {
             decode: (0..tokens.min(8))
                 .map(|_| AttnDecodeScratch::new(stream, a.q_heads as usize, a.head_dim as usize))
                 .collect::<Result<Vec<_>, _>>()?,
+            row_positions: stream.alloc_zeros::<i32>(tokens.max(1))?,
         })
     }
 
@@ -1356,18 +1369,57 @@ impl GatedAttentionBlock {
         // 9. Causal GQA attention over the whole cached window, not just this
         //    batch. `n_keys` is the filled length; the cache buffer itself is
         //    longer and the kernel reads none of the tail.
-        k.mixer.forward(
-            stream,
-            &mut sc.decode[0],
-            &sc.query_roped,
-            &cache.k,
-            &cache.v,
-            &mut sc.pregate,
-            t,
-            cache.max_seq,
-            pos_offset + t,
-            positions,
-        )?;
+        //
+        //    A few query rows go one at a time through the flash-decode
+        //    split instead of together through a prefill tile. The prefill
+        //    kernels take their parallelism from the query axis: at twelve
+        //    rows the GQA-shared kernel launches `kv_heads` blocks — two, on
+        //    a 72-SM card — and scans the whole window with them, measuring
+        //    433 us a layer where twelve decode launches take about 13 us
+        //    each. The split shape carries its own parallelism in the key
+        //    axis, which is the axis a verify pass actually has.
+        //
+        //    Row `i` sits at `pos_offset + i` and attends to `pos_offset + i
+        //    + 1` keys, which is the same causal bound the tiled kernels
+        //    apply; step 8 has already appended every row's K and V, so the
+        //    window each row reads is complete.
+        if t > 1 && t <= ROW_DECODE_MAX_QUERY && k.mixer.decode_split_is_available() {
+            k.mixer
+                .row_positions(stream, positions, &mut sc.row_positions, t)?;
+            for i in 0..t {
+                let q_i = unsafe {
+                    crate::viewslice::subslice(stream, &sc.query_roped, i * q_dim, q_dim)
+                };
+                let pos_i = unsafe { crate::viewslice::subslice(stream, &sc.row_positions, i, 1) };
+                let mut pregate_i =
+                    unsafe { crate::viewslice::subslice(stream, &sc.pregate, i * q_dim, q_dim) };
+                k.mixer.forward(
+                    stream,
+                    &mut sc.decode[0],
+                    &q_i,
+                    &cache.k,
+                    &cache.v,
+                    &mut pregate_i,
+                    1,
+                    cache.max_seq,
+                    pos_offset + i + 1,
+                    &pos_i,
+                )?;
+            }
+        } else {
+            k.mixer.forward(
+                stream,
+                &mut sc.decode[0],
+                &sc.query_roped,
+                &cache.k,
+                &cache.v,
+                &mut sc.pregate,
+                t,
+                cache.max_seq,
+                pos_offset + t,
+                positions,
+            )?;
+        }
 
         // 10. The output gate.
         k.ops.sigmoid_gate(
@@ -2011,18 +2063,55 @@ impl GatedAttentionBlock {
             let mut pg = unsafe {
                 crate::viewslice::subslice(stream, &sc.pregate, base * q_dim, chunk_tokens * q_dim)
             };
-            k.mixer.forward(
-                seq_stream,
-                &mut sc.decode[0],
-                &qr,
-                &caches[i].k,
-                &caches[i].v,
-                &mut pg,
-                chunk_tokens,
-                caches[i].max_seq,
-                pos_offsets[i] + chunk_tokens,
-                positions[i],
-            )?;
+            // A narrow chunk is a speculative verify window, not a
+            // prefill: see step 9 of `forward` for why those rows go one at
+            // a time through the flash-decode split. `sc.decode[i]`, not
+            // `[0]` — these sequences may be on side streams, and the split
+            // path is the one that writes that scratch. A batch wider than
+            // the scratch (which is capped at the serving maximum) takes the
+            // tiled kernel for its tail rather than sharing a slot.
+            if chunk_tokens > 1
+                && chunk_tokens <= ROW_DECODE_MAX_QUERY
+                && i < sc.decode.len()
+                && k.mixer.decode_split_is_available()
+            {
+                let mut rows = unsafe {
+                    crate::viewslice::subslice(stream, &sc.row_positions, base, chunk_tokens)
+                };
+                k.mixer
+                    .row_positions(seq_stream, positions[i], &mut rows, chunk_tokens)?;
+                for j in 0..chunk_tokens {
+                    let q_j = unsafe { crate::viewslice::subslice(stream, &qr, j * q_dim, q_dim) };
+                    let pos_j = unsafe { crate::viewslice::subslice(stream, &rows, j, 1) };
+                    let mut pg_j =
+                        unsafe { crate::viewslice::subslice(stream, &pg, j * q_dim, q_dim) };
+                    k.mixer.forward(
+                        seq_stream,
+                        &mut sc.decode[i],
+                        &q_j,
+                        &caches[i].k,
+                        &caches[i].v,
+                        &mut pg_j,
+                        1,
+                        caches[i].max_seq,
+                        pos_offsets[i] + j + 1,
+                        &pos_j,
+                    )?;
+                }
+            } else {
+                k.mixer.forward(
+                    seq_stream,
+                    &mut sc.decode[0],
+                    &qr,
+                    &caches[i].k,
+                    &caches[i].v,
+                    &mut pg,
+                    chunk_tokens,
+                    caches[i].max_seq,
+                    pos_offsets[i] + chunk_tokens,
+                    positions[i],
+                )?;
+            }
         }
         if let (Some(streams), Some((_, _, joins))) = (fork_streams, self.batch_fork.as_ref()) {
             for (side, join) in streams.iter().zip(joins).take(n - 1) {
