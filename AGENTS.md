@@ -206,7 +206,12 @@ The project's measurement discipline is what has kept it honest; follow it.
   whole-forward A/Bs are so expensive that the honest response to a small
   change was to not measure it. Prefer the narrow bench, then confirm
   end-to-end: `bench_forward` (chunked prefill via `LLMXABE_BENCH_CHUNK`),
-  `bench_decode`, `bench_moe`, `bench_mma`, `profile_forward`.
+  `bench_decode`, `bench_decode_batch`, `bench_dense_ffn` (the `qwen35` FFN
+  alone, and it prints the card's measured streaming ceiling), `bench_moe`,
+  `bench_mma`, `profile_forward`. **A narrow bench that wins is a candidate,
+  not a result** — confirm it in the model, because the two disagree about
+  cache state and at least one change has won every interleaved pair of the
+  former while losing the latter.
 - **Interleaved A/B pairs**, at least three, spreads reported. A single pair
   proves nothing on this host; run-to-run drift has eaten 10%+ "wins" before.
 - **CUDA events, not `Instant`**, for anything inside a pass. Host clocks
