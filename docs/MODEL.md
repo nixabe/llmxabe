@@ -115,6 +115,89 @@ Two consequences, both load-bearing:
 
 The shared-expert tensors (`ffn_*_shexp`) are Q8_0.
 
+### Which formats the engine actually reads
+
+The rule above — the format travels with the pointer — is about not *assuming*
+a format. This is the complement: which formats each kernel family has a
+reader for at all. They are not the same set, and the gap decides whether a
+given GGUF loads.
+
+| Consumer | Reads | Does not read |
+| --- | --- | --- |
+| MoE experts and shared expert (`kernels::moe`) | Q6_K, Q8_0 | everything else |
+| LM head, embeddings, attention and GDN projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16 | **Q6_K** |
+| GDN alpha/beta gates (`GateProjection`) | f32, Q8_0 | **Q6_K** |
+| The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
+
+Only the expert stacks read Q6_K, because that is where the shipped files put
+it. A GGUF that is **uniformly Q6_K** — the ordinary community quant — loads
+its experts and then stops at the first projection:
+
+```
+device 0: 373 tensors, 1.761 GiB
+ERROR: `token_embd.weight` is q6_K, this pass unpacks q8_0
+```
+
+This is not an oversight to be fixed by adding Q6_K everywhere. The last row
+of the table is the reason: the engine's prefill advantage comes from
+repacking Q8_0 projections into the split int8 layout the integer tensor
+cores can load, and **Q6_K has no path there**. A Q6_K projection would fall
+back to the fp32 GEMV — the same fate as `qwen35`'s bf16 `attn_q`/`k`/`v`,
+which costs that model 47% of its prefill. The mixed recipe the shipped files
+use (Q8_0 projections, Q6_K experts) is not a coincidence; it is the shape
+this engine is built to exploit, and it is what a file should be requantized
+*to* rather than away from.
+
+### Serving a second `qwen35moe` checkpoint
+
+`ornith-ai/Ornith-1.5-35B-A3B` is a different finetune of the same
+architecture. Its GGUF metadata is byte-identical to Qwen3.6's on every
+`qwen35moe.*` hyperparameter, with the same 753 tensor names — only
+provenance keys and one `tokenizer.ggml.padding_token_id` differ. It needs no
+code change. What it needs is the recipe above, because its published
+quantizations are uniform.
+
+Reproducing the shipped mix from full weights, read off the reference file
+rather than guessed at:
+
+```sh
+# Emit one override per tensor whose target differs from a plain q8_0 run.
+# `ref.types` is `<name>\t<ggml type>` dumped from Qwen3.6-35B-A3B-UD-Q6_K_XL.
+awk -F'\t' '$2=="Q6_K"{print $1"=q6_K"}
+             /ssm_alpha|ssm_beta|ffn_gate_inp/{if($2=="F32"||$2=="BF16")print $1"=f32"}' \
+  ref.types > ud_recipe.txt          # 222 lines: 80 q6_K, 142 f32
+
+llama-quantize --tensor-type-file ud_recipe.txt \
+  Ornith-1.5-35B-BF16.gguf Ornith-1.5-35B-A3B-UD-Q6_K_XL.gguf q8_0 12
+```
+
+The 80 `q6_K` overrides are `ffn_gate_exps` and `ffn_up_exps` for 40 blocks —
+block 39 is absent, so it falls through to the `q8_0` base, which is exactly
+the exception the table above records.
+
+**Validate the recipe before spending an hour on it.** `--dry-run` against the
+*reference* file must be an identity transform; if the recipe is right, quant
+size equals model size to the decimal:
+
+```
+llama_model_quantize_impl: model size  = 31090.47 MiB (7.35 BPW)
+llama_model_quantize_impl: quant size  = 31090.47 MiB (7.35 BPW)
+```
+
+Applied to Ornith's BF16 it produced 31091.47 MiB and matched the reference
+on 751 of 753 tensors. The two exceptions are `blk.40.ffn_gate_inp{,_shexp}`
+landing f32 where Unsloth left them bf16 — more precise, and what the other
+40 blocks already are.
+
+Two caveats worth stating rather than discovering later. No imatrix was used:
+Ornith's is unpublished and Unsloth's is calibrated on different weights, so
+the 80 Q6_K expert tensors are quantized from BF16 without importance
+weighting. And requantizing from a *published Q6_K* file instead of BF16
+would put Q6_K-rounded values into Q8_0 containers — it loads and runs, but
+the projections would carry Q6_K precision under a Q8_0 name, which is the
+kind of thing that misleads a later reader.
+
+
 ### Three findings from the real file
 
 1. **The GDN state shape is confirmed, not merely derived.** The planning
@@ -316,7 +399,7 @@ Two of those rows cost kernel work rather than a config field:
   at prefill width. The repack is gated per tensor rather than per block, so
   `attn_output` still reaches the tensor cores beside them; what remains is
   the format itself. Requantizing the file to plain Q8_0 takes prefill from
-  360 to 661 tok/s with no engine change, and costs 6.5% of decode besides —
+  362 to 666 tok/s with no engine change, and costs 6.5% of decode besides —
   measured, in [BENCHMARKS.md](BENCHMARKS.md).
 - `ssm_alpha` / `ssm_beta` are f32 in Qwen3.6 and Q8_0 here. The fused gate
   kernel has a Q8_0 instantiation rather than a host-side widening, because

@@ -113,6 +113,47 @@ a replacement claim.
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
 | Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default. On `qwen35` `draft-mtp` is now a win at N=1 **and** N=3; it stays opt-in because on the shipped `UD-Q8_K_XL` file its extra layer and per-sequence draft cache do not fit beside three 128K-capable caches. See WHY. |
 
+## A second `qwen35moe` checkpoint
+
+`ornith-ai/Ornith-1.5-35B-A3B` is a different finetune of the same
+architecture, requantized to the shipped mix (see
+[MODEL.md](MODEL.md#serving-a-second-qwen35moe-checkpoint)). It is here
+because it is the only evidence that the standing above is a property of the
+*engine* and not of one file.
+
+Same method as the table above — one card, N=3, llama.cpp at its own best
+settings, three interleaved alternating reps, prefill on GPU 2 and decode on
+GPU 1. llama.cpp's column is the faster of `-ub 2048` and `-ub 4096` per cell.
+
+| cell | Ornith | sd | llama.cpp | margin | Qwen3.6 above |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| prefill 512 | 3,322.8 | 0.00% | 2,910.3 | **+14.2%** | +9.1% |
+| prefill 2K | 3,869.9 | 0.04% | 3,251.4 | **+19.0%** | +19.3% |
+| prefill 8K | 3,563.2 | 0.17% | 3,180.0 | **+12.0%** | +14.5% |
+| prefill 32K | 2,803.4 | 0.06% | 2,649.3 | **+5.8%** | +5.1% |
+| prefill 65K | 2,218.4 | 0.11% | 2,152.3 | **+3.1%** | +3.9% |
+| prefill 128K | 1,567.1 | 0.20% | 1,555.9 | **+0.7%** | +0.8% |
+| decode 2K | 207.8 | 0.05% | 187.3 | **+10.9%** | +11.4% |
+| decode 32K | 158.6 | 0.22% | 151.6 | **+4.6%** | +5.0% |
+
+**Every cell won all three interleaved pairs**, which is the claim that
+matters at 128K prefill — the thinnest margin here, as it is for Qwen3.6, and
+one this file elsewhere says stands only on alternating pairs: 1,567.6 v
+1,555.9, then 1,570.0 v 1,555.8, then 1,563.7 v 1,553.0.
+
+Two readings of the right-hand column, and only one of them is safe. The
+margins agreeing to within half a point on five of eight cells says the two
+checkpoints are interchangeable to this engine. It does **not** say either
+model moved: those Qwen3.6 numbers were taken on other days, and this file's
+own provenance note says its 512–32K prefill rows predate the per-sequence
+prefill fork.
+
+The 512 row is llama.cpp's noise, not ours. It ranged 2,770.8–2,910.3 across
+the ladder while Ornith sat at 3,322.8 with no measurable spread, and `-c` was
+ruled out as the cause by direct control — 2,843.8 mean at `-c 4096` against
+2,852.3 at the model default of 262,144. The margin is quoted against
+llama.cpp's *best* of three; against its mean it reads +16.6%.
+
 ## Qwen3.8-27B (`qwen35`)
 
 The dense sibling landed after the standing above was taken, and **nothing in
@@ -1230,7 +1271,7 @@ proposed twice.
 | The two-kernel `bm == 1` split, first attempt | −5.2% before `bucket_live` existed: both kernels then walked `sorted_token_ids` and crossed two barriers per bucket to compute `bm`, and only one used the answer. It landed as a win only once `bm` became a table read. |
 | GEMV unroll pragmas on the direct-1 helpers | 20% slower on ffn. A register cliff — the standalone GEMV kernel's unroll depth was tuned against a register budget the narrow kernel, which carries the tiled fallback in the same function, does not have. |
 | A `KU` unroll hint on the GDN tiled projection | Byte-identical SASS at the width N=3 actually uses; −9% at N=2. `ptxas` already reached the same schedule. Whatever closes that kernel's 28%-of-roofline ceiling must change what ptxas schedules, not hint at a schedule it already finds. |
-| Speculative decode as the N=3 lever (n-gram, MTP, DFlash; serving A/B, four interleaved rounds with a reversal) | Every arm loses at N=3: 87.5 / 150.7 / 125.2 tok/s against plain 211.4, despite up to 10.3 accepted tokens per 12-row verify window. The batched verify's fixed cost (~4.8× a plain batch-3 step) outruns the tokens it saves, and the round-gated fallback at identical acceptance also loses (166 vs 211). The measured net wins are n-gram **+9%** and MTP **+1.5%**, both at N=1 only — see WHY. Making the verify pass ride decode's launch machinery instead of the prefill shape is the untried lever. |
+| Speculative decode as the N=3 lever (n-gram, MTP, DFlash; serving A/B, four interleaved rounds with a reversal) | Every arm loses at N=3: 87.5 / 150.7 / 125.2 tok/s against plain 211.4, despite up to 10.3 accepted tokens per 12-row verify window. The batched verify's fixed cost (~4.8× a plain batch-3 step) outruns the tokens it saves, and the round-gated fallback at identical acceptance also loses (166 vs 211). The measured net wins are n-gram **+9%** and MTP **+1.5%**, both at N=1 only — see WHY. Making the verify pass ride decode's launch machinery instead of the prefill shape was named here as the untried lever; it has since been *partly* built — a narrow query window now goes through the flash-decode split rather than a two-block prefill launch (WHY, "Speculative decode"), worth 21 ms of a 194 ms N=3 verify step on `qwen35`. **The MoE serving arm above has not been re-measured against it**, so these numbers stand as the last measurement, not as a current claim. |
 | Removing the routed-partial clear | Below run-to-run spread, and reversing. Deleting a defensive correctness aid for a result smaller than host drift is not justified. |
 | Grant alignment as a prefill lever (`ADMISSION_RESERVE_FRACTION` 4 → 2) | Predicted **+27%**, measured **+1.5%**. The width curve is real — 2,048-wide passes run at 2,760 tok/s against 256-wide at 1,510, and the ratio holds at depth (1,896 vs 1,050 at 64K) — and `choose_prefill_width` does decompose a 3,072-token grant into 2,048 + 4×256. `max_batch = 3`, the 256 tail ceiling, and the grant reaching `execute_prefill` intact were all verified. The penalty still does not appear end to end. The constant stays at 2 because it is never worse and an aligned grant is the honest default, but **do not rank work by that width arithmetic**; the mechanism is confirmed and its cost is not. |
 | Snapshot retention as the cause of the concurrent-session penalty | Nothing. `--cache-ram 0` (no snapshots) and `16GiB` (159 per worker) both land within noise of the 2.41 GiB default's 24, at 64K × 3 sessions. The arena arithmetic is seductive — a 64K prompt needs 31 snapshots at R=2048, three sessions ~93 against 24 — and wrong. Worse, it was first "ruled out" at 16K, where three sessions need exactly 24 and the arena *cannot* bind, which proved nothing in either direction. Test a capacity hypothesis at a depth where the capacity is actually exceeded. |
@@ -1410,6 +1451,12 @@ LLMXABE_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_dense_ffn
 LLMXABE_DENSE_SPLIT_ROWS=8 ...                  # override the RT table
 LLMXABE_FFN_N=4,6,8,12,16,32 ...                # the GEMV/GEMM width sweep
 
+# A second qwen35moe checkpoint. Requant to the shipped mix first — a
+# uniformly-Q6_K file stops at the first projection. Recipe in MODEL.md.
+LLMXABE_MODEL=Ornith-1.5-35B-A3B-UD-Q6_K_XL.gguf CUDA_VISIBLE_DEVICES=2 \
+  LLMXABE_PREFILL_SEQUENCES=3 LLMXABE_BENCH_CHUNK=6138 LLMXABE_BENCH_N=130944 \
+  ./target/release/bench_forward     # depths are multiples of 6138/3 = 2046
+
 # The speculative table. `LLMXABE_SPEC` takes any of the seven drafter names.
 LLMXABE_MODEL="$M" LLMXABE_SPEC=draft-mtp CUDA_VISIBLE_DEVICES=1 \
   ./target/release/bench_worker_spec           # context 256, 512 tok/seq
@@ -1422,13 +1469,21 @@ nsys profile -t cuda --cuda-graph-trace=node -s none -o d \
 nsys export --type sqlite -o d.sqlite d.nsys-rep
 ```
 
-The requantized files, and the two the engine cannot read:
+The requantized files, and the two the engine cannot read. These are
+generated artifacts rather than anything shipped, so a checkout will not have
+them until this is run:
 
 ```sh
 llama-quantize --allow-requantize "$M" Qwen3.8-27B-req-q8_0.gguf  q8_0   12
 llama-quantize --allow-requantize "$M" Qwen3.8-27B-req-q6_k.gguf  q6_k   12
 llama-quantize --allow-requantize "$M" Qwen3.8-27B-req-q4_k_m.gguf q4_k_m 12
 ```
+
+*Why* the last two cannot be read — and which formats each kernel family has
+a reader for at all — is
+[MODEL.md](MODEL.md#which-formats-the-engine-actually-reads). It is not an
+oversight: a k-quant projection has no path to the integer tensor cores, so
+reading one would cost the prefill advantage it was quantized to preserve.
 
 Interleave the *files* within each repetition, not the repetitions within each
 file — this table compares models, and the card drifts.

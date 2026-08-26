@@ -312,7 +312,7 @@ projections takes the integer path only if *it* is Q8_0. It used to be `all`,
 and on this file — three bf16 tensors and one Q8_0 per layer — that one word
 put the entire attention block on the fp32 path at prefill width. What is
 still unreachable is the bf16 tensors themselves, and no gating fixes that:
-prefill on the shipped file is 360 tok/s against 661 on the same weights
+prefill on the shipped file is 362 tok/s against 666 on the same weights
 requantized to Q8_0. An int8 repack of a bf16 tensor would be a *requantization*
 of the model, which is a different thing from a re-layout and is not on the
 table. See [BENCHMARKS.md](BENCHMARKS.md).

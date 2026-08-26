@@ -74,10 +74,16 @@ default of 16 exists so a request that sets no limit cannot run away; it
 truncates most replies.
 
 **`--spec-type none`** is a measured choice, not an omission. At three
-concurrent slots and this context depth every drafter loses, and some do not
-fit in VRAM at all; the numbers and the mechanism are in
-[BENCHMARKS.md](BENCHMARKS.md). Speculation is worth reaching for at *one*
-slot and shallow prompts, which is not this configuration.
+concurrent slots and this context depth every drafter lost when it was
+measured, and some do not fit in VRAM at all; the numbers and the mechanism
+are in [BENCHMARKS.md](BENCHMARKS.md). Speculation is worth reaching for at
+*one* slot and shallow prompts, which is not this configuration.
+
+That measurement predates the verify pass's move onto the flash-decode split,
+which took `qwen35`'s N=3 drafter from losing to winning. **The `qwen35moe`
+serving arm has not been re-run against it**, so this default stands on the
+last measurement rather than a current one — worth re-testing before treating
+it as settled.
 
 **`--temp 1.0 --top-p 0.95 --min-p 0.0`** are per-request defaults for callers
 that send none of their own. Any request may override them. Note that
