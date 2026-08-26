@@ -111,7 +111,7 @@ a replacement claim.
 | KV cache | binary16, 20 KiB/token over 10 attention layers |
 | Recurrent state | fixed ~2 MiB per GDN layer per sequence, independent of depth |
 | Parallel sequences | batched decode and flattened batch prefill at N=1–8 |
-| Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default — a net win at N=1 only, see WHY and WHY NOT |
+| Speculative decode | seven drafters (`ngram`, `ngram-simple`, `ngram-mod`, `ngram-map-k`, `ngram-map-k4v`, `draft-mtp`, `spec-dflash`), each bit-exact against plain decode; off by default. On `qwen35` `draft-mtp` is now a win at N=1 **and** N=3; it stays opt-in because on the shipped `UD-Q8_K_XL` file its extra layer and per-sequence draft cache do not fit beside three 128K-capable caches. See WHY. |
 
 ## Qwen3.8-27B (`qwen35`)
 
@@ -132,14 +132,26 @@ llama.cpp's up to 3% at N=3:
 
 | cell | file | llmxabe agg | per slot | llama.cpp agg | per slot | margin |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| prefill 512, N=1 | UD-Q8_K_XL | 360.4 | 360.4 | 691.7 | 691.7 | −47.9% |
-| prefill 512, N=1 | all-Q8_0 | 660.7 | 660.7 | 789.8 | 789.8 | **−16.3%** |
-| prefill 512, N=3 | UD-Q8_K_XL | 368.8 | 122.9 | 754.2 | 251.4 | −51.1% |
-| prefill 512, N=3 | all-Q8_0 | 700.3 | 233.4 | 854.1 | 284.7 | **−18.0%** |
-| decode, N=1 | UD-Q8_K_XL | 17.84 | 17.84 | 18.06 | 18.06 | −1.2% |
-| decode, N=1 | all-Q8_0 | 19.08 | 19.08 | 19.38 | 19.38 | **−1.5%** |
-| decode, N=3 | UD-Q8_K_XL | 45.37 | 15.12 | 43.75 | 14.58 | **+3.7%** |
-| decode, N=3 | all-Q8_0 | 47.72 | 15.91 | 48.16 | 16.05 | **−0.9%** |
+| prefill 512, N=1 | UD-Q8_K_XL | 361.6 | 361.6 | 681.8 | 681.8 | −47.0% |
+| prefill 512, N=1 | all-Q8_0 | 666.2 | 666.2 | 769.3 | 769.3 | **−13.4%** |
+| prefill 512, N=3 | UD-Q8_K_XL | 370.0 | 123.3 | 756.4 | 252.1 | −51.1% |
+| prefill 512, N=3 | all-Q8_0 | 704.2 | 234.7 | 853.1 | 284.4 | **−17.5%** |
+| decode, N=1 | UD-Q8_K_XL | 18.0 | 18.0 | 18.05 | 18.05 | −0.3% |
+| decode, N=1 | all-Q8_0 | 19.2 | 19.2 | 19.40 | 19.40 | **−1.0%** |
+| decode, N=3 | UD-Q8_K_XL | 46.7 | 15.6 | 43.36 | 14.45 | **+7.7%** |
+| decode, N=3 | all-Q8_0 | 49.1 | 16.4 | 48.15 | 16.05 | **+2.0%** |
+| decode, N=1, `draft-mtp` | all-Q8_0 | 35.1 | 35.1 | 19.40 | 19.40 | **+81%** |
+| decode, N=3, `draft-mtp` | all-Q8_0 | 50.0 | 16.7 | 48.15 | 16.05 | **+3.8%** |
+
+The two `draft-mtp` rows are **not the default** and are not a like-for-like
+kernel comparison: they are this engine running the file's own trained
+next-token-prediction head as a drafter, with a bit-exact verify, against
+llama.cpp running the same file the only way it can. Upstream discards that
+head — `model has unused tensor blk.64.nextn.eh_proj.weight -- ignoring`, on
+every load — so there is no setting that gives it the same option. What the
+rows are for is the size of the gap between a decode step that reads 27 GB
+for one token and one that reads it for 2.86. See the speculative section
+for why it stays opt-in.
 
 `UD-Q8_K_XL` is the shipped Unsloth file: Q8_0 everywhere except
 `output.weight` and every `attn_q`/`attn_k`/`attn_v`, which are bf16.
@@ -158,26 +170,27 @@ serving section below and is not comparable to this table.
 
 What the two rows of each pair say together:
 
-- **Decode is at parity and prefill is not.** Three of the four decode cells
-  are inside this host's own drift; the fourth is ahead. Every prefill cell
-  loses, by 16% on the file both engines read best and by half on the shipped
-  one. Prefill is where this model's remaining gap lives, and it is an
-  arithmetic gap rather than a bandwidth one — see "Where the dense decode
-  step goes" below for why decode has almost nothing left in it.
+- **Decode wins at N=3 and is at parity at N=1; prefill is not.** Both N=3
+  cells are clear of llama.cpp, by 2.0% and 7.7%. Both N=1 cells sit just
+  under it, by 1.0% and 0.3% — the second is inside llama.cpp's own spread
+  across the three reps, the first is not. Every prefill cell loses, by 13%
+  on the file both engines read best and by half on the shipped one. Prefill
+  is where this model's remaining gap lives, and it is an arithmetic gap
+  rather than a bandwidth one — see "Where the dense decode step goes" below
+  for why the N=1 decode cell is not going to be closed by a faster kernel.
 - **The bf16 tensors still cost prefill, and no longer cost decode.** Folding
   them to Q8_0 moves prefill 360 → 661 at N=1; the per-tensor int8 gate
   recovered part of that in the engine, and the rest is `attn_q`/`k`/`v`
   having no integer tensor-core path at bf16 at all. At decode the same
   tensors cost 6.5%, which is the extra bytes and nothing else.
-- **The decode margins moved by 4-6 points and llama.cpp did not move.** The
-  earlier revision of this table read −5.0/−5.2% at N=1 and −5.2% at N=3 on
-  `all-Q8_0`. What changed is on this side: the split int8 layout stopped
-  widening the file's fp16 scales to fp32 (WHY, "Layout"), which is 1.01 GiB
-  of every decoded token and 1.4 GiB of resident VRAM, and the split GEMV's
-  row tile is now chosen per token width. llama.cpp's own numbers in this
-  table are same-hour re-runs and agree with the earlier ones to ~1%, except
-  its `UD-Q8_K_XL` N=3 cell, which drifted 44.09 → 42.4-43.8 across three
-  reps; the +3.7% above is against the best of those three, not the median.
+- **The decode margins have moved several points across two revisions of
+  this table, and llama.cpp has not moved.** Every point of it is on this
+  side: the split int8 layout stopped widening the file's fp16 scales to
+  fp32 (WHY, "Layout"), the GEMV's row tile is chosen per token width, its
+  activations are read as halves, and the block's fp16 narrowing and residual
+  add were folded into launches that were already running. llama.cpp's column
+  is a same-hour alternating re-run in every row, three reps, and its spread
+  is 0.4% at N=1 and under 0.6% at N=3 on both files.
 
 And llama.cpp's outright best on this model is neither file: see "What the
 quantization is worth" below. Do not quote any row here as a claim about the
@@ -214,39 +227,59 @@ of N=3 prefill by splitting 1536 rows into three ubatches. Decode ignores `-ub`
 entirely — it is one token per slot. The `-b 2048 -ub 2048` baseline above is
 therefore llama.cpp's best of these, not its default.
 
-### Speculative decode: the one large N=1 win, and why it inverts at N=3
+### Speculative decode: what the width band was hiding
+
+This section used to end with an experiment it had not run — "instantiating
+`dense_proj_split_t5..t16` would test whether the N=3 result inverts too;
+that is unmeasured and is the obvious next experiment, not a claim." It was
+run, and it inverted.
 
 The MoE model's finding — "verify-step cost sets the sign; a net win at N=1
-only" — transfers in *shape* but not in size, because dense decode is at 80%
-of the memory roofline and a verify step reads the same 30 GB whether it
-checks one token or nine. Measured with `bench_worker_spec` on the `all-Q8_0`
-file, three reps, context 256, 128 tokens per sequence:
+only" — transfers in *shape* but not in size, because dense decode is at the
+memory wall and a verify step reads the same 27 GB whether it checks one
+token or nine. `bench_worker_spec` on the `all-Q8_0` file, GPU 1, context
+256, 512 tokens per sequence:
 
 | drafter | N=1 tok/s | tokens/step | N=3 tok/s | tokens/step |
 | :--- | ---: | ---: | ---: | ---: |
-| none | 18.33 | 1.000 | 46.13 | 3.000 |
-| `ngram` | 18.80 | 1.058 | 20.10 | 4.098 |
-| `draft-mtp` | **27.87** | 2.633 | 42.90 | 9.157 |
-| `ngram-map-k`, `ngram-map-k4v` | OOM | — | OOM | — |
+| none | 19.2 | 1.000 | 49.1 | 3.000 |
+| `ngram` | 20.2 | 1.101 | 23.5 | 4.152 |
+| `draft-mtp` | **35.1** | 2.860 | **50.0** | 9.350 |
 
-**`draft-mtp` is worth +52% at N=1** — far above the +21% the same class of
-change bought on `qwen35moe`, and for the reason the roofline predicts. It
-loses 7% at N=3, and `ngram` loses 56% there.
+**`draft-mtp` is worth +83% at N=1** — far above the +21% the same class of
+change bought on `qwen35moe`, and for the reason the roofline predicts. What
+changed is N=3, which used to lose 7% and now wins. `ngram` still loses
+there, and heavily — it drafts on 1.101 tokens a step at N=1, so at N=3 it
+buys a twelve-row verify pass with almost no acceptance to pay for it.
 
-The sign is set by one constant, and it is not the drafter's: **the dense
-FFN's GEMV/GEMM crossover at `SPLIT_GEMV_MAX_TOKENS = 4`.** A verify step
-presents `N x (1 + drafts)` rows to the feed-forward block. `draft-mtp` at
-N=1 accepts 2.633 tokens per step, which stays under the threshold and keeps
-the split-layout GEMV; at N=3 the same drafter presents ~9 rows and falls onto
-`shared_expert_mma`, the GEMM that discards most of a 64-token tile at those
-widths — the same kernel this file already records as 109.0 ms against a
-GEMV's 63.5. `ngram`'s ~12 rows at N=3 land in the same trap, harder.
+Two constants were holding it down, and neither was the drafter's:
 
-So the honest reading is not "speculation loses at N=3 on this model". It is
-that speculation at N=3 lands in the width band between the GEMV's four tokens
-and the GEMM's sixty-four, which nothing currently serves well. Instantiating
-`dense_proj_split_t5..t16` would test whether the N=3 result inverts too; that
-is unmeasured and is the obvious next experiment, not a claim.
+- **The FFN's GEMV/GEMM crossover.** A verify step presents
+  `N x (1 + drafts)` rows to the feed-forward block — twelve at N=3 — and
+  above four rows that fell onto `shared_expert_mma`, the GEMM that stages a
+  64-token tile and discards most of it. Carrying the GEMV to sixteen tokens
+  is 1.374 -> 0.974 ms a layer at twelve, and took N=3 from 42.2 to 48.2.
+- **The prefill attention kernels' query-axis parallelism.** At twelve query
+  rows the GQA-shared kernel launches `kv_heads` blocks — two, on a 72-SM
+  card — and scans the whole window with them, 433 us a layer. Running those
+  rows through the flash-decode split instead, which carries its parallelism
+  in the key axis, took N=1 from 32.0 to 35.5 and N=3 from 48.2 to 50.5.
+
+So the honest reading was never "speculation loses at N=3 on this model". It
+was that a verify pass is a *shape* — a handful of rows against a deep
+window — that both the decode kernels and the prefill kernels were written
+to exclude, and once something serves that shape the N=3 result follows the
+N=1 one.
+
+**It is still off by default, and the reason is memory, not speed.** The
+head is one more transformer layer of weights and one more draft cache per
+resident sequence. On `all-Q8_0` that fits; on the shipped `UD-Q8_K_XL`,
+which is 2.25 GiB larger, `bench_worker_spec` at N=3 dies in the Gated
+DeltaNet state allocation with 34.99 GiB free after the weights. Turning it
+on by default would trade the 128K-at-N=3 capability for the decode number
+on one file, and it would do it silently, because admission (AGENTS.md
+rule 4) does not yet know a drafter changes the per-sequence reservation.
+That is the work this would need, and it is scheduler work, not kernel work.
 
 ### A whittled MoE is the structural version of requantizing
 
@@ -330,38 +363,51 @@ The dense model's decode step is one streaming problem with a small tail, and
 the only way to read the numbers below is against a measured ceiling rather
 than the pin rate. `bench_dense_ffn`'s calibration kernel — a fully coalesced
 `uint4` read of exactly the resident weight bytes, no arithmetic — streams
-**602.4 GB/s, 89.7% of the 672 GB/s pin rate** (sd 0.30%). That is the number
+**604.5 GB/s, 90.0% of the 672 GB/s pin rate** (sd 0.43%). That is the number
 a kernel on this card is allowed to be compared against.
 
 One `bench_decode` step on `all-Q8_0` at N=1, from an `nsys` capture with
 `--cuda-graph-trace=node` (decode replays a captured graph, and without that
-flag none of it is attributed):
+flag none of it is attributed). Weight bytes are counted from the GGUF tensor
+directory, not inferred from the time:
 
-| stage | launches | ms | weight bytes | GB/s | of 602.4 |
+| stage | launches | ms | weight bytes | GB/s | of 604.5 |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| dense FFN GEMVs | 192 | 31.76 | 18.20 GB | 573 | **95%** |
-| GDN projections | 144 | 10.96 | 5.89 GB | 537 | 89% |
-| attention projections + LM head | 65 | 5.55 | 3.13 GB | 565 | 94% |
-| GDN alpha/beta gates | 48 | 1.00 | 0.03 GB | 25 | 4% |
-| everything else | ~660 | 2.57 | — | — | — |
-| **step** | ~1,110 | **51.84** | 27.24 GB | 525 | **87%** |
+| dense FFN GEMVs | 192 | 31.70 | 18.18 GB | 573 | 95% |
+| GDN projections | 144 | 11.07 | 5.85 GB | 528 | 87% |
+| attention projections | 64 | 3.36 | 1.78 GB | 530 | 88% |
+| LM head | 1 | 2.23 | 1.35 GB | 606 | **100%** |
+| GDN alpha/beta gates | 48 | 1.02 | 0.03 GB | 25 | 4% |
+| everything else | ~596 | 2.60 | — | — | — |
+| **step** | ~1,045 | **51.98** | 27.19 GB | 523 | **87%** |
 
-Two things follow, and they set what is left to win.
+Three things follow, and together they say where a win on this model is and
+is not.
 
-- **The three big GEMV families are at 89–95% of what the card streams**, so
-  the headroom that reads as "13% off peak" is mostly not in them. Both
-  engines are against the same wall: llama.cpp's 19.42 tok/s on this file is
-  536 GB/s over the same 27.6 GB, which is 89% of the same ceiling.
-- **What is left is the tail** — 3.6 ms across 708 launches that move almost
-  no weight, which is 6.9% of the step. The gates are 1.0 ms of it for 25 MB,
-  because one warp per head is 48 warps on a 72-SM card. That is the largest
-  single piece of recoverable time in a dense decode step, and the WHY NOT
-  list records the attempt that collected it and what it cost.
+- **The LM head is at 100% of what this card streams** — 1.35 GB in 2.23 ms
+  is 606 GB/s against a 604.5 GB/s calibration. It is the cleanest available
+  proof that the ceiling is the ceiling. The three GEMV families beside it
+  are at 87–95%. Weighted together the streaming kernels are at 97% of
+  calibration; the "13% off peak" that the step total reads as is almost all
+  the tail, not the GEMVs.
+- **Both engines are against the same wall.** llama.cpp's 19.40 tok/s on this
+  file is 51.55 ms for the same 27.19 GB, 528 GB/s, 87% of the same ceiling.
+  The 1.0% between us is 0.43 ms of launch tail on a 52 ms step. It is not a
+  bandwidth difference and it will not be closed by a faster GEMV.
+- **What is left is the tail** — 2.60 ms across ~596 launches that move almost
+  no weight, 5.0% of the step. The gates are 1.02 ms of it for 30 MB, because
+  one warp per head is 48 warps on a 72-SM card. Every attempt to recover that
+  particular millisecond is now in the WHY NOT list; the ones that worked
+  elsewhere in the tail are single fused launches worth ~0.13 ms each.
 
-The `attention projections + LM head` row is one line because they share an
-entry point: `GatedAttentionBlock` runs its four projections through
-`LmHeadKernels::forward`, so `lm_head_gemv_b1` appears 65 times a step — 16
-layers x 4, plus the head itself.
+The way past the wall is therefore not a kernel. It is reading those 27.19 GB
+for more than one token, which is what the speculative section is about.
+
+An earlier version of this table had one `attention projections + LM head`
+row, because the two share an entry point — `GatedAttentionBlock` runs its
+four projections through `LmHeadKernels::forward`, so `lm_head_gemv_b1`
+appears 65 times a step. Splitting them by duration histogram is what showed
+the head at 606 GB/s; the merged row read as 94% and hid both halves.
 
 ### What the FFN residency is worth
 
@@ -382,7 +428,7 @@ what they are kept for.)
 | :--- | ---: | ---: | :--- |
 | Q8_0, fp32 `moe_shared_ffn` everywhere | 76.2 | 15.74 | 9.1× behind llama.cpp on prefill |
 | split int8, `shared_expert_mma` everywhere | 321.3 | 9.17 | prefill 4.2×; decode −47% |
-| split int8, GEMV at ≤ 4 tokens (**shipped**) | 317.5 | 17.26 | both |
+| split int8, GEMV at ≤ 16 tokens (**shipped**) | 317.5 | 17.26 | both |
 
 The first two rows are single runs on the same card, taken to choose between
 the three; only the shipped row is the three-pair figure from the table above.
@@ -1153,6 +1199,8 @@ proposed twice.
 | Swapping the flash grid's axes for L2 reuse | **−1.7%**. Sibling blocks start together but drift apart faster than 6 MB of L2 spans; only a staging barrier inside one block makes them share. |
 | `ATTN_QT` 16, `GQA_KT` 16, `__maxnreg__(84)` | −10%, −14%, −6%. All three trade the second resident block per SM for something worth less than it. |
 | Copying llama.cpp's 4-query/64-key outer prefill tile | **~8× slower**, `ptxas` clean at 255 registers with zero spill. Four queries launch four times the blocks and a conservative 64-key softmax serialized through four lanes. Copying tile dimensions does not copy the fragment-resident softmax and combine that make them competitive. |
+| Prefetching the GDN alpha/beta gate contraction | 21.2 us a call becomes 28.5 (four blocks staged), 30.8 (two), or 46.3 (one block ahead, the `gdn_proj_split_rows` double-buffer idiom). The kernel is 12 blocks on a 72-SM card and looks latency-bound, so this should have worked; every restructuring made it worse, which says ptxas was already scheduling the tight loop better than the source could. The gates stay as written, and their 1.0 ms stays on the table. |
+| Staging the weights instead of the activations at every GEMV width | 0.549 -> 0.585 ms a layer at three tokens and 0.570 -> 0.695 at four. Hoisting `RT * 8` dequantized weights is what lets `TT` pass four, but at `TT <= 4` the row tile is 8 and sixty-four weights live costs more than the `TT * 8` activations it replaces. Both stagings ship, chosen by `TT`. |
 | Hoisting the GDN Gram kernel out of the chunk loop | Bit-identical, 240 launches → 30, and **0.5% slower**, losing every interleaved pair. In the loop the Gram output hits L2 immediately; hoisted, all eight chunks' squares must coexist in a 6 MiB L2. On this part, launch count is not worth trading locality for. |
 | `shared_expert_mma` on the dense FFN at decode width (Qwen3.8-27B) | 109.0 ms per step against the fp32 path's 63.5, and 9.17 tok/s against 15.74. A GEMM stages a 64-token tile and at one token discards 63/64 of it; the weight bytes are identical either way, so what it loses is the shape it reads them in, not the traffic. Replaced by a copy of `GdnBlock`'s split-layout GEMV — 17.26 tok/s, and *more* accurate than the GEMM besides, since it dequantizes the weights and multiplies in fp32 rather than quantizing activations. |
 | Tiling `gdn_chunk_gram` over target tokens | Nothing. Its keys are 32 KiB per head and sit in L2 — the arithmetic that says a kernel re-reads its input does not say the re-read costs anything. |
@@ -1360,6 +1408,11 @@ CUDA_VISIBLE_DEVICES=1 llama-batched-bench -m "$M" \
 # ~90 s, which is what makes an inner-loop change measurable at all.
 LLMXABE_MODEL="$M" CUDA_VISIBLE_DEVICES=1 ./target/release/bench_dense_ffn
 LLMXABE_DENSE_SPLIT_ROWS=8 ...                  # override the RT table
+LLMXABE_FFN_N=4,6,8,12,16,32 ...                # the GEMV/GEMM width sweep
+
+# The speculative table. `LLMXABE_SPEC` takes any of the seven drafter names.
+LLMXABE_MODEL="$M" LLMXABE_SPEC=draft-mtp CUDA_VISIBLE_DEVICES=1 \
+  ./target/release/bench_worker_spec           # context 256, 512 tok/seq
 
 # Per-kernel attribution of a decode step. `--cuda-graph-trace=node` is not
 # optional: decode replays a captured graph and without it nsys attributes one

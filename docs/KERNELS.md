@@ -277,7 +277,7 @@ Two things had to change around them rather than inside them:
   discards 63/64 of it, and measured 109.0 ms against a GEMV's 63.5 on the
   same weight bytes. `GdnBlock`'s `gdn_proj_split_rows` already reads the
   split int8 layout at these widths, so `dense_ffn.rs` carries a copy of it as
-  `dense_proj_split_rows` and takes it at ≤ 4 tokens. A copy rather than a
+  `dense_proj_split_rows` and takes it at ≤ 16 tokens. A copy rather than a
   shared kernel, deliberately: the GDN path is the measured one on the model
   the benchmark record is about, and moving its codegen to serve a second
   caller buys nothing. See [BENCHMARKS.md](BENCHMARKS.md) for the three-way
