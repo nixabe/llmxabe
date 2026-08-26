@@ -73,7 +73,14 @@ pub const MAX_CONV_KERNEL: usize = 8;
 /// the strided reduction for RMSNorm.
 const MAX_BLOCK: usize = 1024;
 
-const LAYER_OPS_SRC: &str = r#"
+/// The NVRTC translation unit these kernels compile from.
+///
+/// Public so that a caller which keeps its own copy of one of these kernels
+/// can assert, in its own tests, that the copy has not drifted. That is not
+/// a hypothetical: `DenseFfnBlock` carries `rms_norm_rows` with one extra
+/// store, and a drift in the reduction order would put one layer's norm out
+/// of step with every other norm in the model.
+pub const LAYER_OPS_SRC: &str = r#"
 #define MAX_CONV_KERNEL 8
 
 extern "C" {

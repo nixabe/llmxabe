@@ -106,7 +106,7 @@ const SPLIT_WARPS: u32 = 4;
 ///
 /// `LLMXABE_DENSE_SPLIT_ROWS` overrides every entry with one value, so the
 /// table can be re-measured in a single binary rather than argued about.
-const SPLIT_ROWS_FOR: [u32; SPLIT_GEMV_MAX_TOKENS] = [4, 4, 4, 8];
+const SPLIT_ROWS_FOR: [u32; SPLIT_GEMV_MAX_TOKENS] = [4, 4, 8, 8];
 
 /// Row tiles the kernel is compiled for, in the order the entry-point table
 /// below lists them.
@@ -170,9 +170,9 @@ const SPLIT_GEMV_MAX_TOKENS: usize = 4;
 /// same widths — taken at `<= SPLIT_GEMV_MAX_TOKENS`.
 ///
 /// The int8 layout is not an approximation of the Q8_0 one. Q8_0 is an int8
-/// quant and an fp16 scale per 32; the split layout is the same quants with
-/// the scale widened to fp32. Nothing is requantized, and the tensor core
-/// multiplies the quants exactly. What *does* change is that the activations
+/// quant and an fp16 scale per 32; the split layout is the same quants and
+/// the same fp16 scale, moved into two aligned arrays. Nothing is
+/// requantized, and the tensor core multiplies the quants exactly. What *does* change is that the activations
 /// are quantized to int8 — about 1/254 of each 32-element block's largest
 /// magnitude — on the decode path as well as the prefill one. That is
 /// measured against the CPU reference in `tests/dense_ffn_differential.rs`
@@ -215,6 +215,97 @@ __global__ void dense_ffn_add_residual(
     }
 }
 
+// The post-mixer RMSNorm, emitting both widths in one pass.
+//
+// `LayerOpsKernels::rms_norm` produces `normed`, and the split GEMV then
+// needs it narrowed -- two launches over a 20 KiB row, of which the second is
+// almost entirely the card starting it. This is the first with an extra
+// store: the fp32 output survives because `attn_post_norm-N` is a captured
+// waypoint and the golden reads it, and the fp16 output is what the two
+// projections actually consume.
+//
+// **The body is `rms_norm_rows` verbatim**, `block_reduce_sum` included, and
+// it has to stay that way: a different reduction order here would make the
+// dense block's own norm disagree with every other norm in the model.
+// `the_dense_norm_matches_layer_ops` is what keeps the copy honest.
+__device__ __forceinline__ float dense_block_reduce_sum(float v, float* scratch) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+
+    int n_warps = (blockDim.x + 31) >> 5;
+    float total = 0.0f;
+    if (threadIdx.x == 0) {
+        for (int w = 0; w < n_warps; ++w) total += scratch[w];
+        scratch[0] = total;
+    }
+    __syncthreads();
+    return scratch[0];
+}
+
+__global__ void dense_rms_norm_narrow(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    unsigned short* __restrict__ out_h,
+    int width,
+    float eps
+) {
+    extern __shared__ float scratch[];
+    long long base = (long long)blockIdx.x * width;
+
+    float partial = 0.0f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float v = x[base + j];
+        partial += v * v;
+    }
+    float sum_sq = dense_block_reduce_sum(partial, scratch);
+
+    float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);
+
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float v = x[base + j] * inv_rms * weight[j];
+        out[base + j] = v;
+        unsigned short h;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+        out_h[base + j] = h;
+    }
+}
+
+// act_h[i] = (half)(silu(gate[i]) * up[i]).
+//
+// `LayerOpsKernels::swiglu` followed by a separate narrowing pass computes
+// the same thing in two launches and a full-width round trip through memory;
+// the down projection only ever reads the narrowed form, so the fp32
+// intermediate has no other reader and does not need to exist.
+//
+// `expf`, not `__expf`. `layer_ops.rs` has a test asserting its own SwiGLU
+// has not drifted to the fast intrinsic, and this has to agree with it byte
+// for byte or the two residencies stop being comparable.
+//
+// This is *not* folded into the up projection's epilogue, which is where it
+// was tried first: that epilogue runs on `lane == 0`, so 17,408 transcendental
+// calls would land on one lane in thirty-two. It measured 0.585 ms a layer at
+// four tokens against 0.560 here -- the launch it saved cost more than it was
+// worth. See docs/BENCHMARKS.md.
+__global__ void dense_swiglu_narrow(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    unsigned short* __restrict__ act_h,
+    int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float a = (g / (1.0f + expf(-g))) * up[i];
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(a));
+    act_h[i] = h;
+}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -253,14 +344,53 @@ __device__ __forceinline__ float dense_scale(const unsigned short* p, long long 
     return f;
 }
 
-template <int TT, int RT, bool ADD>
+// Two activation halves out of one packed word.
+//
+// One `mov.b32` and two `cvt`s, which is what the hardware does anyway; the
+// alternative of masking and shifting into `h` constraints costs a `PRMT`
+// per half for the same result.
+__device__ __forceinline__ void dense_half2(unsigned int packed, float& a, float& b) {
+    asm("{ .reg .f16 hl, hh;             \n"
+        "  mov.b32 {hl, hh}, %2;         \n"
+        "  cvt.f32.f16 %0, hl;           \n"
+        "  cvt.f32.f16 %1, hh;         }"
+        : "=f"(a), "=f"(b)
+        : "r"(packed));
+}
+
+// `epilogue`, which is uniform across the whole grid and so costs a branch
+// the warp scheduler predicts perfectly:
+//
+//   DENSE_EP_PLAIN   write `out` and nothing else                 (gate, up)
+//   DENSE_EP_ADD     also write `summed = out + residual`, live t only (down)
+//
+// The extra epilogue exists to retire a launch. At one token a 20 KiB
+// elementwise residual add costs about as much as it takes the card to start
+// it, 64 times a step, and the projection that would feed it already has the
+// value in a register: the reduction has happened and `lane == 0` holds the
+// sum, so the only new traffic is the residual row itself.
+//
+// What does *not* belong here is anything transcendental -- see
+// `dense_swiglu_narrow` for the SwiGLU that was tried in this epilogue and
+// measured slower, because `lane == 0` is one lane in thirty-two.
+//
+// `DENSE_EP_ADD` keeps its `valid_tokens` gate. Writing `l_out` on a slot the
+// pass never filled would put a plausible value where the caller left a zero,
+// which `tests/forward_pass.rs` checks for, and AGENTS.md rule 5 says the
+// bound comes from the device scalar rather than the host.
+#define DENSE_EP_PLAIN  0
+#define DENSE_EP_ADD    2
+
+template <int TT, int RT>
 __device__ __forceinline__ void dense_proj_split_rows(
     const signed char* __restrict__ wq,
     const unsigned short* __restrict__ ws,
-    const float* __restrict__ x,
+    const unsigned short* __restrict__ x,
     const float* __restrict__ residual,
     float* __restrict__ out,
     float* __restrict__ summed,
+    const int* __restrict__ valid_tokens,
+    int epilogue,
     int k_dim,
     int n_rows,
     int n_tokens
@@ -307,36 +437,52 @@ __device__ __forceinline__ void dense_proj_split_rows(
                 dnxt[r] = dense_scale(sc[r], (cn + off) >> 5);
             }
         }
+        // Two steps of eight elements rather than four of four: the lane's
+        // sixteen contiguous activations are thirty-two bytes as halves, so
+        // two `uint4` loads cover what four did. **The order of the `+=`
+        // chain is unchanged** — element `off+0` through `off+15` in
+        // sequence, then the next 512-element step — which is what keeps
+        // this a change of activation *precision* and not of summation.
         #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            int e0 = c + off + 4 * u;
-            float4 xv[TT];
+        for (int u = 0; u < 2; ++u) {
+            int e0 = c + off + 8 * u;
+            float xv[TT][8];
             #pragma unroll
             for (int i = 0; i < TT; ++i) {
                 int t = t0 + i;
-                xv[i] = (t < n_tokens)
-                    ? *(const float4*)(x + (long long)t * k_dim + e0)
-                    : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                uint4 h = (t < n_tokens)
+                    ? *(const uint4*)(x + (long long)t * k_dim + e0)
+                    : make_uint4(0u, 0u, 0u, 0u);
+                const unsigned int* hw = (const unsigned int*)&h;
+                #pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    dense_half2(hw[e], xv[i][2 * e], xv[i][2 * e + 1]);
+                }
             }
             #pragma unroll
             for (int r = 0; r < RT; ++r) {
-                unsigned int wrd = ((const unsigned int*)&cur[r])[u];
+                const unsigned int* q = (const unsigned int*)&cur[r];
+                unsigned int lo = q[2 * u];
+                unsigned int hi = q[2 * u + 1];
                 float d = dcur[r];
                 // Low byte first: the split repack keeps quants in element
                 // order, and narrowing through `unsigned char` first makes
                 // the int8 sign-extend rather than taking an
                 // implementation-defined conversion from a value above 127
                 // — the same idiom as `lm_head.rs`.
-                float w0 = (float)(signed char)(unsigned char)(wrd)       * d;
-                float w1 = (float)(signed char)(unsigned char)(wrd >> 8)  * d;
-                float w2 = (float)(signed char)(unsigned char)(wrd >> 16) * d;
-                float w3 = (float)(signed char)(unsigned char)(wrd >> 24) * d;
+                float w[8];
+                w[0] = (float)(signed char)(unsigned char)(lo)       * d;
+                w[1] = (float)(signed char)(unsigned char)(lo >> 8)  * d;
+                w[2] = (float)(signed char)(unsigned char)(lo >> 16) * d;
+                w[3] = (float)(signed char)(unsigned char)(lo >> 24) * d;
+                w[4] = (float)(signed char)(unsigned char)(hi)       * d;
+                w[5] = (float)(signed char)(unsigned char)(hi >> 8)  * d;
+                w[6] = (float)(signed char)(unsigned char)(hi >> 16) * d;
+                w[7] = (float)(signed char)(unsigned char)(hi >> 24) * d;
                 #pragma unroll
                 for (int i = 0; i < TT; ++i) {
-                    acc[r][i] += w0 * xv[i].x;
-                    acc[r][i] += w1 * xv[i].y;
-                    acc[r][i] += w2 * xv[i].z;
-                    acc[r][i] += w3 * xv[i].w;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[r][i] += w[e] * xv[i][e];
                 }
             }
         }
@@ -353,7 +499,9 @@ __device__ __forceinline__ void dense_proj_split_rows(
             if (lane == 0) {
                 long long o = (long long)(t0 + i) * n_rows + (n0 + r);
                 out[o] = sum;
-                if (ADD) summed[o] = sum + residual[o];
+                if (epilogue == DENSE_EP_ADD && (t0 + i) < *valid_tokens) {
+                    summed[o] = sum + residual[o];
+                }
             }
         }
     }
@@ -364,14 +512,19 @@ __device__ __forceinline__ void dense_proj_split_rows(
 extern "C" __global__ void NAME(                                             \
     const signed char* __restrict__ wq,                                      \
     const unsigned short* __restrict__ ws,                                   \
-    const float* __restrict__ x,                                             \
+    const unsigned short* __restrict__ x,                                    \
     float* __restrict__ out,                                                 \
+    const float* __restrict__ residual,                                      \
+    float* __restrict__ summed,                                              \
+    const int* __restrict__ valid_tokens,                                    \
+    int epilogue,                                                            \
     int k_dim,                                                               \
     int n_rows,                                                              \
     int n_tokens                                                             \
 ) {                                                                          \
-    dense_proj_split_rows<TT, RT, false>(                                    \
-        wq, ws, x, nullptr, out, nullptr, k_dim, n_rows, n_tokens);          \
+    dense_proj_split_rows<TT, RT>(                                           \
+        wq, ws, x, residual, out, summed, valid_tokens,                      \
+        epilogue, k_dim, n_rows, n_tokens);                                  \
 }
 
 DENSE_PROJ_SPLIT_ENTRY(dense_proj_split_t1_r4, 1, 4)
@@ -565,9 +718,22 @@ struct SplitGemv {
     /// the same number, so the two cannot drift.
     tile: CudaFunction,
     rows_per_warp: u32,
+    /// `dense_rms_norm_narrow`, which produces `normed` and `normed_h`
+    /// together and so replaces the block's first two launches with one.
+    rms_norm_narrow: CudaFunction,
+    /// `dense_swiglu_narrow`, which produces `activated_h` from the gate and
+    /// up projections in one pass.
+    swiglu_narrow: CudaFunction,
     gate_out: CudaSlice<f32>,
     up_out: CudaSlice<f32>,
-    activated: CudaSlice<f32>,
+    /// The GEMV's activation operands, at half width. See
+    /// [`DENSE_NARROW_ACTIVATIONS`].
+    normed_h: CudaSlice<u16>,
+    activated_h: CudaSlice<u16>,
+    /// One element each, for the epilogue pointers a given launch does not
+    /// read. See [`EpilogueArgs`].
+    pad_f32: CudaSlice<f32>,
+    pad_f32_out: CudaSlice<f32>,
 }
 
 impl DenseFfnBlock {
@@ -628,9 +794,14 @@ impl DenseFfnBlock {
                 tile: module
                     .load_function(&format!("dense_proj_split_t{tokens}_r{rows_per_warp}"))?,
                 rows_per_warp,
+                rms_norm_narrow: module.load_function("dense_rms_norm_narrow")?,
+                swiglu_narrow: module.load_function("dense_swiglu_narrow")?,
                 gate_out: stream.alloc_zeros::<f32>(n)?,
                 up_out: stream.alloc_zeros::<f32>(n)?,
-                activated: stream.alloc_zeros::<f32>(n)?,
+                normed_h: stream.alloc_zeros::<u16>(tokens * geometry.hidden)?,
+                activated_h: stream.alloc_zeros::<u16>(n)?,
+                pad_f32: stream.alloc_zeros::<f32>(1)?,
+                pad_f32_out: stream.alloc_zeros::<f32>(1)?,
             })
         } else {
             None
@@ -656,13 +827,17 @@ impl DenseFfnBlock {
     /// computes every row of the buffer, so `n_tokens` is `max_tokens` and no
     /// row is conditionally skipped. The residual add downstream is what
     /// gates on `valid_tokens`, and it is the only thing that writes `l_out`.
+    #[allow(clippy::too_many_arguments)]
     fn mlp_split_gemv(
         &mut self,
         stream: &Arc<CudaStream>,
         w: &SharedExpertInt8,
-        out: &mut CudaSlice<f32>,
+        residual: &CudaSlice<f32>,
+        ffn_out: &mut CudaSlice<f32>,
+        l_out: &mut CudaSlice<f32>,
     ) -> Result<(), MoeBlockError> {
         let g = self.geometry;
+        let valid = self.buffers.valid_tokens();
         let split = self.split.as_mut().expect("caller checked");
         let f = &split.tile;
         let rt = split.rows_per_warp;
@@ -670,13 +845,20 @@ impl DenseFfnBlock {
         let (gate_q, gate_s) = w.gate();
         let (up_q, up_s) = w.up();
         let (down_q, down_s) = w.down();
+
         project_split(
             stream,
             f,
             gate_q,
             gate_s,
-            &self.normed,
+            &split.normed_h,
             &mut split.gate_out,
+            EpilogueArgs {
+                kind: 0,
+                residual: &split.pad_f32,
+                summed: &mut split.pad_f32_out,
+                valid_tokens: valid,
+            },
             g.hidden,
             g.intermediate,
             g.max_tokens,
@@ -687,18 +869,25 @@ impl DenseFfnBlock {
             f,
             up_q,
             up_s,
-            &self.normed,
+            &split.normed_h,
             &mut split.up_out,
+            EpilogueArgs {
+                kind: 0,
+                residual: &split.pad_f32,
+                summed: &mut split.pad_f32_out,
+                valid_tokens: valid,
+            },
             g.hidden,
             g.intermediate,
             g.max_tokens,
             rt,
         )?;
-        self.layer_ops.swiglu(
+        swiglu_narrow(
             stream,
+            &split.swiglu_narrow,
             &split.gate_out,
             &split.up_out,
-            &mut split.activated,
+            &mut split.activated_h,
             g.max_tokens * g.intermediate,
         )?;
         project_split(
@@ -706,8 +895,14 @@ impl DenseFfnBlock {
             f,
             down_q,
             down_s,
-            &split.activated,
-            out,
+            &split.activated_h,
+            ffn_out,
+            EpilogueArgs {
+                kind: 2,
+                residual,
+                summed: l_out,
+                valid_tokens: valid,
+            },
             g.intermediate,
             g.hidden,
             g.max_tokens,
@@ -790,15 +985,32 @@ impl DenseFfnBlock {
         // 1. post-mixer RMSNorm, over every row of the buffer rather than
         //    just the live ones: a row of zeros normalizes to zeros, since
         //    the epsilon keeps the divisor positive.
-        self.layer_ops.rms_norm(
-            stream,
-            residual,
-            &w.post_norm,
-            &mut self.normed,
-            g.max_tokens,
-            g.hidden,
-            self.eps,
-        )?;
+        //
+        //    The split path runs its own copy of that kernel, which emits the
+        //    fp16 operand the projections read from the same registers rather
+        //    than in a second pass over the row. See `dense_rms_norm_narrow`.
+        match &mut self.split {
+            Some(split) => dense_rms_norm(
+                stream,
+                &split.rms_norm_narrow,
+                residual,
+                &w.post_norm,
+                &mut self.normed,
+                &mut split.normed_h,
+                g.max_tokens,
+                g.hidden,
+                self.eps,
+            )?,
+            None => self.layer_ops.rms_norm(
+                stream,
+                residual,
+                &w.post_norm,
+                &mut self.normed,
+                g.max_tokens,
+                g.hidden,
+                self.eps,
+            )?,
+        }
 
         // 2. the MLP. There is no width gate here, and that is the difference
         //    from `MoeBlock::forward`. There, the weights are resident in
@@ -813,7 +1025,10 @@ impl DenseFfnBlock {
                     return Err(MoeBlockError::Int8WeightsWithoutTensorCores { layer: w.layer });
                 }
                 if self.split.is_some() {
-                    self.mlp_split_gemv(stream, i8w, ffn_out)?;
+                    // The down projection's epilogue writes `l_out`, so this
+                    // path skips the residual-add launch below.
+                    self.mlp_split_gemv(stream, i8w, residual, ffn_out, l_out)?;
+                    return Ok(());
                 } else {
                     self.moe.shared_expert_mma(
                         stream,
@@ -851,9 +1066,11 @@ impl DenseFfnBlock {
             )?,
         }
 
-        // 3. the residual add. Kept out of step 2 rather than folded into the
-        //    down projection so `ffn_out-N` survives as its own waypoint,
-        //    which is what the oracle comparison hangs on.
+        // 3. the residual add, for the tensor-core path only -- the split
+        //    GEMV's down projection does it in its own epilogue and returned
+        //    above. `ffn_out-N` survives as its own waypoint either way,
+        //    which is what the oracle comparison hangs on; what the fused
+        //    form removes is a launch, not a buffer.
         let hidden_i32 = g.hidden as i32;
         let cfg = LaunchConfig {
             grid_dim: (g.max_tokens as u32, (g.hidden as u32).div_ceil(THREADS), 1),
@@ -876,6 +1093,92 @@ impl DenseFfnBlock {
     }
 }
 
+/// The block's own post-mixer RMSNorm: `normed` and `normed_h` in one pass.
+///
+/// Launch shape and shared memory are [`LayerOpsKernels::rms_norm`]'s,
+/// because the kernel body is — one block a row, a block as wide as the row
+/// rounded up to a warp and capped at 1,024, one float of scratch a warp.
+/// `the_dense_norm_matches_layer_ops` is what keeps the two from drifting.
+#[allow(clippy::too_many_arguments)]
+fn dense_rms_norm(
+    stream: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    weight: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    out_h: &mut CudaSlice<u16>,
+    rows: usize,
+    width: usize,
+    eps: f32,
+) -> Result<(), MoeBlockError> {
+    check_len("dense_rms_norm x", rows * width, x.len())?;
+    check_len("dense_rms_norm weight", width, weight.len())?;
+    check_len("dense_rms_norm out", rows * width, out.len())?;
+    check_len("dense_rms_norm out_h", rows * width, out_h.len())?;
+
+    let block = width.next_multiple_of(32).clamp(32, 1024);
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (block as u32, 1, 1),
+        // One float per warp, which is the most `dense_block_reduce_sum`
+        // stores.
+        shared_mem_bytes: (block.div_ceil(32) * size_of::<f32>()) as u32,
+    };
+    let width_i32 = width as i32;
+    let mut builder = stream.launch_builder(f);
+    builder
+        .arg(x)
+        .arg(weight)
+        .arg(&mut *out)
+        .arg(&mut *out_h)
+        .arg(&width_i32)
+        .arg(&eps);
+    // SAFETY: one block per row over buffers of `rows * width`, checked
+    // above, with the in-row loop bounded by `width`, so every thread's
+    // `blockIdx.x * width + j` is in range. `weight` is indexed by `j <
+    // width` and holds that many floats. Shared memory covers one float per
+    // warp, which is all the reduction writes.
+    unsafe { builder.launch(cfg) }?;
+    Ok(())
+}
+
+/// `act_h = (half)(silu(gate) * up)`, one launch for what was three.
+fn swiglu_narrow(
+    stream: &Arc<CudaStream>,
+    f: &CudaFunction,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    act_h: &mut CudaSlice<u16>,
+    elements: usize,
+) -> Result<(), MoeBlockError> {
+    let n = elements as i32;
+    let cfg = LaunchConfig {
+        grid_dim: ((elements as u32).div_ceil(THREADS), 1, 1),
+        block_dim: (THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(f);
+    builder.arg(gate).arg(up).arg(&mut *act_h).arg(&n);
+    // SAFETY: one thread per element over a grid that covers `elements` and
+    // returns above it; all three buffers are that long by the caller's
+    // geometry.
+    unsafe { builder.launch(cfg) }?;
+    Ok(())
+}
+
+/// The five pointers and the selector a projection's epilogue needs.
+///
+/// Every pointer is passed on every launch, because the kernel's selector is
+/// what decides which are read and cudarc has no null device pointer to pass
+/// for the rest. The unused ones are handed the block's one-element pads,
+/// which exist for exactly this and are never dereferenced.
+struct EpilogueArgs<'a> {
+    kind: i32,
+    residual: &'a CudaSlice<f32>,
+    summed: &'a mut CudaSlice<f32>,
+    valid_tokens: &'a CudaSlice<i32>,
+}
+
 /// One split-layout projection: `out[t][n] = sum_k dequant(wq,ws)[n][k] * x[t][k]`.
 ///
 /// Every launch shape comes from the geometry. The token count does not reach
@@ -889,8 +1192,9 @@ fn project_split(
     f: &CudaFunction,
     wq: &CudaSlice<i8>,
     ws: &CudaSlice<u16>,
-    x: &CudaSlice<f32>,
+    x: &CudaSlice<u16>,
     out: &mut CudaSlice<f32>,
+    ep: EpilogueArgs<'_>,
     k_dim: usize,
     n_rows: usize,
     tokens: usize,
@@ -902,12 +1206,23 @@ fn project_split(
         shared_mem_bytes: 0,
     };
     let (k_i32, n_i32, t_i32) = (k_dim as i32, n_rows as i32, tokens as i32);
+    let kind = ep.kind;
+    let EpilogueArgs {
+        residual,
+        summed,
+        valid_tokens,
+        ..
+    } = ep;
     let mut builder = stream.launch_builder(f);
     builder
         .arg(wq)
         .arg(ws)
         .arg(x)
         .arg(&mut *out)
+        .arg(residual)
+        .arg(summed)
+        .arg(valid_tokens)
+        .arg(&kind)
         .arg(&k_i32)
         .arg(&n_i32)
         .arg(&t_i32);
@@ -971,40 +1286,138 @@ mod tests {
         assert!(GLUE_SRC.contains("l_out[base + j] = ffn_out[base + j] + residual[base + j];"));
     }
 
-    /// The two copies of the split-layout projection GEMV must not drift.
+    /// The two copies of the split-layout projection GEMV read the weights
+    /// in the same order, and that part must not drift.
     ///
-    /// `dense_proj_split_rows` is a copy of `GdnBlock`'s
+    /// `dense_proj_split_rows` began as a copy of `GdnBlock`'s
     /// `gdn_proj_split_rows`, and the module comment above says why it is a
-    /// copy rather than a shared translation unit. A copy that is allowed to
-    /// drift is worse than either, and the drift that matters is silent:
-    /// the two bodies would still compile, still run, and quietly disagree on
-    /// a summation order or a scale width. This compares them token for token
-    /// after erasing the two prefixes that are *supposed* to differ.
+    /// copy rather than a shared translation unit. The two are **no longer
+    /// identical**: this one takes its activations as halves and consumes
+    /// them eight at a time, and it selects its epilogue from an argument
+    /// instead of a template parameter. Both differences are on the
+    /// activation side. See `DENSE_NARROW_ACTIVATIONS`.
+    ///
+    /// What is still a copy is the *weight* traversal — the row and scale
+    /// base addresses, the 512-element step, the lane's 16-byte window, and
+    /// the hand-rolled prefetch that Turing needs for want of `cp.async`.
+    /// That is the half whose drift would be silent and expensive: both
+    /// kernels would still compile, still run, and quietly read a different
+    /// scale for a block. So it is compared token for token, and the
+    /// activation half is left to the differential test.
     #[test]
-    fn the_split_gemv_body_matches_the_gdn_blocks() {
-        fn body(src: &str, prefix: &str) -> String {
-            let open = format!(
-                "template <int TT, int RT, bool ADD>\n__device__ __forceinline__ void {prefix}_proj_split_rows("
-            );
+    fn the_split_gemv_weight_traversal_matches_the_gdn_blocks() {
+        /// From the first statement of the body to the end of the prefetch
+        /// block, which is the last thing either kernel does before it
+        /// touches an activation.
+        fn weight_half(src: &str, prefix: &str) -> String {
+            let open = format!("void {prefix}_proj_split_rows(");
             let at = src
                 .find(&open)
                 .unwrap_or_else(|| panic!("{prefix}_proj_split_rows is missing"));
-            let end = src[at..]
-                .find("\n#define ")
-                .unwrap_or_else(|| panic!("{prefix} body has no terminating macro"));
-            src[at..at + end]
+            let from = at
+                + src[at..]
+                    .find("int lane = threadIdx.x;")
+                    .unwrap_or_else(|| panic!("{prefix} body does not open on the lane index"));
+            const END: &str = "(cn + off) >> 5);";
+            let to = from
+                + src[from..]
+                    .find(END)
+                    .unwrap_or_else(|| panic!("{prefix} body has no scale prefetch"))
+                + END.len();
+            src[from..to]
                 .replace(&format!("{prefix}_"), "")
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
         }
-        let dense = body(GLUE_SRC, "dense");
-        let gdn = body(crate::block::gdn::GDN_BLOCK_SRC, "gdn");
+        let dense = weight_half(GLUE_SRC, "dense");
+        let gdn = weight_half(crate::block::gdn::GDN_BLOCK_SRC, "gdn");
         assert_eq!(
             dense, gdn,
-            "the dense FFN's split GEMV has drifted from GdnBlock's; they are \
-             kept identical on purpose -- see the comment above `GLUE_SRC`"
+            "the dense FFN's split GEMV reads weights differently from \
+             GdnBlock's; that half is kept identical on purpose -- see the \
+             comment above `GLUE_SRC`"
         );
+    }
+
+    /// Both kernels narrow a weight byte through `unsigned char` first.
+    ///
+    /// Dropping the intermediate cast makes a quant above 127 take an
+    /// implementation-defined conversion instead of sign-extending, which is
+    /// wrong on half the weights and produces text that still reads fluently.
+    #[test]
+    fn both_split_gemvs_sign_extend_their_quants_the_same_way() {
+        const IDIOM: &str = "(float)(signed char)(unsigned char)";
+        assert!(GLUE_SRC.contains(IDIOM));
+        assert!(crate::block::gdn::GDN_BLOCK_SRC.contains(IDIOM));
+    }
+
+    /// The block's own RMSNorm has not drifted from `LayerOpsKernels`'.
+    ///
+    /// `dense_rms_norm_narrow` exists only to add a second store; everything
+    /// else is `rms_norm_rows` verbatim, `block_reduce_sum` included. A
+    /// different summation order here would put this one layer's norm out of
+    /// step with every other norm in the model, by an amount no benchmark
+    /// would show and the `forward_pass` golden might not either.
+    #[test]
+    fn the_dense_norm_matches_layer_ops() {
+        fn between<'a>(src: &'a str, open: &str, close: &str) -> &'a str {
+            let at = src
+                .find(open)
+                .unwrap_or_else(|| panic!("the kernel source no longer has `{open}`"));
+            let end = at
+                + src[at..]
+                    .find(close)
+                    .unwrap_or_else(|| panic!("`{open}` no longer ends at `{close}`"));
+            &src[at..end]
+        }
+        fn tokens(src: &str) -> String {
+            src.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        // The reduction, token for token. This is the part whose drift
+        // would be silent: a different tree gives a different sum.
+        let dense_reduce = tokens(
+            &between(
+                GLUE_SRC,
+                "__device__ __forceinline__ float dense_block_reduce_sum(",
+                "\n}\n",
+            )
+            .replace("dense_", ""),
+        );
+        let shared_reduce = tokens(between(
+            xabe_cuda::kernels::layer_ops::LAYER_OPS_SRC,
+            "__device__ __forceinline__ float block_reduce_sum(",
+            "\n}\n",
+        ));
+        assert_eq!(
+            dense_reduce, shared_reduce,
+            "the dense block's copy of `block_reduce_sum` has drifted",
+        );
+
+        // And the arithmetic around it. The stores are what the copy exists
+        // to change, so they are the only lines not compared.
+        let dense_body = between(GLUE_SRC, "__global__ void dense_rms_norm_narrow(", "\n}\n");
+        let shared_body = between(
+            xabe_cuda::kernels::layer_ops::LAYER_OPS_SRC,
+            "__global__ void rms_norm_rows(",
+            "\n}\n",
+        );
+        for line in [
+            "long long base = (long long)blockIdx.x * width;",
+            "for (int j = threadIdx.x; j < width; j += blockDim.x) {",
+            "partial += v * v;",
+            "float inv_rms = 1.0f / sqrtf(sum_sq / (float)width + eps);",
+        ] {
+            assert!(dense_body.contains(line), "the dense norm lost `{line}`");
+            assert!(
+                shared_body.contains(line),
+                "`rms_norm_rows` moved on: `{line}`"
+            );
+        }
+        // `layer_ops.rs` has its own test pinning this; the copy needs the
+        // same one or the two diverge the moment that one is relaxed.
+        assert!(!dense_body.contains("rsqrtf"), "the dense norm took rsqrtf");
     }
 
     #[test]
@@ -1033,7 +1446,20 @@ mod tests {
         // The single most plausible way to get this block wrong is to carry
         // the MoE block's sigmoid gate across. `qwen35.cpp:475` asserts
         // `ffn_gate_inp == nullptr`; this asserts the same thing about us.
-        assert!(!GLUE_SRC.contains("expf"));
-        assert!(!GLUE_SRC.contains("gate"));
+        //
+        // Scoped to the projection, not the module: `dense_swiglu_narrow`
+        // legitimately has both an `expf` and a `gate` argument, because
+        // SwiGLU's own gate half is not a router.
+        let at = GLUE_SRC
+            .find("void dense_proj_split_rows(")
+            .expect("the projection is missing");
+        let end = at
+            + GLUE_SRC[at..]
+                .find("\n#define ")
+                .expect("it does not close");
+        let proj = &GLUE_SRC[at..end];
+        assert!(!proj.contains("expf"));
+        assert!(!proj.contains("sigmoid"));
+        assert!(!proj.contains("gate"));
     }
 }
