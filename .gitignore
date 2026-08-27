@@ -12,7 +12,11 @@
 # here. See docs/DOCKER.md.
 /.env
 
-# Model weights and captured goldens are far too large to track.
+# Model weights and captured goldens are far too large to track. The GGUF
+# files now live in-tree under /models; ignore the whole directory rather than
+# leaning on the *.gguf pattern, because the download caches beside them are
+# kept out only by a .gitignore HuggingFace wrote itself.
+/models/
 *.gguf
 *.safetensors
 /goldens/

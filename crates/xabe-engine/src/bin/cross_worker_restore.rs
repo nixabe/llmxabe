@@ -12,7 +12,7 @@ use xabe_sched::SchedulerConfig;
 use xabe_sched::request::{NewRequest, RequestId};
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 const PROMPT: usize = 2048;
 const OUTPUT: u32 = 4;
 

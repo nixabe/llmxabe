@@ -43,9 +43,9 @@ use xabe_sched::config::{
 use xabe_sched::request::{NewRequest, RequestId};
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 const DEFAULT_DFLASH_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/qwen36-35b-a3b-dflash-Q8_0.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/qwen36-35b-a3b-dflash-Q8_0.gguf";
 const DEFAULT_CONTEXT: usize = 256;
 const DEFAULT_TOKENS: u32 = 512;
 const PREFILL_CHUNK: usize = 2_048;

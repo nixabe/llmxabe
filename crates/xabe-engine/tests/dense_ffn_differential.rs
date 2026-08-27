@@ -54,7 +54,7 @@ use xabe_model::config::ModelConfig;
 use xabe_model::weights::{Directory, Role, WeightSchema};
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf";
 
 /// The layer whose FFN is loaded. Block 0 is a Gated DeltaNet layer; the FFN
 /// is identical on both mixer kinds, so the choice is arbitrary and the

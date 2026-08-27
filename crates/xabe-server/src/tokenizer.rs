@@ -98,7 +98,7 @@ mod tests {
     use std::path::PathBuf;
 
     const DEFAULT_MODEL_PATH: &str =
-        "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+        "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
     #[test]
     fn real_qwen_tokenizer_matches_llama_cpp_oracle() {

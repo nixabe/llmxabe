@@ -31,7 +31,7 @@ The compose file bind-mounts one directory, read-only, at `/models`:
 
 ```yaml
 volumes:
-  - ${LLMXABE_MODELS_DIR:-/home/nixabe/llama.cpp/models}:/models:ro
+  - ${LLMXABE_MODELS_DIR:-/home/nixabe/llmxabe/models}:/models:ro
 ```
 
 Read-only is accurate rather than cautious — the engine mmaps the GGUF and
@@ -101,7 +101,7 @@ Set these on the host or in a `.env` file beside `docker-compose.yml`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `LLMXABE_MODELS_DIR` | `/home/nixabe/llama.cpp/models` | Host directory bind-mounted read-only at `/models`. |
+| `LLMXABE_MODELS_DIR` | `/home/nixabe/llmxabe/models` | Host directory bind-mounted read-only at `/models`. |
 | `LLMXABE_MODEL_REL` | `Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` | Model GGUF, relative to the mount. |
 | `LLMXABE_MMPROJ_REL` | `Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf` | Vision projector, relative to the mount. |
 | `LLMXABE_SERVED_MODEL_NAME` | `qwen3.6-35b-a3b` | Id reported by `/v1/models` and echoed in responses. |

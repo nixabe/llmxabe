@@ -31,7 +31,7 @@ use xabe_model::VisionConfig;
 use xabe_model::vision::{VisionRole, VisionWeightSchema};
 
 const DEFAULT_MMPROJ_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf";
 
 fn mmproj_path() -> PathBuf {
     std::env::var_os("LLMXABE_MMPROJ")

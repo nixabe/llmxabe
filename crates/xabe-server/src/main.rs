@@ -40,7 +40,7 @@ const KV_ELEM_BYTES_F16: u64 = 2;
 /// Measured tensor-data size of `Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf`.
 const WEIGHTS_BYTES: u64 = (296 * (1024 * 1024 * 1024)) / 10;
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
 /// Which speculative decoder to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -6,7 +6,7 @@
 #
 # Every value below can be overridden from a `.env` file beside this one, or
 # from the environment. The defaults are this project's own machine: three
-# Quadro RTX 8000 and the GGUF pair under /home/nixabe/llama.cpp/models.
+# Quadro RTX 8000 and the GGUF pair under /home/nixabe/llmxabe/models.
 #
 # Nothing here is a benchmark claim. The measurements behind the `command:`
 # are in docs/BENCHMARKS.md, which is the only place numbers belong.
@@ -103,7 +103,7 @@ services:
     volumes:
       # The models directory, read-only — the engine mmaps the GGUF and never
       # writes here.
-      - ${LLMXABE_MODELS_DIR:-/home/nixabe/llama.cpp/models}:/models:ro
+      - ${LLMXABE_MODELS_DIR:-/home/nixabe/llmxabe/models}:/models:ro
 
     # Bound to loopback by default. A server with no --api-key accepts every
     # caller, and its own preflight says so; set LLMXABE_BIND_ADDR=0.0.0.0

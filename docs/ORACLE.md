@@ -22,7 +22,7 @@ so when the file is absent.
 
 | | |
 | --- | --- |
-| Model | `/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32,611,711,264 B) |
+| Model | `/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32,611,711,264 B) |
 | llama.cpp | commit `fd6863a69542c74a617a1219f1b18ccf773f41ed`, `b10430-26-gfd6863a69` |
 | Built libraries | `/home/nixabe/llama.cpp/build/bin/libllama.so`, `libggml*.so` |
 | GPU | Quadro RTX 8000, sm_75, driver 595.84, `CUDA_VISIBLE_DEVICES=2` |
@@ -133,7 +133,7 @@ FILTERS='model\.input_embed,result_norm,h_nextn,result_output,attn_norm-[0-9]+,a
 
 mkdir -p .golden
 CUDA_VISIBLE_DEVICES=2 tools/oracle/capture \
-  /home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
+  /home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf \
   .golden/qwen36-golden.bin \
   "The capital of France is Paris. The capital of Germany is Berlin. The capital of Japan is" \
   "$FILTERS" | tee .golden/capture.log

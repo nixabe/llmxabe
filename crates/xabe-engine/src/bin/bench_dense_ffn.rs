@@ -54,7 +54,7 @@ use xabe_model::config::ModelConfig;
 use xabe_model::weights::WeightSchema;
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-req-q8_0.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-req-q8_0.gguf";
 
 /// Quadro RTX 8000, sm_75: GDDR6 streaming peak.
 const PEAK_GB_S: f64 = 672.0;

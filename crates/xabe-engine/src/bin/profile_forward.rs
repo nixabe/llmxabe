@@ -59,7 +59,7 @@ use xabe_model::config::{LayerKind, ModelConfig};
 use xabe_model::weights::{Directory, Role, WeightSchema};
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
 /// Quadro RTX 8000, sm_75: HBM-equivalent GDDR6 streaming peak.
 const PEAK_GB_S: f64 = 672.0;

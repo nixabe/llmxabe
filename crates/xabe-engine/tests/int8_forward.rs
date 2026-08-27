@@ -40,7 +40,7 @@ use xabe_model::config::ModelConfig;
 use xabe_model::weights::WeightSchema;
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
 /// Tokens to run. Must be at or above the tensor-core threshold, or this test
 /// compares fp32 against fp32 and passes vacuously — which is asserted below.

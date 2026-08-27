@@ -30,7 +30,7 @@ use xabe_kernels::vision::{PreprocessedImage, preprocess};
 use xabe_model::VisionConfig;
 
 const DEFAULT_MMPROJ_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/mmproj-F16.gguf";
 
 fn setup() -> Option<Arc<CudaContext>> {
     if !xabe_cuda::device::driver_available() {

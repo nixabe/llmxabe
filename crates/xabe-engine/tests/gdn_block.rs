@@ -94,7 +94,7 @@ const LAYERS: [u32; 3] = [0, 4, 20];
 
 /// Where the model lives, matching `golden.rs`'s own default.
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
 // ---------------------------------------------------------------------------
 // Gates

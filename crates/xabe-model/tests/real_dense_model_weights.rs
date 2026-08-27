@@ -20,7 +20,7 @@ use xabe_model::config::ModelConfig;
 use xabe_model::weights::{Role, Section, WeightSchema};
 
 const DEFAULT_MODEL_PATH: &str =
-    "/home/nixabe/llama.cpp/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf";
+    "/home/nixabe/llmxabe/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf";
 
 fn model_path() -> PathBuf {
     std::env::var_os("LLMXABE_DENSE_MODEL")

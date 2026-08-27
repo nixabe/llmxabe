@@ -69,7 +69,7 @@ about whether MTP is supported for this architecture.
 
 | | |
 | --- | --- |
-| Weights | `/home/nixabe/llama.cpp/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32 GB) |
+| Weights | `/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf` (32 GB) |
 | Vision encoder | `mmproj-F16.gguf` (899 MB), same directory |
 
 Tests that read the model honour `$LLMXABE_MODEL` and fall back to the path
