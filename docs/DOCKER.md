@@ -42,6 +42,18 @@ container, and if you point `LLMXABE_MODELS_DIR` at a directory laid out
 differently, override `LLMXABE_MODEL_REL` and `LLMXABE_MMPROJ_REL` with the
 paths relative to it.
 
+The weights reach the container *only* through this mount; they are never
+part of the build. `.dockerignore` excludes `/models/` as a directory, and
+that line is load-bearing in a way the file's older `*.gguf` was not:
+**`.dockerignore` is not `.gitignore`.** Docker's `*` does not cross a `/`,
+so `*.gguf` matched the context root and nothing below it — once the
+checkpoints moved in-tree under `models/`, every build would have uploaded
+94 GB to the daemon. Excluding the directory also catches the HuggingFace
+download caches beside the weights, which are not named `*.gguf` and would
+otherwise ship on their own. Any new pattern meant to match at depth needs a
+`**/` prefix. The context should measure single-digit MB; `docker build`
+prints it as `transferring context`, and that number is the check.
+
 **Images are on by default**, because `LLMXABE_MMPROJ` is set. That loads the
 vision tower on every worker; a server started without it allocates nothing
 for vision and serves the text path unchanged, and image parts get a 400.

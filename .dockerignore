@@ -5,10 +5,21 @@
 /.git
 /.github
 
-# Never in an image, same as .gitignore: weights, goldens, benchmark output,
-# and the local design draft (AGENTS.md).
-*.gguf
-*.safetensors
+# Never in an image: weights, goldens, benchmark output, and the local design
+# draft (AGENTS.md).
+#
+# These are NOT .gitignore semantics, which is the trap. Docker's `*` does not
+# cross a `/`, so a bare `*.gguf` matches only the context root — it let the
+# whole of /models through once the checkpoints moved in-tree. Anything meant
+# to match at depth needs `**/`.
+#
+# /models/ is excluded as a directory for the same reason .gitignore does it:
+# the HuggingFace download caches sitting beside the weights are not named
+# `*.gguf` and would ship on their own. Compose bind-mounts it at /models at
+# run time, so nothing in the build needs it.
+/models/
+**/*.gguf
+**/*.safetensors
 /goldens/
 /.golden/
 /bench-results/
@@ -18,7 +29,7 @@
 /.omc
 /.claude
 **/*.rs.bk
-*.pdb
+**/*.pdb
 
 # Nothing under here affects the binary, and a change to one of them should
 # not invalidate the build cache.
