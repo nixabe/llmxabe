@@ -197,6 +197,23 @@ would put Q6_K-rounded values into Q8_0 containers — it loads and runs, but
 the projections would carry Q6_K precision under a Q8_0 name, which is the
 kind of thing that misleads a later reader.
 
+Its `mmproj` needs converting too, for a different reason. Ornith publishes
+`mmproj-Ornith-1.5-35B-BF16.gguf`; the loader in `xabe-engine`'s `vision`
+module reads F32 and F16 and rejects everything else, so a BF16 mmproj fails
+at load rather than at first image. Rewriting the 110 BF16 tensors as F16 is
+safe by inspection — the largest magnitude anywhere in the tower is 1.45,
+nowhere near F16's 65504, and F16's wider mantissa means every normal-range
+BF16 value survives exactly; only 0.03% of elements move, all of them in the
+subnormal region below 6.1e-5.
+
+The reason to bother is smaller than it looks: **Ornith's vision tower is
+Qwen3.6's, unmodified.** Converted to F16 and stored under the same
+`mmproj-F16.gguf` name, all 334 tensors are bit-identical to the Qwen3.6
+file, and the tower's device-vs-reference differential reports the same
+`max_abs 1.020e-2, cosine 0.999990` for either. The finetune left the encoder
+alone and Unsloth re-exported it into BF16 containers. Keep Ornith's own
+metadata anyway — `general.name` is what the server reports the model as.
+
 
 ### Three findings from the real file
 
