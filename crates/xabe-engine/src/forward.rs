@@ -211,60 +211,130 @@ __global__ void fwd_embed_q8_0(
     }
 }
 
-// The same gather over a Q6_K table.
+// The same gather over any format the shipped files do *not* use.
 //
-// Neither shipped file stores `token_embd.weight` as Q6_K — both are Q8_0 —
-// but a uniform community quant stores every tensor that way, and this is
-// the site whose refusal `docs/MODEL.md` quotes: "`token_embd.weight` is
-// q6_K, this pass unpacks q8_0". The LM head's own Q6_K body does not help
-// here; the head and the embedding are separate tensors in this model (it is
-// untied) and separate kernels.
+// `fwd_embed_q8_0` above stays a separate, specialized kernel because it is
+// the one both shipped models actually take, it is on the hot path, and it is
+// covered by `forward_pass` and `golden`. This is its fallback sibling: one
+// kernel with a runtime format code, covering Q6_K, Q4_0, Q4_K, Q5_K and F16.
 //
-// A row of `hidden` elements is `hidden/256` superblocks of 210 bytes. The
-// index decomposition is `xabe_cuda::kernels::moe`'s `dequant_tile_q6k_impl`
-// read backwards: a flat position `r` inside a superblock is half `r>>7`,
-// interleave group `(r>>5)&3`, and lane `r&31`. Groups 0 and 2 take the low
-// and high nibble of `ql[l]`; groups 1 and 3 the same nibbles of `ql[l+32]`;
-// the two high bits are bit-pair `2*grp` of `qh[l]`; and the int8 sub-scale
-// is `sc[(l>>4) + 2*grp]`.
+// A switch per element rather than a kernel per format, because this is a
+// gather and not a GEMV — it runs once per step over `n_tokens` rows, against
+// a decode step that reads tens of gigabytes — and `format` is uniform across
+// every thread in the grid, so the branch is warp-uniform and predictable.
+// Five near-duplicate kernels would be five places to get an unpacking wrong
+// for a path that cannot show up in a profile.
 //
-// Operand order is `(d * scale) * q`, as in `dequantize_row_q6_K` and every
-// other Q6_K unpack in this project. There is no addition in the
-// reconstruction, so nothing contracts into an FMA and the gathered row is
-// bit-identical to the scalar reference.
-//
-// This is a gather, not a GEMV: it runs once per step over `n_tokens` rows,
-// so it is nowhere near the hot path and is written for legibility.
-__global__ void fwd_embed_q6_k(
+// Every reconstruction below matches its scalar reference operand for
+// operand. The two affine formats use `mul.rn`/`sub.rn` so the subtraction
+// cannot contract into an FMA, which is what keeps them bit-identical rather
+// than merely close; see `k_affine_value` in `xabe_cuda::kernels::lm_head`
+// for the full reasoning.
+#define FWD_EMBED_Q6_K 0
+#define FWD_EMBED_Q4_0 1
+#define FWD_EMBED_Q4_K 2
+#define FWD_EMBED_Q5_K 3
+#define FWD_EMBED_F16  4
+
+__device__ __forceinline__ float fwd_affine(float d1, int code, float m1) {
+    float c = (float)code;
+    float t, r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(t) : "f"(d1), "f"(c));
+    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(t), "f"(m1));
+    return r;
+}
+
+// `get_scale_min_k4` from `ggml-quants.c`; see the copy in `lm_head.rs` for
+// why the `j >= 4` branch is the dangerous one.
+__device__ __forceinline__ void fwd_scale_min_k4(
+    int j, const unsigned char* q, int* sc, int* m
+) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
+    }
+}
+
+__global__ void fwd_embed_quant(
     const unsigned char* __restrict__ table,
     const int* __restrict__ ids,
     float* __restrict__ out,
     int hidden,
-    int n_tokens
+    int n_tokens,
+    int format
 ) {
     int t = blockIdx.x;
     if (t >= n_tokens) return;
 
-    long long superblocks = hidden / 256;
-    const unsigned char* row = table + (long long)ids[t] * superblocks * 210;
+    // Serialized bytes per row, by format.
+    long long row_bytes;
+    switch (format) {
+        case FWD_EMBED_Q6_K: row_bytes = (long long)(hidden / 256) * 210; break;
+        case FWD_EMBED_Q4_0: row_bytes = (long long)(hidden / 32)  * 18;  break;
+        case FWD_EMBED_Q4_K: row_bytes = (long long)(hidden / 256) * 144; break;
+        case FWD_EMBED_Q5_K: row_bytes = (long long)(hidden / 256) * 176; break;
+        default:             row_bytes = (long long)hidden * 2;           break;
+    }
+    const unsigned char* row = table + (long long)ids[t] * row_bytes;
     float* dst = out + (long long)t * hidden;
 
     for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        const unsigned char* sb = row + (long long)(j >> 8) * 210;
-        int r    = j & 255;
-        int half = r >> 7;
-        int grp  = (r >> 5) & 3;
-        int l    = r & 31;
+        float v;
+        if (format == FWD_EMBED_Q6_K) {
+            // Index decomposition is `moe.rs`'s dequant_tile_q6k_impl read
+            // backwards: half r>>7, interleave group (r>>5)&3, lane r&31.
+            const unsigned char* sb = row + (long long)(j >> 8) * 210;
+            int r    = j & 255;
+            int half = r >> 7;
+            int grp  = (r >> 5) & 3;
+            int l    = r & 31;
+            const unsigned char* ql = sb + half * 64 + ((grp & 1) ? l + 32 : l);
+            const unsigned char* qh = sb + 128 + half * 32 + l;
+            const signed char*   sc = (const signed char*)(sb + 192 + half * 8);
+            float d = load_half_le(sb + 208);
+            int lo4 = (grp < 2) ? (*ql & 0xF) : (*ql >> 4);
+            int raw = lo4 | ((((int)*qh >> (2 * grp)) & 3) << 4);
+            v = d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32);
+        } else if (format == FWD_EMBED_Q4_0) {
+            // Byte `k` holds elements `k` and `k + 16` of its block.
+            const unsigned char* blk = row + (long long)(j >> 5) * 18;
+            int r = j & 31;
+            int k = r & 15;
+            float d = load_half_le(blk);
+            unsigned int q = blk[2 + k];
+            int code = (r < 16) ? (int)(q & 0xFu) : (int)(q >> 4);
+            v = (float)(code - 8) * d;
+        } else if (format == FWD_EMBED_F16) {
+            v = load_half_le(row + (long long)j * 2);
+        } else {
+            // Q4_K and Q5_K: four 64-element passes, low nibbles then high.
+            int q5 = (format == FWD_EMBED_Q5_K);
+            int sb_bytes = q5 ? 176 : 144;
+            int qs_off   = q5 ? 48 : 16;
+            const unsigned char* sb = row + (long long)(j >> 8) * sb_bytes;
+            int r   = j & 255;
+            int g   = r >> 6;
+            int sub = (r >> 5) & 1;
+            int l   = r & 31;
+            int js  = 2 * g + sub;
 
-        const unsigned char* ql = sb + half * 64 + ((grp & 1) ? l + 32 : l);
-        const unsigned char* qh = sb + 128 + half * 32 + l;
-        const signed char*   sc = (const signed char*)(sb + 192 + half * 8);
-        float d = load_half_le(sb + 208);
+            float d    = load_half_le(sb);
+            float dmin = load_half_le(sb + 2);
+            int sc, m;
+            fwd_scale_min_k4(js, sb + 4, &sc, &m);
 
-        int lo4 = (grp < 2) ? (*ql & 0xF) : (*ql >> 4);
-        int raw = lo4 | ((((int)*qh >> (2 * grp)) & 3) << 4);
-
-        dst[j] = d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32);
+            unsigned int byte = sb[qs_off + g * 32 + l];
+            int code = (int)(sub ? (byte >> 4) : (byte & 0xFu));
+            if (q5) {
+                // One `qh` plane reused by all four passes; the *bit* moves.
+                code |= (int)((sb[16 + l] >> js) & 1) << 4;
+            }
+            v = fwd_affine(d * (float)sc, code, dmin * (float)m);
+        }
+        dst[j] = v;
     }
 }
 
@@ -738,6 +808,9 @@ pub struct Forward {
     /// `token_embd.weight` in. Chosen once at construction, because the
     /// table's format cannot change under a built `Forward`.
     embed_fn: CudaFunction,
+    /// `fwd_embed_quant`'s format code, or `-1` when [`Self::embed_fn`] is
+    /// the specialized Q8_0 gather, which takes no such argument.
+    embed_code: i32,
     layer_ops: LayerOpsKernels,
     gdn: GdnBlock,
     attention: Vec<GatedAttentionBlock>,
@@ -991,7 +1064,7 @@ impl Forward {
         let ptx = compile(EMBED_SRC, "forward_embed").map_err(ForwardError::Compile)?;
         let module = ctx.load_module(ptx)?;
         let embed_q8_0 = module.load_function("fwd_embed_q8_0")?;
-        let embed_q6_k = module.load_function("fwd_embed_q6_k")?;
+        let embed_quant = module.load_function("fwd_embed_quant")?;
 
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
@@ -1018,21 +1091,30 @@ impl Forward {
             HeadFormat::Q8_0 => q8_0_table_bytes,
             HeadFormat::Bf16 => vocab * hidden * 2,
             HeadFormat::Q6K => vocab * hidden / QK_K * BLOCK_Q6_K_BYTES,
+            HeadFormat::F16 => vocab * hidden * 2,
+            HeadFormat::Q4_0 => vocab * hidden / 32 * 18,
+            HeadFormat::Q4K => vocab * hidden / QK_K * 144,
+            HeadFormat::Q5K => vocab * hidden / QK_K * 176,
         };
         // The gather has a body per format; bf16 has none, because no file
         // seen so far stores the *embedding* that way and an untested third
         // path is worse than a named refusal.
-        let embed_fn = match embd_format {
-            HeadFormat::Q8_0 => embed_q8_0,
-            HeadFormat::Q6K => embed_q6_k,
-            // No file seen so far stores the *embedding* dense, and an
-            // untested path is worse than a refusal that names the format.
+        // `fwd_embed_quant`'s format codes, mirroring the `#define`s in
+        // EMBED_SRC. bf16 is the one format with no gather body: no file seen
+        // so far stores the *embedding* that way, and an untested path is
+        // worse than a refusal that names the format.
+        let (embed_fn, embed_code) = match embd_format {
+            HeadFormat::Q8_0 => (embed_q8_0, -1i32),
+            HeadFormat::Q6K => (embed_quant, 0),
+            HeadFormat::Q4_0 => (embed_quant, 1),
+            HeadFormat::Q4K => (embed_quant, 2),
+            HeadFormat::Q5K => (embed_quant, 3),
+            HeadFormat::F16 => (embed_quant, 4),
             HeadFormat::Bf16 => {
                 return Err(ForwardError::WrongQuant {
                     role: Role::TokenEmbedding,
                     layer: None,
-                    found: placement_type(weights, Role::TokenEmbedding, None)
-                        .unwrap_or(GgmlType::Bf16),
+                    found: GgmlType::Bf16,
                     expected: GgmlType::Q8_0,
                 });
             }
@@ -1232,6 +1314,7 @@ impl Forward {
             vocab,
             rms_eps,
             embed_fn,
+            embed_code,
             layer_ops,
             gdn,
             attention,
@@ -3463,6 +3546,12 @@ impl Forward {
             .arg(&mut self.hidden_state)
             .arg(&hidden_i32)
             .arg(&tokens_i32);
+        // The Q8_0 gather is a distinct entry point with a five-argument
+        // signature; every other format goes through `fwd_embed_quant`, which
+        // takes the format as a sixth.
+        if self.embed_code >= 0 {
+            builder.arg(&self.embed_code);
+        }
         // SAFETY: one block per token slot, returning above `n_tokens`; the
         // output holds `tokens * hidden` floats and the in-row loop is bounded
         // by `hidden`. `embed_fn` is the entry point for the table's own
@@ -3474,11 +3563,6 @@ impl Forward {
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
-}
-
-/// The stored type of one resident tensor, for an error that has to name it.
-fn placement_type(weights: &DeviceWeights, role: Role, layer: Option<u32>) -> Option<GgmlType> {
-    weights.find(role, layer).map(|p| p.ggml_type)
 }
 
 /// Alias one resident Q8_0 tensor, rejecting any other stored format.
@@ -3511,6 +3595,7 @@ fn alias_projection(
         GgmlType::Q8_0 => HeadFormat::Q8_0,
         GgmlType::Bf16 => HeadFormat::Bf16,
         GgmlType::Q6K => HeadFormat::Q6K,
+        GgmlType::F16 => HeadFormat::F16,
         found => {
             return Err(ForwardError::WrongQuant {
                 role,
@@ -3664,24 +3749,31 @@ mod tests {
         ModelConfig::qwen3_6_35b_a3b()
     }
 
-    /// The Q6_K embedding gather against the scalar reference, on a device.
+    /// The fallback embedding gather against the scalar references, on a
+    /// device, for every format it claims to read.
     ///
     /// Exact equality, not a tolerance. A gather does no summation — it
-    /// unpacks a code and multiplies by two scales — so the device result is
-    /// bit-identical to `dequantize_q6_k` or the unpacking is wrong. A
-    /// tolerance here could hide a systematically wrong sub-scale, which is
-    /// the whole failure mode this format has.
+    /// unpacks a code and applies at most a scale and a min — so the device
+    /// result is bit-identical to `dequantize_*` or the unpacking is wrong. A
+    /// tolerance could hide a systematically wrong sub-scale, which is the
+    /// failure mode the k-quants actually have. The affine formats stay exact
+    /// only because `fwd_affine` pins the rounding with `mul.rn`/`sub.rn`;
+    /// without that the subtraction contracts into an FMA and this test is
+    /// what fails.
     ///
-    /// The table is synthetic because no file on this host stores
-    /// `token_embd.weight` as Q6_K — that is precisely why the kernel exists.
-    /// Rows are built from a spread of magnitudes so the quantizer emits a
-    /// range of sub-scales rather than one repeated value.
+    /// The tables are synthetic because no file on this host stores
+    /// `token_embd.weight` in any of these formats — that is precisely why
+    /// the kernel exists. Rows differ in magnitude from one another so a
+    /// kernel that dropped `d`, or fixed a sub-scale, shows up.
     ///
     /// SKIPS — reporting that it skipped — without a driver or a device.
     #[test]
-    fn the_q6_k_embedding_gather_matches_the_scalar_reference() {
+    fn the_fallback_embedding_gather_matches_the_scalar_references() {
         use xabe_cuda::device::driver_available;
-        use xabe_kernels::quant::{dequantize_q6_k, quantize_q6_k};
+        use xabe_kernels::quant::{
+            dequantize_q4_0, dequantize_q4_k, dequantize_q5_k, dequantize_q6_k, dequantize_row_f16,
+            quantize_q4_0, quantize_q4_k, quantize_q5_k, quantize_q6_k,
+        };
 
         if !driver_available() {
             println!("SKIPPED: no CUDA driver present");
@@ -3695,71 +3787,131 @@ mod tests {
         const HIDDEN: usize = 512;
         const VOCAB: usize = 16;
 
-        // A table whose rows differ in scale as well as in shape, so a
-        // kernel that dropped `d` or fixed `sc` would show up.
-        let mut table = Vec::new();
-        let mut reference = Vec::new();
-        for v in 0..VOCAB {
-            let mut row = [0.0f32; HIDDEN];
-            for (i, x) in row.iter_mut().enumerate() {
-                let t = (i as f32) / (HIDDEN as f32) * std::f32::consts::TAU;
-                *x = t.sin() * (1.0 + v as f32) * 0.01;
-            }
-            for sb in row.as_chunks::<256>().0 {
-                let block = quantize_q6_k(sb);
-                table.extend_from_slice(&block.to_bytes());
-                reference.extend_from_slice(&dequantize_q6_k(&block));
-            }
-        }
-        assert_eq!(table.len(), VOCAB * HIDDEN / QK_K * BLOCK_Q6_K_BYTES);
-
-        // Ids deliberately out of order and with a repeat, so a kernel that
-        // ignored `ids` and walked the table sequentially cannot pass.
-        let ids: Vec<i32> = vec![3, 0, 15, 7, 7];
-        let tokens = ids.len();
+        // Rows that differ in scale as well as in shape.
+        let rows: Vec<[f32; HIDDEN]> = (0..VOCAB)
+            .map(|v| {
+                let mut row = [0.0f32; HIDDEN];
+                for (i, x) in row.iter_mut().enumerate() {
+                    let t = (i as f32) / (HIDDEN as f32) * std::f32::consts::TAU;
+                    *x = t.sin() * (1.0 + v as f32) * 0.01;
+                }
+                row
+            })
+            .collect();
 
         let ptx = compile(EMBED_SRC, "forward_embed").expect("NVRTC");
         let module = ctx.load_module(ptx).expect("load module");
         let f = module
-            .load_function("fwd_embed_q6_k")
-            .expect("the Q6_K gather entry point");
-
+            .load_function("fwd_embed_quant")
+            .expect("the fallback gather entry point");
         let stream = ctx.default_stream();
-        let d_table = stream.clone_htod(table.as_slice()).expect("upload table");
+
+        // Ids out of order and with a repeat, so a kernel that ignored `ids`
+        // and walked the table sequentially cannot pass.
+        let ids: Vec<i32> = vec![3, 0, 15, 7, 7];
+        let tokens = ids.len();
         let d_ids = stream.clone_htod(ids.as_slice()).expect("upload ids");
-        let mut d_out = stream
-            .alloc_zeros::<f32>(tokens * HIDDEN)
-            .expect("allocate output");
 
-        let (hidden_i32, tokens_i32) = (HIDDEN as i32, tokens as i32);
-        let cfg = LaunchConfig {
-            grid_dim: (tokens as u32, 1, 1),
-            block_dim: (EMBED_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = stream.launch_builder(&f);
-        builder
-            .arg(&d_table)
-            .arg(&d_ids)
-            .arg(&mut d_out)
-            .arg(&hidden_i32)
-            .arg(&tokens_i32);
-        // SAFETY: one block per token, the in-row loop is bounded by
-        // `hidden`, every id is below `VOCAB`, and the table holds
-        // `VOCAB * HIDDEN` elements as asserted above.
-        unsafe { builder.launch(cfg) }.expect("launch the Q6_K gather");
-        let got = stream.clone_dtoh(&d_out).expect("copy back");
+        // (name, format code, packer) for every format the gather claims.
+        type Packer = fn(&[[f32; HIDDEN]]) -> (Vec<u8>, Vec<f32>);
+        let cases: [(&str, i32, Packer); 5] = [
+            ("q6_K", 0, |rows| {
+                let (mut b, mut r) = (Vec::new(), Vec::new());
+                for row in rows {
+                    for sb in row.as_chunks::<256>().0 {
+                        let q = quantize_q6_k(sb);
+                        b.extend_from_slice(&q.to_bytes());
+                        r.extend_from_slice(&dequantize_q6_k(&q));
+                    }
+                }
+                (b, r)
+            }),
+            ("q4_0", 1, |rows| {
+                let (mut b, mut r) = (Vec::new(), Vec::new());
+                for row in rows {
+                    for blk in row.as_chunks::<32>().0 {
+                        let q = quantize_q4_0(blk);
+                        b.extend_from_slice(&q.to_bytes());
+                        r.extend_from_slice(&dequantize_q4_0(&q));
+                    }
+                }
+                (b, r)
+            }),
+            ("q4_K", 2, |rows| {
+                let (mut b, mut r) = (Vec::new(), Vec::new());
+                for row in rows {
+                    for sb in row.as_chunks::<256>().0 {
+                        let q = quantize_q4_k(sb);
+                        b.extend_from_slice(&q.to_bytes());
+                        r.extend_from_slice(&dequantize_q4_k(&q));
+                    }
+                }
+                (b, r)
+            }),
+            ("q5_K", 3, |rows| {
+                let (mut b, mut r) = (Vec::new(), Vec::new());
+                for row in rows {
+                    for sb in row.as_chunks::<256>().0 {
+                        let q = quantize_q5_k(sb);
+                        b.extend_from_slice(&q.to_bytes());
+                        r.extend_from_slice(&dequantize_q5_k(&q));
+                    }
+                }
+                (b, r)
+            }),
+            ("f16", 4, |rows| {
+                let mut b = Vec::new();
+                for row in rows {
+                    for &v in row.iter() {
+                        b.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+                    }
+                }
+                let r = dequantize_row_f16(&b);
+                (b, r)
+            }),
+        ];
 
-        for (t, &id) in ids.iter().enumerate() {
-            let want = &reference[id as usize * HIDDEN..(id as usize + 1) * HIDDEN];
-            let have = &got[t * HIDDEN..(t + 1) * HIDDEN];
-            assert_eq!(
-                have, want,
-                "token {t} (id {id}): the Q6_K gather is not bit-identical to \
-                 dequantize_q6_k",
-            );
+        for (name, code, pack) in cases {
+            let (table, reference) = pack(&rows);
+            assert_eq!(reference.len(), VOCAB * HIDDEN, "{name}: reference length");
+
+            let d_table = stream.clone_htod(table.as_slice()).expect("upload table");
+            let mut d_out = stream
+                .alloc_zeros::<f32>(tokens * HIDDEN)
+                .expect("allocate output");
+
+            let (hidden_i32, tokens_i32) = (HIDDEN as i32, tokens as i32);
+            let cfg = LaunchConfig {
+                grid_dim: (tokens as u32, 1, 1),
+                block_dim: (EMBED_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&f);
+            builder
+                .arg(&d_table)
+                .arg(&d_ids)
+                .arg(&mut d_out)
+                .arg(&hidden_i32)
+                .arg(&tokens_i32)
+                .arg(&code);
+            // SAFETY: one block per token, the in-row loop is bounded by
+            // `hidden`, every id is below `VOCAB`, and the table holds
+            // `VOCAB * HIDDEN` elements in the format `code` names, as the
+            // length assertion above checks.
+            unsafe { builder.launch(cfg) }.expect("launch the fallback gather");
+            let got = stream.clone_dtoh(&d_out).expect("copy back");
+
+            for (t, &id) in ids.iter().enumerate() {
+                let want = &reference[id as usize * HIDDEN..(id as usize + 1) * HIDDEN];
+                let have = &got[t * HIDDEN..(t + 1) * HIDDEN];
+                assert_eq!(
+                    have, want,
+                    "{name}, token {t} (id {id}): the gather is not \
+                     bit-identical to the scalar reference",
+                );
+            }
+            println!("{name} gather: {tokens} rows x {HIDDEN}, bit-identical");
         }
-        println!("Q6_K gather: {tokens} rows x {HIDDEN}, bit-identical to the reference");
     }
 
     #[test]
@@ -3785,17 +3937,26 @@ mod tests {
             EMBED_SRC
                 .contains("const unsigned char* row = table + (long long)ids[t] * blocks * 34;")
         );
-        // The Q6_K gather strides by 210-byte superblocks, and reconstructs
-        // in the reference's operand order. Both are spelled as literals in
-        // the kernel for the same reason 32 and 34 are.
-        assert!(
-            EMBED_SRC.contains(
-                "const unsigned char* row = table + (long long)ids[t] * superblocks * 210;"
-            )
-        );
+        // The fallback gather's block strides, spelled as literals in the
+        // kernel for the same reason 32 and 34 are.
+        for stride in [
+            "(long long)(hidden / 256) * 210",
+            "(long long)(hidden / 32)  * 18",
+            "(long long)(hidden / 256) * 144",
+            "(long long)(hidden / 256) * 176",
+        ] {
+            assert!(EMBED_SRC.contains(stride), "missing row stride: {stride}");
+        }
+        // Q6_K reconstructs as (d * scale) * q, with no addition to contract.
         assert!(
             EMBED_SRC.contains("d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32)"),
             "the Q6_K gather reassociated away from (d * scale) * q",
+        );
+        // The affine formats pin their rounding, or nvcc contracts the
+        // subtraction into an FMA and the weight stops being bit-identical.
+        assert!(
+            EMBED_SRC.contains("mul.rn.f32") && EMBED_SRC.contains("sub.rn.f32"),
+            "the affine gather lost its rounding pins and may contract to an FMA",
         );
     }
 

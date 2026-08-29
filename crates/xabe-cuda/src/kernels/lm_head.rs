@@ -88,6 +88,13 @@ const BLOCK_Q8_0_BYTES: usize = 34;
 const QK_K: usize = 256;
 const BLOCK_Q6_K_BYTES: usize = 210;
 
+/// The remaining block geometries, same provenance: `ggml-common.h`'s
+/// `block_q4_0`, `block_q4_K` and `block_q5_K` static asserts.
+const QK4_0: usize = 32;
+const BLOCK_Q4_0_BYTES: usize = 18;
+const BLOCK_Q4_K_BYTES: usize = 144;
+const BLOCK_Q5_K_BYTES: usize = 176;
+
 /// Warps per block. One warp owns one output row, so this is also rows per
 /// block.
 ///
@@ -572,6 +579,361 @@ LM_HEAD_BF16_ENTRY(lm_head_bf16_b3r2, 3, 2)
 LM_HEAD_BF16_ENTRY(lm_head_bf16_b3r4, 3, 4)
 
 // ---------------------------------------------------------------------------
+// The same GEMV over an F16 weight tensor.
+// ---------------------------------------------------------------------------
+//
+// Structurally the bf16 body with one line changed: an IEEE half needs a real
+// conversion where bf16 needs only a shift. Everything else — 8 elements per
+// lane in one `uint4`, 256 per warp per step, no staging and no alignment
+// prologue — holds for exactly the same reason, because an f16 row is dense
+// and `hidden` is a multiple of 512.
+//
+// It is a separate body rather than a template parameter over the bf16 one on
+// purpose. The bf16 GEMV serves `qwen35`'s head and its attn_q/k/v — 2.54 GiB
+// of the shipped dense model — and it has **no differential test of its own**
+// in `crates/xabe-engine/tests`. Refactoring a live, unguarded path to save
+// forty lines trades a real risk for a cosmetic gain. If a bf16 differential
+// lands later, folding the two together is a safe follow-up.
+//
+// `cvt.f32.f16` rather than a hand-rolled widening: NVRTC has no include path
+// so `__half2float` is unreachable, and the hardware instruction gets
+// subnormal halves right, which a shift-and-mask version has to be told about.
+// The quantizer emits subnormals for near-zero values, so that path is live.
+__device__ __forceinline__ float widen_f16(unsigned int bits) {
+    unsigned short h = (unsigned short)(bits & 0xFFFFu);
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+    return f;
+}
+
+template <int BT>
+__device__ __forceinline__ void lm_head_rows_f16(
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ hidden_states,
+    int hidden_dim,
+    int vocab,
+    int token_base,
+    float* __restrict__ logits
+) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    if (row >= vocab) return;
+
+    const uint4* g4 = (const uint4*)(weight + (long long)row * hidden_dim * 2);
+    const float* x = hidden_states + (long long)token_base * hidden_dim;
+
+    float acc[BT];
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) acc[t] = 0.0f;
+
+    for (int base = 0; base < hidden_dim; base += 32 * 8) {
+        int j = base + lane * 8;
+        uint4 p = g4[(base >> 3) + lane];
+        float w0 = widen_f16(p.x);
+        float w1 = widen_f16(p.x >> 16);
+        float w2 = widen_f16(p.y);
+        float w3 = widen_f16(p.y >> 16);
+        float w4 = widen_f16(p.z);
+        float w5 = widen_f16(p.z >> 16);
+        float w6 = widen_f16(p.w);
+        float w7 = widen_f16(p.w >> 16);
+
+        #pragma unroll
+        for (int t = 0; t < BT; ++t) {
+            const float* xt = x + (long long)t * hidden_dim + j;
+            float4 xa = *(const float4*)xt;
+            float4 xb = *(const float4*)(xt + 4);
+            acc[t] += w0 * xa.x + w1 * xa.y + w2 * xa.z + w3 * xa.w
+                    + w4 * xb.x + w5 * xb.y + w6 * xb.z + w7 * xb.w;
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) {
+        float v = acc[t];
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) {
+            logits[(long long)(token_base + t) * vocab + row] = v;
+        }
+    }
+}
+
+#define LM_HEAD_F16_ENTRY(NAME, BT)                                         \
+extern "C" __global__ void NAME(                                            \
+    const unsigned char* __restrict__ weight,                               \
+    const float* __restrict__ hidden_states,                                \
+    int hidden_dim,                                                         \
+    int vocab,                                                              \
+    int token_base,                                                         \
+    float* __restrict__ logits                                              \
+) {                                                                         \
+    lm_head_rows_f16<BT>(weight, hidden_states, hidden_dim, vocab,          \
+                         token_base, logits);                               \
+}
+
+LM_HEAD_F16_ENTRY(lm_head_f16_b1, 1)
+LM_HEAD_F16_ENTRY(lm_head_f16_b2, 2)
+LM_HEAD_F16_ENTRY(lm_head_f16_b3, 3)
+LM_HEAD_F16_ENTRY(lm_head_f16_b4, 4)
+LM_HEAD_F16_ENTRY(lm_head_f16_b5, 5)
+LM_HEAD_F16_ENTRY(lm_head_f16_b6, 6)
+LM_HEAD_F16_ENTRY(lm_head_f16_b7, 7)
+LM_HEAD_F16_ENTRY(lm_head_f16_b8, 8)
+
+// ---------------------------------------------------------------------------
+// The same GEMV over Q4_0, Q4_K and Q5_K weight tensors.
+// ---------------------------------------------------------------------------
+//
+// These three are what an ordinary community quant is built from. `Q4_K_M` in
+// particular is a *mixture* — Q4_K for most projections, Q5_K and Q6_K for the
+// ones llama.cpp's heuristics protect — so a file of that name needs all of
+// these bodies plus the Q6_K one above, not any single reader.
+//
+// All three are fallbacks, written the same way as the Q6_K body and for the
+// same reason: their block strides (18, 144 and 176 bytes) do not put a warp's
+// weight read on a sector boundary the way Q8_0's staging pass arranges, so
+// they take the format's own indexing instead and accept the coalescing that
+// gives.
+//
+// # The affine formats need their rounding pinned
+//
+// Q6_K and Q8_0 reconstruct with multiplications only, so the compiler has no
+// addition to contract and the device value is bit-identical to the scalar
+// reference for free. Q4_K and Q5_K are *affine* — `d*sc*q - dmin*m` — and
+// `nvcc` will happily contract that subtraction into an `fma(d1, q, -m1)`,
+// which rounds once where the reference rounds twice. That is a real
+// divergence in the weight itself, not in the sum, and it would turn an exact
+// agreement into a fuzzy one for no gain.
+//
+// `k_affine_value` pins it with `mul.rn` and `sub.rn` in inline PTX. Inline
+// PTX rather than `__fmul_rn`/`__fsub_rn` because NVRTC compiles from a string
+// with no include path — the same constraint that makes `load_half_le` use
+// `cvt.f32.f16` — and the two instructions were going to be issued anyway, so
+// this costs nothing but the compiler's freedom to be wrong.
+__device__ __forceinline__ float k_affine_value(float d1, int code, float m1) {
+    float c = (float)code;
+    float t, r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(t) : "f"(d1), "f"(c));
+    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(t), "f"(m1));
+    return r;
+}
+
+// The packed 6-bit sub-scale/sub-min reader shared by Q4_K and Q5_K.
+//
+// A transcription of `get_scale_min_k4` in `ggml-quants.c`. Eight pairs in
+// twelve bytes, and the packing is not uniform: pairs 0-3 are the low 6 bits
+// of `q[j]` and `q[j+4]`, pairs 4-7 take a low nibble from `q[j+4]` and borrow
+// a high bit-pair from `q[j-4]` (scale) or `q[j]` (min). Reading the second
+// branch as if it were the first yields scales up to 4x too small — finite,
+// plausible, and invisible except as a quietly worse model.
+__device__ __forceinline__ void get_scale_min_k4(
+    int j, const unsigned char* __restrict__ q, int* sc, int* m
+) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
+    }
+}
+
+// Q4_0: 32 elements per 18-byte block, one fp16 delta, codes centred by -8.
+//
+// A warp covers two blocks (64 elements) per step: lane L takes block `L>>4`
+// of the pair and byte `L&15` of it. The two nibbles of that byte are elements
+// `j` and `j + 16` of the block — **not** adjacent outputs, which is the one
+// way this format is easy to get wrong. `hidden_dim` must be a multiple of 64;
+// the geometry check already requires a multiple of 512.
+template <int BT>
+__device__ __forceinline__ void lm_head_rows_q4_0(
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ hidden_states,
+    int hidden_dim,
+    int vocab,
+    int token_base,
+    float* __restrict__ logits
+) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    if (row >= vocab) return;
+
+    int nblocks = hidden_dim >> 5;
+    const unsigned char* w = weight + (long long)row * nblocks * 18;
+    const float* x = hidden_states + (long long)token_base * hidden_dim;
+
+    float acc[BT];
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) acc[t] = 0.0f;
+
+    int sub = lane >> 4;        // which block of the pair
+    int j   = lane & 15;        // which byte within it
+
+    for (int b = 0; b < nblocks; b += 2) {
+        const unsigned char* blk = w + (long long)(b + sub) * 18;
+        float d = load_half_le(blk);
+        unsigned int q = blk[2 + j];
+
+        // Operand order `q * d`, as in `dequantize_row_q4_0` and every other
+        // Q8_0-family unpack here; `d * q` rounds differently.
+        float w0 = (float)((int)(q & 0xFu) - 8) * d;
+        float w1 = (float)((int)(q >> 4) - 8) * d;
+
+        int i = ((b + sub) << 5) + j;
+        #pragma unroll
+        for (int t = 0; t < BT; ++t) {
+            const float* xt = x + (long long)t * hidden_dim + i;
+            acc[t] += w0 * xt[0] + w1 * xt[16];
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) {
+        float v = acc[t];
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) {
+            logits[(long long)(token_base + t) * vocab + row] = v;
+        }
+    }
+}
+
+// Q4_K (144 B) and Q5_K (176 B): 256 elements as four 64-element passes, each
+// pass split into a low-nibble half under sub-scale `2g` and a high-nibble
+// half under `2g+1`.
+//
+// One lane per `l`, so a lane owns eight elements per superblock at flat
+// positions `64g + 32*sub + l`. Byte `qs[32g + l]` carries the two of them
+// that share `g`.
+//
+// `HIGH` selects Q5_K, whose fifth bit lives in a separate 32-byte plane that
+// is **not advanced between passes**: all four index `qh[l]` and it is the bit
+// position `2g + sub` that moves. The reference spells this as two masks
+// shifted left by two each pass, which is the same statement made less
+// directly.
+template <bool HIGH, int BT>
+__device__ __forceinline__ void lm_head_rows_k_affine(
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ hidden_states,
+    int hidden_dim,
+    int vocab,
+    int token_base,
+    float* __restrict__ logits
+) {
+    const int SB = HIGH ? 176 : 144;
+    const int QS = HIGH ? 48 : 16;   // byte offset of `qs` within a superblock
+
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    if (row >= vocab) return;
+
+    int nsb = hidden_dim >> 8;
+    const unsigned char* w = weight + (long long)row * nsb * SB;
+    const float* x = hidden_states + (long long)token_base * hidden_dim;
+
+    float acc[BT];
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) acc[t] = 0.0f;
+
+    for (int sb = 0; sb < nsb; ++sb) {
+        const unsigned char* base = w + (long long)sb * SB;
+        float d    = load_half_le(base);
+        float dmin = load_half_le(base + 2);
+        const unsigned char* scales = base + 4;
+        const unsigned char* qh     = base + 16;   // Q5_K only
+        const unsigned char* qs     = base + QS;
+
+        unsigned int hbits = HIGH ? qh[lane] : 0u;
+
+        #pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            unsigned int byte = qs[g * 32 + lane];
+            #pragma unroll
+            for (int sub = 0; sub < 2; ++sub) {
+                int js = 2 * g + sub;
+                int sc, m;
+                get_scale_min_k4(js, scales, &sc, &m);
+                float d1 = d * (float)sc;
+                float m1 = dmin * (float)m;
+
+                int code = (int)(sub ? (byte >> 4) : (byte & 0xFu));
+                if (HIGH) code |= (int)((hbits >> js) & 1u) << 4;
+
+                float wv = k_affine_value(d1, code, m1);
+                int i = (sb << 8) + g * 64 + sub * 32 + lane;
+                #pragma unroll
+                for (int t = 0; t < BT; ++t) {
+                    acc[t] += wv * x[(long long)t * hidden_dim + i];
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) {
+        float v = acc[t];
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) {
+            logits[(long long)(token_base + t) * vocab + row] = v;
+        }
+    }
+}
+
+#define LM_HEAD_Q4_0_ENTRY(NAME, BT)                                        \
+extern "C" __global__ void NAME(                                            \
+    const unsigned char* __restrict__ weight,                               \
+    const float* __restrict__ hidden_states,                                \
+    int hidden_dim, int vocab, int token_base,                              \
+    float* __restrict__ logits                                              \
+) {                                                                         \
+    lm_head_rows_q4_0<BT>(weight, hidden_states, hidden_dim, vocab,         \
+                          token_base, logits);                              \
+}
+
+#define LM_HEAD_KAFF_ENTRY(NAME, HIGH, BT)                                  \
+extern "C" __global__ void NAME(                                            \
+    const unsigned char* __restrict__ weight,                               \
+    const float* __restrict__ hidden_states,                                \
+    int hidden_dim, int vocab, int token_base,                              \
+    float* __restrict__ logits                                              \
+) {                                                                         \
+    lm_head_rows_k_affine<HIGH, BT>(weight, hidden_states, hidden_dim,      \
+                                    vocab, token_base, logits);             \
+}
+
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b1, 1)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b2, 2)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b3, 3)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b4, 4)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b5, 5)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b6, 6)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b7, 7)
+LM_HEAD_Q4_0_ENTRY(lm_head_q4_0_b8, 8)
+
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b1, false, 1)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b2, false, 2)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b3, false, 3)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b4, false, 4)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b5, false, 5)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b6, false, 6)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b7, false, 7)
+LM_HEAD_KAFF_ENTRY(lm_head_q4_k_b8, false, 8)
+
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b1, true, 1)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b2, true, 2)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b3, true, 3)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b4, true, 4)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b5, true, 5)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b6, true, 6)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b7, true, 7)
+LM_HEAD_KAFF_ENTRY(lm_head_q5_k_b8, true, 8)
+
+// ---------------------------------------------------------------------------
 // The same GEMV over a Q6_K weight tensor.
 // ---------------------------------------------------------------------------
 //
@@ -849,6 +1211,17 @@ pub enum HeadFormat {
     /// "K-quant" 6-bit: 256 quants, 16 int8 group scales and one fp16
     /// super-scale per 210-byte superblock.
     Q6K,
+    /// A dense IEEE half. Unlike bf16 the widening is a real conversion, so
+    /// it needs `cvt.f32.f16` rather than a shift.
+    F16,
+    /// Legacy 4-bit: 32 codes and one fp16 delta per 18-byte block, centred
+    /// by -8. The two nibbles of a byte are elements `j` and `j + 16`.
+    Q4_0,
+    /// "K-quant" 4-bit, **affine**: 256 codes over eight 32-element groups,
+    /// each with a packed 6-bit scale *and min*, over two fp16 super-scales.
+    Q4K,
+    /// "K-quant" 5-bit: as [`Self::Q4K`] plus a separate high-bit plane.
+    Q5K,
 }
 
 impl HeadFormat {
@@ -858,6 +1231,10 @@ impl HeadFormat {
             Self::Q8_0 => BLOCK_Q8_0_BYTES as f64 / QK8_0 as f64,
             Self::Bf16 => 2.0,
             Self::Q6K => BLOCK_Q6_K_BYTES as f64 / QK_K as f64,
+            Self::F16 => 2.0,
+            Self::Q4_0 => BLOCK_Q4_0_BYTES as f64 / QK4_0 as f64,
+            Self::Q4K => BLOCK_Q4_K_BYTES as f64 / QK_K as f64,
+            Self::Q5K => BLOCK_Q5_K_BYTES as f64 / QK_K as f64,
         }
     }
 
@@ -870,6 +1247,10 @@ impl HeadFormat {
             b"q8_0" => Some(Self::Q8_0),
             b"bf16" => Some(Self::Bf16),
             b"q6_K" => Some(Self::Q6K),
+            b"f16" => Some(Self::F16),
+            b"q4_0" => Some(Self::Q4_0),
+            b"q4_K" => Some(Self::Q4K),
+            b"q5_K" => Some(Self::Q5K),
             _ => None,
         }
     }
@@ -906,6 +1287,14 @@ impl<'a> HeadTensor<'a> {
         Self {
             bytes,
             format: HeadFormat::Q6K,
+        }
+    }
+
+    /// An f16 tensor.
+    pub fn f16(bytes: &'a CudaSlice<u8>) -> Self {
+        Self {
+            bytes,
+            format: HeadFormat::F16,
         }
     }
 }
@@ -951,6 +1340,10 @@ impl LmHeadGeometry {
             HeadFormat::Q8_0 => self.row_bytes(),
             HeadFormat::Bf16 => self.hidden * 2,
             HeadFormat::Q6K => self.hidden / QK_K * BLOCK_Q6_K_BYTES,
+            HeadFormat::F16 => self.hidden * 2,
+            HeadFormat::Q4_0 => self.hidden / QK4_0 * BLOCK_Q4_0_BYTES,
+            HeadFormat::Q4K => self.hidden / QK_K * BLOCK_Q4_K_BYTES,
+            HeadFormat::Q5K => self.hidden / QK_K * BLOCK_Q5_K_BYTES,
         }
     }
 
@@ -1105,6 +1498,12 @@ pub struct LmHeadKernels {
     /// The same, over a Q6_K weight tensor. No row tile: the fallback body
     /// has none.
     q6_k_tiles: [CudaFunction; MAX_BATCH_TILE],
+    /// The same, over an f16 weight tensor. No row tile, for the same reason.
+    f16_tiles: [CudaFunction; MAX_BATCH_TILE],
+    /// The three community-quant bodies, likewise untiled.
+    q4_0_tiles: [CudaFunction; MAX_BATCH_TILE],
+    q4_k_tiles: [CudaFunction; MAX_BATCH_TILE],
+    q5_k_tiles: [CudaFunction; MAX_BATCH_TILE],
     /// The bf16 row-tiled three-token entry point, paired with
     /// [`Self::b3_row_tile`]'s row count.
     bf16_b3_row_tile: Option<CudaFunction>,
@@ -1230,6 +1629,46 @@ impl LmHeadKernels {
                 module.load_function("lm_head_q6_k_b7")?,
                 module.load_function("lm_head_q6_k_b8")?,
             ],
+            f16_tiles: [
+                module.load_function("lm_head_f16_b1")?,
+                module.load_function("lm_head_f16_b2")?,
+                module.load_function("lm_head_f16_b3")?,
+                module.load_function("lm_head_f16_b4")?,
+                module.load_function("lm_head_f16_b5")?,
+                module.load_function("lm_head_f16_b6")?,
+                module.load_function("lm_head_f16_b7")?,
+                module.load_function("lm_head_f16_b8")?,
+            ],
+            q4_0_tiles: [
+                module.load_function("lm_head_q4_0_b1")?,
+                module.load_function("lm_head_q4_0_b2")?,
+                module.load_function("lm_head_q4_0_b3")?,
+                module.load_function("lm_head_q4_0_b4")?,
+                module.load_function("lm_head_q4_0_b5")?,
+                module.load_function("lm_head_q4_0_b6")?,
+                module.load_function("lm_head_q4_0_b7")?,
+                module.load_function("lm_head_q4_0_b8")?,
+            ],
+            q4_k_tiles: [
+                module.load_function("lm_head_q4_k_b1")?,
+                module.load_function("lm_head_q4_k_b2")?,
+                module.load_function("lm_head_q4_k_b3")?,
+                module.load_function("lm_head_q4_k_b4")?,
+                module.load_function("lm_head_q4_k_b5")?,
+                module.load_function("lm_head_q4_k_b6")?,
+                module.load_function("lm_head_q4_k_b7")?,
+                module.load_function("lm_head_q4_k_b8")?,
+            ],
+            q5_k_tiles: [
+                module.load_function("lm_head_q5_k_b1")?,
+                module.load_function("lm_head_q5_k_b2")?,
+                module.load_function("lm_head_q5_k_b3")?,
+                module.load_function("lm_head_q5_k_b4")?,
+                module.load_function("lm_head_q5_k_b5")?,
+                module.load_function("lm_head_q5_k_b6")?,
+                module.load_function("lm_head_q5_k_b7")?,
+                module.load_function("lm_head_q5_k_b8")?,
+            ],
             bf16_b3_row_tile,
             b3_row_tile,
             argmax_partial: module.load_function("argmax_partial")?,
@@ -1304,6 +1743,65 @@ impl LmHeadKernels {
                 }
                 weight.bytes.len() / BLOCK_Q6_K_BYTES * QK_K
             }
+            HeadFormat::F16 => {
+                // Same 256-element warp step as the bf16 body it mirrors.
+                if !g.hidden.is_multiple_of(BF16_WARP_STEP) {
+                    return Err(LmHeadError::RaggedContraction {
+                        format: "f16",
+                        hidden: g.hidden,
+                        step: BF16_WARP_STEP,
+                    });
+                }
+                if !weight.bytes.len().is_multiple_of(2) {
+                    return Err(LmHeadError::RaggedWeights {
+                        bytes: weight.bytes.len(),
+                        block_bytes: 2,
+                    });
+                }
+                weight.bytes.len() / 2
+            }
+            HeadFormat::Q4_0 => {
+                // A warp covers two 32-element blocks per step.
+                if !g.hidden.is_multiple_of(2 * QK4_0) {
+                    return Err(LmHeadError::RaggedContraction {
+                        format: "Q4_0",
+                        hidden: g.hidden,
+                        step: 2 * QK4_0,
+                    });
+                }
+                if !weight.bytes.len().is_multiple_of(BLOCK_Q4_0_BYTES) {
+                    return Err(LmHeadError::RaggedWeights {
+                        bytes: weight.bytes.len(),
+                        block_bytes: BLOCK_Q4_0_BYTES,
+                    });
+                }
+                weight.bytes.len() / BLOCK_Q4_0_BYTES * QK4_0
+            }
+            HeadFormat::Q4K | HeadFormat::Q5K => {
+                let block_bytes = if weight.format == HeadFormat::Q4K {
+                    BLOCK_Q4_K_BYTES
+                } else {
+                    BLOCK_Q5_K_BYTES
+                };
+                if !g.hidden.is_multiple_of(QK_K) {
+                    return Err(LmHeadError::RaggedContraction {
+                        format: if weight.format == HeadFormat::Q4K {
+                            "Q4_K"
+                        } else {
+                            "Q5_K"
+                        },
+                        hidden: g.hidden,
+                        step: QK_K,
+                    });
+                }
+                if !weight.bytes.len().is_multiple_of(block_bytes) {
+                    return Err(LmHeadError::RaggedWeights {
+                        bytes: weight.bytes.len(),
+                        block_bytes,
+                    });
+                }
+                weight.bytes.len() / block_bytes * QK_K
+            }
         };
         if found != g.elements() {
             return Err(LmHeadError::WrongElementCount {
@@ -1361,10 +1859,9 @@ impl LmHeadKernels {
             // Q6_K has no row-tiled instantiation — it is the fallback body,
             // and a row tile is an optimization for the formats the shipped
             // files actually use.
-            let row_tiled = self
-                .b3_row_tile
-                .as_ref()
-                .filter(|_| tile == 3 && weight.format != HeadFormat::Q6K);
+            let row_tiled = self.b3_row_tile.as_ref().filter(|_| {
+                tile == 3 && matches!(weight.format, HeadFormat::Q8_0 | HeadFormat::Bf16)
+            });
             let (func, cfg) = match row_tiled {
                 Some((f, rt)) => {
                     let rows_per_block = WARPS_PER_BLOCK as usize * rt;
@@ -1390,6 +1887,10 @@ impl LmHeadKernels {
                     HeadFormat::Q8_0 => (&self.tiles[tile - 1], cfg),
                     HeadFormat::Bf16 => (&self.bf16_tiles[tile - 1], cfg),
                     HeadFormat::Q6K => (&self.q6_k_tiles[tile - 1], cfg),
+                    HeadFormat::F16 => (&self.f16_tiles[tile - 1], cfg),
+                    HeadFormat::Q4_0 => (&self.q4_0_tiles[tile - 1], cfg),
+                    HeadFormat::Q4K => (&self.q4_k_tiles[tile - 1], cfg),
+                    HeadFormat::Q5K => (&self.q5_k_tiles[tile - 1], cfg),
                 },
             };
             let mut builder = stream.launch_builder(func);

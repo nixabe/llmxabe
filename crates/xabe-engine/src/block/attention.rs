@@ -2195,6 +2195,7 @@ fn projection_weight(
         GgmlType::Q8_0 => HeadFormat::Q8_0,
         GgmlType::Bf16 => HeadFormat::Bf16,
         GgmlType::Q6K => HeadFormat::Q6K,
+        GgmlType::F16 => HeadFormat::F16,
         found => {
             return Err(AttentionBlockError::WrongQuant { role, layer, found });
         }

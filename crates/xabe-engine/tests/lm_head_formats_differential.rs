@@ -70,7 +70,11 @@ use xabe_cuda::kernels::lm_head::{
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_kernels::compare::{Tolerance, assert_matches, compare};
 use xabe_kernels::gemv::{argmax, gemv_batch};
-use xabe_kernels::quant::{QK_K, dequantize_q6_k, dequantize_row_q8_0, quantize_q6_k};
+use xabe_kernels::quant::{
+    QK_K, QK4_0, dequantize_q4_0, dequantize_q4_k, dequantize_q5_k, dequantize_q6_k,
+    dequantize_row_f16, dequantize_row_q8_0, quantize_q4_0, quantize_q4_k, quantize_q5_k,
+    quantize_q6_k,
+};
 use xabe_kernels::rng::Xorshift64Star;
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::{Role, WeightSchema};
@@ -176,6 +180,38 @@ fn pack(format: HeadFormat, src: &[f32]) -> (Vec<u8>, Vec<f32>) {
                 let b = quantize_q6_k(x);
                 bytes.extend_from_slice(&b.to_bytes());
                 back.extend_from_slice(&dequantize_q6_k(&b));
+            }
+        }
+        HeadFormat::F16 => {
+            // Dense, so "packing" is just the narrowing conversion — and the
+            // round trip through `dequantize_row_f16` is what the kernel is
+            // claimed to reconstruct. Values here are order 0.25, far inside
+            // f16's range, so nothing saturates; a head whose weights reached
+            // 65504 would be a different test.
+            for &v in src {
+                bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+            back = dequantize_row_f16(&bytes);
+        }
+        HeadFormat::Q4_0 => {
+            for x in src.as_chunks::<QK4_0>().0 {
+                let b = quantize_q4_0(x);
+                bytes.extend_from_slice(&b.to_bytes());
+                back.extend_from_slice(&dequantize_q4_0(&b));
+            }
+        }
+        HeadFormat::Q4K => {
+            for x in src.as_chunks::<QK_K>().0 {
+                let b = quantize_q4_k(x);
+                bytes.extend_from_slice(&b.to_bytes());
+                back.extend_from_slice(&dequantize_q4_k(&b));
+            }
+        }
+        HeadFormat::Q5K => {
+            for x in src.as_chunks::<QK_K>().0 {
+                let b = quantize_q5_k(x);
+                bytes.extend_from_slice(&b.to_bytes());
+                back.extend_from_slice(&dequantize_q5_k(&b));
             }
         }
         other => panic!("no packer for {other:?}"),
@@ -319,4 +355,24 @@ fn check(format: HeadFormat, label: &str, seed: u64) {
 #[test]
 fn the_q6_k_head_body_matches_the_scalar_reference() {
     check(HeadFormat::Q6K, "q6_K", 0x51D6_C0DE);
+}
+
+#[test]
+fn the_f16_head_body_matches_the_scalar_reference() {
+    check(HeadFormat::F16, "f16", 0x00F1_6DEF);
+}
+
+#[test]
+fn the_q4_0_head_body_matches_the_scalar_reference() {
+    check(HeadFormat::Q4_0, "q4_0", 0x0000_4004);
+}
+
+#[test]
+fn the_q4_k_head_body_matches_the_scalar_reference() {
+    check(HeadFormat::Q4K, "q4_K", 0x0004_4B4B);
+}
+
+#[test]
+fn the_q5_k_head_body_matches_the_scalar_reference() {
+    check(HeadFormat::Q5K, "q5_K", 0x0005_4B5B);
 }
