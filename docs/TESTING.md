@@ -312,6 +312,44 @@ cargo test -p xabe-kernels gdn        # the critical path
 cargo run -p xabe-cuda --bin probe    # device gate and milestone-00 spike
 ```
 
+### A green run is not the same as a run
+
+Three ways this suite reports success without having tested anything, all of
+them found the hard way. They compound: a run can hit all three at once and
+look identical to a clean one.
+
+**A skipped test passes.** Tests that need a device, a model or a capture
+print `SKIPPED: ...` and return `ok` — which is the right behaviour, since a
+checkout without 30 GB of weights should not fail — but cargo captures stdout
+for passing tests, so the message is invisible unless you pass `--nocapture`.
+`forward_pass` reports **8 passed in 0.36 s** when it cannot find the golden,
+and 0.36 s is the only visible sign that the workspace's most important gate
+did not execute. **From a `git worktree` it never finds it**: `.golden/` is
+in `.gitignore`, so the capture does not come along. Point it at the one in
+the main checkout:
+
+```sh
+LLMXABE_GOLDEN=/home/nixabe/llmxabe/.golden/qwen36-golden.bin \
+  cargo test --release -p xabe-engine --test forward_pass -- --nocapture
+```
+
+The real thing takes ~21 s and prints its cosine against llama.cpp's captured
+logits. If it finished instantly, it did not run.
+
+**A piped exit status is the pipe's.** `cargo test ... | grep ...` reports
+grep's status, not cargo's, so a run killed by a signal or the OOM killer —
+three workers and a 30 GB model make that ordinary here — exits zero as long
+as the filter matched something earlier. Write the raw output to a file, take
+cargo's own status as the verdict, and keep the filter as the summary you
+read rather than the thing you believe.
+
+**A truncated run looks like a short one.** Count what reported against what
+exists: `cargo test --workspace --release --no-run` prints one `Executable`
+line per test binary — 60 of them at the time of writing, against 34
+`tests/*.rs` files, the rest being lib, bin and doc targets. A sweep that
+stops halfway is otherwise indistinguishable from one that passed, because
+every target it did reach was green.
+
 Serving acceptance uses the scheduler-driven runtime rather than the isolated
 forward benchmarks:
 

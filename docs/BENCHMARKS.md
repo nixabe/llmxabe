@@ -71,6 +71,19 @@ The discipline is the reason the standing can be trusted at all; several
   stale binary rather than a result.
 - **Compare against llama.cpp's best settings, never its defaults.** Measuring
   against `-ub 512` inflated three separate claims before the rule was named.
+- **A sweep decides nothing.** One run per point does not resolve anything
+  below roughly 1.5% on this host, so a sweep is for choosing *where* to put
+  pairs and never for choosing a value. The router's expert tile read
+  208.0 / 208.7 / 207.6 / 207.6 across `ET` 8/4/2/1 — non-monotonic, and read
+  by two agents independently as drift rather than a knee. Under three
+  interleaved reversed pairs in one binary, `ET = 4` won every pair at
+  **+1.31%**: the sweep had understated it threefold. Non-monotonic single
+  runs mean *unmeasured*, not *absent*.
+- **Report the pairs, not the mean.** A three-pair set whose arms are
+  208.7/206.3, 207.9/201.4 and 207.3/205.3 has a mean of +1.79% and an honest
+  reading of about +1.1%: the 201.4 is 2.4% below its own siblings, so it is a
+  bad reading of the baseline rather than a good result. A mean cannot tell
+  those apart and a list of pairs can.
 
 ## Current standing
 
@@ -850,6 +863,50 @@ The same principle repeats at every level of the dispatch:
   kernel: `GdnBlock`'s split-layout projection GEMV already reads that exact
   layout at that exact width. A second architecture is a good test of whether
   a lesson was learned as a mechanism or as a constant.
+- The rule reaches tiles chosen on an axis decode does not have. The router's
+  expert tile was swept at prefill, where `grid.y` is `max_tokens / TT` and
+  the card is full whatever `grid.x` is; 8 won there and was committed. At
+  decode `grid.y` is 1, so `num_experts / ET` is the *entire* grid — 32 blocks,
+  256 warps against the 2,304 this part holds. Halving the tile to 4 doubles
+  the blocks and is **+1.31%** on the step, winning all three interleaved
+  pairs. `ET` is a tile width and not a reduction shape, so every thread still
+  contracts over `j` in the same order and the logits are bit-identical;
+  narrowing further to 2 or 1 loses the extra activation re-reads back again,
+  which is the same L2 argument that chose 8 in the first place.
+
+Two launches that each fail to fill the card can be made to fill it together,
+and the Gated DeltaNet block's input projections are the case for it: `qkv`
+and `gate` read the same normalized activation, write disjoint scratch, and
+are ordered by nothing but the stream they are issued on. At N=3 with the row
+tile 4 they are 2,048 and 1,024 warps against the 1,152 this part holds at
+that kernel's 128 registers — 1.78 waves and then 0.89, each paying its own
+ramp against a half-empty machine, reading **407** and **351 GB/s** where the
+routed-expert GEMVs beside them run 21 waves deep and read 503–518. Forking
+the gate onto a side stream and joining it at the first thing that reads its
+output — four small launches later — merges them into one occupancy pool:
+they overlap 1.46x and the main stream's busy time falls 12.95 → 12.21 ms per
+step. Each output row is still one warp over the same operands in the same
+order, so it is bit-identical by construction.
+
+**It is taken only above one token**, and that boundary is structural rather
+than tuned: the `gemv` specialization *is* the one-token path, so declining to
+fork there needs no new condition. At N=1 the step is launch-latency-bound,
+sixty extra graph nodes buy nothing against a machine with no wave to fill,
+and the fork measured **−1.2%**, losing both pairs, against +0.79% winning all
+three at N=3. That is the second time this engine has hit that wall from a
+different direction — see the shared-expert side-stream row in WHY NOT, flat
+at N=3 and −2.5–3% at N=1, for the first — which is what makes it a property
+of the step rather than a surprise.
+
+Its honest standing is worth stating plainly, because the mechanism is more
+interesting than the margin: **the fork is worth a few tenths of a point at
+N=3 and had to be gated out of N=1 to stop it doing harm.** The router tile
+above, which is a one-line change, is worth more. What the fork buys that the
+number does not show is the second data point on where this step's ceiling
+comes from — anyone who next proposes overlapping two launches at one token
+now has two independent measurements saying the step is launch-latency-bound
+there, rather than one that could be dismissed as particular to the shared
+expert.
 
 ## Parallelism: fill the wave, and split the only axis decode has
 
@@ -1275,6 +1332,9 @@ proposed twice.
 | Removing the routed-partial clear | Below run-to-run spread, and reversing. Deleting a defensive correctness aid for a result smaller than host drift is not justified. |
 | Grant alignment as a prefill lever (`ADMISSION_RESERVE_FRACTION` 4 → 2) | Predicted **+27%**, measured **+1.5%**. The width curve is real — 2,048-wide passes run at 2,760 tok/s against 256-wide at 1,510, and the ratio holds at depth (1,896 vs 1,050 at 64K) — and `choose_prefill_width` does decompose a 3,072-token grant into 2,048 + 4×256. `max_batch = 3`, the 256 tail ceiling, and the grant reaching `execute_prefill` intact were all verified. The penalty still does not appear end to end. The constant stays at 2 because it is never worse and an aligned grant is the honest default, but **do not rank work by that width arithmetic**; the mechanism is confirmed and its cost is not. |
 | Snapshot retention as the cause of the concurrent-session penalty | Nothing. `--cache-ram 0` (no snapshots) and `16GiB` (159 per worker) both land within noise of the 2.41 GiB default's 24, at 64K × 3 sessions. The arena arithmetic is seductive — a 64K prompt needs 31 snapshots at R=2048, three sessions ~93 against 24 — and wrong. Worse, it was first "ruled out" at 16K, where three sessions need exactly 24 and the arena *cannot* bind, which proved nothing in either direction. Test a capacity hypothesis at a depth where the capacity is actually exceeded. |
+| Forking the Gated DeltaNet input projections at one token | **−1.2%** at N=1 2K, losing both interleaved pairs, against +0.79% winning all three at N=3; a first pair read −7.5% and is quoted only as the reason the set was extended. The overlap is real at both widths and irrelevant at one token: the step is launch-latency-bound there, so two events per layer across thirty layers is sixty graph nodes bought against a machine with no wave to fill. Gated to `tokens > 1`, which is free because `gemv` *is* the one-token specialization. Second independent change to hit this wall — see the shared-expert side-stream row above. |
+| Router expert tile below 4 at decode width (`ET` 2 and 1) | 207.6 and 207.6 against `ET = 4`'s 208.7 in the same sweep, and the pairs that confirmed 4 at +1.31% were not extended to them. Narrowing past the knee trades the extra blocks for `TT * hidden` of activation re-read per block — 6 MB a layer at `ET = 1` against 768 KB at 8 — which is the same L2 argument that chose 8 at prefill width, arriving at a different answer because the grid is a different shape. Occupancy is not monotonically worth having. |
+| Reading the Ornith fork's 32K result at all | Three interleaved pairs gave −0.31%, +2.62% and +1.39% while the *baseline* arm ranged 1.85% across its own three runs. The prediction on record was +0.55–0.6%, from a fixed per-layer saving over a step that grows 14.5 → 18.9 ms. The set can neither confirm nor refute that, so no 32K figure is quoted for this change. Recorded because the temptation was to take the mean and call it +1.2%. |
 | Inferring scheduler behaviour from client-side timings | Wrong three times: a lock-starvation fault was read as a scheduler refusing to share, an admission-pacing artefact as a race, and a 2x throughput collapse as a kernel concurrency limit (the kernel charges 5%, not 50%). All three fell out immediately once a step logged its own grants. Instrument the component before theorising about it. |
 
 ## Rejected on arithmetic, before building
@@ -1354,6 +1414,23 @@ Recorded because the *reasoning* is what misleads, not the number.
 - **A negative result taken during an unrelated regression is not a
   measurement.** One change was recorded as a 57% regression while a decode bug
   was live; against a clean baseline it is a small improvement.
+- **"The sweep is non-monotonic, so there is nothing there."** Two agents
+  reached that independently about the router's expert tile and both were
+  wrong. Non-monotonicity across single runs is the signature of a method
+  that cannot resolve the effect, not of an absent effect — and inferring
+  absence from a measurement that could not have detected presence is the
+  error, whatever the subject. Under pairs the same tile won every one at
+  +1.31%. The cheap guard is to ask what the method's resolution *is* before
+  reading its shape: on this host, one run per point resolves nothing below
+  about 1.5%.
+- **A green test target is not a test that ran.** `forward_pass` reports
+  `ok, 8 passed` in 0.36 s when it cannot find the golden, because a skip is
+  a pass and cargo captures stdout. `.golden/` is gitignored, so **every run
+  from a `git worktree` skips it silently** unless `LLMXABE_GOLDEN` points at
+  the main checkout's copy. Related: a `cargo test | grep` pipeline reports
+  grep's exit status, and a sweep that died at target 29 of 60 is
+  indistinguishable from one that passed. All three were live in one
+  afternoon; `docs/TESTING.md` carries the checks.
 - **`ptxas` allocates across a wider scope than the edit.** Adding a branch to
   one device function moved an unrelated `__global__` function's register count
   from 80 to 126, and removing a branch from two near-identical sibling kernels
