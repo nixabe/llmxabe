@@ -331,6 +331,185 @@ __global__ void gdn_proj_q8_0(
     }
 }
 
+// -------------------------------------------------------------------------
+// The same projection over the formats a community quant produces.
+// -------------------------------------------------------------------------
+//
+// `attn_qkv`, `attn_gate` and `ssm_out` are Q8_0 in both shipped files, and
+// `Projection` had exactly two variants because `gdn_proj_*` had exactly two
+// readers. That made this the last wall in `docs/MODEL.md`'s table: a
+// uniformly Q6_K file loaded its experts, head, embedding and gates and
+// stopped here.
+//
+// **These are separate entry points, not arms of `gdn_proj_q8_0`.** Same rule
+// the MoE prologue arrived at the expensive way (`40f7fc6`, -5.05%): a
+// runtime format inside a hot `__forceinline__` body is a shared resource and
+// the formats already there pay for the new ones. `gdn_proj_q8_0` and the
+// `gdn_proj_q8_0_t*` tiles are untouched, which is checkable rather than
+// assertable.
+//
+// **They are deliberately plain**, and slower than the Q8_0 path by more than
+// the unpacking costs: one warp per (row, token) with no token tile, so the
+// weight is re-read once per token. At prefill that is the 59.1% the tiled
+// kernels exist to avoid. A community file pays it. That is the documented
+// trade -- these formats have no route to the int8 repack either, so a file
+// storing projections this way was always going to be slow, and the choice
+// here is between slow and not loading at all.
+//
+// Each lane walks `i = lane, lane + 32, ...` and unpacks one element at a
+// time, re-reading the block header per element. That is wasteful and it is
+// the point: a scalar unpacker straight off `ggml-quants.c` is the form whose
+// correctness can be read, and no shipped file reaches it.
+
+// Q4_0: 32 elements per 18-byte block. Element `e` and `e + 16` share byte
+// `e`, low nibble first, and the codes are centred by -8.
+__device__ __forceinline__ float gdn_dq_q4_0(const unsigned char* row, int i) {
+    const unsigned char* blk = row + (long long)(i >> 5) * 18;
+    int e = i & 31;
+    unsigned int q = blk[2 + (e & 15)];
+    int code = (e < 16) ? (int)(q & 0xFu) : (int)(q >> 4);
+    return (float)(code - 8) * load_half_le(blk);
+}
+
+// Q8_0: 32 elements per 34-byte block, read signed.
+__device__ __forceinline__ float gdn_dq_q8_0(const unsigned char* row, int i) {
+    const unsigned char* blk = row + (long long)(i >> 5) * 34;
+    return (float)(signed char)blk[2 + (i & 31)] * load_half_le(blk);
+}
+
+// Q6_K: 256 elements per **210** bytes. Not 224 -- the MoE stacks are
+// re-strided on upload for an `int4` staging load, and these are aliased out
+// of the arena exactly as the file holds them, so the stride is the file's.
+__device__ __forceinline__ float gdn_dq_q6_k(const unsigned char* row, int i) {
+    const unsigned char* sb = row + (long long)(i >> 8) * 210;
+    int r    = i & 255;
+    int half = r >> 7;
+    int rr   = r & 127;
+    int grp  = rr >> 5;
+    int l    = rr & 31;
+    const unsigned char* ql = sb + half * 64;
+    const unsigned char* qh = sb + 128 + half * 32;
+    const signed char*   sc = (const signed char*)(sb + 192 + half * 8);
+    unsigned int q = ql[(grp & 1) ? l + 32 : l];
+    int lo = (grp < 2) ? (int)(q & 0xFu) : (int)(q >> 4);
+    int code = lo | ((int)((qh[l] >> (2 * grp)) & 3u) << 4);
+    // Operand order `(d * sc) * q`, as `dequantize_row_q6_K` evaluates it.
+    return load_half_le(sb + 208) * (float)sc[(l >> 4) + 2 * grp]
+         * (float)(code - 32);
+}
+
+// `get_scale_min_k4` from `ggml-quants.c`: eight 6-bit scale/min pairs in
+// twelve bytes. The `j >= 4` branch takes its high bits from a *different*
+// byte than its low nibble, and reading it as the `j < 4` branch yields
+// scales up to 4x too small -- finite and plausible, so it gets a
+// differential rather than an eyeball.
+__device__ __forceinline__ void gdn_scale_min_k4(
+    int j, const unsigned char* q, int* sc, int* m
+) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4)   | ((q[j]     >> 6) << 4);
+    }
+}
+
+// Q4_K (144 B) and Q5_K (176 B), affine: `d*sc*code - dmin*m`. `HIGH` selects
+// Q5_K, whose fifth bit lives in a 32-byte plane indexed by `l` with the bit
+// position moving instead of the byte.
+//
+// The subtraction is pinned with `mul.rn`/`sub.rn`: nvcc contracts `a*b - c`
+// into an FMA, which rounds once where the reference rounds twice, and that
+// is a divergence in the weight itself. Inline PTX because NVRTC compiles
+// from a string with no include path.
+__device__ __forceinline__ float gdn_affine(float d1, int code, float m1) {
+    float c = (float)code;
+    float t, r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(t) : "f"(d1), "f"(c));
+    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(t), "f"(m1));
+    return r;
+}
+
+__device__ __forceinline__ float gdn_dq_k_affine(
+    const unsigned char* row, int i, int high
+) {
+    int sbb = high ? 176 : 144;
+    int qsb = high ? 48 : 16;
+    const unsigned char* sb = row + (long long)(i >> 8) * sbb;
+    int r   = i & 255;
+    int g   = r >> 6;
+    int sub = (r >> 5) & 1;
+    int l   = r & 31;
+    int js  = 2 * g + sub;
+
+    int sc, m;
+    gdn_scale_min_k4(js, sb + 4, &sc, &m);
+    unsigned int byte = sb[qsb + g * 32 + l];
+    int code = (int)(sub ? (byte >> 4) : (byte & 0xFu));
+    if (high) code |= (int)((sb[16 + l] >> js) & 1u) << 4;
+    return gdn_affine(load_half_le(sb) * (float)sc, code,
+                      load_half_le(sb + 2) * (float)m);
+}
+
+__device__ __forceinline__ float gdn_dq_q4_k(const unsigned char* row, int i) {
+    return gdn_dq_k_affine(row, i, 0);
+}
+
+__device__ __forceinline__ float gdn_dq_q5_k(const unsigned char* row, int i) {
+    return gdn_dq_k_affine(row, i, 1);
+}
+
+__device__ __forceinline__ float gdn_dq_f16(const unsigned char* row, int i) {
+    return load_half_le(row + (long long)i * 2);
+}
+
+// bf16 is the top 16 bits of an fp32, so widening is a shift -- no table, no
+// rounding, and it is exact.
+__device__ __forceinline__ float gdn_dq_bf16(const unsigned char* row, int i) {
+    const unsigned char* p = row + (long long)i * 2;
+    unsigned int bits = ((unsigned int)p[1] << 24) | ((unsigned int)p[0] << 16);
+    return __int_as_float((int)bits);
+}
+
+// One warp per output row, one token per `blockIdx.y`, lane-strided over the
+// contraction. `ROW_BYTES` is the row stride in bytes as a function of
+// `k_dim`, because it differs per format and a wrong stride reads a plausible
+// neighbouring row rather than faulting.
+#define GDN_PROJ_QUANT(NAME, DQ, ROW_BYTES)                                  \
+extern "C" __global__ void NAME(                                             \
+    const unsigned char* __restrict__ weight,                                \
+    const float* __restrict__ x,                                             \
+    float* __restrict__ out,                                                 \
+    int k_dim,                                                               \
+    int n_rows                                                               \
+) {                                                                          \
+    int lane = threadIdx.x;                                                  \
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;                        \
+    if (n >= n_rows) return;                                                 \
+    int t = blockIdx.y;                                                      \
+                                                                             \
+    const unsigned char* row = weight + (long long)n * (ROW_BYTES);          \
+    const float* xr = x + (long long)t * k_dim;                              \
+                                                                             \
+    float acc = 0.0f;                                                        \
+    for (int i = lane; i < k_dim; i += 32) {                                 \
+        acc += DQ(row, i) * xr[i];                                           \
+    }                                                                        \
+    acc = warp_reduce_sum(acc);                                              \
+    if (lane == 0) {                                                         \
+        out[(long long)t * n_rows + n] = acc;                                \
+    }                                                                        \
+}
+
+GDN_PROJ_QUANT(gdn_proj_qgeneric_q8_0, gdn_dq_q8_0, (long long)(k_dim / 32) * 34)
+GDN_PROJ_QUANT(gdn_proj_qgeneric_q4_0, gdn_dq_q4_0, (long long)(k_dim / 32) * 18)
+GDN_PROJ_QUANT(gdn_proj_qgeneric_q6_k, gdn_dq_q6_k, (long long)(k_dim / 256) * 210)
+GDN_PROJ_QUANT(gdn_proj_qgeneric_q4_k, gdn_dq_q4_k, (long long)(k_dim / 256) * 144)
+GDN_PROJ_QUANT(gdn_proj_qgeneric_q5_k, gdn_dq_q5_k, (long long)(k_dim / 256) * 176)
+GDN_PROJ_QUANT(gdn_proj_qgeneric_f16,  gdn_dq_f16,  (long long)k_dim * 2)
+GDN_PROJ_QUANT(gdn_proj_qgeneric_bf16, gdn_dq_bf16, (long long)k_dim * 2)
+
 // The same projection, tiled over tokens.
 //
 // `gdn_proj_q8_0` above gives each (output row, token) pair its own warp, so
@@ -1377,6 +1556,46 @@ pub struct GdnLayerWeights {
     pub ssm_norm: CudaSlice<f32>,
     /// `ssm_out.weight`, Q8_0 `[value_dim, hidden]`.
     pub out: CudaSlice<u8>,
+    /// How `qkv`, `gate` and `out` are stored.
+    ///
+    /// Q8_0 in both shipped files, and a community quant may store any format
+    /// [`ProjQuant`] names. The tag travels with the bytes for the same
+    /// reason it does everywhere else here: `alias_q8_0` once read a format
+    /// and discarded it, and a Q6_K `attn_qkv` was unpacked as Q8_0 without
+    /// an error anywhere (`ea1c83d`).
+    pub qkv_fmt: ProjQuant,
+    /// See [`Self::qkv_fmt`].
+    pub gate_fmt: ProjQuant,
+    /// See [`Self::qkv_fmt`].
+    pub out_fmt: ProjQuant,
+}
+
+impl GdnLayerWeights {
+    /// `attn_qkv` as a [`Projection`], in whichever form it is stored.
+    pub fn qkv_projection(&self) -> Projection<'_> {
+        Self::projection(&self.qkv, self.qkv_fmt)
+    }
+
+    /// `attn_gate` as a [`Projection`].
+    pub fn gate_projection(&self) -> Projection<'_> {
+        Self::projection(&self.gate, self.gate_fmt)
+    }
+
+    /// `ssm_out` as a [`Projection`].
+    pub fn out_projection(&self) -> Projection<'_> {
+        Self::projection(&self.out, self.out_fmt)
+    }
+
+    /// Q8_0 keeps [`Projection::Q8_0`] and with it the tiled kernels and the
+    /// int8 repack; everything else takes the plain generic path. Routing
+    /// Q8_0 through `Projection::Quant` would be *correct* and would cost
+    /// 59.1% of a 512-token prefill, which is what the token tile bought.
+    fn projection(bytes: &CudaSlice<u8>, fmt: ProjQuant) -> Projection<'_> {
+        match fmt {
+            ProjQuant::Q8_0 => Projection::Q8_0(bytes),
+            other => Projection::Quant(bytes, other),
+        }
+    }
 }
 
 /// `ssm_alpha` / `ssm_beta` in whichever format the file stores them.
@@ -1429,20 +1648,21 @@ impl GateProjection {
         }
     }
 
-    /// Borrow it as a [`Projection`], for the generic projection path, or
-    /// `None` when that path has no reader for this form.
+    /// Borrow it as a [`Projection`], for the generic projection path.
     ///
     /// `alpha_beta_gates` does not go through this — it dispatches on the
     /// *pair* so both gates share one launch — but anything projecting a
-    /// single gate does. `Projection` covers only f32 and Q8_0 because
-    /// `gdn_proj_*` do; a Q6_K gate is served by the fused kernel and has no
-    /// standalone projection, so this returns `None` rather than inventing a
-    /// `Projection` variant with no kernel behind it.
-    pub fn as_projection(&self) -> Option<Projection<'_>> {
+    /// single gate does.
+    ///
+    /// This returned `Option` for one commit, because `Projection` had no
+    /// variant a Q6_K gate could become and inventing one with no kernel
+    /// behind it is how the aliasing defect in `ea1c83d` happened. The
+    /// generic readers exist now, so the honest signature is total again.
+    pub fn as_projection(&self) -> Projection<'_> {
         match self {
-            Self::F32(v) => Some(Projection::F32(v)),
-            Self::Q8_0(v) => Some(Projection::Q8_0(v)),
-            Self::Q6K(_) => None,
+            Self::F32(v) => Projection::F32(v),
+            Self::Q8_0(v) => Projection::Q8_0(v),
+            Self::Q6K(v) => Projection::Quant(v, ProjQuant::Q6K),
         }
     }
 }
@@ -1519,16 +1739,25 @@ impl GdnLayerWeights {
             Ok((bytes, entry.info.ggml_type))
         };
 
-        let quantized = |role: Role| -> Result<CudaSlice<u8>, GdnBlockError> {
-            let (bytes, ty) = raw(role)?;
-            if ty != GgmlType::Q8_0 {
-                return Err(GdnBlockError::UnsupportedQuant {
-                    role,
-                    found: ty,
-                    expected: GgmlType::Q8_0,
-                });
-            }
+        // Upload the bytes as the file holds them. The *caller* decides which
+        // formats it can read and has already matched on the type; a second
+        // check here that disagreed with that match is how the `Q6K` gate arm
+        // below came to call a helper that rejected Q6_K, an arm that could
+        // never succeed and that no shipped file reaches.
+        let bytes_of = |role: Role| -> Result<CudaSlice<u8>, GdnBlockError> {
+            let (bytes, _) = raw(role)?;
             Ok(stream.clone_htod(bytes)?)
+        };
+
+        // A projection weight in any format `gdn_proj_*` reads, with the tag.
+        let projection = |role: Role| -> Result<(CudaSlice<u8>, ProjQuant), GdnBlockError> {
+            let (bytes, ty) = raw(role)?;
+            let fmt = ProjQuant::from_ggml(ty).ok_or(GdnBlockError::UnsupportedQuant {
+                role,
+                found: ty,
+                expected: GgmlType::Q8_0,
+            })?;
+            Ok((stream.clone_htod(bytes)?, fmt))
         };
 
         let floats = |role: Role| -> Result<CudaSlice<f32>, GdnBlockError> {
@@ -1556,8 +1785,8 @@ impl GdnLayerWeights {
             let (_, ty) = raw(role)?;
             match ty {
                 GgmlType::F32 => Ok(GateProjection::F32(floats(role)?)),
-                GgmlType::Q8_0 => Ok(GateProjection::Q8_0(quantized(role)?)),
-                GgmlType::Q6K => Ok(GateProjection::Q6K(quantized(role)?)),
+                GgmlType::Q8_0 => Ok(GateProjection::Q8_0(bytes_of(role)?)),
+                GgmlType::Q6K => Ok(GateProjection::Q6K(bytes_of(role)?)),
                 found => Err(GdnBlockError::UnsupportedQuant {
                     role,
                     found,
@@ -1566,17 +1795,24 @@ impl GdnLayerWeights {
             }
         };
 
+        let (qkv, qkv_fmt) = projection(Role::GdnQkv)?;
+        let (gate, gate_fmt) = projection(Role::GdnGate)?;
+        let (out, out_fmt) = projection(Role::GdnOut)?;
+
         Ok(Self {
             input_norm: floats(Role::InputNorm)?,
-            qkv: quantized(Role::GdnQkv)?,
-            gate: quantized(Role::GdnGate)?,
+            qkv,
+            gate,
             conv1d: floats(Role::GdnConv1d)?,
             alpha: gate_proj(Role::GdnAlpha)?,
             beta: gate_proj(Role::GdnBeta)?,
             dt_bias: floats(Role::GdnDtBias)?,
             a: floats(Role::GdnA)?,
             ssm_norm: floats(Role::GdnNorm)?,
-            out: quantized(Role::GdnOut)?,
+            out,
+            qkv_fmt,
+            gate_fmt,
+            out_fmt,
         })
     }
 }
@@ -1646,6 +1882,92 @@ pub struct GdnTrace<'a> {
     pub mixer: Mixer,
 }
 
+/// A format the GDN block's generic projection kernels read.
+///
+/// Separate from [`HeadFormat`](xabe_cuda::kernels::lm_head::HeadFormat),
+/// which names the same formats for a different kernel family: the head GEMV
+/// has a staged, row-tiled body per format and these have one plain body
+/// each. Keeping the two enums apart is what stops a `HeadFormat` gaining a
+/// variant from silently implying the GDN block can read it -- the gap that
+/// let a Q6_K `attn_qkv` be unpacked as Q8_0 before `ea1c83d`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjQuant {
+    /// 32 elements per 34-byte block. Has a *faster* dedicated path; this
+    /// variant exists so a differential can drive the generic kernel with a
+    /// format whose answer is already known.
+    Q8_0,
+    /// 32 elements per 18-byte block, codes centred by -8.
+    Q4_0,
+    /// 256 elements per **210** bytes -- the file's stride. These weights are
+    /// aliased out of the arena unchanged, unlike the MoE expert stacks,
+    /// which are re-strided to 224 on upload.
+    Q6K,
+    /// 256 elements per 144-byte superblock, affine.
+    Q4K,
+    /// 256 elements per 176-byte superblock, affine, with a fifth bit plane.
+    Q5K,
+    /// Plain fp16.
+    F16,
+    /// Plain bf16.
+    Bf16,
+}
+
+impl ProjQuant {
+    /// The GGUF type this reads, for mapping a tensor's stored format.
+    pub fn from_ggml(ty: GgmlType) -> Option<Self> {
+        Some(match ty {
+            GgmlType::Q8_0 => Self::Q8_0,
+            GgmlType::Q4_0 => Self::Q4_0,
+            GgmlType::Q6K => Self::Q6K,
+            GgmlType::Q4K => Self::Q4K,
+            GgmlType::Q5K => Self::Q5K,
+            GgmlType::F16 => Self::F16,
+            GgmlType::Bf16 => Self::Bf16,
+            _ => return None,
+        })
+    }
+
+    /// Index into the per-format kernel array, in declaration order.
+    fn index(self) -> usize {
+        match self {
+            Self::Q8_0 => 0,
+            Self::Q4_0 => 1,
+            Self::Q6K => 2,
+            Self::Q4K => 3,
+            Self::Q5K => 4,
+            Self::F16 => 5,
+            Self::Bf16 => 6,
+        }
+    }
+
+    /// Elements the contraction width must be a multiple of.
+    ///
+    /// 256 for the k-quants, because a superblock is the unit the scales are
+    /// indexed by; 32 for the block formats; 1 for the float ones.
+    pub fn k_multiple(self) -> usize {
+        match self {
+            Self::Q6K | Self::Q4K | Self::Q5K => 256,
+            Self::Q8_0 | Self::Q4_0 => 32,
+            Self::F16 | Self::Bf16 => 1,
+        }
+    }
+
+    /// Bytes one row of `k_dim` elements occupies, which is what the kernel
+    /// strides by. A wrong stride here reads a plausible neighbouring row
+    /// rather than faulting, so it is spelled once and checked against the
+    /// tensor's real length before every launch.
+    pub fn row_bytes(self, k_dim: usize) -> usize {
+        match self {
+            Self::Q8_0 => k_dim / 32 * 34,
+            Self::Q4_0 => k_dim / 32 * 18,
+            Self::Q6K => k_dim / 256 * 210,
+            Self::Q4K => k_dim / 256 * 144,
+            Self::Q5K => k_dim / 256 * 176,
+            Self::F16 | Self::Bf16 => k_dim * 2,
+        }
+    }
+}
+
 /// A projection weight and how it is stored.
 #[derive(Clone, Copy)]
 pub enum Projection<'a> {
@@ -1653,6 +1975,13 @@ pub enum Projection<'a> {
     Q8_0(&'a CudaSlice<u8>),
     /// Plain fp32.
     F32(&'a CudaSlice<f32>),
+    /// Any other format the generic kernels read, tagged with which.
+    ///
+    /// Takes `gdn_proj_qgeneric_*`: one warp per (row, token), no token tile,
+    /// so the weight is re-read once per token. Slower than [`Self::Q8_0`] by
+    /// much more than the unpacking costs, which is the documented trade --
+    /// these formats have no route to the int8 repack either.
+    Quant(&'a CudaSlice<u8>, ProjQuant),
 }
 
 /// Scratch for one token count.
@@ -1740,6 +2069,8 @@ pub struct GdnBlock {
     proj_split: [CudaFunction; 6],
     proj_split_add: [CudaFunction; 6],
     proj_f32: CudaFunction,
+    /// `gdn_proj_qgeneric_*`, indexed by [`ProjQuant::index`].
+    proj_quant: [CudaFunction; 7],
     alpha_beta_gates: CudaFunction,
     alpha_beta_gates_t1: CudaFunction,
     alpha_beta_gates_q8: CudaFunction,
@@ -1817,6 +2148,15 @@ impl GdnBlock {
                 module.load_function("gdn_proj_split_t16_add")?,
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
+            proj_quant: [
+                module.load_function("gdn_proj_qgeneric_q8_0")?,
+                module.load_function("gdn_proj_qgeneric_q4_0")?,
+                module.load_function("gdn_proj_qgeneric_q6_k")?,
+                module.load_function("gdn_proj_qgeneric_q4_k")?,
+                module.load_function("gdn_proj_qgeneric_q5_k")?,
+                module.load_function("gdn_proj_qgeneric_f16")?,
+                module.load_function("gdn_proj_qgeneric_bf16")?,
+            ],
             alpha_beta_gates: module.load_function("gdn_alpha_beta_gates")?,
             alpha_beta_gates_t1: module.load_function("gdn_alpha_beta_gates_t1")?,
             alpha_beta_gates_q8: module.load_function("gdn_alpha_beta_gates_q8")?,
@@ -2233,7 +2573,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                Projection::Q8_0(&w.qkv),
+                w.qkv_projection(),
                 &s.normed,
                 &mut s.qkv,
                 g.hidden,
@@ -2242,7 +2582,7 @@ impl GdnBlock {
             )?;
             self.project(
                 stream,
-                Projection::Q8_0(&w.gate),
+                w.gate_projection(),
                 &s.normed,
                 &mut s.z,
                 g.hidden,
@@ -2415,7 +2755,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                Projection::Q8_0(&w.out),
+                w.out_projection(),
                 &s.final_output,
                 &mut s.projected,
                 g.value_dim(),
@@ -2554,7 +2894,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                Projection::Q8_0(&w.qkv),
+                w.qkv_projection(),
                 &s.normed,
                 &mut s.qkv,
                 g.hidden,
@@ -2563,7 +2903,7 @@ impl GdnBlock {
             )?;
             self.project(
                 stream,
-                Projection::Q8_0(&w.gate),
+                w.gate_projection(),
                 &s.normed,
                 &mut s.z,
                 g.hidden,
@@ -2786,7 +3126,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                Projection::Q8_0(&w.out),
+                w.out_projection(),
                 &s.final_output,
                 &mut s.projected,
                 g.value_dim(),
@@ -2882,7 +3222,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                Projection::Q8_0(&w.qkv),
+                w.qkv_projection(),
                 &s.normed,
                 &mut s.qkv,
                 g.hidden,
@@ -2891,7 +3231,7 @@ impl GdnBlock {
             )?;
             self.project(
                 stream,
-                Projection::Q8_0(&w.gate),
+                w.gate_projection(),
                 &s.normed,
                 &mut s.z,
                 g.hidden,
@@ -3012,7 +3352,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                Projection::Q8_0(&w.out),
+                w.out_projection(),
                 &s.final_output,
                 &mut s.projected,
                 g.value_dim(),
@@ -3358,6 +3698,43 @@ impl GdnBlock {
                     .arg(&n_i32);
                 // SAFETY: as above, with the weight indexed by
                 // `n * k_dim + i` for `i < k_dim`, which is the length checked.
+                unsafe { builder.launch(cfg) }?;
+            }
+            Projection::Quant(bytes, fmt) => {
+                // A k-quant's scales are indexed per superblock, so a `k_dim`
+                // that is not a whole number of them would read a scale from the
+                // wrong group -- finite and wrong, not a fault. Checked here
+                // rather than assumed, because the outer check above only knows
+                // about Q8_0's 32.
+                if !k_dim.is_multiple_of(fmt.k_multiple()) {
+                    return Err(GdnBlockError::ShapeMismatch {
+                        what: "project k_dim (must be a whole number of blocks \
+                           for this format)",
+                        expected: k_dim.next_multiple_of(fmt.k_multiple()),
+                        got: k_dim,
+                    });
+                }
+                let expected = n_rows * fmt.row_bytes(k_dim);
+                if bytes.len() != expected {
+                    return Err(GdnBlockError::ShapeMismatch {
+                        what: "project quantized weight (bytes)",
+                        expected,
+                        got: bytes.len(),
+                    });
+                }
+                let mut builder = stream.launch_builder(&self.proj_quant[fmt.index()]);
+                builder
+                    .arg(bytes)
+                    .arg(x)
+                    .arg(&mut *out)
+                    .arg(&k_i32)
+                    .arg(&n_i32);
+                // SAFETY: one warp per output row over a grid covering `n_rows`
+                // and returning above it, so the last byte any lane reads is
+                // inside `n_rows * row_bytes(k_dim)` -- the length checked
+                // immediately above, against the same `row_bytes` the kernel
+                // strides by. There is no token tile, so `x` and `out` are
+                // indexed exactly as the untiled Q8_0 kernel indexes them.
                 unsafe { builder.launch(cfg) }?;
             }
         }

@@ -128,16 +128,31 @@ given GGUF loads.
 | LM head and attention projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
 | Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16 | **bf16** |
 | GDN alpha/beta gates (`GateProjection`) | f32, Q8_0, Q6_K | Q4_K, Q5_K, Q4_0, f16, bf16 |
-| The GDN block's own projections (`Projection`: `attn_qkv`, `attn_gate`, `ssm_out`) | f32, Q8_0 | **everything else** |
+| The GDN block's own projections (`Projection`: `attn_qkv`, `attn_gate`, `ssm_out`) | f32, Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16, bf16 | — |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
 
-The `Projection` row is the only wall left. The expert row and the gate row
-both stopped being ones — see below. Note that the `Projection` row is *not*
-the second row: the head GEMV's `HeadFormat` reads seven formats, but the GDN
-block passes three of its tensors to a two-variant `Projection` enum instead,
-so the same tensor is readable in one place and not the other. The repack row
-is why none of the readers that *do* exist is a reason to *prefer* those
-formats.
+**A uniformly Q6_K file now has a reader at every row.** That was the case
+this work set out to close and it is closed — but read the table rather than
+that sentence, because the rows are not uniform. The gate row still stops at
+f32, Q8_0 and Q6_K, so a file storing `ssm_alpha`/`ssm_beta` as Q4_K stops
+there; the gather still refuses bf16; the experts still refuse the float
+formats. Which of those matters depends on what a given recipe actually
+produces, and the way to find out is to load one and read the error, not to
+reason from this paragraph.
+
+All of it is a statement about readers, not a test result on a real file: no
+file on this host stores these tensors in these formats, which is exactly why
+each reader's differential is built by requantizing a real tensor rather than
+by reading a fixture.
+
+The rows still differ in *cost*, and the repack row is why. `Projection` reads
+eight formats but only Q8_0 reaches the token-tiled kernels and the int8
+repack; the other seven take one plain warp-per-(row, token) kernel that
+re-reads the weight once per token. At prefill that is the 59.1% the tiled
+kernels were written to remove. The same asymmetry holds for the experts,
+where only Q6_K and Q8_0 have tuned instantiations. So a reader existing is
+not a reason to *prefer* a format — it is the difference between slow and not
+running.
 
 The embedding gather is a **separate row from the LM head**, and on this model
 that is not a technicality: the head is untied from the embedding, so they are

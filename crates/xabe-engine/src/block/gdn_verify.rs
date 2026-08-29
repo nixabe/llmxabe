@@ -70,7 +70,7 @@ use cudarc::driver::{CudaSlice, CudaStream, DriverError};
 use xabe_cuda::kernels::layer_ops::LayerOpsError;
 
 use crate::block::gdn::{
-    GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState, Projection,
+    GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
 };
 use crate::viewslice::subslice;
 
@@ -430,7 +430,7 @@ pub fn run_layer_with_snapshots_batch(
     } else {
         gdn.project(
             stream,
-            Projection::Q8_0(&weights.qkv),
+            weights.qkv_projection(),
             &scratch.normed,
             &mut scratch.qkv,
             g.hidden,
@@ -439,7 +439,7 @@ pub fn run_layer_with_snapshots_batch(
         )?;
         gdn.project(
             stream,
-            Projection::Q8_0(&weights.gate),
+            weights.gate_projection(),
             &scratch.normed,
             &mut scratch.z,
             g.hidden,
@@ -587,7 +587,7 @@ pub fn run_layer_with_snapshots_batch(
     } else {
         gdn.project(
             stream,
-            Projection::Q8_0(&weights.out),
+            weights.out_projection(),
             &scratch.final_output,
             &mut scratch.projected,
             value_dim,

@@ -714,10 +714,7 @@ fn the_projection_gap_is_llama_cpps_activation_quantization() {
     block
         .project(
             &fx.stream,
-            weights
-                .alpha
-                .as_projection()
-                .expect("this file stores the gates f32 or Q8_0, both of which the generic projection path reads"),
+            weights.alpha.as_projection(),
             &d_norm,
             &mut d_alpha,
             geo.hidden,
@@ -933,10 +930,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                weights
-                .alpha
-                .as_projection()
-                .expect("this file stores the gates f32 or Q8_0, both of which the generic projection path reads"),
+                weights.alpha.as_projection(),
                 &d_gold_norm,
                 &mut d_alpha,
                 geo.hidden,
@@ -947,10 +941,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                weights
-                .beta
-                .as_projection()
-                .expect("this file stores the gates f32 or Q8_0, both of which the generic projection path reads"),
+                weights.beta.as_projection(),
                 &d_gold_norm,
                 &mut d_beta_raw,
                 geo.hidden,

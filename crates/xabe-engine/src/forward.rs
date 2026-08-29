@@ -108,6 +108,7 @@ use crate::block::attention::{
 use crate::block::ffn::{FfnBlock, FfnLayerWeights};
 use crate::block::gdn::{
     GateProjection, GdnBlock, GdnBlockError, GdnGeometry, GdnLayerInt8, GdnLayerWeights, GdnState,
+    ProjQuant,
 };
 use crate::block::gdn_verify::{
     GdnSnapshotRing, GdnVerifyError, GdnVerifyScratch, run_layer_with_snapshots,
@@ -3565,6 +3566,41 @@ impl Forward {
     }
 }
 
+/// Alias one resident GDN projection in whichever format the file stores it.
+///
+/// `attn_qkv`, `attn_gate` and `ssm_out`. Q8_0 in both shipped files and
+/// anything [`ProjQuant`] names in a community quant; the tag travels with
+/// the bytes to `Projection`, which routes Q8_0 to the tiled kernels and the
+/// int8 repack and everything else to the plain generic ones.
+fn alias_gdn_proj(
+    weights: &DeviceWeights,
+    stream: &Arc<CudaStream>,
+    role: Role,
+    layer: u32,
+) -> Result<(CudaSlice<u8>, ProjQuant), ForwardError> {
+    let layer = Some(layer);
+    let placement = weights
+        .find(role, layer)
+        .ok_or(ForwardError::MissingWeight { role, layer })?;
+    let fmt = ProjQuant::from_ggml(placement.ggml_type).ok_or(ForwardError::WrongQuant {
+        role,
+        layer,
+        found: placement.ggml_type,
+        expected: GgmlType::Q8_0,
+    })?;
+    let alias = weights
+        .bytes_of(stream, role, layer)
+        .ok_or(ForwardError::MissingWeight { role, layer })?;
+    // SAFETY: identical to `alias_projection` — the result is sealed in a
+    // `GdnLayerWeights` the caller stores in `Forward` and never takes out of,
+    // and `Forward` outlives nothing that the `DeviceWeights` it was built
+    // from does not.
+    Ok((
+        ManuallyDrop::into_inner(ManuallyDrop::new(unsafe { alias.into_aliasing_slice() })),
+        fmt,
+    ))
+}
+
 /// Alias one resident Q8_0 tensor, rejecting any other stored format.
 ///
 /// The rejection is this function's whole job and it used to be missing. The
@@ -3691,25 +3727,23 @@ fn alias_gdn_layer(
     stream: &Arc<CudaStream>,
     layer: u32,
 ) -> Result<GdnLayerWeights, ForwardError> {
-    let q8 = |role: Role| -> Result<CudaSlice<u8>, ForwardError> {
-        Ok(ManuallyDrop::into_inner(alias_q8_0(
-            weights,
-            stream,
-            role,
-            Some(layer),
-        )?))
-    };
+    let (qkv, qkv_fmt) = alias_gdn_proj(weights, stream, Role::GdnQkv, layer)?;
+    let (gate, gate_fmt) = alias_gdn_proj(weights, stream, Role::GdnGate, layer)?;
+    let (out, out_fmt) = alias_gdn_proj(weights, stream, Role::GdnOut, layer)?;
     Ok(GdnLayerWeights {
         input_norm: alias_f32(weights, stream, Role::InputNorm, layer)?,
-        qkv: q8(Role::GdnQkv)?,
-        gate: q8(Role::GdnGate)?,
+        qkv,
+        gate,
         conv1d: alias_f32(weights, stream, Role::GdnConv1d, layer)?,
         alpha: alias_gate_proj(weights, stream, Role::GdnAlpha, layer)?,
         beta: alias_gate_proj(weights, stream, Role::GdnBeta, layer)?,
         dt_bias: alias_f32(weights, stream, Role::GdnDtBias, layer)?,
         a: alias_f32(weights, stream, Role::GdnA, layer)?,
         ssm_norm: alias_f32(weights, stream, Role::GdnNorm, layer)?,
-        out: q8(Role::GdnOut)?,
+        out,
+        qkv_fmt,
+        gate_fmt,
+        out_fmt,
     })
 }
 
