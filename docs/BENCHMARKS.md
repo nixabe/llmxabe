@@ -52,7 +52,19 @@ The discipline is the reason the standing can be trusted at all; several
   every pair is readable below the drift; a change that wins on the mean but
   loses a pair is not.
 - **Never bench two GPUs at once on this host** — host contention costs ~6%
-  and has manufactured a phantom regression at 65K prefill.
+  and has manufactured a phantom regression at 65K prefill. **Numbers need
+  the whole box, not just the card.** A *correctness* run on another GPU is
+  enough to poison a pair, and not because it competes for SMs you are not
+  using: the CUDA context spin-up and the NVRTC compile around it take host
+  CPU. Two sub-second test runs on a neighbouring card cost one measured pair
+  in this file's history. Outside a pairs window a sibling can use the other
+  cards freely; inside one, nothing else runs anywhere, builds included.
+- **Re-measure after a rebase, not before.** A branch that measured a win
+  against its own base can be net negative once it sits on a moved `main`,
+  and the arithmetic does not warn you: +1.1% over `ac341cc` landed on a
+  `main` that had meanwhile gone −5.0%, which three interleaved pairs found
+  only because the rebased tree was benched against the original baseline
+  rather than assumed equivalent to it.
 - **CUDA events, not `Instant`**, for anything inside a pass. Host clocks
   measure enqueue latency.
 - **Kernel-level first, then end to end.** `bench_attention` (~6 s per A/B)
