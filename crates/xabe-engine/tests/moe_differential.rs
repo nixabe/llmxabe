@@ -1698,15 +1698,22 @@ fn shared_gemv_and_tiled_isolate_the_one_live_token_case() {
 }
 
 /// The router GEMM's one-token instantiation (`moe_block_router_logits_t1`,
-/// `max_tokens == 1`) against the eight-token tile (`moe_block_router_
-/// logits`, `max_tokens > 1`). The two are engineered for bit-identity —
-/// `ROUTER_JC` equals the block width in both instantiations — and this is
-/// what checks that they are, rather than assuming it.
+/// `max_tokens == 1`) against the other two: the three-token tile
+/// (`moe_block_router_logits_t3`) and the eight-token one
+/// (`moe_block_router_logits`, which is what every other width selects). All
+/// three are engineered for bit-identity — `ROUTER_JC` equals the block width
+/// in each — and this is what checks that they are, rather than assuming it.
 ///
-/// Token 0 of a three-token `MoeBlock` is compared against the same
-/// residual row run alone through a one-token block. The rest of the
-/// block (routed experts, shared expert, combine) is not compared here
-/// -- only the logits the two kernels write.
+/// Token 0 of a wider `MoeBlock` is compared against the same residual row
+/// run alone through a one-token block. The rest of the block (routed
+/// experts, shared expert, combine) is not compared here -- only the logits
+/// the kernels write.
+///
+/// `max_tokens == 2` is here because it is the one serving width no benchmark
+/// produces: it comes from the speculative verify step, it takes the wide
+/// tile with six of its eight token slots clamped onto the last live row, and
+/// a router change that was swept, paired and bit-checked at N=1 and N=3
+/// shipped broken at exactly this width. See `docs/TESTING.md`.
 #[test]
 fn router_t1_and_tiled_isolate_the_same_row() {
     use xabe_engine::block::moe::{MoeBlock, MoeLayerWeights};
@@ -1764,20 +1771,27 @@ fn router_t1_and_tiled_isolate_the_same_row() {
     };
 
     let via_t1 = run(1, std::slice::from_ref(&row0));
-    let via_tiled = run(3, &[row0, row1, row2]);
-
-    let result = compare(&via_t1, &via_tiled);
-    println!("router t1 (max_tokens=1) vs tiled (max_tokens=3, token 0): {result}");
     println!(
         "output magnitude: max |t1| = {:.4e}",
         via_t1.iter().fold(0.0f32, |m, v| m.max(v.abs())),
     );
 
-    assert_eq!(
-        via_t1, via_tiled,
-        "router t1 and the TT=8 tile disagree on the same row -- they are \
-         engineered for bit-identity and are not",
-    );
+    // Both other instantiations. Width 2 selects the wide tile and is the
+    // width no bench reaches; width 3 is the serving target's decode shape.
+    for (max_tokens, rows) in [
+        (2, vec![row0.clone(), row1.clone()]),
+        (3, vec![row0.clone(), row1, row2]),
+    ] {
+        let via_tiled = run(max_tokens, &rows);
+        let result = compare(&via_t1, &via_tiled);
+        println!("router t1 vs max_tokens={max_tokens} (token 0): {result}");
+        assert_eq!(
+            via_t1, via_tiled,
+            "router t1 and the max_tokens={max_tokens} tile disagree on the \
+             same row -- every instantiation is engineered for bit-identity \
+             and one is not",
+        );
+    }
 }
 
 /// The routed geometry of the model these differential tests target.

@@ -358,6 +358,29 @@ line per test binary — 60 of them at the time of writing, against 34
 stops halfway is otherwise indistinguishable from one that passed, because
 every target it did reach was green.
 
+### The widths a bench produces are not the widths that exist
+
+Anything that picks a kernel, a tile or a launch config from the token count
+has to be gated on `serving_speculative_identity` before anything else. The
+benchmarks produce N=1, N=3 and prefill chunk widths; the scheduler produces
+those **and a two-token verify step**, and width 2 is the only shape in this
+workspace that no benchmark reaches.
+
+The router's expert tile was swept at N=3, confirmed under interleaved pairs
+at N=3, and checked for bit-identity at N=1 and N=3. It sized a launch for one
+kernel's dynamic shared memory and dispatched a different kernel at exactly
+`max_tokens == 2`, and it shipped. Nothing had asked which widths *exist*:
+
+```sh
+CUDA_VISIBLE_DEVICES=1 \
+  cargo test --release -p xabe-engine --test serving_speculative_identity
+```
+
+About 180 s. It failed with `CUDA_ERROR_ILLEGAL_ADDRESS`, and no bench, no
+differential and no bit-pattern diff did — because every one of them was
+scoped by what the change *was* rather than by which entry points it landed in
+and which shapes the scheduler puts through them.
+
 Serving acceptance uses the scheduler-driven runtime rather than the isolated
 forward benchmarks:
 
