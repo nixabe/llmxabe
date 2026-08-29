@@ -167,6 +167,17 @@ ruled out as the cause by direct control — 2,843.8 mean at `-c 4096` against
 2,852.3 at the model default of 262,144. The margin is quoted against
 llama.cpp's *best* of three; against its mean it reads +16.6%.
 
+**The bar was re-checked and holds.** The decode 2K row's opponent was
+re-measured on a later day, same card, same settings: **186.22 tok/s** at
+`-ub 2048` against the 187.3 recorded above, which is inside this host's own
+run-to-run spread. That matters beyond one row — llama.cpp not having drifted
+is what keeps the other seven cells on live footing rather than stale, and it
+is the cheap half of any head-to-head because that side runs whether or not
+our column has moved. The llmxabe column was **not** re-measured into this
+table on that day: the run that would have supplied it was taken on a tree
+carrying an unrelated 5% regression, so it was discarded rather than
+published. Re-checking the opponent is worth doing on its own.
+
 ## Qwen3.8-27B (`qwen35`)
 
 The dense sibling landed after the standing above was taken, and **nothing in
