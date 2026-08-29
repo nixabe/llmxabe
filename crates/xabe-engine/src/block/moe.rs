@@ -867,10 +867,10 @@ pub(crate) fn quantized_tensor<'f>(
     expected: usize,
 ) -> Result<(&'f [u8], ExpertQuant), MoeBlockError> {
     let (bytes, ty, name) = raw(file, directory, role, layer)?;
-    // One mapping, in `ExpertQuant` itself, so the set of formats the expert
-    // kernels read is stated once rather than at each site that asks.
-    let Some(quant) = ExpertQuant::from_ggml(ty.name()) else {
-        return Err(MoeBlockError::UnsupportedExpertType { name, found: ty });
+    let quant = match ty {
+        GgmlType::Q6K => ExpertQuant::Q6K,
+        GgmlType::Q8_0 => ExpertQuant::Q8_0,
+        found => return Err(MoeBlockError::UnsupportedExpertType { name, found }),
     };
     // The *file's* stride, not the device's: this is validating GGUF bytes.
     let found = bytes.len() / quant.file_block_bytes() * quant.block_elements();
