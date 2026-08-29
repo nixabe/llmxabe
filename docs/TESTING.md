@@ -74,6 +74,35 @@ absorbing reassociation noise. Each carries its rationale in a doc comment.
 Inputs come from a seeded xorshift generator (`rng::Xorshift64Star`) so a
 failure reproduces exactly. No `rand` dependency.
 
+## Controls: a known-good case in every differential
+
+A differential test says "the device agrees with the reference." It does not
+say "the device agrees with the reference *about the thing the test is named
+after*." Those come apart, and when they do the test still passes.
+
+So a differential over several cases should include at least one whose answer
+is already known independently, and **a failing control is more informative
+than a failing case**. It means the harness is measuring something other than
+what its name claims, and every green result beside it is suspect.
+
+The example that earned this section: `moe_quant_formats_differential.rs`
+covers the community-quant expert prologues (Q4_K, Q5_K, Q4_0) and includes
+Q6_K and Q8_0 as a control, because those two are already covered on real
+weights by `moe_differential.rs`. On first run the three new formats passed at
+cosine 1.000000 and **the control failed** at cosine 0.999989, max_abs
+5.5e-4.
+
+Neither number was wrong. Q6_K and Q8_0 have int8 tensor-core bodies and took
+that path; the three new formats have none and took the fp32 one. The int8
+path quantizes the *activations* as well, so it sits further from an fp32
+reference — a property of that path, not of Q6_K's unpacking. The harness was
+comparing two different kernels against one reference and reporting the gap as
+a fact about a format. Fixed by calling `disable_tensor_cores()` so every case
+goes down the path actually under test.
+
+Without the control, three passing tests would have shipped, measuring a
+narrower claim than their names made, and nothing would have said so.
+
 ## The GDN equivalence test
 
 This is the most valuable check in the crate, and the reason milestone 01

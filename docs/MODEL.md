@@ -124,11 +124,15 @@ given GGUF loads.
 
 | Consumer | Reads | Does not read |
 | --- | --- | --- |
-| MoE experts and shared expert (`kernels::moe`) | Q6_K, Q8_0 | everything else |
-| LM head, attention and GDN projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K | everything else |
-| Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K | bf16, f16 |
-| GDN alpha/beta gates (`GateProjection`) | f32, Q8_0 | **Q6_K** |
+| MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0, Q4_K, Q5_K, Q4_0 | f16, bf16, f32 |
+| LM head, attention and GDN projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
+| Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16 | **bf16** |
+| GDN alpha/beta gates (`GateProjection`) | f32, Q8_0 | **everything else** |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
+
+The last two rows are the ones that still decide things. The gates are the
+only remaining wall for a uniform non-Q8_0 file; the repack row is why none of
+the added readers is a reason to *prefer* those formats — see below.
 
 The embedding gather is a **separate row from the LM head**, and on this model
 that is not a technicality: the head is untied from the embedding, so they are
@@ -145,11 +149,16 @@ device 0: 373 tensors, 1.761 GiB
 ERROR: `token_embd.weight` is q6_K, this pass unpacks q8_0
 ```
 
-Both readers now exist — `lm_head_rows_q6_k` for the projections and the head,
-`fwd_embed_q6_k` for the gather — so a uniform Q6_K file gets past this point.
-It still stops later, at the GDN alpha/beta gates, which are the last row in
-this table without a Q6_K reader. **Adding the readers did not make Q6_K a good
-format to store a projection in**, and the repack row is why: the engine's prefill advantage comes from
+Those readers now exist, and so do Q4_K, Q5_K, Q4_0 and f16 alongside them, in
+both the head GEMV and the gather — which is what a `Q4_K_M` file needs, since
+llama.cpp's heuristics make that a *mixture* of Q4_K, Q5_K and Q6_K rather
+than a uniform quant. All of them are checked against the `xabe-kernels`
+scalar references, which are themselves bit-identical to gguf-py's independent
+implementation.
+
+Such a file still stops later, at the GDN alpha/beta gates — the one row above
+with no reader beyond f32 and Q8_0. **Adding the readers did not make any of
+these a good format to store a projection in**, and the repack row is why: the engine's prefill advantage comes from
 repacking Q8_0 projections into the split int8 layout the integer tensor cores
 can load, and **Q6_K has no path there**. A Q6_K projection falls back to the
 fp32 GEMV — the same fate as `qwen35`'s bf16 `attn_q`/`k`/`v`, which costs that
@@ -159,8 +168,16 @@ defeats the alignment trick the Q8_0 body is built around.
 
 So the mixed recipe the shipped files use (Q8_0 projections, Q6_K experts) is
 still what a file should be requantized *to* rather than away from. What
-changed is the failure mode: a uniform quant now runs slower instead of not
+changed is the failure mode: a community quant now runs slower instead of not
 running.
+
+None of this moves a number in `docs/BENCHMARKS.md`, and that is checkable
+rather than asserted. `ExpertQuant::has_mma_body()` is false for Q4_K, Q5_K
+and Q4_0, and the MMA pair selection returns `None` for any pair involving
+them, so kernel selection for both shipped files is what it was; a unit test
+reads the CUDA source to pin it. The `dflash` speculative drafter is a
+separate matter — it refuses anything but Q8_0 by name at load, deliberately,
+and adding formats there would be a different decision from this one.
 
 ### Serving a second `qwen35moe` checkpoint
 
