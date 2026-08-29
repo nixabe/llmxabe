@@ -125,16 +125,18 @@ given GGUF loads.
 | Consumer | Reads | Does not read |
 | --- | --- | --- |
 | MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0 | **Q4_K, Q5_K, Q4_0**, f16, bf16, f32 |
-| LM head, attention and GDN projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
+| LM head and attention projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
 | Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16 | **bf16** |
 | GDN alpha/beta gates (`GateProjection`) | f32, Q8_0 | **everything else** |
+| The GDN block's own projections (`Projection`: `attn_qkv`, `attn_gate`, `ssm_out`) | f32, Q8_0 | **everything else** |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
 
-The first, fourth and fifth rows are the ones that decide things. The expert
-row and the gate row are each a wall: a file whose experts are Q4_K stops at
-the experts, and a file whose gates are anything but f32 or Q8_0 stops at the
-gates. The repack row is why none of the readers that *do* exist is a reason
-to *prefer* those formats — see below.
+The expert row, the gate row and the `Projection` row are each a wall. Note
+that the `Projection` row is *not* the second row: the head GEMV's `HeadFormat` reads seven formats, but the GDN
+block passes three of its tensors to a two-variant `Projection` enum instead,
+so the same tensor is readable in one place and not the other. The repack row
+is why none of the readers that *do* exist is a reason to *prefer* those
+formats.
 
 The embedding gather is a **separate row from the LM head**, and on this model
 that is not a technicality: the head is untied from the embedding, so they are
@@ -160,6 +162,17 @@ implementation.
 
 Such a file still stops later, at the GDN alpha/beta gates — the one row above
 with no reader beyond f32 and Q8_0.
+
+It would also stop at `attn_qkv`, and **until recently it did not stop at all** —
+which was worse. `alias_q8_0`'s body was `alias_projection(..)?.0`: it read
+the stored format and discarded it, and `alias_projection` accepts Q8_0,
+bf16, Q6_K and f16 because the head GEMV reads all four. Its three callers
+hand those bytes to the GDN block, which reads them as `Projection::Q8_0`. A
+Q6_K `attn_qkv` was therefore unpacked with the 34-byte Q8_0 unpacker over
+210-byte superblocks — fluent, wrong text and no error anywhere. It now
+returns `WrongQuant`. Neither shipped file could reach it, which is exactly
+why it survived, and why the table above lists consumers rather than
+formats.
 
 A `Q4_K_M` file stops earlier still, at its experts. The expert prologue reads
 Q6_K and Q8_0 only. Readers for Q4_K, Q5_K and Q4_0 were written and then

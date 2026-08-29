@@ -3566,13 +3566,45 @@ impl Forward {
 }
 
 /// Alias one resident Q8_0 tensor, rejecting any other stored format.
+///
+/// The rejection is this function's whole job and it used to be missing. The
+/// body was `alias_projection(..)?.0`, which *reads* a format and then drops
+/// it on the floor: `alias_projection` accepts Q8_0, bf16, Q6_K and f16,
+/// because the head GEMV has a reader for each. Its three callers here —
+/// `attn_qkv`, `attn_gate`, `ssm_out` — hand the bytes to the GDN block,
+/// which reads them as `Projection::Q8_0`, a type with no other quantized
+/// variant. A uniformly Q6_K file therefore loaded those three tensors and
+/// unpacked 210-byte superblocks with the 34-byte Q8_0 unpacker, producing
+/// fluent, wrong text rather than an error — the exact failure mode
+/// `AGENTS.md` names as the highest-likelihood risk in this project.
+///
+/// Neither shipped file could reach it: both store all three Q8_0. That is
+/// what made it worth fixing before a community quant found it instead.
 fn alias_q8_0(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
     role: Role,
     layer: Option<u32>,
 ) -> Result<ManuallyDrop<CudaSlice<u8>>, ForwardError> {
+    let placement = weights
+        .find(role, layer)
+        .ok_or(ForwardError::MissingWeight { role, layer })?;
+    require_q8_0(role, layer, placement.ggml_type)?;
     Ok(alias_projection(weights, stream, role, layer)?.0)
+}
+
+/// The decision [`alias_q8_0`] makes, as a pure function so it can be tested
+/// without a resident tensor in a format no shipped file stores.
+fn require_q8_0(role: Role, layer: Option<u32>, found: GgmlType) -> Result<(), ForwardError> {
+    if found == GgmlType::Q8_0 {
+        return Ok(());
+    }
+    Err(ForwardError::WrongQuant {
+        role,
+        layer,
+        found,
+        expected: GgmlType::Q8_0,
+    })
 }
 
 /// Alias one resident projection, keeping the format the file stored it in.
@@ -3747,6 +3779,53 @@ mod tests {
 
     fn config() -> ModelConfig {
         ModelConfig::qwen3_6_35b_a3b()
+    }
+
+    /// `alias_q8_0` must refuse every format `alias_projection` accepts but
+    /// the GDN block cannot read.
+    ///
+    /// This is a regression test for a silent-wrong-numbers defect, not a
+    /// hypothetical. `alias_q8_0`'s body was `alias_projection(..)?.0`, which
+    /// reads a format and discards it, and `alias_projection` accepts Q8_0,
+    /// bf16, Q6_K and f16 because the head GEMV has a reader for each. Its
+    /// callers are `attn_qkv`, `attn_gate` and `ssm_out`, which the GDN block
+    /// reads as `Projection::Q8_0` — an enum whose only other variant is f32.
+    /// A uniformly Q6_K file would have unpacked 210-byte superblocks with
+    /// the 34-byte Q8_0 unpacker and generated fluent, wrong text.
+    ///
+    /// The check is tested through the pure `require_q8_0` rather than
+    /// `alias_q8_0` because the latter needs a *resident* tensor in a format
+    /// no file on this host stores. That is the whole difficulty, and it is
+    /// why the defect survived: the shipped files cannot reach it.
+    #[test]
+    fn only_q8_0_may_be_aliased_as_q8_0() {
+        assert!(
+            require_q8_0(Role::GdnQkv, Some(0), GgmlType::Q8_0).is_ok(),
+            "the format both shipped files store must still load",
+        );
+
+        // Every other format `alias_projection` will hand back bytes for.
+        for found in [GgmlType::Q6K, GgmlType::Bf16, GgmlType::F16] {
+            let err = require_q8_0(Role::GdnQkv, Some(0), found)
+                .expect_err("a format the GDN block cannot read must be refused");
+            let ForwardError::WrongQuant {
+                role,
+                layer,
+                found: reported,
+                expected,
+            } = err
+            else {
+                panic!("expected WrongQuant for {found:?}, got {err}");
+            };
+            assert_eq!(role, Role::GdnQkv);
+            assert_eq!(layer, Some(0));
+            assert_eq!(reported, found, "the error must name the format found");
+            assert_eq!(expected, GgmlType::Q8_0);
+        }
+
+        // And a format it would have rejected anyway, so the guard does not
+        // accidentally narrow to only the four above.
+        assert!(require_q8_0(Role::GdnOut, None, GgmlType::F32).is_err());
     }
 
     /// The fallback embedding gather against the scalar references, on a
