@@ -353,10 +353,15 @@ read rather than the thing you believe.
 
 **A truncated run looks like a short one.** Count what reported against what
 exists: `cargo test --workspace --release --no-run` prints one `Executable`
-line per test binary — 60 of them at the time of writing, against 34
-`tests/*.rs` files, the rest being lib, bin and doc targets. A sweep that
-stops halfway is otherwise indistinguishable from one that passed, because
-every target it did reach was green.
+line per test binary — 62 of them at the time of writing, against 36
+`tests/*.rs` files, the rest being lib, bin and doc targets, and a full
+`--workspace --release` run reports 70 `test result:` lines once the eight
+doc-test targets are counted. Every one of those numbers grows when a test
+file lands, so **count them rather than quoting these**; the previous pair had
+drifted by two before anyone checked, and the sentence you are reading was
+written saying 69 and corrected by the very run that verified it. A sweep that stops halfway is otherwise
+indistinguishable from one that passed, because every target it did reach was
+green.
 
 ### The widths a bench produces are not the widths that exist
 
@@ -380,6 +385,19 @@ About 180 s. It failed with `CUDA_ERROR_ILLEGAL_ADDRESS`, and no bench, no
 differential and no bit-pattern diff did — because every one of them was
 scoped by what the change *was* rather than by which entry points it landed in
 and which shapes the scheduler puts through them.
+
+**Choose a differential's widths from the launch's structure, not from the
+widths that seem interesting.** The same afternoon, from the other direction:
+the fused GDN gate kernel's differential covered tokens 1 and 8, which are one
+block on the untiled path and exactly one full tile on the tiled one. Neither
+covered a multi-block launch and neither covered a partial tail, so the two
+cases that looked like the extremes were both interior. Widened to
+`[1, 2, 7, 8, 9, 17]` — one, two and seven blocks untiled; one tile, a tile
+plus a one-row tail, and two tiles plus a tail — and 2 and 9 were the ones
+missing. The kernel was correct; the coverage was thin in a way its case list
+concealed. The general form: enumerate one, several, exactly-a-tile,
+tile-plus-tail, and several-tiles-plus-tail, because those are the shapes a
+grid computation can get wrong.
 
 Serving acceptance uses the scheduler-driven runtime rather than the isolated
 forward benchmarks:
