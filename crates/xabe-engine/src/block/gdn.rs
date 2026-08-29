@@ -660,6 +660,125 @@ __global__ void NAME(                                                           
 GDN_GATES_Q8(gdn_alpha_beta_gates_q8,    8)
 GDN_GATES_Q8(gdn_alpha_beta_gates_q8_t1, 1)
 
+// The same fused gate, over Q6_K `ssm_alpha` / `ssm_beta`.
+//
+// Neither shipped file stores these as Q6_K — Qwen3.6 has them f32 and
+// Qwen3.8 Q8_0 — but a uniform community quant does, and these two tensors
+// are the last thing standing between such a file and loading. They are the
+// two smallest matrices in the layer, so this kernel's speed is irrelevant;
+// its correctness is not, because alpha and beta feed the recurrent decay and
+// an error here degrades every token that follows rather than one.
+//
+// **This is a whole new entry point, not another arm of an existing one**,
+// and that is deliberate. The MoE regression recorded in docs/BENCHMARKS.md
+// came from adding formats to a runtime ladder inside a `__forceinline__`
+// function, where every arm is emitted at every call site and the formats
+// already there pay for the new ones. A macro that emits its own `__global__`
+// per format has no such shared resource: `gdn_alpha_beta_gates{,_t1}` and
+// `gdn_alpha_beta_gates_q8{,_t1}` cannot change, because nothing they contain
+// changed. Checked with `ptxas -v` rather than argued.
+//
+// The summation order is deliberately identical to the f32 and Q8_0 bodies'.
+// There, lane `l` accumulates elements `l, l+32, l+64, ...` ascending. Here a
+// superblock is walked as (half, group) pairs in order and lane `l` takes flat
+// offset `half*128 + grp*32 + l` — the same sequence in the same order, so all
+// three agree in the last bits on weights that agree.
+//
+// The unpacking is `dequantize_row_q6_K`'s with `l` fixed to the lane: the four
+// interleaved codes of a half live at `l, l+32, l+64, l+96`, groups 0 and 2
+// take the low and high nibble of `ql[l]`, groups 1 and 3 the same nibbles of
+// `ql[l+32]`, the two high bits are bit-pair `2*grp` of `qh[l]`, and the
+// sub-scale is `sc[(l>>4) + 2*grp]`. Operand order `(d * scale) * q`, with no
+// addition to contract into an FMA.
+#define GDN_GATES_Q6K(NAME, TT)                                                 \
+__global__ void NAME(                                                           \
+    const unsigned char* __restrict__ w_alpha,                                  \
+    const unsigned char* __restrict__ w_beta,                                   \
+    const float* __restrict__ x,                                                \
+    const float* __restrict__ dt_bias,                                          \
+    const float* __restrict__ ssm_a,                                            \
+    float* __restrict__ alpha,                                                  \
+    float* __restrict__ beta_raw,                                               \
+    float* __restrict__ a_softplus,                                             \
+    float* __restrict__ log_decay,                                              \
+    float* __restrict__ beta,                                                   \
+    int k_dim,                                                                  \
+    int heads,                                                                  \
+    int tokens                                                                  \
+) {                                                                             \
+    int lane = threadIdx.x;                                                     \
+    int n    = blockIdx.x * blockDim.y + threadIdx.y;                           \
+    if (n >= heads) return;                                                     \
+    int t0 = blockIdx.y * TT;                                                   \
+    int nsb = k_dim >> 8;                                                       \
+                                                                                \
+    const unsigned char* ra = w_alpha + (long long)n * nsb * 210;                \
+    const unsigned char* rb = w_beta  + (long long)n * nsb * 210;                \
+                                                                                \
+    float aa[TT];                                                               \
+    float bb[TT];                                                               \
+    _Pragma("unroll")                                                           \
+    for (int u = 0; u < TT; ++u) { aa[u] = 0.0f; bb[u] = 0.0f; }                \
+                                                                                \
+    int is = lane >> 4;                                                         \
+    for (int sb = 0; sb < nsb; ++sb) {                                          \
+        const unsigned char* sa  = ra + (long long)sb * 210;                    \
+        const unsigned char* sbp = rb + (long long)sb * 210;                    \
+        float da = load_half_le(sa + 208);                                      \
+        float db = load_half_le(sbp + 208);                                     \
+        _Pragma("unroll")                                                       \
+        for (int half = 0; half < 2; ++half) {                                  \
+            const signed char* sca =                                            \
+                (const signed char*)(sa + 192 + half * 8);                      \
+            const signed char* scb =                                            \
+                (const signed char*)(sbp + 192 + half * 8);                     \
+            unsigned int qha = sa[128 + half * 32 + lane];                      \
+            unsigned int qhb = sbp[128 + half * 32 + lane];                     \
+            _Pragma("unroll")                                                   \
+            for (int grp = 0; grp < 4; ++grp) {                                 \
+                int off = half * 64 + ((grp & 1) ? lane + 32 : lane);           \
+                unsigned int qla = sa[off];                                     \
+                unsigned int qlb = sbp[off];                                    \
+                int loa = (grp < 2) ? (int)(qla & 0xFu) : (int)(qla >> 4);      \
+                int lob = (grp < 2) ? (int)(qlb & 0xFu) : (int)(qlb >> 4);      \
+                int rawa = loa | ((int)((qha >> (2 * grp)) & 3u) << 4);         \
+                int rawb = lob | ((int)((qhb >> (2 * grp)) & 3u) << 4);         \
+                int si = is + 2 * grp;                                          \
+                float av = da * (float)sca[si] * (float)(rawa - 32);            \
+                float bv = db * (float)scb[si] * (float)(rawb - 32);            \
+                int i = (sb << 8) + half * 128 + grp * 32 + lane;               \
+                _Pragma("unroll")                                               \
+                for (int u = 0; u < TT; ++u) {                                  \
+                    int t = t0 + u;                                             \
+                    float xv = t < tokens ? x[(long long)t * k_dim + i] : 0.0f; \
+                    aa[u] += av * xv;                                           \
+                    bb[u] += bv * xv;                                           \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+    }                                                                           \
+                                                                                \
+    _Pragma("unroll")                                                           \
+    for (int u = 0; u < TT; ++u) {                                              \
+        float a_sum = warp_reduce_sum(aa[u]);                                   \
+        float b_sum = warp_reduce_sum(bb[u]);                                   \
+        int t = t0 + u;                                                         \
+        if (lane == 0 && t < tokens) {                                          \
+            long long i = (long long)t * heads + n;                             \
+            alpha[i] = a_sum;                                                   \
+            beta_raw[i] = b_sum;                                                \
+            float a = a_sum + dt_bias[n];                                       \
+            float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));                  \
+            a_softplus[i] = sp;                                                 \
+            log_decay[i] = sp * ssm_a[n];                                       \
+            beta[i] = 1.0f / (1.0f + expf(-b_sum));                             \
+        }                                                                       \
+    }                                                                           \
+}
+
+GDN_GATES_Q6K(gdn_alpha_beta_gates_q6k,    8)
+GDN_GATES_Q6K(gdn_alpha_beta_gates_q6k_t1, 1)
+
 __global__ void gdn_proj_f32(
     const float* __restrict__ weight,
     const float* __restrict__ x,
@@ -1263,14 +1382,32 @@ pub struct GdnLayerWeights {
 /// `ssm_alpha` / `ssm_beta` in whichever format the file stores them.
 ///
 /// `Qwen3.6-35B-A3B-UD-Q6_K_XL` has them f32 and `Qwen3.8-27B-UD-Q8_K_XL` has
-/// them Q8_0. Both are `[hidden, value_heads]` — the two smallest matrices in
-/// the layer — and both reach the same fused gate kernel, which has an
-/// instantiation per format; see `GDN_GATES_Q8`.
+/// them Q8_0; a uniform community quant of either has them Q6_K. All three are
+/// `[hidden, value_heads]` — the two smallest matrices in the layer — and all
+/// three reach the same fused gate kernel, which has an instantiation per
+/// format and per token tile; see `GDN_GATES_Q8` and `GDN_GATES_Q6K`.
 pub enum GateProjection {
     /// Stored f32, read as-is.
     F32(CudaSlice<f32>),
     /// Stored Q8_0, unpacked in the kernel's inner loop.
     Q8_0(CudaSlice<u8>),
+    /// Stored Q6_K — what a uniform community quant holds these as.
+    Q6K(CudaSlice<u8>),
+}
+
+/// Which of [`GateProjection`]'s forms a pair is in.
+///
+/// A three-way tag rather than the boolean this used to be: the gate kernel
+/// has an instantiation per format and per token tile, and a boolean could
+/// only ever name two of the three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateFormat {
+    /// `gdn_alpha_beta_gates{,_t1}`.
+    F32,
+    /// `gdn_alpha_beta_gates_q8{,_t1}`.
+    Q8_0,
+    /// `gdn_alpha_beta_gates_q6k{,_t1}`.
+    Q6K,
 }
 
 impl GateProjection {
@@ -1279,23 +1416,33 @@ impl GateProjection {
         match self {
             Self::F32(v) => v.len(),
             Self::Q8_0(v) => v.len() / 34 * 32,
+            Self::Q6K(v) => v.len() / 210 * 256,
         }
     }
 
-    /// Whether this is the Q8_0 form.
-    pub fn is_q8_0(&self) -> bool {
-        matches!(self, Self::Q8_0(_))
+    /// Which form this is.
+    pub fn format(&self) -> GateFormat {
+        match self {
+            Self::F32(_) => GateFormat::F32,
+            Self::Q8_0(_) => GateFormat::Q8_0,
+            Self::Q6K(_) => GateFormat::Q6K,
+        }
     }
 
-    /// Borrow it as a [`Projection`], for the generic projection path.
+    /// Borrow it as a [`Projection`], for the generic projection path, or
+    /// `None` when that path has no reader for this form.
     ///
     /// `alpha_beta_gates` does not go through this — it dispatches on the
     /// *pair* so both gates share one launch — but anything projecting a
-    /// single gate does.
-    pub fn as_projection(&self) -> Projection<'_> {
+    /// single gate does. `Projection` covers only f32 and Q8_0 because
+    /// `gdn_proj_*` do; a Q6_K gate is served by the fused kernel and has no
+    /// standalone projection, so this returns `None` rather than inventing a
+    /// `Projection` variant with no kernel behind it.
+    pub fn as_projection(&self) -> Option<Projection<'_>> {
         match self {
-            Self::F32(v) => Projection::F32(v),
-            Self::Q8_0(v) => Projection::Q8_0(v),
+            Self::F32(v) => Some(Projection::F32(v)),
+            Self::Q8_0(v) => Some(Projection::Q8_0(v)),
+            Self::Q6K(_) => None,
         }
     }
 }
@@ -1410,6 +1557,7 @@ impl GdnLayerWeights {
             match ty {
                 GgmlType::F32 => Ok(GateProjection::F32(floats(role)?)),
                 GgmlType::Q8_0 => Ok(GateProjection::Q8_0(quantized(role)?)),
+                GgmlType::Q6K => Ok(GateProjection::Q6K(quantized(role)?)),
                 found => Err(GdnBlockError::UnsupportedQuant {
                     role,
                     found,
@@ -1596,6 +1744,8 @@ pub struct GdnBlock {
     alpha_beta_gates_t1: CudaFunction,
     alpha_beta_gates_q8: CudaFunction,
     alpha_beta_gates_q8_t1: CudaFunction,
+    alpha_beta_gates_q6k: CudaFunction,
+    alpha_beta_gates_q6k_t1: CudaFunction,
     silu: CudaFunction,
     split: CudaFunction,
     silu_split: CudaFunction,
@@ -1671,6 +1821,8 @@ impl GdnBlock {
             alpha_beta_gates_t1: module.load_function("gdn_alpha_beta_gates_t1")?,
             alpha_beta_gates_q8: module.load_function("gdn_alpha_beta_gates_q8")?,
             alpha_beta_gates_q8_t1: module.load_function("gdn_alpha_beta_gates_q8_t1")?,
+            alpha_beta_gates_q6k: module.load_function("gdn_alpha_beta_gates_q6k")?,
+            alpha_beta_gates_q6k_t1: module.load_function("gdn_alpha_beta_gates_q6k_t1")?,
             silu: module.load_function("gdn_silu")?,
             split: module.load_function("gdn_split_qkv")?,
             silu_split: module.load_function("gdn_silu_split_qkv")?,
@@ -3367,11 +3519,13 @@ impl GdnBlock {
         let n = tokens * heads;
         check_len("alpha weight", heads * g.hidden, w_alpha.elements())?;
         check_len("beta weight", heads * g.hidden, w_beta.elements())?;
-        if w_alpha.is_q8_0() != w_beta.is_q8_0() {
+        // One launch serves both gates, so they must agree on a format.
+        let format = w_alpha.format();
+        if format != w_beta.format() {
             return Err(GdnBlockError::ShapeMismatch {
                 what: "alpha and beta must be stored in the same format",
-                expected: usize::from(w_alpha.is_q8_0()),
-                got: usize::from(w_beta.is_q8_0()),
+                expected: format as usize,
+                got: w_beta.format() as usize,
             });
         }
         check_len("alpha-beta x", tokens * g.hidden, x.len())?;
@@ -3388,11 +3542,14 @@ impl GdnBlock {
 
         // A partial token band costs its empty lanes in full, so below a whole
         // band the one-token instantiation is launched instead. See the kernel.
-        let (f, tt) = match (w_alpha.is_q8_0(), tokens < GATE_TT as usize) {
-            (false, true) => (&self.alpha_beta_gates_t1, 1),
-            (false, false) => (&self.alpha_beta_gates, GATE_TT),
-            (true, true) => (&self.alpha_beta_gates_q8_t1, 1),
-            (true, false) => (&self.alpha_beta_gates_q8, GATE_TT),
+        let small = tokens < GATE_TT as usize;
+        let (f, tt) = match (format, small) {
+            (GateFormat::F32, true) => (&self.alpha_beta_gates_t1, 1),
+            (GateFormat::F32, false) => (&self.alpha_beta_gates, GATE_TT),
+            (GateFormat::Q8_0, true) => (&self.alpha_beta_gates_q8_t1, 1),
+            (GateFormat::Q8_0, false) => (&self.alpha_beta_gates_q8, GATE_TT),
+            (GateFormat::Q6K, true) => (&self.alpha_beta_gates_q6k_t1, 1),
+            (GateFormat::Q6K, false) => (&self.alpha_beta_gates_q6k, GATE_TT),
         };
         let cfg = LaunchConfig {
             grid_dim: (
@@ -3410,6 +3567,9 @@ impl GdnBlock {
                 builder.arg(a).arg(b);
             }
             (GateProjection::Q8_0(a), GateProjection::Q8_0(b)) => {
+                builder.arg(a).arg(b);
+            }
+            (GateProjection::Q6K(a), GateProjection::Q6K(b)) => {
                 builder.arg(a).arg(b);
             }
             // Rejected above.

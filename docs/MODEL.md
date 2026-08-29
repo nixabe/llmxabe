@@ -127,12 +127,13 @@ given GGUF loads.
 | MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0 | **Q4_K, Q5_K, Q4_0**, f16, bf16, f32 |
 | LM head and attention projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
 | Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16 | **bf16** |
-| GDN alpha/beta gates (`GateProjection`) | f32, Q8_0 | **everything else** |
+| GDN alpha/beta gates (`GateProjection`) | f32, Q8_0, Q6_K | Q4_K, Q5_K, Q4_0, f16, bf16 |
 | The GDN block's own projections (`Projection`: `attn_qkv`, `attn_gate`, `ssm_out`) | f32, Q8_0 | **everything else** |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
 
-The expert row, the gate row and the `Projection` row are each a wall. Note
-that the `Projection` row is *not* the second row: the head GEMV's `HeadFormat` reads seven formats, but the GDN
+The expert row and the `Projection` row are the walls that remain. The gate row
+stopped being one — see below. Note that the `Projection` row is *not* the
+second row: the head GEMV's `HeadFormat` reads seven formats, but the GDN
 block passes three of its tensors to a two-variant `Projection` enum instead,
 so the same tensor is readable in one place and not the other. The repack row
 is why none of the readers that *do* exist is a reason to *prefer* those
@@ -160,10 +161,14 @@ than a uniform quant. All of them are checked against the `xabe-kernels`
 scalar references, which are themselves bit-identical to gguf-py's independent
 implementation.
 
-Such a file still stops later, at the GDN alpha/beta gates — the one row above
-with no reader beyond f32 and Q8_0.
+Such a file used to stop later, at the GDN alpha/beta gates. It no longer
+does: `gdn_alpha_beta_gates_q6k{,_t1}` unpacks Q6_K in the fused gate's inner
+loop. Those two tensors are the smallest matrices in the layer, so the
+kernel's speed is beside the point; its correctness is not, because alpha and
+beta feed the recurrent decay, and an error there degrades every token that
+follows rather than one.
 
-It would also stop at `attn_qkv`, and **until recently it did not stop at all** —
+It then stops at `attn_qkv`, and **until recently it did not stop at all** —
 which was worse. `alias_q8_0`'s body was `alias_projection(..)?.0`: it read
 the stored format and discarded it, and `alias_projection` accepts Q8_0,
 bf16, Q6_K and f16 because the head GEMV reads all four. Its three callers

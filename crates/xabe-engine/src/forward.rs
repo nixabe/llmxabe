@@ -3715,10 +3715,12 @@ fn alias_gdn_layer(
 
 /// Alias one resident `ssm_alpha` / `ssm_beta` in its stored format.
 ///
-/// f32 on `qwen35moe`, Q8_0 on `qwen35`. Both stay aliases into the arena
-/// rather than widened copies: `GdnLayerWeights` is held in a `ManuallyDrop`
-/// precisely because nothing in it owns its bytes, and an owned buffer in
-/// there would leak once per pass shape.
+/// f32 on `qwen35moe`, Q8_0 on `qwen35`, Q6_K on a uniform community quant
+/// of either. `expected` on the error names f32 only because the variant
+/// carries one type; all three above are accepted. Each stays an alias into
+/// the arena rather than a widened copy: `GdnLayerWeights` is held in a
+/// `ManuallyDrop` precisely because nothing in it owns its bytes, and an
+/// owned buffer in there would leak once per pass shape.
 fn alias_gate_proj(
     weights: &DeviceWeights,
     stream: &Arc<CudaStream>,
@@ -3741,6 +3743,11 @@ fn alias_gate_proj(
             role,
             Some(layer),
         )?))),
+        // A uniform community quant stores the gates Q6_K. The fused gate
+        // kernel has its own entry point for that; see `GDN_GATES_Q6K`.
+        GgmlType::Q6K => Ok(GateProjection::Q6K(ManuallyDrop::into_inner(
+            alias_projection(weights, stream, role, Some(layer))?.0,
+        ))),
         found => Err(ForwardError::WrongQuant {
             role,
             layer: Some(layer),
