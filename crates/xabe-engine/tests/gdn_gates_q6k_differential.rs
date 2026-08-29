@@ -235,11 +235,27 @@ fn the_q6_k_gate_kernel_matches_the_f32_one_on_the_values_it_encodes() {
     let dt_bias = weights.dt_bias;
     let a = weights.a;
 
-    // `tokens == 1` takes `_t1`, `tokens == 8` takes the GATE_TT tile. They
-    // are separate compiled entry points, so both are exercised. 8 is the
-    // tile width; a run of exactly the tile width also checks that the
-    // `t < tokens` guard does not clip the last row.
-    for tokens in [1usize, 8] {
+    // Both entry points, and every shape of grid either can be launched with.
+    // `tokens < GATE_TT` takes `_t1` with `tt = 1`, otherwise the tiled
+    // kernel with `tt = GATE_TT`; the grid's y extent is `tokens / tt`
+    // rounded up, from the same `tt`, so:
+    //
+    //   1   `_t1`,   one block   — the decode width
+    //   2   `_t1`,   two blocks  — multi-block on the untiled kernel
+    //   7   `_t1`,   seven       — the widest the untiled path takes
+    //   8   tiled,   one block   — exactly one full tile
+    //   9   tiled,   two blocks  — a full tile plus a one-row tail
+    //   17  tiled,   three       — two full tiles plus a tail
+    //
+    // 2 and 9 are the ones worth naming. A token count that is neither one
+    // nor a multiple of the tile is where a kernel and the grid it was sized
+    // with can disagree, and that disagreement — `tt` and a second width
+    // derived by rules that agreed at 1 and 3 and not at 2 — is what faulted
+    // main in e4d43e0. It cannot happen here, because `tt` and the function
+    // come out of one match arm and the grid comes out of that same `tt`.
+    // Tested rather than argued, because that is what the router's own
+    // differential had missing at exactly this width.
+    for tokens in [1usize, 2, 7, 8, 9, 17] {
         let mut rng = Xorshift64Star::new(0x_6A11_E500 ^ tokens as u64);
         let x_host = rng.vec_f32(tokens * hidden, -1.0, 1.0);
         let x = stream.clone_htod(&x_host).expect("upload x");
