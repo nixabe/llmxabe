@@ -124,15 +124,17 @@ given GGUF loads.
 
 | Consumer | Reads | Does not read |
 | --- | --- | --- |
-| MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0, Q4_K, Q5_K, Q4_0 | f16, bf16, f32 |
+| MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0 | **Q4_K, Q5_K, Q4_0**, f16, bf16, f32 |
 | LM head, attention and GDN projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
 | Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16 | **bf16** |
 | GDN alpha/beta gates (`GateProjection`) | f32, Q8_0 | **everything else** |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
 
-The last two rows are the ones that still decide things. The gates are the
-only remaining wall for a uniform non-Q8_0 file; the repack row is why none of
-the added readers is a reason to *prefer* those formats — see below.
+The first, fourth and fifth rows are the ones that decide things. The expert
+row and the gate row are each a wall: a file whose experts are Q4_K stops at
+the experts, and a file whose gates are anything but f32 or Q8_0 stops at the
+gates. The repack row is why none of the readers that *do* exist is a reason
+to *prefer* those formats — see below.
 
 The embedding gather is a **separate row from the LM head**, and on this model
 that is not a technicality: the head is untied from the embedding, so they are
@@ -157,8 +159,22 @@ scalar references, which are themselves bit-identical to gguf-py's independent
 implementation.
 
 Such a file still stops later, at the GDN alpha/beta gates — the one row above
-with no reader beyond f32 and Q8_0. **Adding the readers did not make any of
-these a good format to store a projection in**, and the repack row is why: the engine's prefill advantage comes from
+with no reader beyond f32 and Q8_0.
+
+A `Q4_K_M` file stops earlier still, at its experts. The expert prologue reads
+Q6_K and Q8_0 only. Readers for Q4_K, Q5_K and Q4_0 were written and then
+**reverted** (`40f7fc6`): `dequant_tile` is `__forceinline__` and switches on a
+runtime format, so adding three arms emitted all five at all nine call sites,
+moved twenty kernels' register allocation, and cost 5.05% end to end on a
+shipped path. The formats were not the problem and the arithmetic was correct;
+the sharing was. Redoing it needs the format threaded as a compile-time
+parameter so each instantiation carries one unpacker, with `ptxas -v` before
+and after as evidence. Until then the head GEMV and the gather read these
+formats and the experts do not, which is the asymmetry this table exists to
+make visible.
+
+**Adding the readers did not make any of these a good format to store a
+projection in**, and the repack row is why: the engine's prefill advantage comes from
 repacking Q8_0 projections into the split int8 layout the integer tensor cores
 can load, and **Q6_K has no path there**. A Q6_K projection falls back to the
 fp32 GEMV — the same fate as `qwen35`'s bf16 `attn_q`/`k`/`v`, which costs that
@@ -171,11 +187,12 @@ still what a file should be requantized *to* rather than away from. What
 changed is the failure mode: a community quant now runs slower instead of not
 running.
 
-None of this moves a number in `docs/BENCHMARKS.md`, and that is checkable
-rather than asserted. `ExpertQuant::has_mma_body()` is false for Q4_K, Q5_K
-and Q4_0, and the MMA pair selection returns `None` for any pair involving
-them, so kernel selection for both shipped files is what it was; a unit test
-reads the CUDA source to pin it. The `dflash` speculative drafter is a
+None of this moves a number in `docs/BENCHMARKS.md`. The head GEMV and the
+gather reach the added formats through their own entry points — a compiled
+kernel per format, not an arm inside a shared one — so neither shipped file's
+kernel selection or codegen changes. `ExpertQuant` was deliberately left at
+Q6_K and Q8_0 for the reason above, which is the strongest form of that
+guarantee: the expert path has no new code in it at all. The `dflash` speculative drafter is a
 separate matter — it refuses anything but Q8_0 by name at load, deliberately,
 and adding formats there would be a different decision from this one.
 
