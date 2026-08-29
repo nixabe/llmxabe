@@ -86,8 +86,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, DriverError,
+    LaunchConfig, PushKernelArg,
 };
 
 use xabe_cuda::kernels::compile;
@@ -1603,6 +1603,46 @@ pub struct GdnBlock {
     scratch: Option<Scratch>,
     mixer: Mixer,
     geometry: GdnGeometry,
+    /// Side stream and events for overlapping the two input projections at
+    /// decode width.
+    ///
+    /// `qkv` and `gate` read the same `normed` and write disjoint scratch, so
+    /// nothing orders them but the stream they are issued on. At decode width
+    /// neither one fills the card: with the row tile 4 the launches are
+    /// `conv_dim / 4` and `value_dim / 4` warps — 2,048 and 1,024 on a part
+    /// that holds 1,152 at this kernel's 128 registers — so the pair runs 1.78
+    /// waves and then 0.89, and each pays its own ramp and drain against a
+    /// half-empty machine.
+    ///
+    /// Measured on the `qwen35moe` N=3 step they read **407 GB/s** (`qkv`,
+    /// 17.83 MB in 43.8 us) and **351** (`gate`, 8.91 MB in 25.4), against a
+    /// card whose calibrated streaming ceiling is 604.5. The correlation with
+    /// wave count is the whole story: the third projection, `ssm_out`, is
+    /// 0.44 waves and reads 311, while the routed-expert GEMVs beside them —
+    /// a different kernel and layout, but the same card and the same step —
+    /// run 21 waves deep and read 503-518. Forking the second onto its own
+    /// stream merges the pair into one occupancy pool with one tail, which is
+    /// the same argument
+    /// [`crate::block::attention::GatedAttentionBlock`]'s `batch_fork` makes
+    /// for its per-sequence chains.
+    ///
+    /// Nothing about the arithmetic moves: each output row is computed by the
+    /// same warp over the same operands in the same order, so this is
+    /// bit-identical to the serial issue by construction.
+    ///
+    /// **Taken only where there is more than one token.** At `tokens == 1` the
+    /// step is launch-latency-bound rather than occupancy-bound, and two
+    /// events per Gated DeltaNet layer — sixty extra graph nodes — is pure
+    /// overhead against a machine that has no wave to fill: measured
+    /// **−1.2%** at N=1, 2K, losing both interleaved pairs, against +0.79%
+    /// winning all three at N=3. That is the same shape as the shared-expert
+    /// side-stream result in `docs/BENCHMARKS.md`'s WHY NOT list, which is
+    /// flat at N=3 and −2.5–3% at N=1. The `gemv` path *is* the one-token
+    /// path, so declining to fork there is the whole of the gate.
+    ///
+    /// `None` when `LLMXABE_GDN_PROJ_SERIAL` is set, which restores the serial
+    /// order for an A/B.
+    proj_fork: Option<(Arc<CudaStream>, CudaEvent, CudaEvent)>,
 }
 
 impl GdnBlock {
@@ -1680,6 +1720,15 @@ impl GdnBlock {
             geometry,
             mma: MmaKernels::new(ctx).map_err(GdnBlockError::Mma)?,
             xq: None,
+            proj_fork: if std::env::var_os("LLMXABE_GDN_PROJ_SERIAL").is_some() {
+                None
+            } else {
+                Some((
+                    ctx.new_stream()?,
+                    ctx.new_event(None)?,
+                    ctx.new_event(None)?,
+                ))
+            },
         })
     }
 
@@ -2039,6 +2088,8 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
         } else if let Some(i8w) = gemv {
+            // Serial, deliberately. `gemv` is the `tokens == 1` path and
+            // `proj_fork` is measured to *lose* there; see the field.
             self.project_split_gemv(
                 stream,
                 &i8w.qkv_q,
@@ -2058,6 +2109,12 @@ impl GdnBlock {
                 g.value_dim(),
             )?;
         } else if let Some(i8w) = split_tiled {
+            // Same fork as the one-token path above.
+            let fork = self.proj_fork.as_ref();
+            if let Some((side, start, _)) = fork {
+                start.record(stream)?;
+                side.wait(start)?;
+            }
             self.project_split_tiled(
                 stream,
                 &i8w.qkv_q,
@@ -2069,7 +2126,7 @@ impl GdnBlock {
                 tokens,
             )?;
             self.project_split_tiled(
-                stream,
+                fork.map_or(stream, |(side, _, _)| side),
                 &i8w.gate_q,
                 &i8w.gate_s,
                 &s.normed,
@@ -2078,6 +2135,10 @@ impl GdnBlock {
                 g.value_dim(),
                 tokens,
             )?;
+            if let Some((side, _, done)) = fork {
+                done.record(side)?;
+                stream.wait(done)?;
+            }
         } else {
             self.project(
                 stream,
@@ -2330,6 +2391,11 @@ impl GdnBlock {
         //    the batched form `run` already has for a multi-token prefill —
         //    the weight is read once for the whole batch regardless of how
         //    many distinct sequences the tokens belong to.
+        //
+        //    At decode width the gate half goes on `proj_fork`'s side stream
+        //    and is joined at step 7, the first thing that reads `s.z`. See
+        //    the field, and the join site, for why the window is that wide.
+        let mut forked = false;
         if let Some(i8w) = tc {
             self.quantize_activations(stream, &s.normed, tokens, g.hidden)?;
             let (xq, xs) = self.xq.as_ref().expect("quantized above");
@@ -2360,6 +2426,8 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
         } else if let Some(i8w) = gemv {
+            // Serial, deliberately. `gemv` is the `tokens == 1` path and
+            // `proj_fork` is measured to *lose* there; see the field.
             self.project_split_gemv(
                 stream,
                 &i8w.qkv_q,
@@ -2379,6 +2447,12 @@ impl GdnBlock {
                 g.value_dim(),
             )?;
         } else if let Some(i8w) = split_tiled {
+            let fork = self.proj_fork.as_ref();
+            if let Some((side, start, _)) = fork {
+                start.record(stream)?;
+                side.wait(start)?;
+                forked = true;
+            }
             self.project_split_tiled(
                 stream,
                 &i8w.qkv_q,
@@ -2390,7 +2464,7 @@ impl GdnBlock {
                 tokens,
             )?;
             self.project_split_tiled(
-                stream,
+                fork.map_or(stream, |(side, _, _)| side),
                 &i8w.gate_q,
                 &i8w.gate_s,
                 &s.normed,
@@ -2562,6 +2636,20 @@ impl GdnBlock {
                     &mut core_out,
                 )?;
             }
+        }
+
+        // Join the forked gate projection, here rather than beside its launch
+        // because step 7 below is the first thing in the block that reads
+        // `s.z`. Everything between — the convolution, the q/k/v split, the
+        // alpha/beta gates and the delta rule — is on the `qkv` side of the
+        // block and reads `s.normed` at most, so a concurrent reader of the
+        // same activation is all the side stream ever is. Those four are
+        // together ~34 us a layer of small, low-occupancy launches at N=3
+        // against the gate projection's ~25, which is the machine the gate's
+        // 1,024 warps are being asked to fill.
+        if forked && let Some((side, _, done)) = self.proj_fork.as_ref() {
+            done.record(side)?;
+            stream.wait(done)?;
         }
 
         // 7. final_output-N = ssm_norm(core) * silu(z). No state: batches
