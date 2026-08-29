@@ -1698,6 +1698,10 @@ __device__ void route_token(
     // owns it masks it in place. The mask loop is fully unrolled with a
     // predicate rather than indexed by the winner, because a dynamic index
     // into a register array spills it to local memory and undoes the point.
+    // The selected weights' running total, accumulated on lane 0 as they are
+    // chosen. Declared out here because the renormalize below reads it, and
+    // only lane 0 ever writes it. See that block for why it is a register.
+    float sel_sum = 0.0f;
     if (threadIdx.x < 32) {
         int lane = threadIdx.x;
         float p[MOE_ROUTE_LANE_EXPERTS];
@@ -1726,7 +1730,18 @@ __device__ void route_token(
             }
             if (lane == 0) {
                 topk_ids[(long long)token * top_k + j] = bi;
-                topk_weights[(long long)token * top_k + j] = bv;
+                // The weight is *not* stored to global here. It is the
+                // denominator's j-th term and the numerator of the j-th
+                // output, and both consumers are this same lane a few
+                // instructions later; a global store followed by a global
+                // load of the address just written is a dependent round trip
+                // per selected expert. `rval` is dead from here — the
+                // softmax denominator it held was read into `sum_exp`
+                // before this loop, no barrier follows, and no other warp
+                // touches it again — so it is the staging the epilogue
+                // wants. `top_k <= blockDim.x` bounds the index.
+                rval[j] = bv;
+                sel_sum += bv;
             }
         }
     }
@@ -1736,12 +1751,18 @@ __device__ void route_token(
     // Summed in selection order by a single thread, matching the reference's
     // `ranked.iter().map(|&(_, p)| p).sum()`. k is 8; parallelizing this
     // would only add a reduction-order difference for nothing.
+    //
+    // `sel_sum` accumulated `bv` in ascending `j` in the loop above, which is
+    // the same addition of the same eight floats in the same order the
+    // read-back loop performed. That equality is the whole claim: fp32
+    // addition is not associative and these weights multiply the expert
+    // outputs, so a reordering here would move the block's output in its last
+    // bits. Nothing is reordered — only the operands' storage moved from
+    // global to shared and a register.
     if (threadIdx.x == 0) {
         long long b = (long long)token * top_k;
-        float s = 0.0f;
-        for (int j = 0; j < top_k; ++j) s += topk_weights[b + j];
-        if (s > 0.0f) {
-            for (int j = 0; j < top_k; ++j) topk_weights[b + j] = topk_weights[b + j] / s;
+        if (sel_sum > 0.0f) {
+            for (int j = 0; j < top_k; ++j) topk_weights[b + j] = rval[j] / sel_sum;
         } else {
             // Unreachable with a real softmax (every entry is > 0), but the
             // reference guards it rather than propagating NaN, so this does
