@@ -165,55 +165,6 @@ pub(crate) const SHARED_MMA_MIN_TOKENS: usize = 128;
 /// tile to 16 instead measured 1,703 — same register wall, and it also
 /// doubles the staged activation tile.
 const ROUTER_ET: u32 = 8;
-
-/// Experts one router block covers **at decode width**, where the constant
-/// above starves the grid.
-///
-/// At prefill `grid.y` is `max_tokens / TT` and the sweep that chose 8 was run
-/// against a full card. At decode `grid.y` is 1, so `num_experts / ET` is the
-/// entire grid — 32 blocks, 256 warps, against the 2,304 this part holds.
-/// Every routed kernel beside it was given a one-unit sibling for exactly this
-/// reason; the router never was.
-///
-/// The value is bit-identical to 8 by construction — `ET` is a tile width, not
-/// a reduction shape — so this is a scheduling knob and nothing else.
-///
-/// Swept at the shape it is for, N=3 decode on `qwen35moe`, one run each in
-/// series with `ET = 8` repeated last so the card's warming is visible rather
-/// than hidden (it cost 0.58% across the five runs):
-///
-/// | experts per block | blocks | tok/s |
-/// | --- | ---: | ---: |
-/// | 8 | 32 | 208.0 … 206.8 |
-/// | **4** | **64** | **208.7** |
-/// | 2 | 128 | 207.6 |
-/// | 1 | 256 | 207.6 |
-///
-/// More blocks is *not* monotonically better, which is the same L2 argument
-/// `ROUTER_ET` makes: past the knee the extra activation re-reads and the
-/// extra trips cost more than the occupancy buys. 4 is the knee, worth about
-/// half a point drift-corrected.
-///
-/// That sweep is a single run per point and it is **not** monotonic in the
-/// tile size, which is what drift looks like rather than a knee — so it was
-/// not what settled this. Three interleaved reversed pairs of `ET = 4`
-/// against `ET = 8`, in one binary so nothing but the tile differs, at N=3
-/// 2K: **206.8 v 204.3, 207.1 v 203.4, 206.8 v 205.0** — +1.22%, +1.82%,
-/// +0.88%, winning every pair, mean **+1.31%**. The single-run sweep
-/// understated it by a factor of three, which is the usual relationship
-/// between a sweep and a pair set on this host.
-///
-/// `LLMXABE_ROUTER_ET` overrides it; anything other than 8, 4, 2 or 1 falls
-/// back to this value.
-const ROUTER_DECODE_ET: u32 = 4;
-
-/// The narrow expert tiles, in the order the `*_narrow` function arrays hold
-/// them.
-const ROUTER_NARROW_ET: [u32; 3] = [4, 2, 1];
-
-/// Widest token count that takes [`ROUTER_DECODE_ET`] rather than
-/// [`ROUTER_ET`]. Above it the grid has a token axis to fill the card with.
-const ROUTER_NARROW_MAX_TOKENS: usize = ROUTER_TT_N3 as usize;
 /// Contraction the router stages per trip. Mirrors `ROUTER_JC`, and **must**
 /// equal [`THREADS`] — that equality is what preserves the untiled kernel's
 /// per-thread summation order, which the router cannot afford to change.
@@ -335,24 +286,19 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
 // grid: (num_experts / ROUTER_ET, ceil(max_tokens / ROUTER_TT)) — never the
 // live token count.
 
-// Tokens one block carries, and experts it covers. The product is the
+// Tokens one block carries, and experts it covers. The product is the 32
 // accumulators each thread holds. `ROUTER_JC` is the contraction staged per
 // trip and **must equal the block width**, which is what keeps each thread's
 // summation order identical to the untiled kernel's.
+#define ROUTER_ET 8
 #define ROUTER_JC 256
 
-// Instantiated at several token and expert tile widths. `ROUTER_JC` equals the
-// block width in all of them, which is what keeps each thread's summation
-// order identical to the untiled kernel's — and identical *between* the
-// instantiations, so a decode step and a prefill step agree bit for bit on the
-// logits of any token they share.
-//
-// `ET` is a tile width and nothing else: it decides how many experts one
-// block's threads accumulate side by side, and every thread still contracts
-// over `j` in the same `jc + tid` order, reduces down the same warp and sums
-// the same warp partials in the same ascending order. Narrowing it moves no
-// arithmetic — it only splits the same rows across more blocks.
-#define ROUTER_LOGITS(NAME, TT, ROUTER_ET)                                     \
+// Instantiated at two token tile widths. `ROUTER_JC` equals the block width in
+// both, which is what keeps each thread's summation order identical to the
+// untiled kernel's — and identical *between* the two instantiations, so a
+// decode step and a prefill step agree bit for bit on the logits of any token
+// they share.
+#define ROUTER_LOGITS(NAME, TT)                                                \
 __global__ void NAME(                                                          \
     const float* __restrict__ w,                                               \
     const float* __restrict__ x,                                               \
@@ -431,30 +377,9 @@ __global__ void NAME(                                                          \
 // Eight tokens for prefill. One for decode, where seven of the eight
 // accumulators would be a token clamped to the same row — 7/8 of the
 // arithmetic and 7/8 of the staged tile spent recomputing one answer.
-ROUTER_LOGITS(moe_block_router_logits,    8, 8)
-ROUTER_LOGITS(moe_block_router_logits_t3, 3, 8)
-ROUTER_LOGITS(moe_block_router_logits_t1, 1, 8)
-
-// The same two decode widths at narrower expert tiles.
-//
-// `ROUTER_ET = 8` was swept at prefill (see the constant), where `grid.y` is
-// `max_tokens / TT` and the card is full whatever `grid.x` is. At decode
-// `grid.y` is 1, so `grid.x = num_experts / ET` is the *whole* grid: 32 blocks
-// — 256 warps against the 2,304 this part holds at the kernel's register
-// count. The sweep that chose 8 could not see that, because at prefill width
-// no expert tile starves the machine.
-//
-// Narrowing the tile trades instructions for blocks: a trip does `TT`
-// activation loads either way, so `ET = 1` issues 8x the trips' worth of
-// activation traffic across 8x the blocks to cover the same 256 rows. The
-// activation tile is `TT * hidden` — 24 KiB at N=3 — and hot in L1 for every
-// block that re-reads it, which is why the trade can pay at all.
-ROUTER_LOGITS(moe_block_router_logits_t3_e4, 3, 4)
-ROUTER_LOGITS(moe_block_router_logits_t3_e2, 3, 2)
-ROUTER_LOGITS(moe_block_router_logits_t3_e1, 3, 1)
-ROUTER_LOGITS(moe_block_router_logits_t1_e4, 1, 4)
-ROUTER_LOGITS(moe_block_router_logits_t1_e2, 1, 2)
-ROUTER_LOGITS(moe_block_router_logits_t1_e1, 1, 1)
+ROUTER_LOGITS(moe_block_router_logits,    8)
+ROUTER_LOGITS(moe_block_router_logits_t3, 3)
+ROUTER_LOGITS(moe_block_router_logits_t1, 1)
 
 // The shared expert's gate and the combine that consumes it, in one launch.
 //
@@ -966,10 +891,6 @@ pub struct MoeBlock {
     router_logits_fn: CudaFunction,
     router_logits_t3_fn: CudaFunction,
     router_logits_t1_fn: CudaFunction,
-    /// The two decode token tiles at expert tiles 4, 2 and 1, indexed by
-    /// [`ROUTER_DECODE_ET`]'s position in that list. See `ROUTER_ET`.
-    router_logits_t3_narrow: [CudaFunction; 3],
-    router_logits_t1_narrow: [CudaFunction; 3],
     combine_fn: CudaFunction,
     buffers: MoeBuffers,
     normed: CudaSlice<f32>,
@@ -979,9 +900,6 @@ pub struct MoeBlock {
     gate: CudaSlice<f32>,
     geometry: MoeGeometry,
     eps: f32,
-    /// The router's expert tile at decode width. [`ROUTER_DECODE_ET`] unless
-    /// `LLMXABE_ROUTER_ET` names another of 8, 4, 2 or 1.
-    decode_et: u32,
 }
 
 impl MoeBlock {
@@ -1037,16 +955,6 @@ impl MoeBlock {
             router_logits_fn: module.load_function("moe_block_router_logits")?,
             router_logits_t3_fn: module.load_function("moe_block_router_logits_t3")?,
             router_logits_t1_fn: module.load_function("moe_block_router_logits_t1")?,
-            router_logits_t3_narrow: [
-                module.load_function("moe_block_router_logits_t3_e4")?,
-                module.load_function("moe_block_router_logits_t3_e2")?,
-                module.load_function("moe_block_router_logits_t3_e1")?,
-            ],
-            router_logits_t1_narrow: [
-                module.load_function("moe_block_router_logits_t1_e4")?,
-                module.load_function("moe_block_router_logits_t1_e2")?,
-                module.load_function("moe_block_router_logits_t1_e1")?,
-            ],
             combine_fn: module.load_function("moe_block_gate_and_combine")?,
             moe,
             layer_ops,
@@ -1058,11 +966,6 @@ impl MoeBlock {
             gate: stream.alloc_zeros::<f32>(geometry.max_tokens)?,
             geometry,
             eps,
-            decode_et: std::env::var("LLMXABE_ROUTER_ET")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|e| ROUTER_NARROW_ET.contains(e) || *e == ROUTER_ET)
-                .unwrap_or(ROUTER_DECODE_ET),
         })
     }
 
@@ -1229,16 +1132,9 @@ impl MoeBlock {
         } else {
             ROUTER_TT
         };
-        // The expert tile. Only the two decode token tiles have narrow
-        // siblings, and only they are starved for blocks; see
-        // `ROUTER_DECODE_ET`.
-        let narrow = (g.max_tokens <= ROUTER_NARROW_MAX_TOKENS)
-            .then(|| ROUTER_NARROW_ET.iter().position(|&e| e == self.decode_et))
-            .flatten();
-        let et = narrow.map_or(ROUTER_ET, |i| ROUTER_NARROW_ET[i]);
         let cfg = LaunchConfig {
             grid_dim: (
-                (g.num_experts as u32).div_ceil(et),
+                (g.num_experts as u32).div_ceil(ROUTER_ET),
                 (g.max_tokens as u32).div_ceil(tt),
                 1,
             ),
@@ -1246,13 +1142,12 @@ impl MoeBlock {
             // what preserves the untiled kernel's per-thread summation order,
             // and what makes the activation tile private to each thread.
             block_dim: (ROUTER_JC, 1, 1),
-            shared_mem_bytes: ((THREADS.div_ceil(32) * et * tt) as usize * size_of::<f32>()) as u32,
+            shared_mem_bytes: ((THREADS.div_ceil(32) * ROUTER_ET * tt) as usize * size_of::<f32>())
+                as u32,
         };
-        let f = match (tt, narrow) {
-            (1, Some(i)) => &self.router_logits_t1_narrow[i],
-            (ROUTER_TT_N3, Some(i)) => &self.router_logits_t3_narrow[i],
-            (1, None) => &self.router_logits_t1_fn,
-            (ROUTER_TT_N3, None) => &self.router_logits_t3_fn,
+        let f = match tt {
+            1 => &self.router_logits_t1_fn,
+            ROUTER_TT_N3 => &self.router_logits_t3_fn,
             _ => &self.router_logits_fn,
         };
         let mut builder = stream.launch_builder(f);
