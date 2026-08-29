@@ -179,6 +179,11 @@ fn main() {
             stream.clone_htod(&q8_0_stack(stack, 1)).expect("gate"),
             stream.clone_htod(&q8_0_stack(stack, 2)).expect("up"),
         ),
+        // This bench exists to compare the two formats the shipped files put
+        // in their expert stacks, and it synthesizes stacks for exactly those
+        // two. The community-quant formats have no stack builder here, and
+        // `LLMXABE_MOE_QUANT` above refuses to name one.
+        other => unreachable!("LLMXABE_MOE_QUANT cannot select {other:?}"),
     };
     let d_down = stream.clone_htod(&q8_0_stack(stack, 3)).expect("down");
     let d_sgate = stream

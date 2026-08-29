@@ -85,6 +85,9 @@ const QK8_0: usize = 32;
 const QK_K: usize = 256;
 const BLOCK_Q8_0_BYTES: usize = 34;
 const BLOCK_Q6_K_BYTES: usize = 210;
+const BLOCK_Q4_0_BYTES: usize = 18;
+const BLOCK_Q4_K_BYTES: usize = 144;
+const BLOCK_Q5_K_BYTES: usize = 176;
 
 /// Bytes per Q6_K superblock once it is on the device.
 ///
@@ -286,22 +289,60 @@ pub enum ExpertQuant {
     Q6K,
     /// 32 elements per 34-byte block.
     Q8_0,
+    /// 32 elements per 18-byte block, codes centred by -8.
+    Q4_0,
+    /// 256 elements per 144-byte superblock, **affine**: each 32-element group
+    /// carries a packed 6-bit scale *and* min over two fp16 super-scales.
+    Q4K,
+    /// As [`Self::Q4K`] plus a high-bit plane: 176 bytes per superblock.
+    Q5K,
 }
 
 impl ExpertQuant {
-    /// The integer the kernel switches on.
+    /// The format a GGUF type name denotes, or `None` if the expert kernels
+    /// have no reader for it.
+    ///
+    /// By name rather than by `GgmlType`, because `xabe-cuda` does not depend
+    /// on `xabe-gguf`; the one call site that has both does the mapping.
+    pub const fn from_ggml(name: &str) -> Option<Self> {
+        match name.as_bytes() {
+            b"q6_K" => Some(Self::Q6K),
+            b"q8_0" => Some(Self::Q8_0),
+            b"q4_0" => Some(Self::Q4_0),
+            b"q4_K" => Some(Self::Q4K),
+            b"q5_K" => Some(Self::Q5K),
+            _ => None,
+        }
+    }
+}
+
+impl ExpertQuant {
+    /// The integer the kernel switches on. Mirrors `dequant_tile`'s ladder;
+    /// `quant_codes_match_the_kernel` pins the two together.
     const fn code(self) -> i32 {
         match self {
             Self::Q6K => 0,
             Self::Q8_0 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4K => 3,
+            Self::Q5K => 4,
         }
+    }
+
+    /// Whether the int8 tensor-core bodies can read this format.
+    ///
+    /// Only Q6_K and Q8_0 have `mma` prologues. The community-quant formats
+    /// take the fp32 path, which is why adding them cannot move any number in
+    /// `docs/BENCHMARKS.md`: neither shipped file contains one.
+    pub const fn has_mma_body(self) -> bool {
+        matches!(self, Self::Q6K | Self::Q8_0)
     }
 
     /// Elements per serialized block.
     pub const fn block_elements(self) -> usize {
         match self {
-            Self::Q6K => QK_K,
-            Self::Q8_0 => QK8_0,
+            Self::Q6K | Self::Q4K | Self::Q5K => QK_K,
+            Self::Q8_0 | Self::Q4_0 => QK8_0,
         }
     }
 
@@ -313,6 +354,9 @@ impl ExpertQuant {
         match self {
             Self::Q6K => BLOCK_Q6_K_BYTES,
             Self::Q8_0 => BLOCK_Q8_0_BYTES,
+            Self::Q4_0 => BLOCK_Q4_0_BYTES,
+            Self::Q4K => BLOCK_Q4_K_BYTES,
+            Self::Q5K => BLOCK_Q5_K_BYTES,
         }
     }
 
@@ -332,6 +376,12 @@ impl ExpertQuant {
         match self {
             Self::Q6K => BLOCK_Q6_K_DEVICE_BYTES,
             Self::Q8_0 => BLOCK_Q8_0_BYTES,
+            // Q4_K and Q5_K are already 16-byte multiples, so they need no
+            // re-striding; Q4_0's 18 is not, but its tile reads bytes rather
+            // than words, exactly as the 34-byte Q8_0 tile does.
+            Self::Q4_0 => BLOCK_Q4_0_BYTES,
+            Self::Q4K => BLOCK_Q4_K_BYTES,
+            Self::Q5K => BLOCK_Q5_K_BYTES,
         }
     }
 }
@@ -606,13 +656,134 @@ __device__ __forceinline__ void dequant_tile_q8_0_wide(
     }
 }
 
+// Q4_0, Q4_K and Q5_K tiles, for expert stacks a community quant produced.
+//
+// `Q4_K_M` — the most common community build of either architecture — stores
+// `ffn_*_exps` as a *mixture* of Q4_K, Q5_K and Q6_K depending on the layer,
+// so an engine that reads only Q6_K and Q8_0 cannot load one at all. These
+// three close that, on the fp32 path only: none of them reaches the int8
+// tensor-core bodies, and `mma_quant_for` below still returns `None` for
+// every pair involving them, so the shipped files' kernel selection is
+// untouched.
+//
+// All three keep the tile contract the Q6_K prologue established: `i0` is a
+// multiple of MOE_TK, a lane owns the four *consecutive* elements
+// `4L .. 4L+3`, and because `4L % 32` is at most 28 those four never cross a
+// 32-element group boundary. That is what lets each of these read its scale
+// once per tile instead of once per element.
+
+// The affine reconstruction, with its rounding pinned.
+//
+// Q4_K and Q5_K are `d*sc*q - dmin*m`, and nvcc will contract that subtraction
+// into `fma(d1, q, -m1)`, which rounds once where `dequantize_row_q4_K` rounds
+// twice. That is a divergence in the weight itself, so it is pinned with
+// `mul.rn`/`sub.rn`. Both instructions were going to be issued anyway; the
+// only thing given up is the compiler's freedom to be wrong. Q6_K and Q8_0
+// need none of this because their reconstructions have no addition at all.
+__device__ __forceinline__ float moe_affine_value(float d1, int code, float m1) {
+    float c = (float)code;
+    float t, r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(t) : "f"(d1), "f"(c));
+    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(t), "f"(m1));
+    return r;
+}
+
+// `get_scale_min_k4` from `ggml-quants.c`. Eight 6-bit scale/min pairs in
+// twelve bytes; the `j >= 4` branch borrows its high bit-pair from a different
+// byte than it takes its low nibble from, and reading it as if it were the
+// `j < 4` branch yields scales up to 4x too small — finite and plausible.
+__device__ __forceinline__ void moe_scale_min_k4(
+    int j, const unsigned char* __restrict__ q, int* sc, int* m
+) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4)  | ((q[j]     >> 6) << 4);
+    }
+}
+
+// Q4_0: 32 elements per 18-byte block, codes centred by -8.
+//
+// Byte `k` of a block holds elements `k` and `k + 16` — so a lane's four
+// consecutive elements come from four *consecutive bytes*, all through the
+// same nibble, because `r` is a multiple of 4 and `r .. r+3` therefore never
+// straddles the 16-element halfway point.
+__device__ __forceinline__ void dequant_tile_q4_0(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    long long i = i0 + 4 * wlane;
+    const unsigned char* blk = src + (i >> 5) * 18;
+    int r = (int)(i & 31);
+    float d = load_half_le(blk);
+    const unsigned char* qp = blk + 2 + (r & 15);
+    int high = r >> 4;
+
+    #pragma unroll
+    for (int t = 0; t < MOE_TN; ++t) {
+        unsigned int q = qp[t];
+        int code = high ? (int)(q >> 4) : (int)(q & 0xFu);
+        // Operand order `q * d`, as in `dequantize_row_q4_0`.
+        out[t] = (float)(code - 8) * d;
+    }
+}
+
+// Q4_K (144 B) and Q5_K (176 B): 256 elements as four 64-element passes, each
+// split into a low-nibble half under sub-scale `2g` and a high-nibble half
+// under `2g+1`. `HIGH` selects Q5_K, whose fifth bit lives in a 32-byte plane
+// that is *not* advanced between passes — all four index `qh[l]` and it is the
+// bit position `2g + sub` that moves.
+template<bool HIGH>
+__device__ __forceinline__ void dequant_tile_k_affine(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    const int SB = HIGH ? 176 : 144;
+    const int QS = HIGH ? 48 : 16;
+
+    long long i = i0 + 4 * wlane;
+    const unsigned char* base = src + (i >> 8) * SB;
+    int r   = (int)(i & 255);
+    int g   = r >> 6;
+    int sub = (r >> 5) & 1;
+    int l   = r & 31;
+    int js  = 2 * g + sub;
+
+    float d    = load_half_le(base);
+    float dmin = load_half_le(base + 2);
+    int sc, m;
+    moe_scale_min_k4(js, base + 4, &sc, &m);
+    // Hoisted: all four elements of the tile share one group, so they share
+    // one scale and one min. Same lever as the Q6_K prologue's hoisted header.
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)m;
+
+    const unsigned char* qs = base + QS + g * 32 + l;
+    const unsigned char* qh = base + 16 + l;
+
+    #pragma unroll
+    for (int t = 0; t < MOE_TN; ++t) {
+        unsigned int byte = qs[t];
+        int code = (int)(sub ? (byte >> 4) : (byte & 0xFu));
+        if (HIGH) code |= (int)((qh[t] >> js) & 1u) << 4;
+        out[t] = moe_affine_value(d1, code, m1);
+    }
+}
+
 // The GEMM prologue: unpack exactly the weight tile about to be multiplied.
 // Nothing is materialized in fp32 beyond the four values in registers.
+//
+// The codes are `ExpertQuant::code()`; a mismatch between the two lists reads
+// every expert as the wrong format, so `quant_codes_match_the_kernel` in the
+// Rust tests below pins them.
 __device__ __forceinline__ void dequant_tile(
     const unsigned char* __restrict__ src, int quant, long long i0, int wlane, float* out
 ) {
-    if (quant == 0) dequant_tile_q6k(src, i0, wlane, out);
-    else            dequant_tile_q8_0_wide(src, i0, wlane, out);
+    if      (quant == 0) dequant_tile_q6k(src, i0, wlane, out);
+    else if (quant == 1) dequant_tile_q8_0_wide(src, i0, wlane, out);
+    else if (quant == 2) dequant_tile_q4_0(src, i0, wlane, out);
+    else if (quant == 3) dequant_tile_k_affine<false>(src, i0, wlane, out);
+    else                 dequant_tile_k_affine<true>(src, i0, wlane, out);
 }
 
 // Stage MOE_TM rows x MOE_TK columns of activations into shared memory, in
@@ -5327,12 +5498,70 @@ mod tests {
         assert!(too_many.to_string().contains("65"));
     }
 
+    /// `ExpertQuant::code` and `dequant_tile`'s ladder must agree.
+    ///
+    /// They are two independent lists — one Rust, one inside a CUDA string —
+    /// and a mismatch reads every expert of the swapped formats as the other
+    /// one. That produces finite, wrongly-scaled weights rather than a crash,
+    /// which is the failure mode `AGENTS.md` calls the highest-likelihood
+    /// risk in this project.
+    #[test]
+    fn quant_codes_match_the_kernel() {
+        for (q, code, body) in [
+            (ExpertQuant::Q6K, 0, "dequant_tile_q6k(src"),
+            (ExpertQuant::Q8_0, 1, "dequant_tile_q8_0_wide(src"),
+            (ExpertQuant::Q4_0, 2, "dequant_tile_q4_0(src"),
+            (ExpertQuant::Q4K, 3, "dequant_tile_k_affine<false>(src"),
+            (ExpertQuant::Q5K, 4, "dequant_tile_k_affine<true>(src"),
+        ] {
+            assert_eq!(q.code(), code, "{q:?} code drifted");
+            let arm = if code == 4 {
+                format!("else                 {body}")
+            } else if code == 0 {
+                format!("if      (quant == {code}) {body}")
+            } else {
+                format!("else if (quant == {code}) {body}")
+            };
+            assert!(
+                MOE_SRC.contains(&arm),
+                "dequant_tile has no arm `{arm}` for {q:?}",
+            );
+        }
+        // Only these two have int8 tensor-core prologues; if that ever stops
+        // being true the MMA selection below has to learn about it.
+        assert!(ExpertQuant::Q6K.has_mma_body() && ExpertQuant::Q8_0.has_mma_body());
+        for q in [ExpertQuant::Q4_0, ExpertQuant::Q4K, ExpertQuant::Q5K] {
+            assert!(!q.has_mma_body(), "{q:?} claims an mma body it lacks");
+        }
+    }
+
+    /// The affine formats' rounding is pinned, or nvcc contracts their
+    /// subtraction into an FMA and the weight stops matching the reference.
+    #[test]
+    fn the_affine_prologue_cannot_contract_into_an_fma() {
+        assert!(
+            MOE_SRC.contains("mul.rn.f32") && MOE_SRC.contains("sub.rn.f32"),
+            "moe_affine_value lost its rounding pins",
+        );
+    }
+
     #[test]
     fn quant_block_geometry_matches_the_ggml_layout() {
         assert_eq!(ExpertQuant::Q6K.block_elements(), 256);
         assert_eq!(ExpertQuant::Q6K.file_block_bytes(), 210);
         assert_eq!(ExpertQuant::Q6K.block_bytes(), 224);
         assert_eq!(ExpertQuant::Q8_0.block_elements(), 32);
+        assert_eq!(ExpertQuant::Q4_0.block_bytes(), 18);
+        assert_eq!(ExpertQuant::Q4_0.block_elements(), 32);
+        assert_eq!(ExpertQuant::Q4K.block_bytes(), 144);
+        assert_eq!(ExpertQuant::Q5K.block_bytes(), 176);
+        assert_eq!(ExpertQuant::Q4K.block_elements(), 256);
+        assert_eq!(ExpertQuant::Q5K.block_elements(), 256);
+        // Q4_K and Q5_K need no device re-striding; Q6_K is the only one
+        // whose file and device strides differ.
+        for q in [ExpertQuant::Q4_0, ExpertQuant::Q4K, ExpertQuant::Q5K] {
+            assert_eq!(q.file_block_bytes(), q.block_bytes(), "{q:?} re-strided");
+        }
         assert_eq!(ExpertQuant::Q8_0.block_bytes(), 34);
         assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);
         assert_eq!(BLOCK_Q8_0_BYTES, 2 + QK8_0);
