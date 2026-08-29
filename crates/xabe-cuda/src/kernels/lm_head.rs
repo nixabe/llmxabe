@@ -74,7 +74,6 @@ use cudarc::driver::{
 };
 
 use super::compile;
-use super::moe::ExpertQuant;
 
 /// Elements per Q8_0 block, and serialized bytes per block.
 ///
@@ -83,6 +82,11 @@ use super::moe::ExpertQuant;
 /// alter this module's alignment validation.
 const QK8_0: usize = 32;
 const BLOCK_Q8_0_BYTES: usize = 34;
+
+/// Elements per k-quant superblock, and serialized bytes per Q6_K superblock.
+/// Duplicated for the same reason as the Q8_0 pair above.
+const QK_K: usize = 256;
+const BLOCK_Q6_K_BYTES: usize = 210;
 
 /// Warps per block. One warp owns one output row, so this is also rows per
 /// block.
@@ -138,6 +142,11 @@ const STAGE_BLOCKS: usize = 16;
 /// of this for the loop to have no ragged tail. Mirrors the `32 * 8` in
 /// `lm_head_rows_bf16`.
 const BF16_WARP_STEP: usize = 256;
+
+/// Weight elements one warp of the Q6_K body covers per iteration: the whole
+/// 256-element superblock, since the two 128-element halves are an inner
+/// unrolled pair. Mirrors the `hidden_dim >> 8` in `lm_head_rows_q6_k`.
+const Q6_K_WARP_STEP: usize = QK_K;
 
 /// Threads per block in both argmax passes.
 const ARGMAX_THREADS: u32 = 256;
@@ -563,6 +572,134 @@ LM_HEAD_BF16_ENTRY(lm_head_bf16_b3r2, 3, 2)
 LM_HEAD_BF16_ENTRY(lm_head_bf16_b3r4, 3, 4)
 
 // ---------------------------------------------------------------------------
+// The same GEMV over a Q6_K weight tensor.
+// ---------------------------------------------------------------------------
+//
+// Neither shipped file stores a tensor this kernel family is asked for as
+// Q6_K — both put their projections and their head at Q8_0 or bf16, and Q6_K
+// appears only in the expert stacks, which `moe.rs` owns. This body exists for
+// the *other* files: the ordinary community quant of either architecture is
+// uniform, so `token_embd.weight` and every projection arrive as Q6_K and the
+// model previously stopped at the first one with "is q6_K, this pass unpacks
+// q8_0".
+//
+// It is a fallback and is written as one. There is no staging pass, no row
+// tile and no prefetch — a 210-byte superblock stride defeats the alignment
+// trick the Q8_0 body is built around, and the file that needs this path is
+// not the file whose numbers are in docs/BENCHMARKS.md. What it has instead is
+// the indexing the format already wants: one lane per `l`, which is exactly
+// how `dequantize_row_q6_K` walks a superblock, so every load below is a
+// 32-lane contiguous byte read and the 6-bit unpacking is the reference's
+// arithmetic with nothing rearranged.
+//
+// A warp covers one 128-element half per step and two halves per superblock,
+// so `hidden_dim` must be a multiple of 256. GGUF enforces that already —
+// `ne[0] % blck_size != 0` is refused at parse — and `with_row_tile` requires
+// a multiple of 512 on top, so the check in `forward` is a guard rail rather
+// than a live branch.
+//
+// Operand order is `(d * scale) * q`, the same as `dequant.rs`'s
+// `dequantize_q6_k` and `xabe_kernels::quant::dequantize_q6_k`. Reassociating
+// to `d * (scale * q)` is mathematically equal, rounds differently, and would
+// cost the weight-level bit-identity for nothing.
+template <int BT>
+__device__ __forceinline__ void lm_head_rows_q6_k(
+    const unsigned char* __restrict__ weight,
+    const float* __restrict__ hidden_states,
+    int hidden_dim,
+    int vocab,
+    int token_base,
+    float* __restrict__ logits
+) {
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int lane = threadIdx.x;
+    if (row >= vocab) return;
+
+    int nsb = hidden_dim >> 8;
+    const unsigned char* w = weight + (long long)row * nsb * 210;
+    const float* x = hidden_states + (long long)token_base * hidden_dim;
+
+    float acc[BT];
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) acc[t] = 0.0f;
+
+    // `is` selects which of the two per-16-element scales in a lane's quarter
+    // applies, and depends only on the lane, so it is hoisted out of both
+    // loops.
+    int is = lane >> 4;
+
+    for (int sb = 0; sb < nsb; ++sb) {
+        const unsigned char* base = w + (long long)sb * 210;
+        // One broadcast load of the superblock delta for all 256 elements.
+        float d = load_half_le(base + 208);
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned char* ql = base + half * 64;
+            const unsigned char* qh = base + 128 + half * 32;
+            const signed char*   sc = (const signed char*)(base + 192 + half * 8);
+
+            // Three contiguous 32-byte warp reads. The four codes a lane owns
+            // are interleaved across the half at l, l+32, l+64, l+96 — the
+            // format's own layout, not a choice made here.
+            unsigned int ql0 = ql[lane];
+            unsigned int ql1 = ql[lane + 32];
+            unsigned int qhb = qh[lane];
+
+            int raw1 = (int)((ql0 & 0xFu) | ((qhb & 3u) << 4));
+            int raw2 = (int)((ql1 & 0xFu) | (((qhb >> 2) & 3u) << 4));
+            int raw3 = (int)((ql0 >> 4)   | (((qhb >> 4) & 3u) << 4));
+            int raw4 = (int)((ql1 >> 4)   | (((qhb >> 6) & 3u) << 4));
+
+            float w0 = d * (float)sc[is]     * (float)(raw1 - 32);
+            float w1 = d * (float)sc[is + 2] * (float)(raw2 - 32);
+            float w2 = d * (float)sc[is + 4] * (float)(raw3 - 32);
+            float w3 = d * (float)sc[is + 6] * (float)(raw4 - 32);
+
+            int j = (sb << 8) + half * 128 + lane;
+            #pragma unroll
+            for (int t = 0; t < BT; ++t) {
+                const float* xt = x + (long long)t * hidden_dim + j;
+                acc[t] += w0 * xt[0] + w1 * xt[32] + w2 * xt[64] + w3 * xt[96];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < BT; ++t) {
+        float v = acc[t];
+        for (int off = 16; off > 0; off >>= 1) {
+            v += __shfl_down_sync(0xffffffff, v, off);
+        }
+        if (lane == 0) {
+            logits[(long long)(token_base + t) * vocab + row] = v;
+        }
+    }
+}
+
+#define LM_HEAD_Q6_K_ENTRY(NAME, BT)                                        \
+extern "C" __global__ void NAME(                                            \
+    const unsigned char* __restrict__ weight,                               \
+    const float* __restrict__ hidden_states,                                \
+    int hidden_dim,                                                         \
+    int vocab,                                                              \
+    int token_base,                                                         \
+    float* __restrict__ logits                                              \
+) {                                                                         \
+    lm_head_rows_q6_k<BT>(weight, hidden_states, hidden_dim, vocab,         \
+                          token_base, logits);                              \
+}
+
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b1, 1)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b2, 2)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b3, 3)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b4, 4)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b5, 5)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b6, 6)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b7, 7)
+LM_HEAD_Q6_K_ENTRY(lm_head_q6_k_b8, 8)
+
+// ---------------------------------------------------------------------------
 // Greatest logit, lowest index on a tie: `xabe_kernels::gemv::argmax`.
 // ---------------------------------------------------------------------------
 //
@@ -696,12 +833,22 @@ extern "C" __global__ void argmax_prob(
 /// `attn_v` and `nextn.eh_proj` as bf16 and everything else Q8_0. So the
 /// format travels with the pointer, read out of the file's own tensor
 /// directory, rather than being a property of the kernel or of the model.
+///
+/// Neither shipped file uses Q6_K here; the ordinary *uniform* community
+/// quant of either architecture does, for every tensor including the head,
+/// and that is who [`Self::Q6K`] is for. It takes the fallback body — no
+/// staging, no row tile — and it does not reach the split-int8 tensor-core
+/// repack at all, so a file quantized that way trades prefill throughput for
+/// loading. See `docs/MODEL.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadFormat {
     /// 32 quants and one fp16 delta per 34-byte block.
     Q8_0,
     /// A dense 2-byte truncated fp32. Widening is a shift, so it is exact.
     Bf16,
+    /// "K-quant" 6-bit: 256 quants, 16 int8 group scales and one fp16
+    /// super-scale per 210-byte superblock.
+    Q6K,
 }
 
 impl HeadFormat {
@@ -710,6 +857,7 @@ impl HeadFormat {
         match self {
             Self::Q8_0 => BLOCK_Q8_0_BYTES as f64 / QK8_0 as f64,
             Self::Bf16 => 2.0,
+            Self::Q6K => BLOCK_Q6_K_BYTES as f64 / QK_K as f64,
         }
     }
 
@@ -721,6 +869,7 @@ impl HeadFormat {
         match name.as_bytes() {
             b"q8_0" => Some(Self::Q8_0),
             b"bf16" => Some(Self::Bf16),
+            b"q6_K" => Some(Self::Q6K),
             _ => None,
         }
     }
@@ -749,6 +898,14 @@ impl<'a> HeadTensor<'a> {
         Self {
             bytes,
             format: HeadFormat::Bf16,
+        }
+    }
+
+    /// A Q6_K tensor — what a uniform community quant stores these as.
+    pub fn q6_k(bytes: &'a CudaSlice<u8>) -> Self {
+        Self {
+            bytes,
+            format: HeadFormat::Q6K,
         }
     }
 }
@@ -793,6 +950,7 @@ impl LmHeadGeometry {
         match format {
             HeadFormat::Q8_0 => self.row_bytes(),
             HeadFormat::Bf16 => self.hidden * 2,
+            HeadFormat::Q6K => self.hidden / QK_K * BLOCK_Q6_K_BYTES,
         }
     }
 
@@ -865,21 +1023,16 @@ pub enum LmHeadError {
         geometry: Box<LmHeadGeometry>,
         reason: &'static str,
     },
-    /// A weight format this kernel does not unpack.
+    /// `hidden` is not a whole number of the named body's warp step.
     ///
-    /// Q8_0 and bf16 are implemented, because those are the two formats the
-    /// two model files actually use for these tensors — verified against
-    /// each file's own tensor directory. `docs/KERNELS.md` proposes
-    /// re-quantizing the head to Q6_K to cut its 540 MB/token; that would
-    /// slot [`super::moe`]'s `q6k_element` into the prologue unchanged, but
-    /// shipping an untested third path ahead of that decision would be worse
-    /// than rejecting it here.
-    UnsupportedQuant(ExpertQuant),
-    /// `hidden` is not a whole number of the bf16 body's 256-element warp
-    /// steps. Structurally unreachable behind the multiple-of-512 geometry
-    /// check, and kept because that check is about the Q8_0 staging pass and
-    /// could reasonably be relaxed for a format that does not stage.
-    Bf16RaggedContraction { hidden: usize },
+    /// Structurally unreachable behind the multiple-of-512 geometry check,
+    /// and kept because that check is about the Q8_0 staging pass and could
+    /// reasonably be relaxed for a format that does not stage.
+    RaggedContraction {
+        format: &'static str,
+        hidden: usize,
+        step: usize,
+    },
     /// The weight tensor is not a whole number of Q8_0 blocks.
     ///
     /// Rejected rather than truncated: a partial trailing block would make
@@ -905,14 +1058,14 @@ impl std::fmt::Display for LmHeadError {
             Self::UnsupportedGeometry { geometry, reason } => {
                 write!(f, "unsupported LM head geometry {geometry:?}: {reason}")
             }
-            Self::UnsupportedQuant(q) => write!(
+            Self::RaggedContraction {
+                format,
+                hidden,
+                step,
+            } => write!(
                 f,
-                "the LM head kernel unpacks Q8_0 only, not {q:?}; see LmHeadError::UnsupportedQuant",
-            ),
-            Self::Bf16RaggedContraction { hidden } => write!(
-                f,
-                "the bf16 GEMV covers 256 elements per warp step, so `hidden` must be a \
-                 multiple of 256, not {hidden}",
+                "the {format} GEMV covers {step} elements per warp step, so `hidden` must be a \
+                 multiple of {step}, not {hidden}",
             ),
             Self::RaggedWeights { bytes, block_bytes } => write!(
                 f,
@@ -949,6 +1102,9 @@ pub struct LmHeadKernels {
     tiles: [CudaFunction; MAX_BATCH_TILE],
     /// The same, over a bf16 weight tensor.
     bf16_tiles: [CudaFunction; MAX_BATCH_TILE],
+    /// The same, over a Q6_K weight tensor. No row tile: the fallback body
+    /// has none.
+    q6_k_tiles: [CudaFunction; MAX_BATCH_TILE],
     /// The bf16 row-tiled three-token entry point, paired with
     /// [`Self::b3_row_tile`]'s row count.
     bf16_b3_row_tile: Option<CudaFunction>,
@@ -1064,6 +1220,16 @@ impl LmHeadKernels {
                 module.load_function("lm_head_bf16_b7")?,
                 module.load_function("lm_head_bf16_b8")?,
             ],
+            q6_k_tiles: [
+                module.load_function("lm_head_q6_k_b1")?,
+                module.load_function("lm_head_q6_k_b2")?,
+                module.load_function("lm_head_q6_k_b3")?,
+                module.load_function("lm_head_q6_k_b4")?,
+                module.load_function("lm_head_q6_k_b5")?,
+                module.load_function("lm_head_q6_k_b6")?,
+                module.load_function("lm_head_q6_k_b7")?,
+                module.load_function("lm_head_q6_k_b8")?,
+            ],
             bf16_b3_row_tile,
             b3_row_tile,
             argmax_partial: module.load_function("argmax_partial")?,
@@ -1080,7 +1246,7 @@ impl LmHeadKernels {
 
     /// `logits[t][v] = sum_h weight[v][h] * hidden_states[t][h]`.
     ///
-    /// `weight` is the raw tensor from the GGUF file in whichever of the two
+    /// `weight` is the raw tensor from the GGUF file in whichever of the
     /// formats [`HeadFormat`] names, `hidden_states`
     /// is `[max_tokens][hidden]` and `logits` is `[max_tokens][vocab]`; rows
     /// past `tokens` in either are neither read nor written.
@@ -1108,7 +1274,11 @@ impl LmHeadKernels {
             }
             HeadFormat::Bf16 => {
                 if !g.hidden.is_multiple_of(BF16_WARP_STEP) {
-                    return Err(LmHeadError::Bf16RaggedContraction { hidden: g.hidden });
+                    return Err(LmHeadError::RaggedContraction {
+                        format: "bf16",
+                        hidden: g.hidden,
+                        step: BF16_WARP_STEP,
+                    });
                 }
                 if !weight.bytes.len().is_multiple_of(2) {
                     return Err(LmHeadError::RaggedWeights {
@@ -1117,6 +1287,22 @@ impl LmHeadKernels {
                     });
                 }
                 weight.bytes.len() / 2
+            }
+            HeadFormat::Q6K => {
+                if !g.hidden.is_multiple_of(Q6_K_WARP_STEP) {
+                    return Err(LmHeadError::RaggedContraction {
+                        format: "Q6_K",
+                        hidden: g.hidden,
+                        step: Q6_K_WARP_STEP,
+                    });
+                }
+                if !weight.bytes.len().is_multiple_of(BLOCK_Q6_K_BYTES) {
+                    return Err(LmHeadError::RaggedWeights {
+                        bytes: weight.bytes.len(),
+                        block_bytes: BLOCK_Q6_K_BYTES,
+                    });
+                }
+                weight.bytes.len() / BLOCK_Q6_K_BYTES * QK_K
             }
         };
         if found != g.elements() {
@@ -1160,42 +1346,51 @@ impl LmHeadKernels {
             // module docs name against the activation-pipe cost that scales
             // with BT. Row arithmetic is identical, so the logits are
             // bit-identical to the untiled path.
-            let bf16 = weight.format == HeadFormat::Bf16;
-            // The bf16 body stages nothing, so its shared request is zero;
-            // asking for the Q8_0 staging buffer anyway would cost occupancy
-            // for a buffer no lane touches.
-            let cfg = if bf16 {
+            // Only the Q8_0 body stages; the others read global memory
+            // directly, and asking for a staging buffer no lane touches would
+            // cost them occupancy for nothing.
+            let staged = weight.format == HeadFormat::Q8_0;
+            let cfg = if staged {
+                cfg
+            } else {
                 LaunchConfig {
                     shared_mem_bytes: 0,
                     ..cfg
                 }
-            } else {
-                cfg
             };
-            let row_tiled = self.b3_row_tile.as_ref().filter(|_| tile == 3);
+            // Q6_K has no row-tiled instantiation — it is the fallback body,
+            // and a row tile is an optimization for the formats the shipped
+            // files actually use.
+            let row_tiled = self
+                .b3_row_tile
+                .as_ref()
+                .filter(|_| tile == 3 && weight.format != HeadFormat::Q6K);
             let (func, cfg) = match row_tiled {
                 Some((f, rt)) => {
                     let rows_per_block = WARPS_PER_BLOCK as usize * rt;
                     let rt_cfg = LaunchConfig {
                         grid_dim: (g.vocab.div_ceil(rows_per_block) as u32, 1, 1),
                         block_dim: (WARP, WARPS_PER_BLOCK, 1),
-                        shared_mem_bytes: if bf16 {
-                            0
-                        } else {
+                        shared_mem_bytes: if staged {
                             (WARPS_PER_BLOCK as usize * rt * STAGE_BLOCKS * BLOCK_Q8_0_BYTES) as u32
+                        } else {
+                            0
                         },
                     };
-                    let func = match (bf16, self.bf16_b3_row_tile.as_ref()) {
-                        (true, Some(b)) => b,
-                        (true, None) => {
+                    let func = match (weight.format, self.bf16_b3_row_tile.as_ref()) {
+                        (HeadFormat::Bf16, Some(b)) => b,
+                        (HeadFormat::Bf16, None) => {
                             unreachable!("the bf16 row tile is loaded exactly when the Q8_0 one is")
                         }
-                        (false, _) => f,
+                        _ => f,
                     };
                     (func, rt_cfg)
                 }
-                None if bf16 => (&self.bf16_tiles[tile - 1], cfg),
-                None => (&self.tiles[tile - 1], cfg),
+                None => match weight.format {
+                    HeadFormat::Q8_0 => (&self.tiles[tile - 1], cfg),
+                    HeadFormat::Bf16 => (&self.bf16_tiles[tile - 1], cfg),
+                    HeadFormat::Q6K => (&self.q6_k_tiles[tile - 1], cfg),
+                },
             };
             let mut builder = stream.launch_builder(func);
             builder
@@ -1648,10 +1843,16 @@ mod tests {
             reason: "hidden must be a whole number of 32-element Q8_0 blocks",
         };
         assert!(bad.to_string().contains("Q8_0 blocks"));
+        // The ragged-contraction message names the format it is about, so a
+        // Q6_K tensor with a bad `hidden` cannot be misread as a bf16 one.
         assert!(
-            LmHeadError::UnsupportedQuant(ExpertQuant::Q6K)
-                .to_string()
-                .contains("Q8_0 only"),
+            LmHeadError::RaggedContraction {
+                format: "Q6_K",
+                hidden: 100,
+                step: QK_K,
+            }
+            .to_string()
+            .contains("Q6_K"),
         );
         assert!(
             LmHeadError::RaggedWeights {

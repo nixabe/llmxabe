@@ -2194,6 +2194,7 @@ fn projection_weight(
     let format = match placement.ggml_type {
         GgmlType::Q8_0 => HeadFormat::Q8_0,
         GgmlType::Bf16 => HeadFormat::Bf16,
+        GgmlType::Q6K => HeadFormat::Q6K,
         found => {
             return Err(AttentionBlockError::WrongQuant { role, layer, found });
         }

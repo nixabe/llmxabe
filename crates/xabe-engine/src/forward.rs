@@ -126,6 +126,12 @@ use crate::weights::DeviceWeights;
 const QK8_0: usize = 32;
 const BLOCK_Q8_0_BYTES: usize = 34;
 
+/// Elements per k-quant superblock, and Q6_K's serialized size, for sizing an
+/// `output.weight` a uniform community quant stored as Q6_K. Same reason as
+/// the pair above; the same test asserts they agree with the kernel crate.
+const QK_K: usize = 256;
+const BLOCK_Q6_K_BYTES: usize = 210;
+
 /// Threads per block for the embedding gather.
 const EMBED_THREADS: u32 = 256;
 
@@ -202,6 +208,63 @@ __global__ void fwd_embed_q8_0(
         float d = load_half_le(blk);
         signed char q = (signed char)blk[2 + (j % 32)];
         dst[j] = d * (float)q;
+    }
+}
+
+// The same gather over a Q6_K table.
+//
+// Neither shipped file stores `token_embd.weight` as Q6_K — both are Q8_0 —
+// but a uniform community quant stores every tensor that way, and this is
+// the site whose refusal `docs/MODEL.md` quotes: "`token_embd.weight` is
+// q6_K, this pass unpacks q8_0". The LM head's own Q6_K body does not help
+// here; the head and the embedding are separate tensors in this model (it is
+// untied) and separate kernels.
+//
+// A row of `hidden` elements is `hidden/256` superblocks of 210 bytes. The
+// index decomposition is `xabe_cuda::kernels::moe`'s `dequant_tile_q6k_impl`
+// read backwards: a flat position `r` inside a superblock is half `r>>7`,
+// interleave group `(r>>5)&3`, and lane `r&31`. Groups 0 and 2 take the low
+// and high nibble of `ql[l]`; groups 1 and 3 the same nibbles of `ql[l+32]`;
+// the two high bits are bit-pair `2*grp` of `qh[l]`; and the int8 sub-scale
+// is `sc[(l>>4) + 2*grp]`.
+//
+// Operand order is `(d * scale) * q`, as in `dequantize_row_q6_K` and every
+// other Q6_K unpack in this project. There is no addition in the
+// reconstruction, so nothing contracts into an FMA and the gathered row is
+// bit-identical to the scalar reference.
+//
+// This is a gather, not a GEMV: it runs once per step over `n_tokens` rows,
+// so it is nowhere near the hot path and is written for legibility.
+__global__ void fwd_embed_q6_k(
+    const unsigned char* __restrict__ table,
+    const int* __restrict__ ids,
+    float* __restrict__ out,
+    int hidden,
+    int n_tokens
+) {
+    int t = blockIdx.x;
+    if (t >= n_tokens) return;
+
+    long long superblocks = hidden / 256;
+    const unsigned char* row = table + (long long)ids[t] * superblocks * 210;
+    float* dst = out + (long long)t * hidden;
+
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
+        const unsigned char* sb = row + (long long)(j >> 8) * 210;
+        int r    = j & 255;
+        int half = r >> 7;
+        int grp  = (r >> 5) & 3;
+        int l    = r & 31;
+
+        const unsigned char* ql = sb + half * 64 + ((grp & 1) ? l + 32 : l);
+        const unsigned char* qh = sb + 128 + half * 32 + l;
+        const signed char*   sc = (const signed char*)(sb + 192 + half * 8);
+        float d = load_half_le(sb + 208);
+
+        int lo4 = (grp < 2) ? (*ql & 0xF) : (*ql >> 4);
+        int raw = lo4 | ((((int)*qh >> (2 * grp)) & 3) << 4);
+
+        dst[j] = d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32);
     }
 }
 
@@ -671,6 +734,9 @@ pub struct Forward {
     vocab: usize,
     rms_eps: f32,
 
+    /// The embedding gather for whichever format the file stores
+    /// `token_embd.weight` in. Chosen once at construction, because the
+    /// table's format cannot change under a built `Forward`.
     embed_fn: CudaFunction,
     layer_ops: LayerOpsKernels,
     gdn: GdnBlock,
@@ -924,7 +990,8 @@ impl Forward {
 
         let ptx = compile(EMBED_SRC, "forward_embed").map_err(ForwardError::Compile)?;
         let module = ctx.load_module(ptx)?;
-        let embed_fn = module.load_function("fwd_embed_q8_0")?;
+        let embed_q8_0 = module.load_function("fwd_embed_q8_0")?;
+        let embed_q6_k = module.load_function("fwd_embed_q6_k")?;
 
         let layer_ops = LayerOpsKernels::new(ctx)?;
 
@@ -935,21 +1002,48 @@ impl Forward {
         // and has no other bound to check against: a short table would read
         // past its own end for a high-numbered token.
         //
-        // Their *sizes* differ by format, though, and only by format: the
-        // embedding table is Q8_0 in both files, while `output.weight` is
-        // Q8_0 in `qwen35moe` and bf16 in `qwen35`. Checking the head against
-        // the Q8_0 figure would reject the dense model for holding exactly
-        // the bytes it should.
-        let w_token_embd = alias_q8_0(weights, stream, Role::TokenEmbedding, None)?;
+        // Their *sizes* differ by format, though, and only by format: both
+        // files store the embedding Q8_0, while `output.weight` is Q8_0 in
+        // `qwen35moe` and bf16 in `qwen35`, and a uniform community quant
+        // stores both Q6_K. Checking either against the Q8_0 figure would
+        // reject a file for holding exactly the bytes it should.
+        let (w_token_embd, embd_format) =
+            alias_projection(weights, stream, Role::TokenEmbedding, None)?;
         let (w_lm_head, lm_head_format) = alias_projection(weights, stream, Role::LmHead, None)?;
         let q8_0_table_bytes = vocab * hidden / QK8_0 * BLOCK_Q8_0_BYTES;
-        let head_bytes = match lm_head_format {
+        // Both tables are sized by their own format. They need not agree:
+        // the head is untied from the embedding, and a mixed file can quantize
+        // them differently.
+        let table_bytes = |format: HeadFormat| match format {
             HeadFormat::Q8_0 => q8_0_table_bytes,
             HeadFormat::Bf16 => vocab * hidden * 2,
+            HeadFormat::Q6K => vocab * hidden / QK_K * BLOCK_Q6_K_BYTES,
+        };
+        // The gather has a body per format; bf16 has none, because no file
+        // seen so far stores the *embedding* that way and an untested third
+        // path is worse than a named refusal.
+        let embed_fn = match embd_format {
+            HeadFormat::Q8_0 => embed_q8_0,
+            HeadFormat::Q6K => embed_q6_k,
+            // No file seen so far stores the *embedding* dense, and an
+            // untested path is worse than a refusal that names the format.
+            HeadFormat::Bf16 => {
+                return Err(ForwardError::WrongQuant {
+                    role: Role::TokenEmbedding,
+                    layer: None,
+                    found: placement_type(weights, Role::TokenEmbedding, None)
+                        .unwrap_or(GgmlType::Bf16),
+                    expected: GgmlType::Q8_0,
+                });
+            }
         };
         for (role, len, expected) in [
-            (Role::TokenEmbedding, w_token_embd.len(), q8_0_table_bytes),
-            (Role::LmHead, w_lm_head.len(), head_bytes),
+            (
+                Role::TokenEmbedding,
+                w_token_embd.len(),
+                table_bytes(embd_format),
+            ),
+            (Role::LmHead, w_lm_head.len(), table_bytes(lm_head_format)),
         ] {
             if len != expected {
                 return Err(ForwardError::WrongTableSize {
@@ -3371,14 +3465,20 @@ impl Forward {
             .arg(&tokens_i32);
         // SAFETY: one block per token slot, returning above `n_tokens`; the
         // output holds `tokens * hidden` floats and the in-row loop is bounded
-        // by `hidden`. The table was checked to be Q8_0 of `vocab * hidden`
-        // elements at construction, so `ids[t] * (hidden/32) * 34 + hidden/32
-        // * 34 - 1` is its last byte for any `ids[t] < vocab` — which the
-        // vocabulary itself bounds, and a token id outside it is the caller's
-        // to reject.
+        // by `hidden`. `embed_fn` is the entry point for the table's own
+        // format, and the table was checked at construction to hold exactly
+        // `vocab * hidden` elements *in that format*, so the last byte a row
+        // reaches — `(ids[t] + 1) * row_stride - 1` for either stride — is
+        // inside it for any `ids[t] < vocab`. The vocabulary itself bounds
+        // that, and a token id outside it is the caller's to reject.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }
+}
+
+/// The stored type of one resident tensor, for an error that has to name it.
+fn placement_type(weights: &DeviceWeights, role: Role, layer: Option<u32>) -> Option<GgmlType> {
+    weights.find(role, layer).map(|p| p.ggml_type)
 }
 
 /// Alias one resident Q8_0 tensor, rejecting any other stored format.
@@ -3410,6 +3510,7 @@ fn alias_projection(
     let format = match placement.ggml_type {
         GgmlType::Q8_0 => HeadFormat::Q8_0,
         GgmlType::Bf16 => HeadFormat::Bf16,
+        GgmlType::Q6K => HeadFormat::Q6K,
         found => {
             return Err(ForwardError::WrongQuant {
                 role,
@@ -3563,6 +3664,104 @@ mod tests {
         ModelConfig::qwen3_6_35b_a3b()
     }
 
+    /// The Q6_K embedding gather against the scalar reference, on a device.
+    ///
+    /// Exact equality, not a tolerance. A gather does no summation — it
+    /// unpacks a code and multiplies by two scales — so the device result is
+    /// bit-identical to `dequantize_q6_k` or the unpacking is wrong. A
+    /// tolerance here could hide a systematically wrong sub-scale, which is
+    /// the whole failure mode this format has.
+    ///
+    /// The table is synthetic because no file on this host stores
+    /// `token_embd.weight` as Q6_K — that is precisely why the kernel exists.
+    /// Rows are built from a spread of magnitudes so the quantizer emits a
+    /// range of sub-scales rather than one repeated value.
+    ///
+    /// SKIPS — reporting that it skipped — without a driver or a device.
+    #[test]
+    fn the_q6_k_embedding_gather_matches_the_scalar_reference() {
+        use xabe_cuda::device::driver_available;
+        use xabe_kernels::quant::{dequantize_q6_k, quantize_q6_k};
+
+        if !driver_available() {
+            println!("SKIPPED: no CUDA driver present");
+            return;
+        }
+        let Ok(ctx) = CudaContext::new(0) else {
+            println!("SKIPPED: could not create a context on device 0");
+            return;
+        };
+
+        const HIDDEN: usize = 512;
+        const VOCAB: usize = 16;
+
+        // A table whose rows differ in scale as well as in shape, so a
+        // kernel that dropped `d` or fixed `sc` would show up.
+        let mut table = Vec::new();
+        let mut reference = Vec::new();
+        for v in 0..VOCAB {
+            let mut row = [0.0f32; HIDDEN];
+            for (i, x) in row.iter_mut().enumerate() {
+                let t = (i as f32) / (HIDDEN as f32) * std::f32::consts::TAU;
+                *x = t.sin() * (1.0 + v as f32) * 0.01;
+            }
+            for sb in row.as_chunks::<256>().0 {
+                let block = quantize_q6_k(sb);
+                table.extend_from_slice(&block.to_bytes());
+                reference.extend_from_slice(&dequantize_q6_k(&block));
+            }
+        }
+        assert_eq!(table.len(), VOCAB * HIDDEN / QK_K * BLOCK_Q6_K_BYTES);
+
+        // Ids deliberately out of order and with a repeat, so a kernel that
+        // ignored `ids` and walked the table sequentially cannot pass.
+        let ids: Vec<i32> = vec![3, 0, 15, 7, 7];
+        let tokens = ids.len();
+
+        let ptx = compile(EMBED_SRC, "forward_embed").expect("NVRTC");
+        let module = ctx.load_module(ptx).expect("load module");
+        let f = module
+            .load_function("fwd_embed_q6_k")
+            .expect("the Q6_K gather entry point");
+
+        let stream = ctx.default_stream();
+        let d_table = stream.clone_htod(table.as_slice()).expect("upload table");
+        let d_ids = stream.clone_htod(ids.as_slice()).expect("upload ids");
+        let mut d_out = stream
+            .alloc_zeros::<f32>(tokens * HIDDEN)
+            .expect("allocate output");
+
+        let (hidden_i32, tokens_i32) = (HIDDEN as i32, tokens as i32);
+        let cfg = LaunchConfig {
+            grid_dim: (tokens as u32, 1, 1),
+            block_dim: (EMBED_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&f);
+        builder
+            .arg(&d_table)
+            .arg(&d_ids)
+            .arg(&mut d_out)
+            .arg(&hidden_i32)
+            .arg(&tokens_i32);
+        // SAFETY: one block per token, the in-row loop is bounded by
+        // `hidden`, every id is below `VOCAB`, and the table holds
+        // `VOCAB * HIDDEN` elements as asserted above.
+        unsafe { builder.launch(cfg) }.expect("launch the Q6_K gather");
+        let got = stream.clone_dtoh(&d_out).expect("copy back");
+
+        for (t, &id) in ids.iter().enumerate() {
+            let want = &reference[id as usize * HIDDEN..(id as usize + 1) * HIDDEN];
+            let have = &got[t * HIDDEN..(t + 1) * HIDDEN];
+            assert_eq!(
+                have, want,
+                "token {t} (id {id}): the Q6_K gather is not bit-identical to \
+                 dequantize_q6_k",
+            );
+        }
+        println!("Q6_K gather: {tokens} rows x {HIDDEN}, bit-identical to the reference");
+    }
+
     #[test]
     fn the_embedding_row_stride_matches_the_kernel() {
         // The kernel spells 32 and 34 as literals because NVRTC has no access
@@ -3576,9 +3775,27 @@ mod tests {
         );
         assert_eq!(BLOCK_Q8_0_BYTES, 2 + QK8_0);
         assert_eq!(2048 / QK8_0 * BLOCK_Q8_0_BYTES, 2176);
+        assert_eq!(QK_K, xabe_cuda::kernels::dequant::QK_K);
+        assert_eq!(
+            BLOCK_Q6_K_BYTES,
+            xabe_cuda::kernels::dequant::BLOCK_Q6_K_BYTES
+        );
+        assert_eq!(BLOCK_Q6_K_BYTES, QK_K / 2 + QK_K / 4 + QK_K / 16 + 2);
         assert!(
             EMBED_SRC
                 .contains("const unsigned char* row = table + (long long)ids[t] * blocks * 34;")
+        );
+        // The Q6_K gather strides by 210-byte superblocks, and reconstructs
+        // in the reference's operand order. Both are spelled as literals in
+        // the kernel for the same reason 32 and 34 are.
+        assert!(
+            EMBED_SRC.contains(
+                "const unsigned char* row = table + (long long)ids[t] * superblocks * 210;"
+            )
+        );
+        assert!(
+            EMBED_SRC.contains("d * (float)sc[(l >> 4) + 2 * grp] * (float)(raw - 32)"),
+            "the Q6_K gather reassociated away from (d * scale) * q",
         );
     }
 
