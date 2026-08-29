@@ -1874,12 +1874,34 @@ impl LmHeadKernels {
                             0
                         },
                     };
-                    let func = match (weight.format, self.bf16_b3_row_tile.as_ref()) {
-                        (HeadFormat::Bf16, Some(b)) => b,
-                        (HeadFormat::Bf16, None) => {
-                            unreachable!("the bf16 row tile is loaded exactly when the Q8_0 one is")
-                        }
-                        _ => f,
+                    // Exhaustive on the format, with no catch-all. Only
+                    // Q8_0 and bf16 have row-tiled entry points, and
+                    // `row_tiled` above admits only those two, so `_ => f`
+                    // would be correct today and silently wrong the moment
+                    // that filter grows an arm: the new format would take the
+                    // *Q8_0* kernel, which indexes a staging buffer this
+                    // launch may request zero bytes of. That is the shape that
+                    // faulted main in e4d43e0 — `tt` and `narrow` derived by
+                    // rules that disagreed at one width, and a `_` arm picking
+                    // a kernel wanting twice the shared memory it was launched
+                    // with. Spelling the formats out makes adding a
+                    // `HeadFormat` variant a compile error here rather than an
+                    // out-of-bounds read.
+                    let func = match weight.format {
+                        HeadFormat::Q8_0 => f,
+                        HeadFormat::Bf16 => self
+                            .bf16_b3_row_tile
+                            .as_ref()
+                            .expect("the bf16 row tile is loaded exactly when the Q8_0 one is"),
+                        HeadFormat::Q6K
+                        | HeadFormat::F16
+                        | HeadFormat::Q4_0
+                        | HeadFormat::Q4K
+                        | HeadFormat::Q5K => unreachable!(
+                            "{:?} has no row-tiled entry point and `row_tiled` \
+                             does not admit it",
+                            weight.format,
+                        ),
                     };
                     (func, rt_cfg)
                 }
