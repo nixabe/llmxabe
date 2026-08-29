@@ -124,16 +124,16 @@ given GGUF loads.
 
 | Consumer | Reads | Does not read |
 | --- | --- | --- |
-| MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0 | **Q4_K, Q5_K, Q4_0**, f16, bf16, f32 |
+| MoE experts and shared expert (`kernels::moe`, `ExpertQuant`) | Q6_K, Q8_0, Q4_K, Q5_K, Q4_0 | f16, bf16, f32 |
 | LM head and attention projections at decode (`kernels::lm_head`, `HeadFormat`) | Q8_0, bf16, Q6_K, Q4_K, Q5_K, Q4_0, f16 | f32 |
 | Token embedding gather (`forward.rs`, `fwd_embed_*`) | Q8_0, Q6_K, Q4_K, Q5_K, Q4_0, f16 | **bf16** |
 | GDN alpha/beta gates (`GateProjection`) | f32, Q8_0, Q6_K | Q4_K, Q5_K, Q4_0, f16, bf16 |
 | The GDN block's own projections (`Projection`: `attn_qkv`, `attn_gate`, `ssm_out`) | f32, Q8_0 | **everything else** |
 | The split int8 tensor-core repack (`MmaKernels::repack`) | Q8_0 | everything else |
 
-The expert row and the `Projection` row are the walls that remain. The gate row
-stopped being one — see below. Note that the `Projection` row is *not* the
-second row: the head GEMV's `HeadFormat` reads seven formats, but the GDN
+The `Projection` row is the only wall left. The expert row and the gate row
+both stopped being ones — see below. Note that the `Projection` row is *not*
+the second row: the head GEMV's `HeadFormat` reads seven formats, but the GDN
 block passes three of its tensors to a two-variant `Projection` enum instead,
 so the same tensor is readable in one place and not the other. The repack row
 is why none of the readers that *do* exist is a reason to *prefer* those
@@ -179,17 +179,25 @@ returns `WrongQuant`. Neither shipped file could reach it, which is exactly
 why it survived, and why the table above lists consumers rather than
 formats.
 
-A `Q4_K_M` file stops earlier still, at its experts. The expert prologue reads
-Q6_K and Q8_0 only. Readers for Q4_K, Q5_K and Q4_0 were written and then
-**reverted** (`40f7fc6`): `dequant_tile` is `__forceinline__` and switches on a
-runtime format, so adding three arms emitted all five at all nine call sites,
-moved twenty kernels' register allocation, and cost 5.05% end to end on a
-shipped path. The formats were not the problem and the arithmetic was correct;
-the sharing was. Redoing it needs the format threaded as a compile-time
-parameter so each instantiation carries one unpacker, with `ptxas -v` before
-and after as evidence. Until then the head GEMV and the gather read these
-formats and the experts do not, which is the asymmetry this table exists to
-make visible.
+A `Q4_K_M` file's experts now load too. Readers for Q4_K, Q5_K and Q4_0 were
+written once and **reverted** (`40f7fc6`) because `dequant_tile` was
+`__forceinline__` over a *runtime* format: three added arms emitted all five
+at all nine call sites, moved twenty kernels' register allocation, and cost
+5.05% end to end. The formats were never the problem; the sharing was.
+
+The prologue is now `dequant_tile_ct<Q>`, a template, so each instantiation
+contains one unpacker and the branch is gone before ptxas sees it. Every tuned
+family is compiled once per shipped format — `moe_expert_ffn_q6k`,
+`moe_expert_ffn_q8`, and so on — and the kernel is chosen by format on the
+host instead of a code being handed to a kernel that branches on it. The three
+community formats have no tuned instantiation and take four plain
+`*_community` kernels at every width, which is the right trade for tensors no
+shipped file stores and which have no route to the integer tensor cores
+anyway.
+
+**Removing a branch is not automatically free**, and that is the durable part:
+see "Compile-time formats free registers that ptxas then spends" in
+[BENCHMARKS.md](BENCHMARKS.md)'s WHY.
 
 **Adding the readers did not make any of these a good format to store a
 projection in**, and the repack row is why: the engine's prefill advantage comes from

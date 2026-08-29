@@ -870,6 +870,13 @@ pub(crate) fn quantized_tensor<'f>(
     let quant = match ty {
         GgmlType::Q6K => ExpertQuant::Q6K,
         GgmlType::Q8_0 => ExpertQuant::Q8_0,
+        // `Q4_K_M` -- the ordinary community build -- stores `ffn_*_exps` as
+        // a mixture of Q4_K, Q5_K and Q6_K by layer. These three read through
+        // the `*_community` kernels rather than the tuned families, which are
+        // compiled per shipped format; see `ExpertQuant::is_community`.
+        GgmlType::Q4_0 => ExpertQuant::Q4_0,
+        GgmlType::Q4K => ExpertQuant::Q4K,
+        GgmlType::Q5K => ExpertQuant::Q5K,
         found => return Err(MoeBlockError::UnsupportedExpertType { name, found }),
     };
     // The *file's* stride, not the device's: this is validating GGUF bytes.
@@ -979,6 +986,14 @@ impl MoeBlock {
     /// compared an integer MoE against an integer MoE and said nothing.
     pub fn disable_tensor_cores(&mut self) {
         self.moe.disable_tensor_cores();
+    }
+
+    /// Route every expert format through the `*_community` kernels — see
+    /// [`MoeKernels::force_community`]. Differential tests set this so their
+    /// Q6_K/Q8_0 control exercises the same kernels as the community cases
+    /// rather than a different, already-covered path.
+    pub fn force_community(&mut self, on: bool) {
+        self.moe.force_community(on);
     }
 
     /// Pin the routed-expert kernels to the flat decode regime regardless of

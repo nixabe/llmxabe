@@ -84,6 +84,10 @@ use super::mma::MmaKernels;
 const QK8_0: usize = 32;
 const QK_K: usize = 256;
 const BLOCK_Q8_0_BYTES: usize = 34;
+const QK4_0: usize = 32;
+const BLOCK_Q4_0_BYTES: usize = 18;
+const BLOCK_Q4_K_BYTES: usize = 144;
+const BLOCK_Q5_K_BYTES: usize = 176;
 const BLOCK_Q6_K_BYTES: usize = 210;
 
 /// Bytes per Q6_K superblock once it is on the device.
@@ -286,6 +290,18 @@ pub enum ExpertQuant {
     Q6K,
     /// 32 elements per 34-byte block.
     Q8_0,
+    /// 32 elements per 18-byte block, codes centred by -8.
+    ///
+    /// This and the two below are **community-quant formats**: no shipped file
+    /// stores an expert stack in them, and none has an int8 tensor-core body,
+    /// so they take the four `*_community` kernels at every token count. See
+    /// `dequant_tile_community` in the kernel source for why that is a
+    /// separate path rather than three more arms of the tuned one.
+    Q4_0,
+    /// 256 elements per 144-byte superblock, affine (`d*sc*q - dmin*m`).
+    Q4K,
+    /// 256 elements per 176-byte superblock, affine, with a fifth bit plane.
+    Q5K,
 }
 
 impl ExpertQuant {
@@ -294,7 +310,33 @@ impl ExpertQuant {
         match self {
             Self::Q6K => 0,
             Self::Q8_0 => 1,
+            Self::Q4_0 => 2,
+            Self::Q4K => 3,
+            Self::Q5K => 4,
         }
+    }
+
+    /// Index into the tuned kernels' per-format arrays.
+    ///
+    /// `dequant_tile_ct` takes the format as a template parameter, so each
+    /// tuned family is compiled once per shipped format and the runtime
+    /// ladder is gone. Community formats have no tuned instantiation -- the
+    /// caller must route them to the `*_community` kernels before reaching
+    /// this, which `tuned_format` below is for.
+    fn tuned_index(self) -> usize {
+        match self {
+            Self::Q6K => 0,
+            Self::Q8_0 => 1,
+            other => unreachable!("{other:?} has no tuned entry point"),
+        }
+    }
+
+    /// Whether this format is read only by the `*_community` kernels.
+    ///
+    /// The tuned families' `dequant_tile` names two formats and must go on
+    /// naming exactly two; everything else routes to the plain path.
+    pub const fn is_community(self) -> bool {
+        matches!(self, Self::Q4_0 | Self::Q4K | Self::Q5K)
     }
 
     /// Elements per serialized block.
@@ -302,6 +344,8 @@ impl ExpertQuant {
         match self {
             Self::Q6K => QK_K,
             Self::Q8_0 => QK8_0,
+            Self::Q4_0 => QK4_0,
+            Self::Q4K | Self::Q5K => QK_K,
         }
     }
 
@@ -313,6 +357,9 @@ impl ExpertQuant {
         match self {
             Self::Q6K => BLOCK_Q6_K_BYTES,
             Self::Q8_0 => BLOCK_Q8_0_BYTES,
+            Self::Q4_0 => BLOCK_Q4_0_BYTES,
+            Self::Q4K => BLOCK_Q4_K_BYTES,
+            Self::Q5K => BLOCK_Q5_K_BYTES,
         }
     }
 
@@ -332,6 +379,13 @@ impl ExpertQuant {
         match self {
             Self::Q6K => BLOCK_Q6_K_DEVICE_BYTES,
             Self::Q8_0 => BLOCK_Q8_0_BYTES,
+            // No re-striding: 18, 144 and 176 are all even *and* their fields
+            // are byte-addressed by the community prologue, which makes no
+            // alignment claim. Only Q6_K's 210 needed padding, and only
+            // because the staged path loads it as `int4`.
+            Self::Q4_0 => BLOCK_Q4_0_BYTES,
+            Self::Q4K => BLOCK_Q4_K_BYTES,
+            Self::Q5K => BLOCK_Q5_K_BYTES,
         }
     }
 }
@@ -412,6 +466,7 @@ const MOE_SRC: &str = r#"
 #define MOE_TK   128
 #define MOE_TN   4
 #define MOE_ROWS 8
+#define GEMM_THREADS_CU (MOE_ROWS * 32)
 // Contraction passes a decode GEMV issues before consuming any of them.
 //
 // These loops are bounded by `hidden` or `intermediate`, both runtime values,
@@ -608,11 +663,189 @@ __device__ __forceinline__ void dequant_tile_q8_0_wide(
 
 // The GEMM prologue: unpack exactly the weight tile about to be multiplied.
 // Nothing is materialized in fp32 beyond the four values in registers.
-__device__ __forceinline__ void dequant_tile(
+
+
+// -------------------------------------------------------------------------
+// Community-quant tiles: Q4_0, Q4_K, Q5_K.
+// -------------------------------------------------------------------------
+//
+// `Q4_K_M` -- the most common community build of either architecture -- stores
+// `ffn_*_exps` as a *mixture* of Q4_K, Q5_K and Q6_K depending on the layer,
+// so an engine reading only Q6_K and Q8_0 cannot load one at all.
+//
+// **These are reached only from `dequant_tile_community` below, which only the
+// `_community` kernels call.** That separation is the whole design and it was
+// paid for: an earlier attempt (2238d5d, reverted in 40f7fc6) added these
+// three as arms of `dequant_tile` itself. That function is `__forceinline__`
+// with a *runtime* `quant`, so every arm it names is emitted at every one of
+// its nine call sites -- five unpack bodies where two had been. It cost
+// `moe_shared_ffn_gemv` +20 registers, `moe_expert_ffn_flat` +18,
+// `moe_expert_ffn` +16, `moe_expert_ffn_gemv` +11, moved twenty kernels, and
+// measured -5.05% on an Ornith N=3 2K decode step. `__noinline__` to contain
+// it was worse (+44 and +38), because a device call spills live values across
+// the ABI boundary. See BENCHMARKS.md's WHY NOT row.
+//
+// So `dequant_tile` above is untouched and still names exactly two formats.
+// Nothing on the shipped path can see this code, which is checkable rather
+// than assertable: the 33 pre-existing kernels' register allocation is
+// byte-identical with these present.
+//
+// All three keep the tile contract the Q6_K prologue established: `i0` is a
+// multiple of MOE_TK, a lane owns the four *consecutive* elements
+// `4L .. 4L+3`, and because `4L % 32` is at most 28 those four never cross a
+// 32-element group boundary. That is what lets each read its scale once per
+// tile instead of once per element.
+
+// The affine reconstruction, with its rounding pinned.
+//
+// Q4_K and Q5_K are `d*sc*q - dmin*m`, and nvcc will contract that subtraction
+// into `fma(d1, q, -m1)`, which rounds once where `dequantize_row_q4_K` rounds
+// twice. That is a divergence in the weight itself, so it is pinned with
+// `mul.rn`/`sub.rn`. Both instructions were going to be issued anyway; the
+// only thing given up is the compiler's freedom to be wrong. Q6_K and Q8_0
+// need none of this because their reconstructions have no addition at all.
+//
+// Inline PTX rather than `__fmul_rn`/`__fsub_rn` because NVRTC compiles from a
+// string with no include path.
+__device__ __forceinline__ float moe_affine_value(float d1, int code, float m1) {
+    float c = (float)code;
+    float t, r;
+    asm("mul.rn.f32 %0, %1, %2;" : "=f"(t) : "f"(d1), "f"(c));
+    asm("sub.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(t), "f"(m1));
+    return r;
+}
+
+// `get_scale_min_k4` from `ggml-quants.c`. Eight 6-bit scale/min pairs in
+// twelve bytes; the `j >= 4` branch borrows its high bit-pair from a different
+// byte than it takes its low nibble from, and reading it as if it were the
+// `j < 4` branch yields scales up to 4x too small -- finite and plausible,
+// which is why it gets a differential test rather than an eyeball.
+__device__ __forceinline__ void moe_scale_min_k4(
+    int j, const unsigned char* __restrict__ q, int* sc, int* m
+) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m  = (q[j + 4] >> 4)   | ((q[j]     >> 6) << 4);
+    }
+}
+
+// Q4_0: 32 elements per 18-byte block, codes centred by -8.
+//
+// Byte `k` of a block holds elements `k` and `k + 16` -- so a lane's four
+// consecutive elements come from four *consecutive bytes*, all through the
+// same nibble, because `r` is a multiple of 4 and `r .. r+3` therefore never
+// straddle the halves.
+__device__ __forceinline__ void dequant_tile_q4_0(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    long long i = i0 + 4 * wlane;
+    const unsigned char* blk = src + (i >> 5) * 18;
+    int r = (int)(i & 31);
+    float d = load_half_le(blk);
+    const unsigned char* qp = blk + 2 + (r & 15);
+    int high = r >> 4;
+
+    #pragma unroll
+    for (int t = 0; t < MOE_TN; ++t) {
+        unsigned int q = qp[t];
+        int code = high ? (int)(q >> 4) : (int)(q & 0xFu);
+        // Operand order `q * d`, as in `dequantize_row_q4_0`.
+        out[t] = (float)(code - 8) * d;
+    }
+}
+
+// Q4_K (144 B) and Q5_K (176 B): 256 elements as four 64-element passes, each
+// split into a low-nibble half under sub-scale `2g` and a high-nibble half
+// under `2g+1`. `HIGH` selects Q5_K, whose fifth bit lives in a 32-byte plane
+// that is *not* advanced between passes -- all four index `qh[l]` and it is
+// the bit position `2g + sub` that moves.
+template<bool HIGH>
+__device__ __forceinline__ void dequant_tile_k_affine(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    const int SB = HIGH ? 176 : 144;
+    const int QS = HIGH ? 48 : 16;
+
+    long long i = i0 + 4 * wlane;
+    const unsigned char* base = src + (i >> 8) * SB;
+    int r   = (int)(i & 255);
+    int g   = r >> 6;
+    int sub = (r >> 5) & 1;
+    int l   = r & 31;
+    int js  = 2 * g + sub;
+
+    float d    = load_half_le(base);
+    float dmin = load_half_le(base + 2);
+    int sc, m;
+    moe_scale_min_k4(js, base + 4, &sc, &m);
+    // Hoisted: all four elements of the tile share one group, so they share
+    // one scale and one min. Same lever as the Q6_K prologue's hoisted header.
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)m;
+
+    const unsigned char* qs = base + QS + g * 32 + l;
+    const unsigned char* qh = base + 16 + l;
+
+    #pragma unroll
+    for (int t = 0; t < MOE_TN; ++t) {
+        unsigned int byte = qs[t];
+        int code = (int)(sub ? (byte >> 4) : (byte & 0xFu));
+        if (HIGH) code |= (int)((qh[t] >> js) & 1u) << 4;
+        out[t] = moe_affine_value(d1, code, m1);
+    }
+}
+
+// The community ladder. All five formats, in its own function, called only
+// from the `_community` kernels -- so the two-arm `dequant_tile` above pays
+// nothing for any of this existing.
+//
+// It names Q6_K and Q8_0 as well as the three new ones because a *pair* can be
+// mixed: `Q4_K_M` gives some layers a Q4_K `ffn_gate_exps` beside a Q6_K
+// `ffn_up_exps`, and one kernel reads both. Five arms here cost nothing --
+// this function has exactly four call sites, all inside kernels that are the
+// slow path by construction -- where the same five arms inside `dequant_tile`
+// cost 5.05% of a decode step.
+//
+// The codes are `ExpertQuant::code()`; a mismatch between the two lists reads
+// every expert of the swapped formats as the other one, which is finite and
+// wrongly scaled rather than a crash. `quant_codes_match_the_kernel` in the
+// Rust tests below pins them.
+__device__ __forceinline__ void dequant_tile_community(
     const unsigned char* __restrict__ src, int quant, long long i0, int wlane, float* out
 ) {
-    if (quant == 0) dequant_tile_q6k(src, i0, wlane, out);
-    else            dequant_tile_q8_0_wide(src, i0, wlane, out);
+    if      (quant == 0) dequant_tile_q6k(src, i0, wlane, out);
+    else if (quant == 1) dequant_tile_q8_0_wide(src, i0, wlane, out);
+    else if (quant == 2) dequant_tile_q4_0(src, i0, wlane, out);
+    else if (quant == 3) dequant_tile_k_affine<false>(src, i0, wlane, out);
+    else                 dequant_tile_k_affine<true>(src, i0, wlane, out);
+}
+
+// The GEMM prologue, with the format as a **compile-time** parameter.
+//
+// This is the shape 40f7fc6's revert message prescribed. The runtime-`quant`
+// form this replaces was `__forceinline__` with the format in a register, so
+// every arm it named was emitted at every one of its nine call sites and the
+// arms paid for each other -- three added formats cost the two already there
+// up to +20 registers and 5.05% of a decode step. With `Q` a template
+// parameter each instantiation contains exactly one unpacker and the branch
+// is gone before ptxas sees it, so the cost of naming a format is borne only
+// by the kernels instantiated at it.
+//
+// The codes match `ExpertQuant::code()`; `quant_codes_match_the_kernel` pins
+// the two lists, because a swap reads every expert of both formats as the
+// other one -- finite, wrongly scaled weights rather than a crash.
+template<int Q>
+__device__ __forceinline__ void dequant_tile_ct(
+    const unsigned char* __restrict__ src, long long i0, int wlane, float* out
+) {
+    if      (Q == 0) dequant_tile_q6k(src, i0, wlane, out);
+    else if (Q == 1) dequant_tile_q8_0_wide(src, i0, wlane, out);
+    else if (Q == 2) dequant_tile_q4_0(src, i0, wlane, out);
+    else if (Q == 3) dequant_tile_k_affine<false>(src, i0, wlane, out);
+    else             dequant_tile_k_affine<true>(src, i0, wlane, out);
 }
 
 // Stage MOE_TM rows x MOE_TK columns of activations into shared memory, in
@@ -726,10 +959,10 @@ __device__ __forceinline__ void warp_reduce_tile(float* acc) {
 // The staging is double-buffered by hand — `prefetch_tile` issues pass j+1's
 // global loads *before* pass j's arithmetic, so the round trip overlaps the
 // multiply-adds instead of stalling the block at the barrier.
-template<int TM>
+template<int TM, int GQ, int UQ>
 __device__ __forceinline__ void tile_gemm_pair(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ src, const long long* rows, float* xs,
     long long wrow, int k_len, int lane, int live, float* ag, float* au
 ) {
@@ -747,8 +980,8 @@ __device__ __forceinline__ void tile_gemm_pair(
         if (live) {
             float wg[MOE_TN];
             float wu[MOE_TN];
-            dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
-            dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+            dequant_tile_ct<GQ>(gate_q, wrow + j0, lane, wg);
+            dequant_tile_ct<UQ>(up_q,   wrow + j0, lane, wu);
             #pragma unroll
             for (int m = 0; m < TM; ++m) {
                 float4 xv = tile_row4(xs, m, lane);
@@ -764,9 +997,9 @@ __device__ __forceinline__ void tile_gemm_pair(
 }
 
 // As above for a single weight matrix: the down projection.
-template<int TM>
+template<int TM, int Q>
 __device__ __forceinline__ void tile_gemm_single(
-    const unsigned char* __restrict__ w_q, int w_quant,
+    const unsigned char* __restrict__ w_q,
     const float* __restrict__ src, const long long* rows, float* xs,
     long long wrow, int k_len, int lane, int live, float* ad
 ) {
@@ -783,7 +1016,7 @@ __device__ __forceinline__ void tile_gemm_single(
         if (j0 + MOE_TK < k_len) prefetch_tile<TM>(src, rows, j0 + MOE_TK, pf);
         if (live) {
             float wd[MOE_TN];
-            dequant_tile(w_q, w_quant, wrow + j0, lane, wd);
+            dequant_tile_ct<Q>(w_q, wrow + j0, lane, wd);
             #pragma unroll
             for (int m = 0; m < TM; ++m) {
                 float4 xv = tile_row4(xs, m, lane);
@@ -873,9 +1106,10 @@ __device__ __forceinline__ void tile_gemm_single(
 // staged through shared memory first or read directly, the same
 // accumulation order, and `x + 0.0f == x` in IEEE 754 for a padding
 // contribution either way.
+template<int GQ, int UQ>
 __device__ __forceinline__ void tile_gemm_pair_direct1(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ src, const long long* rows,
     long long wrow, int k_len, int lane, int live, float* ag, float* au
 ) {
@@ -890,8 +1124,8 @@ __device__ __forceinline__ void tile_gemm_pair_direct1(
     for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
         float wg[MOE_TN];
         float wu[MOE_TN];
-        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
-        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+        dequant_tile_ct<GQ>(gate_q, wrow + j0, lane, wg);
+        dequant_tile_ct<UQ>(up_q,   wrow + j0, lane, wu);
         float4 xv = *(const float4*)(src + rows[0] + j0 + 4 * lane);
         ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
         ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
@@ -903,8 +1137,9 @@ __device__ __forceinline__ void tile_gemm_pair_direct1(
 }
 
 // As above for a single weight matrix: the down projection.
+template<int Q>
 __device__ __forceinline__ void tile_gemm_single_direct1(
-    const unsigned char* __restrict__ w_q, int w_quant,
+    const unsigned char* __restrict__ w_q,
     const float* __restrict__ src, const long long* rows,
     long long wrow, int k_len, int lane, int live, float* ad
 ) {
@@ -916,7 +1151,7 @@ __device__ __forceinline__ void tile_gemm_single_direct1(
     }
     for (int j0 = 0; j0 < k_len; j0 += MOE_TK) {
         float wd[MOE_TN];
-        dequant_tile(w_q, w_quant, wrow + j0, lane, wd);
+        dequant_tile_ct<Q>(w_q, wrow + j0, lane, wd);
         float4 xv = *(const float4*)(src + rows[0] + j0 + 4 * lane);
         ad[0] += wd[0] * xv.x;
         ad[0] += wd[1] * xv.y;
@@ -2123,9 +2358,12 @@ __global__ void moe_align_block_size(
 // MOE_TM-wide accumulate unconditional and fully unrolled. Branching per slot
 // would put a runtime index on the accumulator array and spill it to local
 // memory, which costs far more than the wasted multiply-adds.
-__global__ void moe_expert_ffn(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int GQ, int UQ>
+__device__ __forceinline__ void moe_expert_ffn_impl(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ hidden_states,
     const int* __restrict__ sorted_token_ids,
     const int* __restrict__ expert_ids,
@@ -2178,8 +2416,8 @@ __global__ void moe_expert_ffn(
         if (bm == 0) continue;
         float ag[MOE_TM];
         float au[MOE_TM];
-#define MOE_FFN_TILE(TM) tile_gemm_pair<TM>(                                  \
-            gate_q, gate_quant, up_q, up_quant, hidden_states, rows, xs,      \
+#define MOE_FFN_TILE(TM) tile_gemm_pair<TM, GQ, UQ>(                          \
+            gate_q, up_q, hidden_states, rows, xs,                            \
             wrow, hidden, lane, live, ag, au)
         MOE_TILE_DISPATCH(MOE_FFN_TILE)
 #undef MOE_FFN_TILE
@@ -2199,6 +2437,43 @@ __global__ void moe_expert_ffn(
         }
     }
 }
+
+extern "C" {
+
+__launch_bounds__(GEMM_THREADS_CU, 3)
+__global__ void moe_expert_ffn_q6k(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_impl<0, 0>(gate_q, up_q, hidden_states, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, inter);
+}
+
+__launch_bounds__(GEMM_THREADS_CU, 3)
+__global__ void moe_expert_ffn_q8(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_impl<1, 1>(gate_q, up_q, hidden_states, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, inter);
+}
+
 
 // Decode-width direct mapping without the sorted dispatch indirection. One
 // grid.y block names one routed pair directly, so all blocks below
@@ -2236,9 +2511,12 @@ __global__ void moe_expert_ffn_flat_q6(
 }
 
 
-__global__ void moe_expert_ffn_flat(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int GQ, int UQ>
+__device__ __forceinline__ void moe_expert_ffn_flat_impl(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ hidden_states,
     const int* __restrict__ topk_ids,
     const int* __restrict__ valid_tokens,
@@ -2259,14 +2537,45 @@ __global__ void moe_expert_ffn_flat(
     long long rows[1] = {(long long)(flat / top_k) * hidden};
     float ag[1];
     float au[1];
-    tile_gemm_pair_direct1(
-        gate_q, gate_quant, up_q, up_quant, hidden_states, rows,
+    tile_gemm_pair_direct1<GQ, UQ>(
+        gate_q, up_q, hidden_states, rows,
         wrow, hidden, lane, 1, ag, au);
     if (lane == 0) {
         float act = ag[0] / (1.0f + expf(-ag[0]));
         inter[(long long)flat * intermediate + r] = act * au[0];
     }
 }
+
+extern "C" {
+
+__global__ void moe_expert_ffn_flat_q6k(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_flat_impl<0, 0>(gate_q, up_q, hidden_states, topk_ids, valid_tokens, top_k, hidden, intermediate, inter);
+}
+
+__global__ void moe_expert_ffn_flat_q8(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_flat_impl<1, 1>(gate_q, up_q, hidden_states, topk_ids, valid_tokens, top_k, hidden, intermediate, inter);
+}
+
 
 // -------------------------------------------------------------------------
 // 3a. The same two projections when there is exactly one token.
@@ -2292,9 +2601,12 @@ __global__ void moe_expert_ffn_flat(
 // only a different way of arriving at it.
 //
 // grid: (ceil(intermediate / MOE_ROWS), expert_block_capacity).
-__global__ void moe_expert_ffn_gemv(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int GQ, int UQ>
+__device__ __forceinline__ void moe_expert_ffn_gemv_impl(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ hidden_states,
     const int* __restrict__ sorted_token_ids,
     const int* __restrict__ expert_ids,
@@ -2335,8 +2647,8 @@ __global__ void moe_expert_ffn_gemv(
     for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
         float wg[MOE_TN];
         float wu[MOE_TN];
-        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
-        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+        dequant_tile_ct<GQ>(gate_q, wrow + j0, lane, wg);
+        dequant_tile_ct<UQ>(up_q,   wrow + j0, lane, wu);
         // `hidden` is a multiple of MOE_TK and the row base of a multiple of
         // it, so this 16-byte load is aligned by construction.
         float4 xv = *(const float4*)(xs + j0 + 4 * lane);
@@ -2354,12 +2666,50 @@ __global__ void moe_expert_ffn_gemv(
     }
 }
 
+extern "C" {
+
+__global__ void moe_expert_ffn_gemv_q6k(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_gemv_impl<0, 0>(gate_q, up_q, hidden_states, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, inter);
+}
+
+__global__ void moe_expert_ffn_gemv_q8(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_expert_ffn_gemv_impl<1, 1>(gate_q, up_q, hidden_states, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, inter);
+}
+
+
 // The down projection of the same step. Contracts over `intermediate` and
 // writes through `store_slot_contribution`, exactly as the tiled kernel does.
 //
 // grid: (ceil(hidden / MOE_ROWS), expert_block_capacity).
-__global__ void moe_expert_down_gemv(
-    const unsigned char* __restrict__ down_q, int down_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int Q>
+__device__ __forceinline__ void moe_expert_down_gemv_impl(
+    const unsigned char* __restrict__ down_q,
     const float* __restrict__ inter,
     const float* __restrict__ topk_weights,
     const int* __restrict__ sorted_token_ids,
@@ -2394,7 +2744,7 @@ __global__ void moe_expert_down_gemv(
     #pragma unroll MOE_DOWN_UNROLL
     for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
         float wd[MOE_TN];
-        dequant_tile(down_q, down_quant, wrow + j0, lane, wd);
+        dequant_tile_ct<Q>(down_q, wrow + j0, lane, wd);
         float4 xv = *(const float4*)(xs + j0 + 4 * lane);
         ad[0] += wd[0] * xv.x;
         ad[0] += wd[1] * xv.y;
@@ -2407,6 +2757,41 @@ __global__ void moe_expert_down_gemv(
         store_slot_contribution(partial, topk_weights, flat, numel, hidden, h, ad[0]);
     }
 }
+
+extern "C" {
+
+__global__ void moe_expert_down_gemv_q6k(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_gemv_impl<0>(down_q, inter, topk_weights, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, partial);
+}
+
+__global__ void moe_expert_down_gemv_q8(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_gemv_impl<1>(down_q, inter, topk_weights, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, partial);
+}
+
 
 // -------------------------------------------------------------------------
 // 3b. The same gate/up projection on the integer tensor cores.
@@ -2511,8 +2896,11 @@ moe_expert_ffn_mma_fused_iq(
 //
 // Padding slots read `inter` as zero rather than as whatever the previous
 // step left there, and `store_slot_contribution` drops their output entirely.
-__global__ void moe_expert_down(
-    const unsigned char* __restrict__ down_q, int down_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int Q>
+__device__ __forceinline__ void moe_expert_down_impl(
+    const unsigned char* __restrict__ down_q,
     const float* __restrict__ inter,
     const float* __restrict__ topk_weights,
     const int* __restrict__ sorted_token_ids,
@@ -2560,8 +2948,8 @@ __global__ void moe_expert_down(
         // dequantizing and contracting the down-projection stack against it.
         if (bm == 0) continue;
         float ad[MOE_TM];
-#define MOE_DOWN_TILE(TM) tile_gemm_single<TM>(                               \
-            down_q, down_quant, inter, rows, xs,                              \
+#define MOE_DOWN_TILE(TM) tile_gemm_single<TM, Q>(                            \
+            down_q, inter, rows, xs,                                          \
             wrow, intermediate, lane, live, ad)
         MOE_TILE_DISPATCH(MOE_DOWN_TILE)
 #undef MOE_DOWN_TILE
@@ -2578,11 +2966,49 @@ __global__ void moe_expert_down(
     }
 }
 
+extern "C" {
+
+__global__ void moe_expert_down_q6k(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_impl<0>(down_q, inter, topk_weights, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, partial);
+}
+
+__global__ void moe_expert_down_q8(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_impl<1>(down_q, inter, topk_weights, sorted_token_ids, expert_ids, valid_tokens, top_k, block_size, hidden, intermediate, partial);
+}
+
+
 // Down half of the flat routed-pair mapping above. `inter` and `partial`
 // share the same flat id, so neither dispatch table nor a sorted-slot-to-flat
 // lookup participates in the hot contraction.
-__global__ void moe_expert_down_flat(
-    const unsigned char* __restrict__ down_q, int down_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int Q>
+__device__ __forceinline__ void moe_expert_down_flat_impl(
+    const unsigned char* __restrict__ down_q,
     const float* __restrict__ inter,
     const float* __restrict__ topk_weights,
     const int* __restrict__ topk_ids,
@@ -2603,12 +3029,43 @@ __global__ void moe_expert_down_flat(
     long long wrow = ((long long)e * hidden + h) * intermediate;
     long long rows[1] = {(long long)flat * intermediate};
     float ad[1];
-    tile_gemm_single_direct1(
-        down_q, down_quant, inter, rows, wrow, intermediate, lane, 1, ad);
+    tile_gemm_single_direct1<Q>(
+        down_q, inter, rows, wrow, intermediate, lane, 1, ad);
     if (lane == 0) {
         partial[(long long)flat * hidden + h] = topk_weights[flat] * ad[0];
     }
 }
+
+extern "C" {
+
+__global__ void moe_expert_down_flat_q6k(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_flat_impl<0>(down_q, inter, topk_weights, topk_ids, valid_tokens, top_k, hidden, intermediate, partial);
+}
+
+__global__ void moe_expert_down_flat_q8(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ topk_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    moe_expert_down_flat_impl<1>(down_q, inter, topk_weights, topk_ids, valid_tokens, top_k, hidden, intermediate, partial);
+}
+
 
 // -------------------------------------------------------------------------
 // 3c. The down projection on the integer tensor cores.
@@ -2906,9 +3363,12 @@ __global__ void moe_swiglu(
 // the eight-fold parallelism they buy.
 //
 // grid: (intermediate,). block: MOE_ROWS warps, all on one row.
-__global__ void moe_shared_ffn_gemv(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int GQ, int UQ>
+__device__ __forceinline__ void moe_shared_ffn_gemv_impl(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ hidden_states,
     const int* __restrict__ valid_tokens,
     int hidden,
@@ -2935,8 +3395,8 @@ __global__ void moe_shared_ffn_gemv(
     for (int j0 = warp * chunk; j0 < stop; j0 += MOE_TK) {
         float wg[MOE_TN];
         float wu[MOE_TN];
-        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);
-        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);
+        dequant_tile_ct<GQ>(gate_q, wrow + j0, lane, wg);
+        dequant_tile_ct<UQ>(up_q,   wrow + j0, lane, wu);
         float4 xv = *(const float4*)(hidden_states + j0 + 4 * lane);
         ag[0] += wg[0] * xv.x;  au[0] += wu[0] * xv.x;
         ag[0] += wg[1] * xv.y;  au[0] += wu[1] * xv.y;
@@ -2958,9 +3418,39 @@ __global__ void moe_shared_ffn_gemv(
     }
 }
 
+extern "C" {
+
+__global__ void moe_shared_ffn_gemv_q6k(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_shared_ffn_gemv_impl<0, 0>(gate_q, up_q, hidden_states, valid_tokens, hidden, intermediate, inter);
+}
+
+__global__ void moe_shared_ffn_gemv_q8(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_shared_ffn_gemv_impl<1, 1>(gate_q, up_q, hidden_states, valid_tokens, hidden, intermediate, inter);
+}
+
+
 // grid: (ceil(hidden / MOE_ROWS),).
-__global__ void moe_shared_down_gemv(
-    const unsigned char* __restrict__ down_q, int down_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int Q>
+__device__ __forceinline__ void moe_shared_down_gemv_impl(
+    const unsigned char* __restrict__ down_q,
     const float* __restrict__ inter,
     const int* __restrict__ valid_tokens,
     int hidden,
@@ -2979,7 +3469,7 @@ __global__ void moe_shared_down_gemv(
     #pragma unroll MOE_DOWN_UNROLL
     for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
         float wd[MOE_TN];
-        dequant_tile(down_q, down_quant, wrow + j0, lane, wd);
+        dequant_tile_ct<Q>(down_q, wrow + j0, lane, wd);
         float4 xv = *(const float4*)(inter + j0 + 4 * lane);
         ad[0] += wd[0] * xv.x;
         ad[0] += wd[1] * xv.y;
@@ -2991,6 +3481,31 @@ __global__ void moe_shared_down_gemv(
     if (lane == 0) out[h] = ad[0];
 }
 
+extern "C" {
+
+__global__ void moe_shared_down_gemv_q6k(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ out
+) {
+    moe_shared_down_gemv_impl<0>(down_q, inter, valid_tokens, hidden, intermediate, out);
+}
+
+__global__ void moe_shared_down_gemv_q8(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ out
+) {
+    moe_shared_down_gemv_impl<1>(down_q, inter, valid_tokens, hidden, intermediate, out);
+}
+
+
 // The one-token shared-expert GEMV, tiled over tokens. `moe_shared_ffn`
 // reduces the 2,048-term product in one warp; the GEMV splits it across
 // `MOE_SHARED_WARPS` warps and adds the four partials in shared memory
@@ -3000,10 +3515,11 @@ __global__ void moe_shared_down_gemv(
 // different registers.
 //
 // grid: (intermediate, ceil(max_tokens / TT)). block: MOE_SHARED_WARPS warps.
-#define MOE_SHARED_FFN_GEMV_TILED(NAME, TT)                                  \
+#define MOE_SHARED_FFN_GEMV_TILED(NAME, TT, GQ, UQ, MINB)                                  \
+__launch_bounds__(GEMM_THREADS_CU, MINB)                                     \
 __global__ void NAME(                                                        \
-    const unsigned char* __restrict__ gate_q, int gate_quant,                \
-    const unsigned char* __restrict__ up_q,   int up_quant,                  \
+    const unsigned char* __restrict__ gate_q,                                \
+    const unsigned char* __restrict__ up_q,                                  \
     const float* __restrict__ hidden_states,                                 \
     const int* __restrict__ valid_tokens,                                    \
     int hidden,                                                              \
@@ -3032,8 +3548,8 @@ __global__ void NAME(                                                        \
     for (int j0 = warp * chunk; j0 < stop; j0 += MOE_TK) {                   \
         float wg[MOE_TN];                                                    \
         float wu[MOE_TN];                                                    \
-        dequant_tile(gate_q, gate_quant, wrow + j0, lane, wg);               \
-        dequant_tile(up_q,   up_quant,   wrow + j0, lane, wu);               \
+        dequant_tile_ct<GQ>(gate_q, wrow + j0, lane, wg);               \
+        dequant_tile_ct<UQ>(up_q,   wrow + j0, lane, wu);               \
         _Pragma("unroll")                                                    \
         for (int i = 0; i < (TT); ++i) {                                     \
             int t = t0 + i;                                                  \
@@ -3075,16 +3591,21 @@ __global__ void NAME(                                                        \
     }                                                                        \
 }
 
-MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t2,  2)
-MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t3,  3)
-MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t4,  4)
-MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t8,  8)
-MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t16, 16)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t2_q6k,  2, 0, 0, 4)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t2_q8,   2, 1, 1, 4)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t3_q6k,  3, 0, 0, 4)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t3_q8,   3, 1, 1, 4)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t4_q6k,  4, 0, 0, 3)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t4_q8,   4, 1, 1, 3)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t8_q6k,  8, 0, 0, 2)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t8_q8,   8, 1, 1, 2)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t16_q6k, 16, 0, 0, 1)
+MOE_SHARED_FFN_GEMV_TILED(moe_shared_ffn_gemv_t16_q8,  16, 1, 1, 1)
 
 // grid: (ceil(hidden / MOE_ROWS), ceil(max_tokens / TT)).
-#define MOE_SHARED_DOWN_GEMV_TILED(NAME, TT)                                 \
+#define MOE_SHARED_DOWN_GEMV_TILED(NAME, TT, Q)                                 \
 __global__ void NAME(                                                        \
-    const unsigned char* __restrict__ down_q, int down_quant,                \
+    const unsigned char* __restrict__ down_q,                                \
     const float* __restrict__ inter,                                         \
     const int* __restrict__ valid_tokens,                                    \
     int hidden,                                                              \
@@ -3109,7 +3630,7 @@ __global__ void NAME(                                                        \
     _Pragma("unroll 4")                                                      \
     for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {                      \
         float wd[MOE_TN];                                                    \
-        dequant_tile(down_q, down_quant, wrow + j0, lane, wd);               \
+        dequant_tile_ct<Q>(down_q, wrow + j0, lane, wd);               \
         _Pragma("unroll")                                                    \
         for (int i = 0; i < (TT); ++i) {                                     \
             int t = t0 + i;                                                  \
@@ -3135,11 +3656,16 @@ __global__ void NAME(                                                        \
     }                                                                        \
 }
 
-MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t2,  2)
-MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t3,  3)
-MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t4,  4)
-MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t8,  8)
-MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t16, 16)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t2_q6k,  2, 0)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t2_q8,   2, 1)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t3_q6k,  3, 0)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t3_q8,   3, 1)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t4_q6k,  4, 0)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t4_q8,   4, 1)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t8_q6k,  8, 0)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t8_q8,   8, 1)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t16_q6k, 16, 0)
+MOE_SHARED_DOWN_GEMV_TILED(moe_shared_down_gemv_t16_q8,  16, 1)
 
 // -------------------------------------------------------------------------
 // 4. fp32 weighted sum of each token's top-k contributions.
@@ -3187,9 +3713,12 @@ __global__ void moe_reduce(
 // (ceil(intermediate / MOE_ROWS), ceil(max_tokens / MOE_TM)) — both from the
 // geometry, neither from the live token count, which is still the device
 // scalar the staging gates on.
-__global__ void moe_shared_ffn(
-    const unsigned char* __restrict__ gate_q, int gate_quant,
-    const unsigned char* __restrict__ up_q,   int up_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int GQ, int UQ>
+__device__ __forceinline__ void moe_shared_ffn_impl(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
     const float* __restrict__ hidden_states,
     const int* __restrict__ valid_tokens,
     int hidden,
@@ -3218,8 +3747,8 @@ __global__ void moe_shared_ffn(
     int bm = live_tile_rows(rows);
     float ag[MOE_TM];
     float au[MOE_TM];
-#define MOE_SHARED_FFN_TILE(TM) tile_gemm_pair<TM>(                           \
-        gate_q, gate_quant, up_q, up_quant, hidden_states, rows, xs,          \
+#define MOE_SHARED_FFN_TILE(TM) tile_gemm_pair<TM, GQ, UQ>(                   \
+        gate_q, up_q, hidden_states, rows, xs,                                \
         wrow, hidden, lane, live, ag, au)
     MOE_TILE_DISPATCH(MOE_SHARED_FFN_TILE)
 #undef MOE_SHARED_FFN_TILE
@@ -3235,9 +3764,39 @@ __global__ void moe_shared_ffn(
     }
 }
 
+extern "C" {
+
+__global__ void moe_shared_ffn_q6k(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_shared_ffn_impl<0, 0>(gate_q, up_q, hidden_states, valid_tokens, hidden, intermediate, inter);
+}
+
+__global__ void moe_shared_ffn_q8(
+    const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    moe_shared_ffn_impl<1, 1>(gate_q, up_q, hidden_states, valid_tokens, hidden, intermediate, inter);
+}
+
+
 // grid: (ceil(hidden / MOE_ROWS), ceil(max_tokens / MOE_TM)).
-__global__ void moe_shared_down(
-    const unsigned char* __restrict__ down_q, int down_quant,
+}  // extern "C" -- a template cannot have C linkage
+
+template<int Q>
+__device__ __forceinline__ void moe_shared_down_impl(
+    const unsigned char* __restrict__ down_q,
     const float* __restrict__ inter,
     const int* __restrict__ valid_tokens,
     int hidden,
@@ -3265,8 +3824,8 @@ __global__ void moe_shared_down(
 
     int bm = live_tile_rows(rows);
     float ad[MOE_TM];
-#define MOE_SHARED_DOWN_TILE(TM) tile_gemm_single<TM>(                        \
-        down_q, down_quant, inter, rows, xs,                                  \
+#define MOE_SHARED_DOWN_TILE(TM) tile_gemm_single<TM, Q>(                     \
+        down_q, inter, rows, xs,                                              \
         wrow, intermediate, lane, live, ad)
     MOE_TILE_DISPATCH(MOE_SHARED_DOWN_TILE)
 #undef MOE_SHARED_DOWN_TILE
@@ -3279,7 +3838,316 @@ __global__ void moe_shared_down(
     }
 }
 
+extern "C" {
+
+__global__ void moe_shared_down_q6k(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ out
+) {
+    moe_shared_down_impl<0>(down_q, inter, valid_tokens, hidden, intermediate, out);
 }
+
+__global__ void moe_shared_down_q8(
+    const unsigned char* __restrict__ down_q,
+    const float* __restrict__ inter,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ out
+) {
+    moe_shared_down_impl<1>(down_q, inter, valid_tokens, hidden, intermediate, out);
+}
+
+
+}
+// -------------------------------------------------------------------------
+// 6. The community-quant path.
+// -------------------------------------------------------------------------
+//
+// Four kernels covering what the eleven tuned fp32 families cover for Q6_K and
+// Q8_0: routed gate/up, routed down, shared gate/up, shared down. They are
+// selected whenever *any* of the three expert tensors is Q4_0, Q4_K or Q5_K,
+// at every token count, instead of the gemv / narrow / flat / tiled family the
+// shipped formats pick between.
+//
+// **They are deliberately plain.** No shared-memory staging, no hand-rolled
+// double buffer, no prefetch, no row tile, no int8 tensor-core path -- each
+// reads its weight tile straight from global and holds a MOE_TM-wide band of
+// tokens in registers. That costs performance a community file was never going
+// to have anyway (`MmaKernels::repack` takes Q8_0 only, so these formats have
+// no route to the integer tensor cores at all) and buys the property that
+// matters: a bug here cannot reach a shipped file, because nothing on the
+// shipped path calls into this section.
+//
+// The alternative -- teaching the eleven tuned families three more formats --
+// is what 2238d5d did and 40f7fc6 reverted at -5.05%. See
+// `dequant_tile_community` above for the mechanism. Four plain kernels that
+// nothing else links against is the shape that has no such failure mode.
+//
+// Accumulation order matches the tuned kernels': lane-major over the tile,
+// `MOE_TN` products folded into one accumulator per token in index order.
+
+extern "C" {
+
+// Routed gate/up. grid: (ceil(intermediate / MOE_ROWS), expert_block_capacity).
+__global__ void moe_expert_ffn_community(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = ((long long)e * intermediate + r) * hidden;
+
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        // A padding slot's id is >= numel; it contributes nothing and must not
+        // be dereferenced. -1 marks it, exactly as `live_tile_rows` expects of
+        // the staged path.
+        long long rows[MOE_TM];
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            int slot = m0 + m;
+            long long src = -1;
+            if (slot < block_size) {
+                int flat = sorted_token_ids[(long long)blk * block_size + slot];
+                if (flat < numel) src = (long long)(flat / top_k) * hidden;
+            }
+            rows[m] = src;
+        }
+
+        float ag[MOE_TM];
+        float au[MOE_TM];
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) { ag[m] = 0.0f; au[m] = 0.0f; }
+
+        for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
+            float wg[MOE_TN];
+            float wu[MOE_TN];
+            dequant_tile_community(gate_q, gate_quant, wrow + j0, lane, wg);
+            dequant_tile_community(up_q,   up_quant,   wrow + j0, lane, wu);
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (rows[m] < 0) continue;
+                // `hidden` is a multiple of MOE_TK and each row base a
+                // multiple of `hidden`, so this 16-byte load is aligned by
+                // construction -- the same argument the tuned kernels make.
+                float4 xv = *(const float4*)(hidden_states + rows[m] + j0 + 4 * lane);
+                ag[m] += wg[0] * xv.x;  au[m] += wu[0] * xv.x;
+                ag[m] += wg[1] * xv.y;  au[m] += wu[1] * xv.y;
+                ag[m] += wg[2] * xv.z;  au[m] += wu[2] * xv.z;
+                ag[m] += wg[3] * xv.w;  au[m] += wu[3] * xv.w;
+            }
+        }
+
+        warp_reduce_tile<MOE_TM>(ag);
+        warp_reduce_tile<MOE_TM>(au);
+
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (rows[m] < 0) continue;
+                float act = ag[m] / (1.0f + expf(-ag[m]));
+                inter[((long long)blk * block_size + m0 + m) * intermediate + r] =
+                    act * au[m];
+            }
+        }
+    }
+}
+
+// Routed down. grid: (ceil(hidden / MOE_ROWS), expert_block_capacity).
+__global__ void moe_expert_down_community(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted_token_ids,
+    const int* __restrict__ expert_ids,
+    const int* __restrict__ valid_tokens,
+    int top_k,
+    int block_size,
+    int hidden,
+    int intermediate,
+    float* __restrict__ partial
+) {
+    int blk = blockIdx.y;
+    int e = expert_ids[blk];
+    if (e < 0) return;
+
+    int numel = (*valid_tokens) * top_k;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = ((long long)e * hidden + h) * intermediate;
+    const float* xs = inter + (long long)blk * block_size * intermediate;
+
+    for (int m0 = 0; m0 < block_size; m0 += MOE_TM) {
+        int flats[MOE_TM];
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            int slot = m0 + m;
+            flats[m] = slot < block_size
+                ? sorted_token_ids[(long long)blk * block_size + slot]
+                : numel;
+        }
+
+        float ad[MOE_TM];
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) { ad[m] = 0.0f; }
+
+        for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
+            float wd[MOE_TN];
+            dequant_tile_community(down_q, down_quant, wrow + j0, lane, wd);
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (flats[m] >= numel) continue;
+                const float* row = xs + (long long)(m0 + m) * intermediate;
+                float4 xv = *(const float4*)(row + j0 + 4 * lane);
+                ad[m] += wd[0] * xv.x;
+                ad[m] += wd[1] * xv.y;
+                ad[m] += wd[2] * xv.z;
+                ad[m] += wd[3] * xv.w;
+            }
+        }
+
+        warp_reduce_tile<MOE_TM>(ad);
+
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MOE_TM; ++m) {
+                if (flats[m] >= numel) continue;
+                store_slot_contribution(
+                    partial, topk_weights, flats[m], numel, hidden, h, ad[m]);
+            }
+        }
+    }
+}
+
+// Shared gate/up. No indirection: every token goes through the one expert.
+// grid: (ceil(intermediate / MOE_ROWS), ceil(tokens / MOE_TM)).
+__global__ void moe_shared_ffn_community(
+    const unsigned char* __restrict__ gate_q, int gate_quant,
+    const unsigned char* __restrict__ up_q,   int up_quant,
+    const float* __restrict__ hidden_states,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ inter
+) {
+    int nvalid = *valid_tokens;
+    int t0 = blockIdx.y * MOE_TM;
+    if (t0 >= nvalid) return;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int r = blockIdx.x * MOE_ROWS + warp;
+    if (r >= intermediate) return;
+    long long wrow = (long long)r * hidden;
+
+    float ag[MOE_TM];
+    float au[MOE_TM];
+    #pragma unroll
+    for (int m = 0; m < MOE_TM; ++m) { ag[m] = 0.0f; au[m] = 0.0f; }
+
+    for (int j0 = 0; j0 < hidden; j0 += MOE_TK) {
+        float wg[MOE_TN];
+        float wu[MOE_TN];
+        dequant_tile_community(gate_q, gate_quant, wrow + j0, lane, wg);
+        dequant_tile_community(up_q,   up_quant,   wrow + j0, lane, wu);
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            if (t0 + m >= nvalid) continue;
+            float4 xv = *(const float4*)(
+                hidden_states + (long long)(t0 + m) * hidden + j0 + 4 * lane);
+            ag[m] += wg[0] * xv.x;  au[m] += wu[0] * xv.x;
+            ag[m] += wg[1] * xv.y;  au[m] += wu[1] * xv.y;
+            ag[m] += wg[2] * xv.z;  au[m] += wu[2] * xv.z;
+            ag[m] += wg[3] * xv.w;  au[m] += wu[3] * xv.w;
+        }
+    }
+
+    warp_reduce_tile<MOE_TM>(ag);
+    warp_reduce_tile<MOE_TM>(au);
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            if (t0 + m >= nvalid) continue;
+            float act = ag[m] / (1.0f + expf(-ag[m]));
+            inter[(long long)(t0 + m) * intermediate + r] = act * au[m];
+        }
+    }
+}
+
+// Shared down. grid: (ceil(hidden / MOE_ROWS), ceil(tokens / MOE_TM)).
+__global__ void moe_shared_down_community(
+    const unsigned char* __restrict__ down_q, int down_quant,
+    const float* __restrict__ inter,
+    const int* __restrict__ valid_tokens,
+    int hidden,
+    int intermediate,
+    float* __restrict__ out
+) {
+    int nvalid = *valid_tokens;
+    int t0 = blockIdx.y * MOE_TM;
+    if (t0 >= nvalid) return;
+
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int h = blockIdx.x * MOE_ROWS + warp;
+    if (h >= hidden) return;
+    long long wrow = (long long)h * intermediate;
+
+    float ad[MOE_TM];
+    #pragma unroll
+    for (int m = 0; m < MOE_TM; ++m) { ad[m] = 0.0f; }
+
+    for (int j0 = 0; j0 < intermediate; j0 += MOE_TK) {
+        float wd[MOE_TN];
+        dequant_tile_community(down_q, down_quant, wrow + j0, lane, wd);
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            if (t0 + m >= nvalid) continue;
+            float4 xv = *(const float4*)(
+                inter + (long long)(t0 + m) * intermediate + j0 + 4 * lane);
+            ad[m] += wd[0] * xv.x;
+            ad[m] += wd[1] * xv.y;
+            ad[m] += wd[2] * xv.z;
+            ad[m] += wd[3] * xv.w;
+        }
+    }
+
+    warp_reduce_tile<MOE_TM>(ad);
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int m = 0; m < MOE_TM; ++m) {
+            if (t0 + m >= nvalid) continue;
+            out[(long long)(t0 + m) * hidden + h] = ad[m];
+        }
+    }
+}
+
+}  // extern "C"
+
 "#;
 
 /// The MoE shapes this instance is compiled and sized for.
@@ -3734,31 +4602,39 @@ pub struct MoeKernels {
     route_dispatch_t1: CudaFunction,
     align_count: CudaFunction,
     align: CudaFunction,
-    expert_ffn: CudaFunction,
-    expert_ffn_gemv: CudaFunction,
-    expert_down_gemv: CudaFunction,
+    expert_ffn: [CudaFunction; 2],
+    expert_ffn_gemv: [CudaFunction; 2],
+    expert_down_gemv: [CudaFunction; 2],
     /// Decode-width mapping, indexed directly by routed pair rather than by
     /// the sorted dispatch tables. `_q6` drops the Q8 unpack family the
     /// shipping file never asks the gate/up projections for.
-    expert_ffn_flat: CudaFunction,
+    expert_ffn_flat: [CudaFunction; 2],
     expert_ffn_flat_q6: CudaFunction,
-    expert_down_flat: CudaFunction,
+    expert_down_flat: [CudaFunction; 2],
     expert_ffn_mma: CudaFunction,
     expert_ffn_mma_q8: CudaFunction,
     /// Drives the activation quantization the tensor-core path consumes.
     /// `None` if the integer path is unavailable on this device.
     mma: Option<MmaKernels>,
-    expert_down: CudaFunction,
+    expert_down: [CudaFunction; 2],
     expert_down_mma: CudaFunction,
     reduce: CudaFunction,
-    shared_ffn: CudaFunction,
-    shared_down: CudaFunction,
-    shared_ffn_gemv: CudaFunction,
-    shared_down_gemv: CudaFunction,
+    shared_ffn: [CudaFunction; 2],
+    shared_down: [CudaFunction; 2],
+    /// The plain path for Q4_0 / Q4_K / Q5_K expert stacks, taken at every
+    /// token count when any of the three tensors is one of those. Held
+    /// unconditionally because they are four entry points in a module that
+    /// already compiles thirty-three; see `ExpertQuant::is_community`.
+    expert_ffn_community: CudaFunction,
+    expert_down_community: CudaFunction,
+    shared_ffn_community: CudaFunction,
+    shared_down_community: CudaFunction,
+    shared_ffn_gemv: [CudaFunction; 2],
+    shared_down_gemv: [CudaFunction; 2],
     /// `moe_shared_ffn_gemv` / `moe_shared_down_gemv` tiled over tokens at
     /// `SHARED_GEMV_TILES` widths. Index matches `shared_gemv_tile_for`.
-    shared_ffn_gemv_tiled: [CudaFunction; 5],
-    shared_down_gemv_tiled: [CudaFunction; 5],
+    shared_ffn_gemv_tiled: [[CudaFunction; 2]; 5],
+    shared_down_gemv_tiled: [[CudaFunction; 2]; 5],
     swiglu: CudaFunction,
     geometry: MoeGeometry,
     /// The dispatch-slot ceiling `expert_ffn_mma`/`expert_down_mma` were
@@ -3774,6 +4650,7 @@ pub struct MoeKernels {
     /// Pin the routed-expert path to the flat decode-regime kernels
     /// regardless of `max_tokens` — see [`Self::set_exact_decode_regime`].
     exact_regime: bool,
+    force_community: bool,
 }
 
 impl MoeKernels {
@@ -3876,12 +4753,27 @@ impl MoeKernels {
             route_dispatch_t1: module.load_function("moe_route_dispatch_t1")?,
             align_count: module.load_function("moe_align_count")?,
             align: module.load_function("moe_align_block_size")?,
-            expert_ffn: module.load_function("moe_expert_ffn")?,
-            expert_ffn_gemv: module.load_function("moe_expert_ffn_gemv")?,
-            expert_down_gemv: module.load_function("moe_expert_down_gemv")?,
-            expert_ffn_flat: module.load_function("moe_expert_ffn_flat")?,
+            expert_ffn: [
+                module.load_function("moe_expert_ffn_q6k")?,
+                module.load_function("moe_expert_ffn_q8")?,
+            ],
+            expert_ffn_gemv: [
+                module.load_function("moe_expert_ffn_gemv_q6k")?,
+                module.load_function("moe_expert_ffn_gemv_q8")?,
+            ],
+            expert_down_gemv: [
+                module.load_function("moe_expert_down_gemv_q6k")?,
+                module.load_function("moe_expert_down_gemv_q8")?,
+            ],
+            expert_ffn_flat: [
+                module.load_function("moe_expert_ffn_flat_q6k")?,
+                module.load_function("moe_expert_ffn_flat_q8")?,
+            ],
             expert_ffn_flat_q6: module.load_function("moe_expert_ffn_flat_q6")?,
-            expert_down_flat: module.load_function("moe_expert_down_flat")?,
+            expert_down_flat: [
+                module.load_function("moe_expert_down_flat_q6k")?,
+                module.load_function("moe_expert_down_flat_q8")?,
+            ],
             expert_ffn_mma: module.load_function(if narrow {
                 "moe_expert_ffn_mma_narrow"
             } else {
@@ -3893,36 +4785,86 @@ impl MoeKernels {
             // A failure is not fatal: the fp32 path stays available and the
             // launch below falls back to it.
             mma: MmaKernels::new(ctx).ok(),
-            expert_down: module.load_function("moe_expert_down")?,
+            expert_down: [
+                module.load_function("moe_expert_down_q6k")?,
+                module.load_function("moe_expert_down_q8")?,
+            ],
             expert_down_mma: module.load_function(if narrow {
                 "moe_expert_down_mma_narrow"
             } else {
                 "moe_expert_down_mma"
             })?,
             reduce: module.load_function("moe_reduce")?,
-            shared_ffn: module.load_function("moe_shared_ffn")?,
-            shared_down: module.load_function("moe_shared_down")?,
-            shared_ffn_gemv: module.load_function("moe_shared_ffn_gemv")?,
-            shared_down_gemv: module.load_function("moe_shared_down_gemv")?,
+            shared_ffn: [
+                module.load_function("moe_shared_ffn_q6k")?,
+                module.load_function("moe_shared_ffn_q8")?,
+            ],
+            shared_down: [
+                module.load_function("moe_shared_down_q6k")?,
+                module.load_function("moe_shared_down_q8")?,
+            ],
+            expert_ffn_community: module.load_function("moe_expert_ffn_community")?,
+            expert_down_community: module.load_function("moe_expert_down_community")?,
+            shared_ffn_community: module.load_function("moe_shared_ffn_community")?,
+            shared_down_community: module.load_function("moe_shared_down_community")?,
+            shared_ffn_gemv: [
+                module.load_function("moe_shared_ffn_gemv_q6k")?,
+                module.load_function("moe_shared_ffn_gemv_q8")?,
+            ],
+            shared_down_gemv: [
+                module.load_function("moe_shared_down_gemv_q6k")?,
+                module.load_function("moe_shared_down_gemv_q8")?,
+            ],
             shared_ffn_gemv_tiled: [
-                module.load_function("moe_shared_ffn_gemv_t2")?,
-                module.load_function("moe_shared_ffn_gemv_t3")?,
-                module.load_function("moe_shared_ffn_gemv_t4")?,
-                module.load_function("moe_shared_ffn_gemv_t8")?,
-                module.load_function("moe_shared_ffn_gemv_t16")?,
+                [
+                    module.load_function("moe_shared_ffn_gemv_t2_q6k")?,
+                    module.load_function("moe_shared_ffn_gemv_t2_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_ffn_gemv_t3_q6k")?,
+                    module.load_function("moe_shared_ffn_gemv_t3_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_ffn_gemv_t4_q6k")?,
+                    module.load_function("moe_shared_ffn_gemv_t4_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_ffn_gemv_t8_q6k")?,
+                    module.load_function("moe_shared_ffn_gemv_t8_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_ffn_gemv_t16_q6k")?,
+                    module.load_function("moe_shared_ffn_gemv_t16_q8")?,
+                ],
             ],
             shared_down_gemv_tiled: [
-                module.load_function("moe_shared_down_gemv_t2")?,
-                module.load_function("moe_shared_down_gemv_t3")?,
-                module.load_function("moe_shared_down_gemv_t4")?,
-                module.load_function("moe_shared_down_gemv_t8")?,
-                module.load_function("moe_shared_down_gemv_t16")?,
+                [
+                    module.load_function("moe_shared_down_gemv_t2_q6k")?,
+                    module.load_function("moe_shared_down_gemv_t2_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_down_gemv_t3_q6k")?,
+                    module.load_function("moe_shared_down_gemv_t3_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_down_gemv_t4_q6k")?,
+                    module.load_function("moe_shared_down_gemv_t4_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_down_gemv_t8_q6k")?,
+                    module.load_function("moe_shared_down_gemv_t8_q8")?,
+                ],
+                [
+                    module.load_function("moe_shared_down_gemv_t16_q6k")?,
+                    module.load_function("moe_shared_down_gemv_t16_q8")?,
+                ],
             ],
             swiglu: module.load_function("moe_swiglu")?,
             geometry,
             mma_m,
             fused_iq,
             exact_regime: false,
+            force_community: false,
         })
     }
 
@@ -4012,6 +4954,22 @@ impl MoeKernels {
     /// needs to quantize activations is dropped.
     pub fn disable_tensor_cores(&mut self) {
         self.mma = None;
+    }
+
+    /// Route every format through the `*_community` kernels.
+    ///
+    /// For differential tests, and it exists because of a specific failure:
+    /// the community formats have no tuned instantiation, so a harness that
+    /// checks them against Q6_K and Q8_0 as a control is comparing two
+    /// different *kernels* against one reference. The control then passes
+    /// while covering none of the code under test -- which is the trap
+    /// `docs/TESTING.md`'s Controls section is about, arrived at a second
+    /// time by a different route.
+    ///
+    /// With this set, the control runs the same kernels as the cases and a
+    /// green control means something.
+    pub fn force_community(&mut self, on: bool) {
+        self.force_community = on;
     }
 
     /// Pin the routed-expert kernels to the flat decode regime — the direct
@@ -4321,9 +5279,26 @@ impl MoeKernels {
         let block_size = g.block_size as i32;
         let hidden = g.hidden as i32;
         let intermediate = g.intermediate as i32;
-        let gate_code = gate.quant.code();
-        let up_code = up.quant.code();
-        let down_code = down.quant.code();
+        // `dequant_tile_ct` takes the format as a template parameter, so the
+        // kernel is chosen by format here instead of a code being passed to a
+        // kernel that branches on it. Only the two shipped formats have tuned
+        // instantiations; a community format -- or a gate/up pair whose halves
+        // disagree, which has no diagonal instantiation -- goes to the
+        // `*_community` kernels, which keep a runtime ladder in a body nothing
+        // on the shipped path links against.
+        let ffn_community =
+            self.force_community || gate.quant != up.quant || gate.quant.is_community();
+        let down_community = self.force_community || down.quant.is_community();
+        let ffn_idx = if ffn_community {
+            0
+        } else {
+            gate.quant.tuned_index()
+        };
+        let down_idx = if down_community {
+            0
+        } else {
+            down.quant.tuned_index()
+        };
         let shared = tile_shared_bytes();
 
         // One token is a GEMV, not a GEMM, and gets its own pair of kernels.
@@ -4352,7 +5327,7 @@ impl MoeKernels {
         let narrow =
             !gemv && !use_mma && (g.max_tokens <= MOE_NARROW_DECODE_MAX || self.exact_regime);
 
-        if gemv {
+        if ffn_community {
             let cfg = LaunchConfig {
                 grid_dim: (
                     (g.intermediate as u32).div_ceil(TILE_ROWS),
@@ -4362,12 +5337,42 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&self.expert_ffn_gemv);
+            let gate_code = gate.quant.code();
+            let up_code = up.quant.code();
+            let mut builder = stream.launch_builder(&self.expert_ffn_community);
             builder
                 .arg(gate.bytes)
                 .arg(&gate_code)
                 .arg(up.bytes)
                 .arg(&up_code)
+                .arg(hidden_states)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.inter);
+            // SAFETY: same bounds as the tuned launches -- the grid is
+            // (intermediate, expert_block_capacity), every slot index is
+            // gated on the device `valid_tokens`, and `inter` is
+            // `expert_block_capacity * block_size * intermediate` floats.
+            unsafe { builder.launch(cfg) }?;
+        } else if gemv {
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.intermediate as u32).div_ceil(TILE_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.expert_ffn_gemv[ffn_idx]);
+            builder
+                .arg(gate.bytes)
+                .arg(up.bytes)
                 .arg(hidden_states)
                 .arg(&buffers.sorted_token_ids)
                 .arg(&buffers.expert_ids)
@@ -4466,17 +5471,15 @@ impl MoeKernels {
                 let direct = if q6 {
                     &self.expert_ffn_flat_q6
                 } else {
-                    &self.expert_ffn_flat
+                    &self.expert_ffn_flat[ffn_idx]
                 };
                 let mut direct_builder = stream.launch_builder(direct);
+                // Neither entry point takes a format any more: `_q6` was
+                // always specialized, and `expert_ffn_flat[ffn_idx]` now is
+                // too. The `q6` split survives only because the two have
+                // different bodies, not different signatures.
                 direct_builder.arg(gate.bytes);
-                if !q6 {
-                    direct_builder.arg(&gate_code);
-                }
                 direct_builder.arg(up.bytes);
-                if !q6 {
-                    direct_builder.arg(&up_code);
-                }
                 direct_builder
                     .arg(hidden_states)
                     .arg(&buffers.topk_ids)
@@ -4489,12 +5492,10 @@ impl MoeKernels {
                 // device scalar gates it to the live prefix.
                 unsafe { direct_builder.launch(direct_cfg) }?;
             } else {
-                let mut builder = stream.launch_builder(&self.expert_ffn);
+                let mut builder = stream.launch_builder(&self.expert_ffn[ffn_idx]);
                 builder
                     .arg(gate.bytes)
-                    .arg(&gate_code)
                     .arg(up.bytes)
-                    .arg(&up_code)
                     .arg(hidden_states)
                     .arg(&buffers.sorted_token_ids)
                     .arg(&buffers.expert_ids)
@@ -4525,7 +5526,12 @@ impl MoeKernels {
             stream.memset_zeros(&mut buffers.partial)?;
         }
 
-        if gemv {
+        // `&& !down_community` because the community branch below owns the
+        // down projection at every width. Without it a one-token community
+        // pass launched this *and* that one, and the second write won -- which
+        // is how the Q6_K control passed while doubly dispatched, masking a
+        // Q8_0 failure that was really this bug.
+        if gemv && !down_community {
             let cfg = LaunchConfig {
                 grid_dim: (
                     (g.hidden as u32).div_ceil(TILE_ROWS),
@@ -4535,10 +5541,9 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&self.expert_down_gemv);
+            let mut builder = stream.launch_builder(&self.expert_down_gemv[down_idx]);
             builder
                 .arg(down.bytes)
-                .arg(&down_code)
                 .arg(&buffers.inter)
                 .arg(&buffers.topk_weights)
                 .arg(&buffers.sorted_token_ids)
@@ -4563,7 +5568,35 @@ impl MoeKernels {
             && down.quant == ExpertQuant::Q8_0
             && !self.exact_regime;
 
-        if gemv {
+        if down_community {
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    (g.hidden as u32).div_ceil(TILE_ROWS),
+                    g.expert_block_capacity() as u32,
+                    1,
+                ),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let down_code = down.quant.code();
+            let mut builder = stream.launch_builder(&self.expert_down_community);
+            builder
+                .arg(down.bytes)
+                .arg(&down_code)
+                .arg(&buffers.inter)
+                .arg(&buffers.topk_weights)
+                .arg(&buffers.sorted_token_ids)
+                .arg(&buffers.expert_ids)
+                .arg(&buffers.valid_tokens)
+                .arg(&top_k)
+                .arg(&block_size)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.partial);
+            // SAFETY: as the tuned down launches; `partial` is cleared above
+            // whenever the path taken does not overwrite every live row.
+            unsafe { builder.launch(cfg) }?;
+        } else if gemv {
             // Launched above, alongside its gate/up half. Falls through to the
             // reduction the other two paths also reach.
         } else if down_mma {
@@ -4635,10 +5668,9 @@ impl MoeKernels {
                     block_dim: (GEMM_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 };
-                let mut direct_builder = stream.launch_builder(&self.expert_down_flat);
+                let mut direct_builder = stream.launch_builder(&self.expert_down_flat[down_idx]);
                 direct_builder
                     .arg(down.bytes)
-                    .arg(&down_code)
                     .arg(&buffers.inter)
                     .arg(&buffers.topk_weights)
                     .arg(&buffers.topk_ids)
@@ -4650,10 +5682,9 @@ impl MoeKernels {
                 // SAFETY: each block reads and writes one routed pair.
                 unsafe { direct_builder.launch(direct_cfg) }?;
             } else {
-                let mut builder = stream.launch_builder(&self.expert_down);
+                let mut builder = stream.launch_builder(&self.expert_down[down_idx]);
                 builder
                     .arg(down.bytes)
-                    .arg(&down_code)
                     .arg(&buffers.inter)
                     .arg(&buffers.topk_weights)
                     .arg(&buffers.sorted_token_ids)
@@ -4843,9 +5874,76 @@ impl MoeKernels {
 
         let hidden = g.hidden as i32;
         let intermediate = g.intermediate as i32;
-        let gate_code = gate.quant.code();
-        let up_code = up.quant.code();
-        let down_code = down.quant.code();
+        // `dequant_tile_ct` takes the format as a template parameter, so the
+        // kernel is chosen by format here instead of a code being passed to a
+        // kernel that branches on it. Only the two shipped formats have tuned
+        // instantiations; a community format -- or a gate/up pair whose halves
+        // disagree, which has no diagonal instantiation -- goes to the
+        // `*_community` kernels, which keep a runtime ladder in a body nothing
+        // on the shipped path links against.
+        let ffn_community =
+            self.force_community || gate.quant != up.quant || gate.quant.is_community();
+        let down_community = self.force_community || down.quant.is_community();
+        let ffn_idx = if ffn_community {
+            0
+        } else {
+            gate.quant.tuned_index()
+        };
+        let down_idx = if down_community {
+            0
+        } else {
+            down.quant.tuned_index()
+        };
+
+        // If either half is a community format, both take the plain path.
+        // Splitting them would be correct but buys nothing: a file that
+        // quantizes one of the shared expert's three tensors that way has
+        // quantized all three, and keeping the branch whole means the shared
+        // expert has one community shape to test rather than four.
+        if ffn_community || down_community {
+            let token_tiles = (g.max_tokens as u32).div_ceil(TILE_M as u32);
+            let gate_code = gate.quant.code();
+            let up_code = up.quant.code();
+            let down_code = down.quant.code();
+            let ffn_cfg = LaunchConfig {
+                grid_dim: ((g.intermediate as u32).div_ceil(TILE_ROWS), token_tiles, 1),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.shared_ffn_community);
+            builder
+                .arg(gate.bytes)
+                .arg(&gate_code)
+                .arg(up.bytes)
+                .arg(&up_code)
+                .arg(hidden_states)
+                .arg(&buffers.valid_tokens)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(&mut buffers.shared_inter);
+            // SAFETY: grid is (intermediate, token tiles); `shared_inter` is
+            // `max_tokens * intermediate` floats and the token index is gated
+            // on the device `valid_tokens`.
+            unsafe { builder.launch(ffn_cfg) }?;
+
+            let down_cfg = LaunchConfig {
+                grid_dim: ((g.hidden as u32).div_ceil(TILE_ROWS), token_tiles, 1),
+                block_dim: (GEMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = stream.launch_builder(&self.shared_down_community);
+            builder
+                .arg(down.bytes)
+                .arg(&down_code)
+                .arg(&buffers.shared_inter)
+                .arg(&buffers.valid_tokens)
+                .arg(&hidden)
+                .arg(&intermediate)
+                .arg(out);
+            // SAFETY: as above; `out` is `max_tokens * hidden` floats.
+            unsafe { builder.launch(down_cfg) }?;
+            return Ok(());
+        }
 
         // One token is a GEMV; see `moe_shared_ffn_gemv`. Decode-width
         // batches (`1 < max_tokens <= SHARED_GEMV_MAX_TOKENS`) are the
@@ -4873,12 +5971,10 @@ impl MoeKernels {
                 block_dim: (SHARED_WARPS * 32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&self.shared_ffn_gemv);
+            let mut builder = stream.launch_builder(&self.shared_ffn_gemv[ffn_idx]);
             builder
                 .arg(gate.bytes)
-                .arg(&gate_code)
                 .arg(up.bytes)
-                .arg(&up_code)
                 .arg(hidden_states)
                 .arg(&buffers.valid_tokens)
                 .arg(&hidden)
@@ -4894,10 +5990,9 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&self.shared_down_gemv);
+            let mut builder = stream.launch_builder(&self.shared_down_gemv[down_idx]);
             builder
                 .arg(down.bytes)
-                .arg(&down_code)
                 .arg(&buffers.shared_inter)
                 .arg(&buffers.valid_tokens)
                 .arg(&hidden)
@@ -4916,12 +6011,10 @@ impl MoeKernels {
                 block_dim: (SHARED_WARPS * 32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&self.shared_ffn_gemv_tiled[slot]);
+            let mut builder = stream.launch_builder(&self.shared_ffn_gemv_tiled[slot][ffn_idx]);
             builder
                 .arg(gate.bytes)
-                .arg(&gate_code)
                 .arg(up.bytes)
-                .arg(&up_code)
                 .arg(hidden_states)
                 .arg(&buffers.valid_tokens)
                 .arg(&hidden)
@@ -4939,10 +6032,9 @@ impl MoeKernels {
                 block_dim: (GEMM_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut builder = stream.launch_builder(&self.shared_down_gemv_tiled[slot]);
+            let mut builder = stream.launch_builder(&self.shared_down_gemv_tiled[slot][down_idx]);
             builder
                 .arg(down.bytes)
-                .arg(&down_code)
                 .arg(&buffers.shared_inter)
                 .arg(&buffers.valid_tokens)
                 .arg(&hidden)
@@ -4960,12 +6052,10 @@ impl MoeKernels {
             block_dim: (GEMM_THREADS, 1, 1),
             shared_mem_bytes: shared,
         };
-        let mut builder = stream.launch_builder(&self.shared_ffn);
+        let mut builder = stream.launch_builder(&self.shared_ffn[ffn_idx]);
         builder
             .arg(gate.bytes)
-            .arg(&gate_code)
             .arg(up.bytes)
-            .arg(&up_code)
             .arg(hidden_states)
             .arg(&buffers.valid_tokens)
             .arg(&hidden)
@@ -4981,10 +6071,9 @@ impl MoeKernels {
             block_dim: (GEMM_THREADS, 1, 1),
             shared_mem_bytes: shared,
         };
-        let mut builder = stream.launch_builder(&self.shared_down);
+        let mut builder = stream.launch_builder(&self.shared_down[down_idx]);
         builder
             .arg(down.bytes)
-            .arg(&down_code)
             .arg(&buffers.shared_inter)
             .arg(&buffers.valid_tokens)
             .arg(&hidden)
@@ -5376,14 +6465,141 @@ mod tests {
         assert_eq!(SHARED_GEMV_MAX_TOKENS, 16);
     }
 
+    /// `ExpertQuant::code`, `dequant_tile_ct`'s arms and the community
+    /// ladder's arms must agree.
+    ///
+    /// Three independent lists -- one Rust, two inside a CUDA string -- and a
+    /// mismatch reads every expert of the swapped formats as the other one.
+    /// That produces finite, wrongly-scaled weights rather than a crash,
+    /// which `AGENTS.md` calls the highest-likelihood risk in this project.
+    #[test]
+    fn quant_codes_match_the_kernel() {
+        for (q, code, body) in [
+            (ExpertQuant::Q6K, 0, "dequant_tile_q6k(src"),
+            (ExpertQuant::Q8_0, 1, "dequant_tile_q8_0_wide(src"),
+            (ExpertQuant::Q4_0, 2, "dequant_tile_q4_0(src"),
+            (ExpertQuant::Q4K, 3, "dequant_tile_k_affine<false>(src"),
+            (ExpertQuant::Q5K, 4, "dequant_tile_k_affine<true>(src"),
+        ] {
+            assert_eq!(q.code(), code, "{q:?} code drifted");
+            // The compile-time prologue dispatches on `Q`, the community
+            // ladder on a runtime `quant`; both must map this code to this
+            // unpacker.
+            assert!(
+                MOE_SRC.contains(&format!("(Q == {code}) {body}"))
+                    || (code == 4 && MOE_SRC.contains(&format!("else             {body}"))),
+                "dequant_tile_ct has no arm mapping {code} to {body}",
+            );
+            assert!(
+                MOE_SRC.contains(&format!("(quant == {code}) {body}"))
+                    || (code == 4 && MOE_SRC.contains(&format!("else                 {body}"))),
+                "dequant_tile_community has no arm mapping {code} to {body}",
+            );
+        }
+    }
+
+    /// Every tuned family is compiled once per shipped format, and the two
+    /// arrays the launcher indexes are in that order.
+    ///
+    /// `tuned_index` maps Q6_K to 0 and Q8_0 to 1; if a family were loaded in
+    /// the other order the engine would read every expert of both formats as
+    /// the other one, silently.
+    #[test]
+    fn every_tuned_family_is_compiled_at_both_shipped_formats() {
+        for fam in [
+            "moe_expert_ffn",
+            "moe_expert_ffn_flat",
+            "moe_expert_ffn_gemv",
+            "moe_expert_down",
+            "moe_expert_down_flat",
+            "moe_expert_down_gemv",
+            "moe_shared_ffn",
+            "moe_shared_down",
+            "moe_shared_ffn_gemv",
+            "moe_shared_down_gemv",
+        ] {
+            for suffix in ["_q6k", "_q8"] {
+                assert!(
+                    MOE_SRC.contains(&format!("void {fam}{suffix}(")),
+                    "{fam}{suffix} is not compiled",
+                );
+            }
+            // And the runtime-ladder form is gone from the tuned path: a
+            // kernel taking `int gate_quant` would be one that branches per
+            // tile, which is the 5.05% regression 40f7fc6 reverted.
+            assert!(
+                !MOE_SRC.contains(&format!("void {fam}(")),
+                "{fam} still has an unspecialized entry point",
+            );
+        }
+        for tt in [2, 3, 4, 8, 16] {
+            for suffix in ["_q6k", "_q8"] {
+                assert!(
+                    MOE_SRC.contains(&format!("moe_shared_ffn_gemv_t{tt}{suffix},")),
+                    "moe_shared_ffn_gemv_t{tt}{suffix} is not instantiated",
+                );
+            }
+        }
+    }
+
+    /// The affine formats' rounding is pinned, or nvcc contracts their
+    /// subtraction into an FMA and the weight stops matching the reference.
+    #[test]
+    fn the_affine_prologue_cannot_contract_into_an_fma() {
+        assert!(
+            MOE_SRC.contains("mul.rn.f32") && MOE_SRC.contains("sub.rn.f32"),
+            "moe_affine_value lost its rounding pins",
+        );
+    }
+
+    /// Community formats have no tuned instantiation, so asking for one is a
+    /// routing bug rather than something to paper over at run time.
+    #[test]
+    #[should_panic(expected = "has no tuned entry point")]
+    fn a_community_format_has_no_tuned_index() {
+        let _ = ExpertQuant::Q4K.tuned_index();
+    }
+
     #[test]
     fn the_shared_expert_has_no_indirection() {
         // If the shared-expert kernels ever grow a `sorted_token_ids`
         // argument, the hoist has been undone.
-        let start = MOE_SRC
-            .find("void moe_shared_ffn")
-            .expect("shared ffn present");
-        let tail = &MOE_SRC[start..];
+        //
+        // Scans each shared body in turn rather than everything after the
+        // first one. The tail form passed only while the shared kernels
+        // happened to be last in the source: appending any routed kernel
+        // after them -- as the community path does -- put `sorted_token_ids`
+        // inside the scanned range and failed a test about the shared expert
+        // for a reason that had nothing to do with it.
+        let mut bodies = String::new();
+        let mut from = 0;
+        while let Some(hit) = MOE_SRC[from..].find("void moe_shared_") {
+            let open = MOE_SRC[from + hit..]
+                .find('{')
+                .expect("a kernel definition has a body");
+            let mut depth = 0usize;
+            let mut end = from + hit + open;
+            for (i, c) in MOE_SRC[from + hit + open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = from + hit + open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            bodies.push_str(&MOE_SRC[from + hit..=end]);
+            from = end;
+        }
+        assert!(
+            bodies.contains("moe_shared_ffn"),
+            "no shared kernel bodies were found to check",
+        );
+        let tail = &bodies[..];
         assert!(
             !tail.contains("sorted_token_ids"),
             "the shared expert must not consult the routed dispatch tables",

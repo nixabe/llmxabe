@@ -715,6 +715,63 @@ enough to flip expert selection and spike a layer's divergence 26×.
 The reasons the engine is shaped the way it is. Each is a mechanism that paid,
 stated so it transfers to the next kernel rather than as a changelog entry.
 
+## Compile-time formats free registers that ptxas then spends
+
+The MoE expert prologue took its format as a runtime argument inside a
+`__forceinline__` function, so every arm was emitted at all nine call sites
+and the arms paid for each other — the mechanism that made adding three
+community formats cost 5.05% (see WHY NOT). The fix is to make the format a
+template parameter, `dequant_tile_ct<Q>`, and compile each tuned family once
+per format: one unpacker per instantiation, branch gone before ptxas sees it.
+
+**That is not automatically free, and the direction of the surprise is worth
+carrying.** Removing the branch *raised* register counts on the hot kernels,
+because ptxas allocates against an occupancy target and freed budget gets
+spent on unrolling and loads in flight rather than returned:
+
+    moe_expert_ffn        80 -> 96 registers   24 -> 16 warps/SM
+    moe_expert_ffn_gemv   44 -> 59             40 -> 32 (both cap at 32)
+    moe_shared_ffn_gemv   42 -> 57             40 -> 32 (both cap at 32)
+    moe_shared_ffn_gemv_t3  64 -> 66           32 -> 24
+
+Only two of those are real. sm_75 holds 64 K registers and 32 warps per SM, so
+**64 registers per thread is the full-occupancy budget at any block size**, and
+a kernel moving 44 -> 59 changes nothing because the warp ceiling was already
+binding. `moe_expert_ffn` crossing into 96 and `..._t3` crossing 64 are the two
+that cost blocks.
+
+Both are recovered with `__launch_bounds__(GEMM_THREADS_CU, N)` at the blocks
+per SM the runtime-ladder form reached — 3 for `moe_expert_ffn`, 4 for `_t3` —
+and **ptxas hits those caps with zero spill stores and zero spill loads**, so
+the branch removal is kept and the occupancy with it. Final state: 57 kernels,
+no occupancy regression against the 33-kernel baseline anywhere, no spills
+anywhere, and module compile 3.13 s -> 3.82 s.
+
+**And it is a win, not merely a wash.** `bench_decode_batch 2048 32`,
+`LLMXABE_BATCH_N=1,2,3`, GPU 0, box otherwise idle, three interleaved pairs
+with the order reversed in the middle one, against the immediately preceding
+commit:
+
+    N=1   +6.98%  +2.86%  +6.92%   (worst +2.86%)
+    N=2   +1.58%  +1.46%  +0.98%   (worst +0.98%)
+    N=3   +1.36%  +1.51%  +1.21%   (worst +1.21%)
+
+Nine of nine comparisons favour the specialized form, including the reversed
+pair where run order works against it. N=1's spread is wide and its smallest
+delta is the base-first pair, which is what first-runner-wins predicts; treat
++2.9% as the N=1 claim rather than +7%. N=2 and N=3 are tight enough to read
+directly. Binaries were checked with `strings` to confirm each arm carried the
+kernels it was supposed to before any of this was believed.
+
+**The standing table has not been re-measured against llama.cpp**, so these
+are deltas against our own previous commit and nothing more.
+
+Two traps in the tool, both paid for here. `__launch_bounds__(T, 1)` is not a
+no-op — it tells ptxas one block per SM suffices, which *relaxes* its default
+heuristic and made `_t4` and `_t8` worse than leaving the attribute off. And a
+register count is not an outcome: it is only evidence once turned into blocks
+per SM, which needs the granularity (8 on Turing) and the warp ceiling.
+
 ## Arithmetic: integer tensor cores are the only way to win prefill
 
 llama.cpp runs the same 2,491 GFLOP of a 512-token pass at ~61% of this card's
@@ -1346,7 +1403,7 @@ proposed twice.
 | Removing the routed-partial clear | Below run-to-run spread, and reversing. Deleting a defensive correctness aid for a result smaller than host drift is not justified. |
 | Grant alignment as a prefill lever (`ADMISSION_RESERVE_FRACTION` 4 → 2) | Predicted **+27%**, measured **+1.5%**. The width curve is real — 2,048-wide passes run at 2,760 tok/s against 256-wide at 1,510, and the ratio holds at depth (1,896 vs 1,050 at 64K) — and `choose_prefill_width` does decompose a 3,072-token grant into 2,048 + 4×256. `max_batch = 3`, the 256 tail ceiling, and the grant reaching `execute_prefill` intact were all verified. The penalty still does not appear end to end. The constant stays at 2 because it is never worse and an aligned grant is the honest default, but **do not rank work by that width arithmetic**; the mechanism is confirmed and its cost is not. |
 | Snapshot retention as the cause of the concurrent-session penalty | Nothing. `--cache-ram 0` (no snapshots) and `16GiB` (159 per worker) both land within noise of the 2.41 GiB default's 24, at 64K × 3 sessions. The arena arithmetic is seductive — a 64K prompt needs 31 snapshots at R=2048, three sessions ~93 against 24 — and wrong. Worse, it was first "ruled out" at 16K, where three sessions need exactly 24 and the arena *cannot* bind, which proved nothing in either direction. Test a capacity hypothesis at a depth where the capacity is actually exceeded. |
-| Community-quant formats in the runtime `dequant_tile` ladder, and `__noinline__` to contain them | The ladder is `__forceinline__` with a runtime `quant`, so every arm is emitted at every call site — nine of them across `tile_gemm_pair`, `tile_gemm_single`, the `_direct1` variants and the shared-expert bodies. Three extra formats cost `moe_shared_ffn_gemv` +20 registers (42 → 62), `moe_expert_ffn_flat` +18, `moe_expert_ffn` +16, `moe_expert_ffn_gemv` +11; 20 kernels moved, **−5.05%** on Ornith N=3 2K (195.5 against 205.9, three interleaved pairs, same card two minutes apart). `moe_expert_ffn_flat_q6` did **not** move — it is specialized with no runtime `quant` — which localizes the cost to the ladder rather than to the bodies existing. **`__noinline__` is worse, not better**: `moe_expert_ffn` 80 → 124 and `moe_shared_ffn` 92 → 130, because a non-inlined device call spills live values across the ABI boundary. Reverted. A compile-time flag threaded through all nine sites is the only version worth trying, and it needs before/after `ptxas -v` before it lands. **The generalisation is structural**: a runtime ladder inside a `__forceinline__` function is a *shared resource*, so an arm added for one format is paid for by every format already using it; a macro that emits a separate `__global__` per format — as `GDN_GATES` does — is not, and a new one there touches nothing existing. Which of the two shapes a kernel family uses decides whether adding a format is free, and it is worth knowing before writing the format rather than after measuring it. |
+| Community-quant formats in the runtime `dequant_tile` ladder, and `__noinline__` to contain them | The ladder is `__forceinline__` with a runtime `quant`, so every arm is emitted at every call site — nine of them across `tile_gemm_pair`, `tile_gemm_single`, the `_direct1` variants and the shared-expert bodies. Three extra formats cost `moe_shared_ffn_gemv` +20 registers (42 → 62), `moe_expert_ffn_flat` +18, `moe_expert_ffn` +16, `moe_expert_ffn_gemv` +11; 20 kernels moved, **−5.05%** on Ornith N=3 2K (195.5 against 205.9, three interleaved pairs, same card two minutes apart). `moe_expert_ffn_flat_q6` did **not** move — it is specialized with no runtime `quant` — which localizes the cost to the ladder rather than to the bodies existing. **`__noinline__` is worse, not better**: `moe_expert_ffn` 80 → 124 and `moe_shared_ffn` 92 → 130, because a non-inlined device call spills live values across the ABI boundary. Reverted. **The compile-time flag it prescribed has since landed** — `dequant_tile_ct<Q>`, one instantiation per format, no runtime branch; see "Compile-time formats free registers that ptxas then spends" in WHY for the before/after and for the occupancy trap it turned up on the way. **The generalisation is structural**: a runtime ladder inside a `__forceinline__` function is a *shared resource*, so an arm added for one format is paid for by every format already using it; a macro that emits a separate `__global__` per format — as `GDN_GATES` does — is not, and a new one there touches nothing existing. Which of the two shapes a kernel family uses decides whether adding a format is free, and it is worth knowing before writing the format rather than after measuring it. |
 | Forking the Gated DeltaNet input projections onto a side stream | **−1.2%** at N=1 2K, losing both interleaved pairs, against +0.79% winning all three at N=3; a first pair read −7.5% and is quoted only as the reason the set was extended. The overlap is real at both widths (1.46x in `nsys`) and irrelevant at one token: the step is launch-latency-bound there, so two events per layer across thirty layers is sixty graph nodes bought against a machine with no wave to fill. Second independent change to hit that wall — see the shared-expert side-stream row above. **Reverted, and the N=3 figure is not a current claim**: a `replace_all` had put the fork into `run_batch_prefill` as well as `run_batch_decode` — one uncaptured path and one inside a graph capture, both forking onto one side stream recording one pair of events, on a `GdnBlock` that serving alternates between them. The +0.79% was measured against a stale pinned binary by the same method that produced the router tile's +1.31%, which did not survive re-measurement against a baseline built from its own commit. Anyone re-attempting this owes it a clean baseline before quoting a number. |
 | Narrowing the router's expert tile at decode width (`ET` 8 → 4) | **Nothing — and the sweep that motivated it cannot resolve anything it claimed.** This host drifts **−0.8% at N=3 over ten minutes**, monotonically and in one direction, which is larger than every effect the `ET` sweep reported; a sequential sweep crossing that drift produces exactly the ragged curve that invites an occupancy-knee story, so **neither the sweep's shape nor its knee is evidence of anything until it is re-run interleaved**. Nor can a sweep be corrected for order after the fact: drift favours the first position and cold caches, first-touch faults and the NVRTC compile penalise it, so the sign of the bias is not even known without measuring it. Re-measured against a baseline built from the pinned commit rather than a stale binary: three interleaved reversed pairs at 2K read +0.24 / −0.19 / −0.05% at N=3, +0.30 / +0.18 / −0.12% at N=2 and +0.49 / +0.29 / 0.00% at N=1 — the sign flips inside every set. The +1.31% recorded here before came from pairs against a stale pinned binary, and a control A/B of that binary against current main read +0.53 / −0.05% at N=3, so the baseline gap does not explain it; the original sweep's run order was not kept, so it cannot be checked against the drift either. The grid arithmetic is not wrong — `grid.y` is 1 at decode, so `ET = 8` is 32 blocks and 256 warps against the 2,304 this part holds — it is just not what binds. `ptxas -v` either side: the prefill kernel unmoved at 96 registers, so nothing was traded for the non-result. Prefill cannot be hiding a win (it selects that unmoved kernel) and depth cannot be (router cost is independent of KV depth, so the tile is a *smaller* fraction of a deeper step). |
 | Reading the Ornith fork's 32K result at all | Three interleaved pairs gave −0.31%, +2.62% and +1.39% while the *baseline* arm ranged 1.85% across its own three runs. The prediction on record was +0.55–0.6%, from a fixed per-layer saving over a step that grows 14.5 → 18.9 ms. The set can neither confirm nor refute that, so no 32K figure is quoted for this change. Recorded because the temptation was to take the mean and call it +1.2%. |

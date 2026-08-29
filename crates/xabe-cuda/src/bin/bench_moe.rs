@@ -179,6 +179,12 @@ fn main() {
             stream.clone_htod(&q8_0_stack(stack, 1)).expect("gate"),
             stream.clone_htod(&q8_0_stack(stack, 2)).expect("up"),
         ),
+        // This bench exists to compare the two *shipped* expert formats' tuned
+        // kernels against each other. The community formats have no tuned
+        // kernel to bench -- they take the plain `*_community` path at every
+        // width by construction -- so a number here would compare a plain
+        // kernel with a staged one and say nothing about either.
+        other => unreachable!("LLMXABE_MOE_QUANT does not accept {other:?}"),
     };
     let d_down = stream.clone_htod(&q8_0_stack(stack, 3)).expect("down");
     let d_sgate = stream
