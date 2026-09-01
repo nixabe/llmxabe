@@ -2457,11 +2457,128 @@ __global__ void attn_kv_append(
     }
 }
 
+// The decode step's per-sequence rotary and cache append, batched over the
+// launch: one grid advances every sequence's query and key through
+// `attn_rope_partial_neox`'s arithmetic and appends the roped key and the
+// value to that sequence's own cache, each sequence reading its own
+// position through a scalar pointer slot -- the idiom `conv1d_step_batch`
+// and the GDN step kernels use, so graph capture sees stable pointers.
+//
+// It replaces three launches per sequence per layer (rope q, rope k,
+// append) that were issued on a side stream each. At decode width every
+// one of them was under six microseconds, i.e. mostly its own floor.
+//
+// Bit-identical to the three kernels it replaces, by construction: the
+// rotary body is `attn_rope_partial_neox`'s with `t = 0` (the position is
+// `(double)*pos + (double)0`, which is exact), the tail is a copy, and the
+// cache write is `f2h` of the same float the separate append read back
+// from `k_out`. `attention_differential` gates it against the separate
+// launches.
+//
+// grid: (q_heads + kv_heads, n_seq). block: head_dim. Head blocks below
+// `q_heads` rope the query; the rest rope one key head and append it with
+// its value. Thread `d < rope_dim / 2` owns the pair `(d, d + half)`;
+// threads at and past `rope_dim` copy the tail.
+#define ATTN_STEP_SLOTS 8
+
+__device__ __forceinline__ unsigned long long attn_slot(
+    int z,
+    unsigned long long s0, unsigned long long s1,
+    unsigned long long s2, unsigned long long s3,
+    unsigned long long s4, unsigned long long s5,
+    unsigned long long s6, unsigned long long s7
+) {
+    switch (z) {
+        case 0: return s0; case 1: return s1; case 2: return s2; case 3: return s3;
+        case 4: return s4; case 5: return s5; case 6: return s6; default: return s7;
+    }
+}
+
+__global__ void attn_decode_rope_append_batch(
+    const float* __restrict__ q_in,
+    float* __restrict__ q_out,
+    const float* __restrict__ k_in,
+    float* __restrict__ k_out,
+    const float* __restrict__ v_in,
+    unsigned long long rp0, unsigned long long rp1, unsigned long long rp2, unsigned long long rp3,
+    unsigned long long rp4, unsigned long long rp5, unsigned long long rp6, unsigned long long rp7,
+    unsigned long long ap0, unsigned long long ap1, unsigned long long ap2, unsigned long long ap3,
+    unsigned long long ap4, unsigned long long ap5, unsigned long long ap6, unsigned long long ap7,
+    unsigned long long kc0, unsigned long long kc1, unsigned long long kc2, unsigned long long kc3,
+    unsigned long long kc4, unsigned long long kc5, unsigned long long kc6, unsigned long long kc7,
+    unsigned long long vc0, unsigned long long vc1, unsigned long long vc2, unsigned long long vc3,
+    unsigned long long vc4, unsigned long long vc5, unsigned long long vc6, unsigned long long vc7,
+    int q_heads,
+    int kv_heads,
+    int head_dim,
+    int rope_dim,
+    float theta_base
+) {
+    int seq = blockIdx.y;
+    int h = blockIdx.x;
+    int d = threadIdx.x;
+    const int* rope_pos = (const int*)attn_slot(seq, rp0, rp1, rp2, rp3, rp4, rp5, rp6, rp7);
+
+    bool is_q = h < q_heads;
+    const float* in = is_q ? q_in : k_in;
+    float* out = is_q ? q_out : k_out;
+    int heads = is_q ? q_heads : kv_heads;
+    int hh = is_q ? h : h - q_heads;
+    long long base = ((long long)seq * heads + hh) * (long long)head_dim;
+
+    // The key head's cache row for this sequence's position.
+    unsigned short* k_cache = 0;
+    unsigned short* v_cache = 0;
+    long long at = 0;
+    if (!is_q) {
+        const int* pos = (const int*)attn_slot(seq, ap0, ap1, ap2, ap3, ap4, ap5, ap6, ap7);
+        k_cache = (unsigned short*)attn_slot(seq, kc0, kc1, kc2, kc3, kc4, kc5, kc6, kc7);
+        v_cache = (unsigned short*)attn_slot(seq, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7);
+        at = (long long)(*pos) * (long long)kv_heads * (long long)head_dim
+           + (long long)hh * (long long)head_dim;
+    }
+
+    int half = rope_dim >> 1;
+    if (d >= rope_dim) {
+        float x = in[base + d];
+        out[base + d] = x;
+        if (!is_q) {
+            k_cache[at + d] = f2h(x);
+            v_cache[at + d] = f2h(v_in[base + d]);
+        }
+        return;
+    }
+    if (d >= half) return;
+
+    double freq = pow((double)theta_base, -2.0 * (double)d / (double)rope_dim);
+    double pos_d = (double)(*rope_pos) + (double)0;
+    double angle = pos_d * freq;
+    float sin_a = (float)sin(angle);
+    float cos_a = (float)cos(angle);
+
+    float x0 = in[base + d];
+    float x1 = in[base + d + half];
+    float y0 = x0 * cos_a - x1 * sin_a;
+    float y1 = x0 * sin_a + x1 * cos_a;
+    out[base + d]        = y0;
+    out[base + d + half] = y1;
+    if (!is_q) {
+        k_cache[at + d]        = f2h(y0);
+        k_cache[at + d + half] = f2h(y1);
+        v_cache[at + d]        = f2h(v_in[base + d]);
+        v_cache[at + d + half] = f2h(v_in[base + d + half]);
+    }
+}
+
 }
 "#;
 
 /// Threads per block for [`AttentionKernels::append_kv`].
 const APPEND_THREADS: u32 = 256;
+
+/// Sequences one `attn_decode_rope_append_batch` launch carries: the
+/// kernel's pointer-slot count (`ATTN_STEP_SLOTS`).
+pub const STEP_SLOTS: usize = 8;
 
 /// Something went wrong compiling or launching an attention kernel.
 #[derive(Debug)]
@@ -2602,6 +2719,9 @@ pub struct AttentionKernels {
     decode_combine: CudaFunction,
     flash_t1: CudaFunction,
     append: CudaFunction,
+    /// `attn_decode_rope_append_batch`: rope q, rope k and the cache append
+    /// for every sequence of a decode step under one grid.
+    rope_append_batch: CudaFunction,
     q_heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -2714,6 +2834,7 @@ impl AttentionKernels {
             decode_combine: module.load_function("attn_flash_decode_combine")?,
             flash_t1: module.load_function("attn_flash_causal_t1")?,
             append: module.load_function("attn_kv_append")?,
+            rope_append_batch: module.load_function("attn_decode_rope_append_batch")?,
             q_heads,
             kv_heads,
             head_dim,
@@ -3611,6 +3732,111 @@ impl AttentionKernels {
         // `positions[0] * row + span - 1` — inside `max_keys * row`, which
         // both caches were checked to hold, for any position the caller's own
         // `max_seq` check admits.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
+    /// [`Self::rope`] on the query and the key and [`Self::append_kv`] for
+    /// every sequence of a decode step, in one launch.
+    ///
+    /// `q_in`/`q_out` are `[n][q_heads][head_dim]`, `k_in`/`k_out` and
+    /// `v_in` `[n][kv_heads][head_dim]`, sequence-major. `rope_positions[i]`
+    /// and `positions[i]` are device pointers to sequence `i`'s rotary
+    /// position and cache position; `k_caches[i]`/`v_caches[i]` its cache
+    /// bases. `n` is at most [`STEP_SLOTS`].
+    ///
+    /// Bit-identical to the three separate launches; see the kernel.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer in the first `n` slots must be live for this launch:
+    /// the positions one `i32` each, the caches at least `max_keys *
+    /// kv_heads * head_dim` halves each, for a `max_keys` above every
+    /// position, and the caches must be distinct sequences' (the kernel
+    /// writes them without synchronization between blocks).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rope_append_batch_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        q_in: &CudaSlice<f32>,
+        q_out: &mut CudaSlice<f32>,
+        k_in: &CudaSlice<f32>,
+        k_out: &mut CudaSlice<f32>,
+        v_in: &CudaSlice<f32>,
+        rope_positions: &[u64],
+        positions: &[u64],
+        k_caches: &[u64],
+        v_caches: &[u64],
+        rope_dim: usize,
+        theta_base: f32,
+    ) -> Result<(), AttentionError> {
+        let n = rope_positions.len();
+        if n == 0 || n > STEP_SLOTS {
+            return Err(AttentionError::BufferShape {
+                what: "rope/append batch (1..=STEP_SLOTS sequences)",
+                expected: STEP_SLOTS,
+                actual: n,
+            });
+        }
+        Self::expect_len("rope/append batch positions", positions.len(), n)?;
+        Self::expect_len("rope/append batch key caches", k_caches.len(), n)?;
+        Self::expect_len("rope/append batch value caches", v_caches.len(), n)?;
+        if !rope_dim.is_multiple_of(2) || rope_dim > self.head_dim {
+            return Err(AttentionError::UnsupportedRopeDim {
+                rope_dim,
+                head_dim: self.head_dim,
+            });
+        }
+        let q_n = n * self.q_heads * self.head_dim;
+        let kv_n = n * self.kv_heads * self.head_dim;
+        Self::expect_len("rope/append batch q_in", q_in.len(), q_n)?;
+        Self::expect_len("rope/append batch q_out", q_out.len(), q_n)?;
+        Self::expect_len("rope/append batch k_in", k_in.len(), kv_n)?;
+        Self::expect_len("rope/append batch k_out", k_out.len(), kv_n)?;
+        Self::expect_len("rope/append batch v_in", v_in.len(), kv_n)?;
+
+        let fill = |src: &[u64]| {
+            let mut slots = [src[0]; STEP_SLOTS];
+            slots[..n].copy_from_slice(src);
+            slots
+        };
+        let (rp, ap, kc, vc) = (
+            fill(rope_positions),
+            fill(positions),
+            fill(k_caches),
+            fill(v_caches),
+        );
+        let cfg = LaunchConfig {
+            grid_dim: ((self.q_heads + self.kv_heads) as u32, n as u32, 1),
+            block_dim: (self.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (q_heads, kv_heads, head_dim, rope_dim_i) = (
+            self.q_heads as i32,
+            self.kv_heads as i32,
+            self.head_dim as i32,
+            rope_dim as i32,
+        );
+        let mut builder = stream.launch_builder(&self.rope_append_batch);
+        builder
+            .arg(q_in)
+            .arg(&mut *q_out)
+            .arg(k_in)
+            .arg(&mut *k_out)
+            .arg(v_in);
+        for slot in rp.iter().chain(&ap).chain(&kc).chain(&vc) {
+            builder.arg(slot);
+        }
+        builder
+            .arg(&q_heads)
+            .arg(&kv_heads)
+            .arg(&head_dim)
+            .arg(&rope_dim_i)
+            .arg(&theta_base);
+        // SAFETY: `grid.y = n` bounds the pointer slots to the caller's live
+        // sequences, whose validity is the caller's contract above; every
+        // activation buffer was checked to hold exactly `n` sequences of its
+        // width and each thread touches its own head's slice.
         unsafe { builder.launch(cfg) }?;
         Ok(())
     }

@@ -97,7 +97,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, DriverError, PinnedHostSlice};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DriverError, PinnedHostSlice,
+};
 
 use xabe_cuda::arena::ArenaError;
 use xabe_cuda::kernels::attention::{AttentionError, AttentionKernels, AttnDecodeScratch};
@@ -1669,6 +1671,56 @@ impl GatedAttentionBlock {
             self.rms_eps,
         )?;
 
+        // 7. Rotary on the query and the key, and the cache append, for
+        //    every sequence in one launch — three launches per sequence
+        //    become one per step, on the main stream before the fork. Each
+        //    sequence's positions and caches ride in as pointer slots, the
+        //    idiom the GDN step kernels use, so the captured graph sees
+        //    stable pointers. Above the slot count the per-sequence launches
+        //    below carry it, same arithmetic.
+        let batched_rope_append = n <= xabe_cuda::kernels::attention::STEP_SLOTS;
+        if batched_rope_append {
+            let row = kv_dim;
+            for cache in caches.iter() {
+                if cache.k.len() < cache.max_seq * row || cache.v.len() < cache.max_seq * row {
+                    return Err(AttentionBlockError::BufferShape {
+                        what: "batch decode kv cache",
+                        expected: cache.max_seq * row,
+                        actual: cache.k.len().min(cache.v.len()),
+                    });
+                }
+            }
+            let rope_ptrs: Vec<u64> = rope_positions
+                .iter()
+                .map(|p| p.device_ptr(stream).0)
+                .collect();
+            let pos_ptrs: Vec<u64> = positions.iter().map(|p| p.device_ptr(stream).0).collect();
+            let k_ptrs: Vec<u64> = caches.iter().map(|c| c.k.device_ptr(stream).0).collect();
+            let v_ptrs: Vec<u64> = caches.iter().map(|c| c.v.device_ptr(stream).0).collect();
+            // SAFETY: each position pointer is a live one-element `i32`
+            // buffer held by the caller for this call; each cache pointer is
+            // a live `max_seq * kv_dim` cache checked just above, held
+            // mutably through `caches` and distinct per sequence; the
+            // activation buffers are `[t][width]` with `t == n`, checked by
+            // `AttnScratch::new`.
+            unsafe {
+                k.mixer.rope_append_batch_raw(
+                    stream,
+                    &sc.query_normed,
+                    &mut sc.query_roped,
+                    &sc.key_normed,
+                    &mut sc.key_roped,
+                    &sc.value,
+                    &rope_ptrs,
+                    &pos_ptrs,
+                    &k_ptrs,
+                    &v_ptrs,
+                    self.rope_dim,
+                    self.rope_theta,
+                )?;
+            }
+        }
+
         debug_assert!(secondary_streams.is_empty() || secondary_streams.len() == n - 1);
         debug_assert_eq!(joins.len(), secondary_streams.len());
         if !secondary_streams.is_empty() {
@@ -1692,53 +1744,55 @@ impl GatedAttentionBlock {
             // `sc.query_roped`'s and `sc.key_normed`'s/`sc.key_roped`'s own
             // per-token widths, and `kv_dim` is `sc.value`'s, all checked by
             // `AttnScratch::new` against `tokens * width`.
-            let q_normed_i = unsafe {
-                crate::viewslice::subslice(sequence_stream, &sc.query_normed, i * q_dim, q_dim)
-            };
             let mut q_roped_i = unsafe {
                 crate::viewslice::subslice(sequence_stream, &sc.query_roped, i * q_dim, q_dim)
             };
-            k.mixer.rope(
-                sequence_stream,
-                &q_normed_i,
-                &mut q_roped_i,
-                1,
-                self.q_heads,
-                self.rope_dim,
-                rope_positions[i],
-                self.rope_theta,
-            )?;
+            if !batched_rope_append {
+                let q_normed_i = unsafe {
+                    crate::viewslice::subslice(sequence_stream, &sc.query_normed, i * q_dim, q_dim)
+                };
+                k.mixer.rope(
+                    sequence_stream,
+                    &q_normed_i,
+                    &mut q_roped_i,
+                    1,
+                    self.q_heads,
+                    self.rope_dim,
+                    rope_positions[i],
+                    self.rope_theta,
+                )?;
 
-            let k_normed_i = unsafe {
-                crate::viewslice::subslice(sequence_stream, &sc.key_normed, i * kv_dim, kv_dim)
-            };
-            let mut k_roped_i = unsafe {
-                crate::viewslice::subslice(sequence_stream, &sc.key_roped, i * kv_dim, kv_dim)
-            };
-            k.mixer.rope(
-                sequence_stream,
-                &k_normed_i,
-                &mut k_roped_i,
-                1,
-                self.kv_heads,
-                self.rope_dim,
-                rope_positions[i],
-                self.rope_theta,
-            )?;
+                let k_normed_i = unsafe {
+                    crate::viewslice::subslice(sequence_stream, &sc.key_normed, i * kv_dim, kv_dim)
+                };
+                let mut k_roped_i = unsafe {
+                    crate::viewslice::subslice(sequence_stream, &sc.key_roped, i * kv_dim, kv_dim)
+                };
+                k.mixer.rope(
+                    sequence_stream,
+                    &k_normed_i,
+                    &mut k_roped_i,
+                    1,
+                    self.kv_heads,
+                    self.rope_dim,
+                    rope_positions[i],
+                    self.rope_theta,
+                )?;
 
-            let value_i = unsafe {
-                crate::viewslice::subslice(sequence_stream, &sc.value, i * kv_dim, kv_dim)
-            };
-            k.mixer.append_kv(
-                sequence_stream,
-                &k_roped_i,
-                &value_i,
-                &mut caches[i].k,
-                &mut caches[i].v,
-                1,
-                caches[i].max_seq,
-                positions[i],
-            )?;
+                let value_i = unsafe {
+                    crate::viewslice::subslice(sequence_stream, &sc.value, i * kv_dim, kv_dim)
+                };
+                k.mixer.append_kv(
+                    sequence_stream,
+                    &k_roped_i,
+                    &value_i,
+                    &mut caches[i].k,
+                    &mut caches[i].v,
+                    1,
+                    caches[i].max_seq,
+                    positions[i],
+                )?;
+            }
 
             let mut pregate_i = unsafe {
                 crate::viewslice::subslice(sequence_stream, &sc.pregate, i * q_dim, q_dim)

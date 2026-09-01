@@ -73,7 +73,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaStream, DevicePtr};
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_cuda::kernels::attention::{
     AttentionKernels, AttnDecodeScratch, attn_packed_gate_offset, attn_packed_query_offset,
@@ -1108,4 +1108,182 @@ fn the_packed_query_tensor_is_deinterleaved_per_head_not_split_in_half() {
         ModelConfig::qwen3_6_35b_a3b().hidden_size,
         wrong.max_abs_error,
     );
+}
+
+/// `rope_append_batch_raw` — rope q, rope k and the cache append for every
+/// sequence of a decode step under one grid — against the three separate
+/// launches, at every batch width the slot count admits, with distinct
+/// positions per sequence.
+///
+/// Exact, with no tolerance: the batched kernel runs the rotary body with
+/// `t = 0`, copies the tail, and writes `f2h` of the same float the
+/// separate append read back, so the roped buffers and both caches must be
+/// identical bit for bit. A difference means a pointer slot or a head seam
+/// is wrong.
+#[test]
+fn batched_rope_append_agrees_with_the_separate_launches() {
+    let Some(ctx) = setup() else {
+        return;
+    };
+    let stream = ctx.default_stream();
+    let g = geometry();
+    let kernels = AttentionKernels::new(&ctx, g.q_heads, g.kv_heads, g.head_dim).expect("compiles");
+    let q_dim = g.q_heads * g.head_dim;
+    let kv_dim = g.kv_heads * g.head_dim;
+    const MAX_SEQ: usize = 64;
+    const THETA_BASE: f32 = 10_000.0;
+    let mut rng = Xorshift64Star::new(0x_5EED_A77E);
+
+    for n in [1usize, 2, 3, 4, 8] {
+        let q = rng.vec_f32(n * q_dim, -2.0, 2.0);
+        let k = rng.vec_f32(n * kv_dim, -2.0, 2.0);
+        let v = rng.vec_f32(n * kv_dim, -2.0, 2.0);
+        // Distinct rotary and cache positions per sequence, so a slot
+        // mix-up shows.
+        let rope_pos: Vec<i32> = (0..n).map(|i| 1000 + 37 * i as i32).collect();
+        let cache_pos: Vec<i32> = (0..n).map(|i| 3 + 7 * i as i32).collect();
+        let d_q = stream.clone_htod(&q).expect("upload q");
+        let d_k = stream.clone_htod(&k).expect("upload k");
+        let d_v = stream.clone_htod(&v).expect("upload v");
+        let d_rope_pos: Vec<_> = rope_pos
+            .iter()
+            .map(|&p| stream.clone_htod(&[p]).expect("upload pos"))
+            .collect();
+        let d_cache_pos: Vec<_> = cache_pos
+            .iter()
+            .map(|&p| stream.clone_htod(&[p]).expect("upload pos"))
+            .collect();
+
+        // --- separate launches, one sequence's buffers at a time ---------
+        let mut qs: Vec<f32> = Vec::with_capacity(n * q_dim);
+        let mut ks: Vec<f32> = Vec::with_capacity(n * kv_dim);
+        let mut kc_sep: Vec<_> = (0..n)
+            .map(|_| stream.alloc_zeros::<u16>(MAX_SEQ * kv_dim).expect("alloc"))
+            .collect();
+        let mut vc_sep: Vec<_> = (0..n)
+            .map(|_| stream.alloc_zeros::<u16>(MAX_SEQ * kv_dim).expect("alloc"))
+            .collect();
+        for i in 0..n {
+            let q_i = stream
+                .clone_htod(&q[i * q_dim..(i + 1) * q_dim])
+                .expect("upload");
+            let mut qo_i = stream.alloc_zeros::<f32>(q_dim).expect("alloc");
+            kernels
+                .rope(
+                    &stream,
+                    &q_i,
+                    &mut qo_i,
+                    1,
+                    g.q_heads,
+                    g.rope_dim,
+                    &d_rope_pos[i],
+                    THETA_BASE,
+                )
+                .expect("rope q");
+            let k_i = stream
+                .clone_htod(&k[i * kv_dim..(i + 1) * kv_dim])
+                .expect("upload");
+            let mut ko_i = stream.alloc_zeros::<f32>(kv_dim).expect("alloc");
+            kernels
+                .rope(
+                    &stream,
+                    &k_i,
+                    &mut ko_i,
+                    1,
+                    g.kv_heads,
+                    g.rope_dim,
+                    &d_rope_pos[i],
+                    THETA_BASE,
+                )
+                .expect("rope k");
+            let v_i = stream
+                .clone_htod(&v[i * kv_dim..(i + 1) * kv_dim])
+                .expect("upload");
+            kernels
+                .append_kv(
+                    &stream,
+                    &ko_i,
+                    &v_i,
+                    &mut kc_sep[i],
+                    &mut vc_sep[i],
+                    1,
+                    MAX_SEQ,
+                    &d_cache_pos[i],
+                )
+                .expect("append");
+            stream.synchronize().expect("sync");
+            qs.extend_from_slice(&stream.clone_dtoh(&qo_i).expect("read"));
+            ks.extend_from_slice(&stream.clone_dtoh(&ko_i).expect("read"));
+        }
+
+        // --- one launch ----------------------------------------------------
+        let mut q_bat = stream.alloc_zeros::<f32>(n * q_dim).expect("alloc");
+        let mut k_bat = stream.alloc_zeros::<f32>(n * kv_dim).expect("alloc");
+        let kc_bat: Vec<_> = (0..n)
+            .map(|_| stream.alloc_zeros::<u16>(MAX_SEQ * kv_dim).expect("alloc"))
+            .collect();
+        let vc_bat: Vec<_> = (0..n)
+            .map(|_| stream.alloc_zeros::<u16>(MAX_SEQ * kv_dim).expect("alloc"))
+            .collect();
+        let ptrs = |v: &[cudarc::driver::CudaSlice<i32>]| -> Vec<u64> {
+            v.iter().map(|s| s.device_ptr(&stream).0).collect()
+        };
+        let cptrs = |v: &[cudarc::driver::CudaSlice<u16>]| -> Vec<u64> {
+            v.iter().map(|s| s.device_ptr(&stream).0).collect()
+        };
+        // SAFETY: every slot is a live buffer allocated above, distinct per
+        // sequence, sized `MAX_SEQ * kv_dim` with positions under `MAX_SEQ`.
+        unsafe {
+            kernels
+                .rope_append_batch_raw(
+                    &stream,
+                    &d_q,
+                    &mut q_bat,
+                    &d_k,
+                    &mut k_bat,
+                    &d_v,
+                    &ptrs(&d_rope_pos),
+                    &ptrs(&d_cache_pos),
+                    &cptrs(&kc_bat),
+                    &cptrs(&vc_bat),
+                    g.rope_dim,
+                    THETA_BASE,
+                )
+                .expect("batched rope/append");
+        }
+        stream.synchronize().expect("sync");
+
+        let back = |b: &cudarc::driver::CudaSlice<f32>| stream.clone_dtoh(b).expect("read");
+        let back16 = |b: &cudarc::driver::CudaSlice<u16>| stream.clone_dtoh(b).expect("read");
+        let (qb, kb) = (back(&q_bat), back(&k_bat));
+        stream.synchronize().expect("sync");
+        assert!(
+            qs.iter().all(|x| x.is_finite()),
+            "n {n}: separate rope produced a non-finite value"
+        );
+        assert_eq!(
+            qs, qb,
+            "n {n}: roped query differs under the batched launch"
+        );
+        assert_eq!(ks, kb, "n {n}: roped key differs under the batched launch");
+        for i in 0..n {
+            let (a, b) = (back16(&kc_sep[i]), back16(&kc_bat[i]));
+            let (c, d) = (back16(&vc_sep[i]), back16(&vc_bat[i]));
+            stream.synchronize().expect("sync");
+            let written = a.iter().filter(|&&x| x != 0).count();
+            assert!(
+                written > 0,
+                "n {n}, seq {i}: the separate append wrote nothing"
+            );
+            assert_eq!(
+                a, b,
+                "n {n}, seq {i}: key cache differs under the batched launch"
+            );
+            assert_eq!(
+                c, d,
+                "n {n}, seq {i}: value cache differs under the batched launch"
+            );
+        }
+        println!("n {n}: roped q/k and {n} key/value caches bit-identical");
+    }
 }
