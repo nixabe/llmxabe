@@ -418,13 +418,15 @@ pub fn run_layer_with_snapshots_batch(
                 unsafe { subslice(stream, &scratch.normed, start * g.hidden, piece * g.hidden) };
             let mut qkv_i =
                 unsafe { subslice(stream, &scratch.qkv, start * conv_dim, piece * conv_dim) };
-            gdn.project_split_tiled(
-                stream, qkv_q, qkv_s, &normed_i, &mut qkv_i, g.hidden, conv_dim, piece,
-            )?;
             let mut z_i =
                 unsafe { subslice(stream, &scratch.z, start * value_dim, piece * value_dim) };
-            gdn.project_split_tiled(
-                stream, gate_q, gate_s, &normed_i, &mut z_i, g.hidden, value_dim, piece,
+            gdn.project_split_pair(
+                stream,
+                (qkv_q, qkv_s, &mut qkv_i, conv_dim),
+                (gate_q, gate_s, &mut z_i, value_dim),
+                &normed_i,
+                g.hidden,
+                piece,
             )?;
         }
     } else {

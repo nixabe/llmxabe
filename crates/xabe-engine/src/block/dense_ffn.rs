@@ -1399,10 +1399,18 @@ mod tests {
             let at = src
                 .find(&open)
                 .unwrap_or_else(|| panic!("{prefix}_proj_split_rows is missing"));
+            // Both bodies open on the lane index; the GDN copy then takes
+            // its first row from the entry point (so two matrices can share
+            // one grid) where this one computes it in place. The window
+            // opens after that, at the token index.
+            assert!(
+                src[at..].contains("int lane = threadIdx.x;"),
+                "{prefix} body does not open on the lane index"
+            );
             let from = at
                 + src[at..]
-                    .find("int lane = threadIdx.x;")
-                    .unwrap_or_else(|| panic!("{prefix} body does not open on the lane index"));
+                    .find("int t0 = blockIdx.y * TT;")
+                    .unwrap_or_else(|| panic!("{prefix} body has no token index"));
             const END: &str = "(cn + off) >> 5);";
             let to = from
                 + src[from..]

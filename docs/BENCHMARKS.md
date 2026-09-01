@@ -969,15 +969,45 @@ them run 21 waves deep and read 503–518. Forked onto a side stream they do
 overlap, 1.46x, and the main stream's busy time falls 12.95 → 12.21 ms per
 step in `nsys`.
 
-**It is not in the engine**, and the overlap is why it is worth writing down
-anyway. The fork was built, measured at +0.79% at N=3, found to be −1.2% at
-N=1, reverted for a defect, and never re-measured against a clean baseline —
-see WHY NOT. Its durable content is the second data point on where this step's
-ceiling comes from: anyone proposing to overlap two launches at one token now
-has two independent measurements saying the step is launch-latency-bound
-there, rather than one that could be dismissed as particular to the shared
-expert. The overlap is real at both widths and buys nothing at one token,
-which is a fact about the step and not about either change.
+**The fork is not in the engine; the merge is.** The fork was built,
+measured at +0.79% at N=3, found to be −1.2% at N=1, reverted for a defect,
+and never re-measured against a clean baseline — see WHY NOT. What it left
+behind was the second data point on where this step's ceiling comes from:
+two independent measurements saying the step is launch-latency-bound at one
+token, so anything that *adds* work to the stream — an event pair per layer,
+sixty graph nodes — loses there whatever it overlaps elsewhere.
+
+What survives that constraint is putting both matrices under **one grid**.
+`gdn_proj_split_pair_*` takes the two weight pointers, the two outputs and
+the row seam, and each warp group runs the single-matrix body on whichever
+matrix its rows fall in — no event, no second stream, and every output is
+the same chain of additions the separate launches produced, asserted bit for
+bit at every token width the tile table has structure at. The two partial
+waves become one grid of 2.67, and the ramp and drain are paid once. Three
+interleaved pairs at 2K on GPU 1, order reversed in the middle pair, the
+baseline arm flat across the sitting (210.1–210.6):
+
+| width | pair 1 | pair 2 | pair 3 |
+| :--- | ---: | ---: | ---: |
+| N=3 | 210.3 → 213.4 | 210.1 → 213.7 | 210.6 → 212.9 |
+| N=1 | 109.3 → 111.1 | 108.9 → 111.3 | 109.3 → 111.7 |
+
+**+1.1–1.7% at N=3 and +1.6–2.2% at N=1**, every pair won, and the N=1 side
+is the tell: the fork *lost* there, and a merge that pays no events wins
+there, which is the launch-bound reading confirmed from the other direction.
+Depth was not measured; the saving is a fixed amount per layer and is a
+smaller fraction of a deeper step.
+
+The one thing it cost was registers, and only until it was told not to.
+Left to itself ptxas spent the second pointer set: the one-token tile went
+80 → 96 registers and crossed from six resident blocks to five for no
+arithmetic. `__launch_bounds__(128, 6)` put it back at 80 with no spill and
+`t2`–`t4` held their counts under the matching bound; the two widest tiles
+are left unbounded, because the bound that would restore `t8`'s fourth
+block costs 24 bytes of spill and `(128, 2)` on `t16` sends ptxas to 255
+registers *and* a spill against 208 unbounded — the `(T, 1)` trap from
+"Compile-time formats free registers", one notch up. Check the count on
+every tile of a family, not the one the target width uses.
 
 ## Parallelism: fill the wave, and split the only axis decode has
 

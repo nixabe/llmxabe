@@ -1198,6 +1198,11 @@ __device__ __forceinline__ float gdn_scale(const unsigned short* p, long long i)
     return f;
 }
 
+// `n0` is the warp's first row, computed by the entry point rather than
+// here so that `gdn_proj_split_pair` can put two matrices under one grid:
+// the entry decides which matrix a warp group belongs to and hands the body
+// that matrix's own row index, and the arithmetic per output is this body's
+// either way. Callers guarantee `n0 < n_rows`.
 template <int TT, int RT, bool ADD>
 __device__ __forceinline__ void gdn_proj_split_rows(
     const signed char* __restrict__ wq,
@@ -1208,11 +1213,10 @@ __device__ __forceinline__ void gdn_proj_split_rows(
     float* __restrict__ summed,
     int k_dim,
     int n_rows,
-    int n_tokens
+    int n_tokens,
+    int n0
 ) {
     int lane = threadIdx.x;
-    int n0 = (blockIdx.x * blockDim.y + threadIdx.y) * RT;
-    if (n0 >= n_rows) return;
     int t0 = blockIdx.y * TT;
     if (t0 >= n_tokens) return;
     int live_t = n_tokens - t0; if (live_t > TT) live_t = TT;
@@ -1304,6 +1308,10 @@ __device__ __forceinline__ void gdn_proj_split_rows(
     }
 }
 
+// The warp group's first row. Uniform across the warp, so the early return
+// on a group past the matrix is warp-uniform too.
+#define GDN_PROJ_SPLIT_ROW0(RT) ((blockIdx.x * blockDim.y + threadIdx.y) * (RT))
+
 #define GDN_PROJ_SPLIT_ENTRY(NAME, TT, RT)                                   \
 extern "C" __global__ void NAME(                                             \
     const signed char* __restrict__ wq,                                      \
@@ -1314,8 +1322,63 @@ extern "C" __global__ void NAME(                                             \
     int n_rows,                                                              \
     int n_tokens                                                             \
 ) {                                                                          \
+    int n0 = GDN_PROJ_SPLIT_ROW0(RT);                                        \
+    if (n0 >= n_rows) return;                                                \
     gdn_proj_split_rows<TT, RT, false>(                                      \
-        wq, ws, x, nullptr, out, nullptr, k_dim, n_rows, n_tokens);          \
+        wq, ws, x, nullptr, out, nullptr, k_dim, n_rows, n_tokens, n0);      \
+}
+
+// Two matrices that read the same activation under one grid: the `qkv` and
+// `gate` input projections of the Gated DeltaNet block. Row groups below
+// `n_rows0` belong to the first matrix and the rest, re-based, to the
+// second. Each warp group runs the single-matrix body on its own matrix,
+// so every output is the same chain of additions the separate launches
+// produce — the tests assert it rather than trusting this sentence.
+//
+// Why one grid: at decode width the two launches are 1.78 and 0.89 waves
+// of a 1,152-warp residency, each paying its own ramp and drain against a
+// half-empty machine (BENCHMARKS.md, "Decode is a GEMV"). Forking the second
+// onto a side stream was measured and reverted — the events cost more than
+// the overlap at one token. One launch has no events to pay for.
+//
+// Host guarantees `n_rows0 % RT == 0`, so no warp group straddles the seam.
+//
+// `BOUNDS` pins the entry to the single-matrix kernel's residency where
+// that is needed and possible. Left to itself ptxas spends the second
+// pointer set on registers — 80 -> 96 at `t1` — which crosses a
+// blocks-per-SM line for no arithmetic gain; `__launch_bounds__(128, 6)`
+// puts it back at 80 with no spill, and `t2`..`t4` hold their counts under
+// the same bound. The two widest tiles are left unbounded: at `t8` the
+// bound that restores four blocks costs 24 bytes of spill, and at `t16`
+// `(128, 2)` relaxes ptxas's own heuristic to 255 registers *and* spills,
+// against 208 unbounded — the `(T, 1)` trap from BENCHMARKS.md, one notch
+// up.
+#define GDN_PROJ_SPLIT_PAIR_ENTRY(NAME, TT, RT, BOUNDS)                      \
+extern "C" __global__ void BOUNDS NAME(                                      \
+    const signed char* __restrict__ wq0,                                     \
+    const unsigned short* __restrict__ ws0,                                  \
+    float* __restrict__ out0,                                                \
+    int n_rows0,                                                             \
+    const signed char* __restrict__ wq1,                                     \
+    const unsigned short* __restrict__ ws1,                                  \
+    float* __restrict__ out1,                                                \
+    int n_rows1,                                                             \
+    const float* __restrict__ x,                                             \
+    int k_dim,                                                               \
+    int n_tokens                                                             \
+) {                                                                          \
+    int n0 = GDN_PROJ_SPLIT_ROW0(RT);                                        \
+    const signed char* wq = wq0;                                             \
+    const unsigned short* ws = ws0;                                          \
+    float* out = out0;                                                       \
+    int n_rows = n_rows0;                                                    \
+    if (n0 >= n_rows0) {                                                     \
+        n0 -= n_rows0;                                                       \
+        wq = wq1; ws = ws1; out = out1; n_rows = n_rows1;                    \
+    }                                                                        \
+    if (n0 >= n_rows) return;                                                \
+    gdn_proj_split_rows<TT, RT, false>(                                      \
+        wq, ws, x, nullptr, out, nullptr, k_dim, n_rows, n_tokens, n0);      \
 }
 
 #define GDN_PROJ_SPLIT_ADD_ENTRY(NAME, TT, RT)                               \
@@ -1330,8 +1393,10 @@ extern "C" __global__ void NAME(                                             \
     int n_rows,                                                              \
     int n_tokens                                                             \
 ) {                                                                          \
+    int n0 = GDN_PROJ_SPLIT_ROW0(RT);                                        \
+    if (n0 >= n_rows) return;                                                \
     gdn_proj_split_rows<TT, RT, true>(                                       \
-        wq, ws, x, residual, out, summed, k_dim, n_rows, n_tokens);          \
+        wq, ws, x, residual, out, summed, k_dim, n_rows, n_tokens, n0);      \
 }
 
 // RT falls as TT rises to hold the accumulator array at or below 16 floats
@@ -1343,6 +1408,12 @@ GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t3,  3, 4)
 GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t4,  4, 4)
 GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t8,  8, 2)
 GDN_PROJ_SPLIT_ENTRY(gdn_proj_split_t16, 16, 1)
+GDN_PROJ_SPLIT_PAIR_ENTRY(gdn_proj_split_pair_t1,  1, 4, __launch_bounds__(128, 6))
+GDN_PROJ_SPLIT_PAIR_ENTRY(gdn_proj_split_pair_t2,  2, 4, __launch_bounds__(128, 5))
+GDN_PROJ_SPLIT_PAIR_ENTRY(gdn_proj_split_pair_t3,  3, 4, __launch_bounds__(128, 4))
+GDN_PROJ_SPLIT_PAIR_ENTRY(gdn_proj_split_pair_t4,  4, 4, __launch_bounds__(128, 4))
+GDN_PROJ_SPLIT_PAIR_ENTRY(gdn_proj_split_pair_t8,  8, 2, )
+GDN_PROJ_SPLIT_PAIR_ENTRY(gdn_proj_split_pair_t16, 16, 1, )
 
 GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t1_add,  1, 4)
 GDN_PROJ_SPLIT_ADD_ENTRY(gdn_proj_split_t2_add,  2, 4)
@@ -2068,6 +2139,9 @@ pub struct GdnBlock {
     /// paired with its fused-residual form.
     proj_split: [CudaFunction; 6],
     proj_split_add: [CudaFunction; 6],
+    /// `gdn_proj_split_pair_*`: the `qkv` and `gate` projections under one
+    /// grid, same widths.
+    proj_split_pair: [CudaFunction; 6],
     proj_f32: CudaFunction,
     /// `gdn_proj_qgeneric_*`, indexed by [`ProjQuant::index`].
     proj_quant: [CudaFunction; 7],
@@ -2146,6 +2220,14 @@ impl GdnBlock {
                 module.load_function("gdn_proj_split_t4_add")?,
                 module.load_function("gdn_proj_split_t8_add")?,
                 module.load_function("gdn_proj_split_t16_add")?,
+            ],
+            proj_split_pair: [
+                module.load_function("gdn_proj_split_pair_t1")?,
+                module.load_function("gdn_proj_split_pair_t2")?,
+                module.load_function("gdn_proj_split_pair_t3")?,
+                module.load_function("gdn_proj_split_pair_t4")?,
+                module.load_function("gdn_proj_split_pair_t8")?,
+                module.load_function("gdn_proj_split_pair_t16")?,
             ],
             proj_f32: module.load_function("gdn_proj_f32")?,
             proj_quant: [
@@ -2531,43 +2613,21 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
         } else if let Some(i8w) = gemv {
-            self.project_split_gemv(
+            self.project_split_pair(
                 stream,
-                &i8w.qkv_q,
-                &i8w.qkv_s,
+                (&i8w.qkv_q, &i8w.qkv_s, &mut s.qkv, g.conv_dim()),
+                (&i8w.gate_q, &i8w.gate_s, &mut s.z, g.value_dim()),
                 &s.normed,
-                &mut s.qkv,
                 g.hidden,
-                g.conv_dim(),
-            )?;
-            self.project_split_gemv(
-                stream,
-                &i8w.gate_q,
-                &i8w.gate_s,
-                &s.normed,
-                &mut s.z,
-                g.hidden,
-                g.value_dim(),
+                1,
             )?;
         } else if let Some(i8w) = split_tiled {
-            self.project_split_tiled(
+            self.project_split_pair(
                 stream,
-                &i8w.qkv_q,
-                &i8w.qkv_s,
+                (&i8w.qkv_q, &i8w.qkv_s, &mut s.qkv, g.conv_dim()),
+                (&i8w.gate_q, &i8w.gate_s, &mut s.z, g.value_dim()),
                 &s.normed,
-                &mut s.qkv,
                 g.hidden,
-                g.conv_dim(),
-                tokens,
-            )?;
-            self.project_split_tiled(
-                stream,
-                &i8w.gate_q,
-                &i8w.gate_s,
-                &s.normed,
-                &mut s.z,
-                g.hidden,
-                g.value_dim(),
                 tokens,
             )?;
         } else {
@@ -2852,43 +2912,21 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
         } else if let Some(i8w) = gemv {
-            self.project_split_gemv(
+            self.project_split_pair(
                 stream,
-                &i8w.qkv_q,
-                &i8w.qkv_s,
+                (&i8w.qkv_q, &i8w.qkv_s, &mut s.qkv, g.conv_dim()),
+                (&i8w.gate_q, &i8w.gate_s, &mut s.z, g.value_dim()),
                 &s.normed,
-                &mut s.qkv,
                 g.hidden,
-                g.conv_dim(),
-            )?;
-            self.project_split_gemv(
-                stream,
-                &i8w.gate_q,
-                &i8w.gate_s,
-                &s.normed,
-                &mut s.z,
-                g.hidden,
-                g.value_dim(),
+                1,
             )?;
         } else if let Some(i8w) = split_tiled {
-            self.project_split_tiled(
+            self.project_split_pair(
                 stream,
-                &i8w.qkv_q,
-                &i8w.qkv_s,
+                (&i8w.qkv_q, &i8w.qkv_s, &mut s.qkv, g.conv_dim()),
+                (&i8w.gate_q, &i8w.gate_s, &mut s.z, g.value_dim()),
                 &s.normed,
-                &mut s.qkv,
                 g.hidden,
-                g.conv_dim(),
-                tokens,
-            )?;
-            self.project_split_tiled(
-                stream,
-                &i8w.gate_q,
-                &i8w.gate_s,
-                &s.normed,
-                &mut s.z,
-                g.hidden,
-                g.value_dim(),
                 tokens,
             )?;
         } else {
@@ -3201,23 +3239,13 @@ impl GdnBlock {
                 )
                 .map_err(GdnBlockError::Mma)?;
         } else if let Some(i8w) = gemv {
-            self.project_split_gemv(
+            self.project_split_pair(
                 stream,
-                &i8w.qkv_q,
-                &i8w.qkv_s,
+                (&i8w.qkv_q, &i8w.qkv_s, &mut s.qkv, g.conv_dim()),
+                (&i8w.gate_q, &i8w.gate_s, &mut s.z, g.value_dim()),
                 &s.normed,
-                &mut s.qkv,
                 g.hidden,
-                g.conv_dim(),
-            )?;
-            self.project_split_gemv(
-                stream,
-                &i8w.gate_q,
-                &i8w.gate_s,
-                &s.normed,
-                &mut s.z,
-                g.hidden,
-                g.value_dim(),
+                1,
             )?;
         } else {
             self.project(
@@ -3504,6 +3532,105 @@ impl GdnBlock {
         tokens: usize,
     ) -> Result<(), GdnBlockError> {
         self.launch_split_proj(stream, wq, ws, x, None, out, k_dim, n_rows, tokens)
+    }
+
+    /// The `qkv` and `gate` projections of one activation under one grid.
+    ///
+    /// `(wq0, ws0) -> out0` over `n_rows0` rows and `(wq1, ws1) -> out1`
+    /// over `n_rows1`, both contracting `x[tokens][k_dim]`. Every output is
+    /// the chain of additions [`Self::project_split_gemv`] and
+    /// [`Self::project_split_tiled`] would have produced for it — one grid,
+    /// two matrices, the same body per warp group; `gdn_proj_differential`
+    /// asserts the bit-equality. At decode width the two launches were 1.78
+    /// and 0.89 waves each paying its own ramp; together they are one grid
+    /// of 2.67.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project_split_pair(
+        &self,
+        stream: &Arc<CudaStream>,
+        first: (&CudaSlice<i8>, &CudaSlice<u16>, &mut CudaSlice<f32>, usize),
+        second: (&CudaSlice<i8>, &CudaSlice<u16>, &mut CudaSlice<f32>, usize),
+        x: &CudaSlice<f32>,
+        k_dim: usize,
+        tokens: usize,
+    ) -> Result<(), GdnBlockError> {
+        let (wq0, ws0, out0, n_rows0) = first;
+        let (wq1, ws1, out1, n_rows1) = second;
+        check_len("split pair x", tokens * k_dim, x.len())?;
+        check_len("split pair out0", tokens * n_rows0, out0.len())?;
+        check_len("split pair out1", tokens * n_rows1, out1.len())?;
+        check_len("split pair wq0", n_rows0 * k_dim, wq0.len())?;
+        check_len("split pair ws0", n_rows0 * k_dim / QK8_0, ws0.len())?;
+        check_len("split pair wq1", n_rows1 * k_dim, wq1.len())?;
+        check_len("split pair ws1", n_rows1 * k_dim / QK8_0, ws1.len())?;
+        if tokens == 0 {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "split pair tokens",
+                expected: 1,
+                got: 0,
+            });
+        }
+        if !k_dim.is_multiple_of(512) {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "split pair k_dim (must be a multiple of 512)",
+                expected: k_dim.next_multiple_of(512),
+                got: k_dim,
+            });
+        }
+        let (slot, tt, rt) = split_tile_for(tokens);
+        // The seam between the matrices must fall on a warp-group boundary,
+        // or one group would read the end of one matrix and the start of
+        // the other as a single row tile.
+        for (what, n) in [
+            (
+                "split pair n_rows0 (must be a multiple of the row tile)",
+                n_rows0,
+            ),
+            (
+                "split pair n_rows1 (must be a multiple of the row tile)",
+                n_rows1,
+            ),
+        ] {
+            if !n.is_multiple_of(rt as usize) {
+                return Err(GdnBlockError::ShapeMismatch {
+                    what,
+                    expected: n.next_multiple_of(rt as usize),
+                    got: n,
+                });
+            }
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (
+                ((n_rows0 + n_rows1) as u32 / rt).div_ceil(PROJ_WARPS),
+                (tokens as u32).div_ceil(tt),
+                1,
+            ),
+            block_dim: (32, PROJ_WARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        let (k_i32, n0_i32, n1_i32, t_i32) =
+            (k_dim as i32, n_rows0 as i32, n_rows1 as i32, tokens as i32);
+        let mut builder = stream.launch_builder(&self.proj_split_pair[slot]);
+        builder
+            .arg(wq0)
+            .arg(ws0)
+            .arg(&mut *out0)
+            .arg(&n0_i32)
+            .arg(wq1)
+            .arg(ws1)
+            .arg(&mut *out1)
+            .arg(&n1_i32)
+            .arg(x)
+            .arg(&k_i32)
+            .arg(&t_i32);
+        // SAFETY: a warp group covers RT whole rows of exactly one matrix
+        // (both row counts are multiples of RT, checked above) under a grid
+        // returning past `n_rows0 + n_rows1`; the token axis is covered by
+        // `ceil(tokens / TT)` slices whose ragged tail takes the guarded
+        // zero-padded path; every buffer was length-checked above against
+        // exactly the extent the kernel indexes.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
     }
 
     /// Select and launch one `gdn_proj_split_*` entry point.

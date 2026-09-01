@@ -319,3 +319,125 @@ fn split_layout_tiled_agrees_with_the_gemv() {
          GEMV it claims to generalize",
     );
 }
+
+/// `project_split_pair` (the `qkv` and `gate` projections under one grid)
+/// against the two single-matrix launches it replaces, at every token
+/// width the launch has structure at: one, several, exactly a tile, a tile
+/// plus a tail, several tiles plus a tail (`(1,4) (2,4) (3,4) (4,4) (8,2)
+/// (16,1)` are the tiles).
+///
+/// Bit-exact, with no tolerance: a warp group in the pair kernel runs the
+/// single-matrix body on its own matrix, so every output must be the same
+/// chain of additions. A nonzero difference means the seam between the two
+/// matrices landed inside a row tile, or the row re-basing is wrong.
+#[test]
+fn split_layout_pair_agrees_with_the_two_single_launches() {
+    let Some((ctx, file, config)) = setup() else {
+        return;
+    };
+    let stream = ctx.default_stream();
+    let schema = WeightSchema::new(&config);
+    let directory = schema.resolve(&file).expect("schema resolves");
+    let geometry = GdnGeometry::from_config(&config, 32, 1e-6);
+    let block = GdnBlock::new(&ctx, geometry).expect("kernels compile");
+    let weights =
+        GdnLayerWeights::upload(&stream, &file, &directory, LAYER).expect("weights upload");
+    let int8 = block.repack(&stream, &weights).expect("repack builds");
+    let (qkv_q, qkv_s) = int8.qkv();
+    let (gate_q, gate_s) = int8.gate();
+
+    let hidden = geometry.hidden;
+    let conv_dim = geometry.conv_dim();
+    let value_dim = geometry.value_dim();
+    let mut rng = Xorshift64Star::new(0x_5EED_9D04);
+
+    for tokens in [1usize, 2, 3, 4, 5, 8, 9, 17] {
+        let rows = rng.vec_f32(tokens * hidden, -1.0, 1.0);
+        let x = stream.clone_htod(&rows).expect("upload x");
+
+        let mut qkv_single = stream
+            .alloc_zeros::<f32>(tokens * conv_dim)
+            .expect("out allocates");
+        let mut z_single = stream
+            .alloc_zeros::<f32>(tokens * value_dim)
+            .expect("out allocates");
+        if tokens == 1 {
+            block
+                .project_split_gemv(&stream, qkv_q, qkv_s, &x, &mut qkv_single, hidden, conv_dim)
+                .expect("split gemv runs");
+            block
+                .project_split_gemv(
+                    &stream,
+                    gate_q,
+                    gate_s,
+                    &x,
+                    &mut z_single,
+                    hidden,
+                    value_dim,
+                )
+                .expect("split gemv runs");
+        } else {
+            block
+                .project_split_tiled(
+                    &stream,
+                    qkv_q,
+                    qkv_s,
+                    &x,
+                    &mut qkv_single,
+                    hidden,
+                    conv_dim,
+                    tokens,
+                )
+                .expect("split tiled runs");
+            block
+                .project_split_tiled(
+                    &stream,
+                    gate_q,
+                    gate_s,
+                    &x,
+                    &mut z_single,
+                    hidden,
+                    value_dim,
+                    tokens,
+                )
+                .expect("split tiled runs");
+        }
+
+        let mut qkv_pair = stream
+            .alloc_zeros::<f32>(tokens * conv_dim)
+            .expect("out allocates");
+        let mut z_pair = stream
+            .alloc_zeros::<f32>(tokens * value_dim)
+            .expect("out allocates");
+        block
+            .project_split_pair(
+                &stream,
+                (qkv_q, qkv_s, &mut qkv_pair, conv_dim),
+                (gate_q, gate_s, &mut z_pair, value_dim),
+                &x,
+                hidden,
+                tokens,
+            )
+            .expect("split pair runs");
+
+        let (a, b) = (dtoh(&stream, &qkv_single), dtoh(&stream, &qkv_pair));
+        let (c, d) = (dtoh(&stream, &z_single), dtoh(&stream, &z_pair));
+        println!(
+            "tokens {tokens}: qkv max_abs_diff {:.3e}, gate max_abs_diff {:.3e}",
+            max_abs_diff(&a, &b),
+            max_abs_diff(&c, &d),
+        );
+        assert!(
+            a.iter().all(|v| v.is_finite()) && c.iter().all(|v| v.is_finite()),
+            "tokens {tokens}: the single launches produced a non-finite value"
+        );
+        assert_eq!(
+            a, b,
+            "tokens {tokens}: gdn_proj_split_pair disagrees with the single qkv launch"
+        );
+        assert_eq!(
+            c, d,
+            "tokens {tokens}: gdn_proj_split_pair disagrees with the single gate launch"
+        );
+    }
+}
