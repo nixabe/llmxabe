@@ -1009,6 +1009,40 @@ registers *and* a spill against 208 unbounded — the `(T, 1)` trap from
 "Compile-time formats free registers", one notch up. Check the count on
 every tile of a family, not the one the target width uses.
 
+**The same seam carries a whole small kernel into a big one's grid.** The
+shared expert at decode width was two launches of its own — 2.2 MB of
+gate/up and 1.1 MB of down at 6.8 and 4.1 us, which is 240–330 GB/s and
+mostly ramp and drain — beside a routed-expert launch several waves deep
+that reads the same activation and is ready at the same moment. Its
+side-stream overlap is in WHY NOT (flat at N=3, −2.5–3% at N=1: events).
+`moe_fused_{ffn,down}_*` give the shared expert's blocks `blockIdx.y` slots
+past the routed grid and run the shared body there — two rows per
+256-thread block for the gate/up, since that body was written for four
+warps splitting one row's contraction, and one row per warp for the down —
+while the routed blocks run the routed body on the indices the separate
+launch gave them. Forty layers lose two launches each, `partial`,
+`shared_inter` and the shared output are bit-identical to the four-launch
+form at every width the fused entries cover (`moe_fused_shared_
+differential`, widths 1–4 with every slot live and with one live token in a
+wider pass), and the register count is the max of the two bodies rather
+than their sum. Three interleaved pairs against the qkv+gate merge as the
+baseline, same method and card, baseline arm drifting −0.5% over the
+sitting:
+
+| width | pair 1 | pair 2 | pair 3 |
+| :--- | ---: | ---: | ---: |
+| N=3 | 213.6 → 216.8 | 212.7 → 214.9 | 212.6 → 216.0 |
+| N=1 | 111.9 → 114.7 | 111.1 → 114.2 | 111.2 → 113.9 |
+
+**+1.0–1.6% at N=3 and +2.4–2.8% at N=1**, every pair won; by `nsys` the
+step lost 80 launches (745 → 665 at N=1) and 0.25 ms of wall at N=1 and
+0.28 ms at N=3. The rule the two merges share: at one token every launch
+under ten microseconds is mostly its own floor, and the floor is paid once
+per grid, not once per body. What a side stream cannot buy — because the
+events it needs are themselves graph nodes on a step with no slack — a
+seam in `blockIdx` buys for free, as long as each body is left exactly as
+its separate launch ran it.
+
 ## Parallelism: fill the wave, and split the only axis decode has
 
 Decode attention's grid was `(1, q_heads)` — **sixteen blocks on a 72-SM
@@ -1381,6 +1415,7 @@ proposed twice.
 | Attempt | Result |
 | --- | --- |
 | GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call against RT=4's 33.9. RT=1 octuples the warps and the in-flight bytes and is the *worst* of the three, so memory-level parallelism was never the binding constraint — instruction count per byte is, and it falls with RT. |
+| The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical by construction and **flat at N=1** (23.0 us either way), **+25% at N=3** (28.2 → 35.2 us). Same finding as the row above on a second shape: the grid was 0.44 waves deep and doubling its warps bought nothing, because the kernel's cost at three tokens is the activation instruction count per weight byte, which RT halving doubles. Wave fill is not what binds a decode-width GEMV on this card; do not re-derive it from the grid arithmetic. |
 | GDN split projection, char4 partition + row tile + prefetch | 40.0/36.7 us against the shipped `uint4` form's 33.9/29.3, despite fully-coalesced activation loads and ~2.7x fewer L1 wavefronts per byte on paper. The wavefront model predicted the wrong winner; the wide weight load won anyway. |
 | `q8_0` KV cache (llama.cpp side) | −2.5% at depth 0, **−15.5%** at 32K, **−35.8%** at 128K. Turing's in-kernel dequant costs more than the halved traffic saves, and the KV path already ran at ~80% of peak. Keep `-ctk f16 -ctv f16`. |
 | Requantize experts Q6_K → Q8_0 | 4–8% for **+30% VRAM**. The dequantization format is not what limits that kernel. |
@@ -1423,7 +1458,7 @@ proposed twice.
 | `WPO=4` decode occupancy width | ~4.5% slower than `WPO=2` at 32K N=3, before and after the register-spill fix. Never wins at any depth measured. |
 | Decode blocks 48 or 60 at 72 logical splits | 150.5 and 139.5 against 36 blocks' 152–153. 48 divides 72 unevenly and the long blocks set the makespan; 60 spills into a second wave. |
 | Three independent N=1 decode graphs on one card | 129.9 vs 147.7 tok/s at 2K. Separate streams repeat weight traffic and contend more than their overlap recovers; serving keeps batched weight reuse. |
-| Shared-expert side-stream overlap | Flat at N=3 (no SM or DRAM slack to hide in), **−2.5–3%** at N=1 (the step is launch-latency-bound and two events per MoE layer is pure overhead). |
+| Shared-expert side-stream overlap | Flat at N=3 (no SM or DRAM slack to hide in), **−2.5–3%** at N=1 (the step is launch-latency-bound and two events per MoE layer is pure overhead). The launches it tried to hide were later removed instead — the shared expert's blocks now ride the routed expert's grid, no events; see WHY, "The same seam carries a whole small kernel". |
 | Independent GDN streams at prefill | Within thermal drift, reversing across warmed pairs. Removed rather than kept on a cold-card gain. |
 | Cross-sequence prefill flattening at *equal* total ubatch | 0.99×. At fixed physical width, batching does not reduce the number of full-model passes. It wins only when the pass gets wider — see WHY. |
 | The two-kernel `bm == 1` split, first attempt | −5.2% before `bucket_live` existed: both kernels then walked `sorted_token_ids` and crossed two barriers per bucket to compute `bm`, and only one used the answer. It landed as a win only once `bm` became a table read. |

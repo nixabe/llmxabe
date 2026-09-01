@@ -1186,69 +1186,99 @@ impl MoeBlock {
         self.moe
             .route_and_dispatch(stream, &mut self.buffers, &self.logits)?;
 
-        // 3. the routed experts. Stopping at `partial`: step 5 sums the
-        //    top-k contributions itself, which saves a launch per layer.
-        self.moe.grouped_forward_partial(
-            stream,
-            &mut self.buffers,
-            QuantTensor {
-                bytes: &w.gate_exps,
-                quant: w.gate_quant,
-            },
-            QuantTensor {
-                bytes: &w.up_exps,
-                quant: w.up_quant,
-            },
-            QuantTensor {
-                bytes: &w.down_exps,
-                quant: w.down_quant,
-            },
-            &self.normed,
-        )?;
+        let gate = QuantTensor {
+            bytes: &w.gate_exps,
+            quant: w.gate_quant,
+        };
+        let up = QuantTensor {
+            bytes: &w.up_exps,
+            quant: w.up_quant,
+        };
+        let down = QuantTensor {
+            bytes: &w.down_exps,
+            quant: w.down_quant,
+        };
+        let shared_gate = QuantTensor {
+            bytes: &w.shared_gate,
+            quant: w.shared_gate_quant,
+        };
+        let shared_up = QuantTensor {
+            bytes: &w.shared_up,
+            quant: w.shared_up_quant,
+        };
+        let shared_down = QuantTensor {
+            bytes: &w.shared_down,
+            quant: w.shared_down_quant,
+        };
 
-        // 4. the shared expert, ungated — the kernel implements `expert_mlp`
-        //    and nothing else.
-        // Gated on **this pass's** token count, not merely on the repacked
-        // weights existing. `Forward::reshape` shares one
-        // `Vec<MoeLayerWeights>` between a wide prefill pass and a one-token
-        // decode pass, so a decode step inherits whatever the prefill upload
-        // repacked. Checking only for the repack sent every decode step down
-        // the six-launch integer path to fill one slot of a 64-token tile, and
-        // cost 57% of decode throughput — 15.39 ms per step became 24.13 —
-        // while `bench_forward`'s n = 1 column, which builds its own weights
-        // and so never repacks, showed nothing wrong.
+        // 4 (before 3). The shared expert's tensor-core path, gated on
+        //    **this pass's** token count, not merely on the repacked weights
+        //    existing. `Forward::reshape` shares one `Vec<MoeLayerWeights>`
+        //    between a wide prefill pass and a one-token decode pass, so a
+        //    decode step inherits whatever the prefill upload repacked.
+        //    Checking only for the repack sent every decode step down the
+        //    six-launch integer path to fill one slot of a 64-token tile, and
+        //    cost 57% of decode throughput — 15.39 ms per step became 24.13 —
+        //    while `bench_forward`'s n = 1 column, which builds its own
+        //    weights and so never repacks, showed nothing wrong.
         let wide_enough = g.max_tokens >= SHARED_MMA_MIN_TOKENS;
-        match w
+        let shared_mma = w
             .shared_int8
             .as_ref()
-            .filter(|_| wide_enough && self.moe.tensor_cores_enabled())
-        {
-            Some(i8w) => self.moe.shared_expert_mma(
+            .filter(|_| wide_enough && self.moe.tensor_cores_enabled());
+
+        // 3 + 4. At decode width the shared expert's blocks ride the routed
+        //    expert's two launches instead of taking two of their own; the
+        //    bodies are the same, so the outputs are. Stopping at `partial`
+        //    either way: step 5 sums the top-k contributions itself, which
+        //    saves a launch per layer.
+        let fused = if shared_mma.is_none() {
+            self.moe.grouped_forward_partial_with_shared(
                 stream,
                 &mut self.buffers,
-                i8w,
+                gate,
+                up,
+                down,
+                shared_gate,
+                shared_up,
+                shared_down,
                 &self.normed,
                 &mut self.shexp,
-            )?,
-            None => {
-                self.moe.shared_expert(
+            )?
+        } else {
+            false
+        };
+        if !fused {
+            self.moe.grouped_forward_partial(
+                stream,
+                &mut self.buffers,
+                gate,
+                up,
+                down,
+                &self.normed,
+            )?;
+
+            // The shared expert, ungated — the kernel implements `expert_mlp`
+            // and nothing else.
+            match shared_mma {
+                Some(i8w) => self.moe.shared_expert_mma(
                     stream,
                     &mut self.buffers,
-                    QuantTensor {
-                        bytes: &w.shared_gate,
-                        quant: w.shared_gate_quant,
-                    },
-                    QuantTensor {
-                        bytes: &w.shared_up,
-                        quant: w.shared_up_quant,
-                    },
-                    QuantTensor {
-                        bytes: &w.shared_down,
-                        quant: w.shared_down_quant,
-                    },
+                    i8w,
                     &self.normed,
                     &mut self.shexp,
-                )?;
+                )?,
+                None => {
+                    self.moe.shared_expert(
+                        stream,
+                        &mut self.buffers,
+                        shared_gate,
+                        shared_up,
+                        shared_down,
+                        &self.normed,
+                        &mut self.shexp,
+                    )?;
+                }
             }
         }
 
