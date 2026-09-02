@@ -389,6 +389,7 @@ overridable per request.
 | Sampling temperature when a request sets none | `--temperature` (alias `--temp`) | `1.0` |
 | Nucleus cutoff when a request sets none | `--top-p` | `1.0` |
 | Relative-probability floor when a request sets none | `--min-p` | `0` |
+| Top-k candidates when a request sets none | `--top-k` | `0` |
 | Model name reported and echoed | `--alias` | `Qwen3.6-35B-A3B` |
 
 `16` is OpenAI's historical default and truncates most chat replies; raise it

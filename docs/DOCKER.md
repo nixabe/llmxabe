@@ -97,7 +97,7 @@ serving arm has not been re-run against it**, so this default stands on the
 last measurement rather than a current one — worth re-testing before treating
 it as settled.
 
-**`--temp 1.0 --top-p 0.95 --min-p 0.0`** are per-request defaults for callers
+**`--temp 1.0 --top-p 0.95 --min-p 0.0 --top-k 20`** are per-request defaults for callers
 that send none of their own. Any request may override them. Note that
 temperature above 0 costs a host round-trip per emitted token per sequence,
 where `--temp 0` decides greedily on-device; that is a throughput lever, and

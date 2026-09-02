@@ -99,6 +99,8 @@ struct ResponsesRequest {
     /// Not OpenAI's field, but llama.cpp-aimed clients send it here too.
     #[serde(default)]
     min_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
 }
 
 impl ResponsesRequest {
@@ -522,7 +524,7 @@ pub(crate) async fn create(
             state.sampling_defaults,
             request.temperature,
             request.top_p,
-            None,
+            request.top_k,
             request.min_p,
             None,
         )?,
@@ -1097,6 +1099,12 @@ mod tests {
     fn a_silent_request_follows_the_server_default() {
         assert!(request(r#"{"input":"Hi"}"#).thinking_enabled(true));
         assert!(!request(r#"{"input":"Hi"}"#).thinking_enabled(false));
+    }
+
+    #[test]
+    fn top_k_parses_on_responses_request() {
+        let req = request(r#"{"input":"Hi","top_k":40}"#);
+        assert_eq!(req.top_k, Some(40));
     }
 
     #[test]

@@ -265,20 +265,40 @@ struct Args {
     no_reasoning: bool,
 
     /// Sampling temperature for requests that do not set one; 0 is greedy
-    #[arg(long, visible_alias = "temp", default_value_t = 1.0)]
+    #[arg(
+        long,
+        visible_alias = "temp",
+        env = "LLMXABE_TEMP",
+        default_value_t = 1.0
+    )]
     temperature: f32,
 
     /// Nucleus cutoff for requests that do not set one; 1 disables it
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(
+        long,
+        visible_alias = "top_p",
+        env = "LLMXABE_TOP_P",
+        default_value_t = 1.0
+    )]
     top_p: f32,
 
     /// Keep only tokens at least this likely relative to the most likely
     /// token, for requests that do not set it; 0 disables it
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(
+        long,
+        visible_alias = "min_p",
+        env = "LLMXABE_MIN_P",
+        default_value_t = 0.0
+    )]
     min_p: f32,
 
     /// Keep only this many top candidate tokens for requests that do not set it; 0 disables it
-    #[arg(long, default_value_t = 0)]
+    #[arg(
+        long,
+        visible_alias = "top_k",
+        env = "LLMXABE_TOP_K",
+        default_value_t = 0
+    )]
     top_k: u32,
 }
 
@@ -965,6 +985,12 @@ mod tests {
 
         let joined = Args::parse_from(["--temp=0"]);
         assert_eq!(joined.temperature, 0.0);
+
+        let underscore_aliases =
+            Args::parse_from(["--top_k", "20", "--top_p", "0.9", "--min_p", "0.05"]);
+        assert_eq!(underscore_aliases.top_k, 20);
+        assert_eq!(underscore_aliases.top_p, 0.9);
+        assert_eq!(underscore_aliases.min_p, 0.05);
     }
 
     #[test]
