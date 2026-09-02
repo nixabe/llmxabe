@@ -1073,6 +1073,126 @@ __global__ void gdn_silu_split_qkv(
     }
 }
 
+// One decode token's convolution step, SiLU and q/k/v split in one launch.
+//
+// At decode width `conv1d_step_batch` (layer_ops) and `gdn_silu_split_qkv`
+// above were two launches per layer, the second reading back the 8,192
+// floats the first had just written: at one token that is a second launch
+// floor to move 32 KB through L2. Here the thread that convolves a channel
+// applies the SiLU to its own accumulator, so `conv_raw` is still written
+// (it is a captured waypoint) but never re-read.
+//
+// The convolution per channel is `conv1d_step_batch`'s, operand for
+// operand: the same `carry` register stage, the same `__fadd_rn(__fmul_rn)`
+// chain in tap order, the same in-place window advance. `gdn.rs`'s source
+// gate holds the two texts equal. The SiLU and the split are
+// `gdn_silu_split_qkv`'s. Only the thread-to-channel mapping differs, and
+// no arithmetic depends on it, so the outputs are bit-identical to the
+// two-launch form (`gdn_conv_silu_differential`).
+//
+// The per-sequence conv caches ride in as pointer slots like the recurrent
+// step's, so graph capture sees a fixed argument list.
+//
+// grid: (value_heads, n_seq). block: head_dim. `x` and `conv_raw`/`silu`
+// are `[n_seq][conv_dim]`, one token per sequence.
+#define GDN_MAX_CONV_KERNEL 8
+__device__ __forceinline__ float gdn_conv_step_channel(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* state,
+    int ch,
+    int conv_kernel
+) {
+    int carry = conv_kernel - 1;
+
+    float staged[GDN_MAX_CONV_KERNEL];
+    for (int j = 0; j < carry; ++j) {
+        staged[j] = state[(long long)ch * carry + j];
+    }
+    float xv0 = x[ch];
+
+    float acc = 0.0f;
+    for (int i = 0; i < conv_kernel; ++i) {
+        float xv = (i < carry) ? staged[i] : xv0;
+        acc = __fadd_rn(acc, __fmul_rn(xv, weight[(long long)ch * conv_kernel + i]));
+    }
+
+    for (int j = 0; j + 1 < carry; ++j) {
+        state[(long long)ch * carry + j] = staged[j + 1];
+    }
+    if (carry > 0) {
+        state[(long long)ch * carry + carry - 1] = xv0;
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float gdn_silu_scalar(float v) {
+    return v / (1.0f + expf(-v));
+}
+
+__global__ void gdn_conv_silu_split_step_batch(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    unsigned long long s0, unsigned long long s1,
+    unsigned long long s2, unsigned long long s3,
+    unsigned long long s4, unsigned long long s5,
+    unsigned long long s6, unsigned long long s7,
+    float* __restrict__ conv_raw,
+    float* __restrict__ silu,
+    float* __restrict__ q,
+    float* __restrict__ k,
+    float* __restrict__ v,
+    int head_dim,
+    int qk_heads,
+    int value_heads,
+    int conv_kernel
+) {
+    int h = blockIdx.x;
+    int t = blockIdx.y;
+    int d = threadIdx.x;
+    float* state;
+    switch (t) {
+        case 0: state = (float*)s0; break;
+        case 1: state = (float*)s1; break;
+        case 2: state = (float*)s2; break;
+        case 3: state = (float*)s3; break;
+        case 4: state = (float*)s4; break;
+        case 5: state = (float*)s5; break;
+        case 6: state = (float*)s6; break;
+        default: state = (float*)s7; break;
+    }
+
+    int key_dim  = qk_heads * head_dim;
+    int conv_dim = 2 * key_dim + value_heads * head_dim;
+
+    const float* xt = x + (long long)t * conv_dim;
+    float*       cr = conv_raw + (long long)t * conv_dim;
+    float*       sr = silu + (long long)t * conv_dim;
+
+    int iv = 2 * key_dim + h * head_dim + d;
+    float vv = gdn_conv_step_channel(xt, weight, state, iv, conv_kernel);
+    cr[iv] = vv;
+    vv = gdn_silu_scalar(vv);
+    sr[iv] = vv;
+    v[((long long)t * value_heads + h) * head_dim + d] = vv;
+
+    if (h < qk_heads) {
+        int iq = h * head_dim + d;
+        int ik = key_dim + h * head_dim + d;
+        float qv = gdn_conv_step_channel(xt, weight, state, iq, conv_kernel);
+        float kv = gdn_conv_step_channel(xt, weight, state, ik, conv_kernel);
+        cr[iq] = qv;
+        cr[ik] = kv;
+        qv = gdn_silu_scalar(qv);
+        kv = gdn_silu_scalar(kv);
+        sr[iq] = qv;
+        sr[ik] = kv;
+        long long o = ((long long)t * qk_heads + h) * head_dim + d;
+        q[o] = qv;
+        k[o] = kv;
+    }
+}
+
 __global__ void gdn_split_qkv(
     const float* __restrict__ conv,
     float* __restrict__ q,
@@ -2221,6 +2341,7 @@ pub struct GdnBlock {
     silu: CudaFunction,
     split: CudaFunction,
     silu_split: CudaFunction,
+    conv_silu_split_step_batch: CudaFunction,
     gates: CudaFunction,
     scratch: Option<Scratch>,
     mixer: Mixer,
@@ -2315,6 +2436,7 @@ impl GdnBlock {
             silu: module.load_function("gdn_silu")?,
             split: module.load_function("gdn_split_qkv")?,
             silu_split: module.load_function("gdn_silu_split_qkv")?,
+            conv_silu_split_step_batch: module.load_function("gdn_conv_silu_split_step_batch")?,
             gates: module.load_function("gdn_gates")?,
             scratch: None,
             mixer: Mixer::Chunked,
@@ -3086,6 +3208,11 @@ impl GdnBlock {
         //    over the *launch*: one grid.y slice per sequence, per-sequence
         //    conv caches as pointer slots. Above the kernel's slot count it
         //    falls back to one launch per sequence, same arithmetic.
+        //
+        //    Under the slot count, step 4's SiLU and split ride in the same
+        //    launch: the thread that convolves a channel gates its own
+        //    accumulator, so `conv_raw` is written for the trace and never
+        //    read back. See `gdn_conv_silu_split_step_batch`.
         let conv_dim = g.conv_dim();
         if tokens <= xabe_cuda::kernels::gdn::STEP_MAX_BATCH {
             let conv_ptrs: Vec<u64> = states
@@ -3097,14 +3224,16 @@ impl GdnBlock {
             // distinct sequences; `s.qkv` and `s.conv_raw` are
             // `[tokens][conv_dim]`, checked by `Scratch::new`.
             unsafe {
-                self.layer_ops.conv1d_step_batch_raw(
+                self.conv_silu_split_step_batch_raw(
                     stream,
                     &s.qkv,
                     &w.conv1d,
                     &conv_ptrs,
                     &mut s.conv_raw,
-                    conv_dim,
-                    g.conv_kernel,
+                    &mut s.conv_silu,
+                    &mut s.q,
+                    &mut s.k,
+                    &mut s.v,
                 )?;
             }
         } else {
@@ -3128,21 +3257,22 @@ impl GdnBlock {
                     g.conv_kernel,
                 )?;
             }
-        }
 
-        // 4. conv_output_silu-N and the q/k/v split. No state: every element
-        //    of `s.conv_raw` — now correctly one sequence's own window per
-        //    token, from step 3 — is read exactly once, so this batches over
-        //    every sequence in one launch.
-        self.silu_split_qkv(
-            stream,
-            &s.conv_raw,
-            &mut s.conv_silu,
-            &mut s.q,
-            &mut s.k,
-            &mut s.v,
-            tokens,
-        )?;
+            // 4. conv_output_silu-N and the q/k/v split, for the widths the
+            //    fused launch above does not cover. No state: every element
+            //    of `s.conv_raw` — now correctly one sequence's own window
+            //    per token, from step 3 — is read exactly once, so this
+            //    batches over every sequence in one launch.
+            self.silu_split_qkv(
+                stream,
+                &s.conv_raw,
+                &mut s.conv_silu,
+                &mut s.q,
+                &mut s.k,
+                &mut s.v,
+                tokens,
+            )?;
+        }
 
         // 5. alpha-N / a_softplus-N / gate-N and beta-N / beta_sigmoid-N. No
         //    state, batches the same way step 2 does.
@@ -4048,6 +4178,97 @@ impl GdnBlock {
         Ok(())
     }
 
+    /// One decode token per sequence: the convolution step over each
+    /// sequence's own cache, the SiLU and the q/k/v split, in one launch.
+    ///
+    /// Bit-identical to `LayerOpsKernels::conv1d_step_batch_raw` followed by
+    /// [`Self::silu_split_qkv`]; see `gdn_conv_silu_split_step_batch`.
+    /// `conv_states` holds one live `[conv_dim][conv_kernel - 1]` cache
+    /// pointer per sequence, at most `STEP_MAX_BATCH` of them.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer in `conv_states` must be a live, distinct device
+    /// allocation of `conv_dim * (conv_kernel - 1)` floats that nothing else
+    /// touches for the duration of the launch.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn conv_silu_split_step_batch_raw(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &CudaSlice<f32>,
+        conv_weight: &CudaSlice<f32>,
+        conv_states: &[u64],
+        conv_raw: &mut CudaSlice<f32>,
+        silu: &mut CudaSlice<f32>,
+        q: &mut CudaSlice<f32>,
+        k: &mut CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+    ) -> Result<(), GdnBlockError> {
+        let g = self.geometry;
+        let n = conv_states.len();
+        if n == 0 || n > xabe_cuda::kernels::gdn::STEP_MAX_BATCH {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "conv step batch sequences",
+                expected: xabe_cuda::kernels::gdn::STEP_MAX_BATCH,
+                got: n,
+            });
+        }
+        if g.conv_kernel == 0 || g.conv_kernel > 8 {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "conv kernel taps",
+                expected: 8,
+                got: g.conv_kernel,
+            });
+        }
+        let conv_dim = g.conv_dim();
+        check_len("conv step x", n * conv_dim, x.len())?;
+        check_len(
+            "conv step weight",
+            conv_dim * g.conv_kernel,
+            conv_weight.len(),
+        )?;
+        check_len("conv step conv_raw", n * conv_dim, conv_raw.len())?;
+        check_len("conv step silu", n * conv_dim, silu.len())?;
+        check_len("conv step q", n * g.key_dim(), q.len())?;
+        check_len("conv step k", n * g.key_dim(), k.len())?;
+        check_len("conv step v", n * g.value_dim(), v.len())?;
+
+        let mut slots = [conv_states[0]; xabe_cuda::kernels::gdn::STEP_MAX_BATCH];
+        slots[..n].copy_from_slice(conv_states);
+        let cfg = LaunchConfig {
+            grid_dim: (g.value_heads as u32, n as u32, 1),
+            block_dim: (g.head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (head_dim, qk_heads, value_heads, conv_kernel) = (
+            g.head_dim as i32,
+            g.qk_heads as i32,
+            g.value_heads as i32,
+            g.conv_kernel as i32,
+        );
+        let mut builder = stream.launch_builder(&self.conv_silu_split_step_batch);
+        builder.arg(x).arg(conv_weight);
+        for slot in &slots {
+            builder.arg(slot);
+        }
+        builder
+            .arg(&mut *conv_raw)
+            .arg(&mut *silu)
+            .arg(&mut *q)
+            .arg(&mut *k)
+            .arg(&mut *v)
+            .arg(&head_dim)
+            .arg(&qk_heads)
+            .arg(&value_heads)
+            .arg(&conv_kernel);
+        // SAFETY: `grid.y = n` bounds the pointer slots to the live ones the
+        // caller vouches for; every other buffer was length-checked above
+        // against exactly the extent the kernel indexes, which is
+        // `gdn_silu_split_qkv`'s over `n` tokens.
+        unsafe { builder.launch(cfg) }?;
+        Ok(())
+    }
+
     /// SiLU and the q/k/v split, in one launch.
     ///
     /// `silu` is `conv_output_silu-N` and is still produced; see the kernel.
@@ -4536,6 +4757,61 @@ mod tests {
     }
 
     use super::*;
+
+    /// The fused decode-step kernel convolves a channel with
+    /// `conv1d_step_batch`'s arithmetic, kept textually equal: the register
+    /// stage, the tap-order `__fadd_rn(__fmul_rn)` chain and the in-place
+    /// window advance. Only the input index differs (the fused body is
+    /// handed the token's row), and that line sits outside both windows.
+    #[test]
+    fn the_fused_conv_step_matches_layer_ops_conv1d_step_batch() {
+        fn window(src: &str, open: &str) -> String {
+            let at = src
+                .find(open)
+                .unwrap_or_else(|| panic!("{open} is missing"));
+            let from = at
+                + src[at..]
+                    .find("float acc = 0.0f;")
+                    .unwrap_or_else(|| panic!("{open} has no accumulator"));
+            const END: &str = "= xv0;\n    }";
+            let to = from
+                + src[from..]
+                    .find(END)
+                    .unwrap_or_else(|| panic!("{open} has no window advance"))
+                + END.len();
+            // `conv1d_step_batch` writes its output between the chain and the
+            // advance; the fused body returns it instead.
+            src[from..to]
+                .replace("out[(long long)z * channels + ch] = acc;", "")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        let layer_ops = window(
+            xabe_cuda::kernels::layer_ops::LAYER_OPS_SRC,
+            "__global__ void conv1d_step_batch(",
+        );
+        let fused = window(GDN_BLOCK_SRC, "float gdn_conv_step_channel(");
+        assert_eq!(
+            layer_ops, fused,
+            "gdn_conv_step_channel's convolution drifted from conv1d_step_batch's"
+        );
+        let src = xabe_cuda::kernels::layer_ops::LAYER_OPS_SRC;
+        let at = src
+            .find("__global__ void conv1d_step_batch(")
+            .expect("present");
+        assert!(
+            src[at..].contains("float staged[MAX_CONV_KERNEL];"),
+            "the register stage moved"
+        );
+        let at = GDN_BLOCK_SRC
+            .find("float gdn_conv_step_channel(")
+            .expect("present");
+        assert!(
+            GDN_BLOCK_SRC[at..].contains("float staged[GDN_MAX_CONV_KERNEL];"),
+            "the fused register stage moved"
+        );
+    }
 
     /// Where a snippet starts in the kernel source, or a failure naming it.
     fn at(needle: &str) -> usize {
