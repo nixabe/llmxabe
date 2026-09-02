@@ -2082,9 +2082,18 @@ __global__ void moe_route(
 // private to a thread, which removes the reduction, the intermediate
 // `counts` array and the second launch along with it.
 //
-// The two barriers that remain are real: the fill must land before the
-// scatter overwrites part of it, and the prefix sum must be complete before
-// any thread reads its base.
+// The barriers that remain are real: the fill must land before the scatter
+// overwrites part of it, and the prefix sum must be complete before any
+// thread reads its base.
+//
+// The prefix sum itself was thread 0 walking 256 dependent shared-memory
+// adds -- about 4 us of the 11.7 us this block costs at one token, forty
+// times a step, with 255 threads waiting at the barrier. It is now a
+// shuffle scan inside each warp and a walk over the warp totals, which is
+// the same integer sum in a different association; integer addition is
+// associative, so the values are identical. `warp_sums` is
+// `blockDim.x / 32` ints of shared memory. A block narrower than the expert
+// count keeps the serial walk.
 //
 // grid: (1,). block: MOE_THREADS.
 __device__ void dispatch_token(
@@ -2096,6 +2105,7 @@ __device__ void dispatch_token(
     int sorted_capacity,
     int expert_capacity,
     int* cumsum,
+    int* warp_sums,
     int* __restrict__ sorted_token_ids,
     int* __restrict__ expert_ids,
     int* __restrict__ num_tokens_post_pad
@@ -2117,7 +2127,23 @@ __device__ void dispatch_token(
     }
     __syncthreads();
 
-    if (tid == 0) {
+    if (num_experts <= (int)blockDim.x) {
+        int lane = tid & 31;
+        int warp = tid >> 5;
+        int v = (tid < num_experts) ? cumsum[tid + 1] : 0;
+        for (int o = 1; o < 32; o <<= 1) {
+            int n = __shfl_up_sync(0xffffffffu, v, o);
+            if (lane >= o) v += n;
+        }
+        if (lane == 31) warp_sums[warp] = v;
+        __syncthreads();
+        int carry = 0;
+        for (int w = 0; w < warp; ++w) carry += warp_sums[w];
+        v += carry;
+        if (tid < num_experts) cumsum[tid + 1] = v;
+        if (tid == 0) cumsum[0] = 0;
+        if (tid == num_experts - 1) *num_tokens_post_pad = v;
+    } else if (tid == 0) {
         cumsum[0] = 0;
         for (int i = 0; i < num_experts; ++i) cumsum[i + 1] += cumsum[i];
         *num_tokens_post_pad = cumsum[num_experts];
@@ -2153,8 +2179,10 @@ __global__ void moe_dispatch_t1(
     int* __restrict__ expert_ids,
     int* __restrict__ num_tokens_post_pad
 ) {
+    int* cumsum = (int*)xabe_shared;
     dispatch_token(topk_ids, valid_tokens, top_k, num_experts, block_size,
-                   sorted_capacity, expert_capacity, (int*)xabe_shared,
+                   sorted_capacity, expert_capacity, cumsum,
+                   cumsum + num_experts + 1,
                    sorted_token_ids, expert_ids, num_tokens_post_pad);
 }
 
@@ -2170,7 +2198,8 @@ __global__ void moe_dispatch_t1(
 // of warp 0 wrote `topk_ids`, and a block barrier fences those writes for
 // every thread that is about to read them.
 //
-// grid: (1,). block: MOE_THREADS. Shared: probs + rval + ridx + cumsum.
+// grid: (1,). block: MOE_THREADS. Shared: probs + rval + ridx + cumsum +
+// warp sums.
 __global__ void moe_route_dispatch_t1(
     const float* __restrict__ logits,
     const int* __restrict__ valid_tokens,
@@ -2196,6 +2225,7 @@ __global__ void moe_route_dispatch_t1(
     __syncthreads();
     dispatch_token(topk_ids, valid_tokens, top_k, num_experts, block_size,
                    sorted_capacity, expert_capacity, cumsum,
+                   cumsum + num_experts + 1,
                    sorted_token_ids, expert_ids, num_tokens_post_pad);
 }
 
@@ -5494,9 +5524,10 @@ impl MoeKernels {
         let block_size = g.block_size as i32;
         let sorted_capacity = g.sorted_capacity() as i32;
         let expert_capacity = g.expert_block_capacity() as i32;
-        // probs + one (float, int) reduction slot per thread + cumsum.
+        // probs + one (float, int) reduction slot per thread + cumsum + one
+        // scan total per warp.
         let shared = ((g.num_experts + THREADS as usize) * size_of::<f32>()
-            + (THREADS as usize + g.num_experts + 1) * size_of::<i32>())
+            + (THREADS as usize + g.num_experts + 1 + THREADS as usize / 32) * size_of::<i32>())
             as u32;
 
         let cfg = LaunchConfig {
@@ -5608,7 +5639,9 @@ impl MoeKernels {
             let cfg = LaunchConfig {
                 grid_dim: (1, 1, 1),
                 block_dim: (THREADS, 1, 1),
-                shared_mem_bytes: ((g.num_experts + 1) * size_of::<i32>()) as u32,
+                // cumsum + one scan total per warp.
+                shared_mem_bytes: ((g.num_experts + 1 + THREADS as usize / 32) * size_of::<i32>())
+                    as u32,
             };
             let mut builder = stream.launch_builder(&self.dispatch_t1);
             builder
