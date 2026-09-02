@@ -116,20 +116,24 @@ processes. Prefill on GPU 2, decode on GPU 1.
 | prefill 32K | 2,790.3 ± 5.8 | 2,655.1 | **+5.1%** |
 | prefill 65K | 2,226.0 ± 0.2 | 2,142.8 | **+3.9%** |
 | prefill 128K | 1,564.5 ± 0.3 | 1,551.6 | **+0.8%** |
-| decode 2K | 206.4 | 185.2 | **+11.4%** |
-| decode 32K | 158.3 / 157.8 / 158.2 | 150.7 / 150.8 / 150.6 | **+4.9%** |
+| decode 2K | 217.3 / 217.1 / 216.6 | 184.5 / 185.9 / 183.3 | **+16.8–18.2%** |
+| decode 32K | 165.7 / 166.5 / 165.2 | 151.0 / 150.4 / 150.8 | **+9.5–10.7%** |
 
 Provenance, in the spirit of the drift rules above: the 512–32K prefill rows
 ran a binary predating the per-sequence prefill fork, whose effect at those
 depths is orders of magnitude inside the reported margins; the 65K row was
 measured while gates ran on a neighbouring card and its margin is therefore a
-floor; the 128K rows ran clean and uncontended. The prefill 2K and both
-decode rows are alternating same-card runs of the current tree; their
-llama.cpp columns are the standing head-to-head rather than a same-hour
-re-run, so read those three margins with llama.cpp's ~1%/day drift in mind.
+floor; the 128K rows ran clean and uncontended. The two decode rows are
+three same-hour alternating pairs (middle pair reversed) of the current
+tree against `llama-batched-bench` on GPU 1 with the box quiet, listed
+pair by pair; the prefill 2K row is an alternating same-card run of the
+current tree whose llama.cpp column is the standing head-to-head rather
+than a same-hour re-run, so read that margin with llama.cpp's ~1%/day
+drift in mind.
 
-Single sequence, same tree, for reference: **~87.5 tok/s** decode at 32K and
-103.2 tok/s at 2K. Aggregate across three cards, one session each, is a
+Single sequence, same tree, for reference: **~87.5 tok/s** decode at 32K
+(not re-measured since the decode folds) and 115 tok/s at 2K
+(`bench_decode_batch` at N=1). Aggregate across three cards, one session each, is a
 deployment figure and **not** the per-instance N=3 target — do not cite it as
 a replacement claim.
 
