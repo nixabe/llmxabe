@@ -6181,7 +6181,7 @@ impl MoeKernels {
     /// differential` asserts it.
     ///
     /// Returns `Ok(false)`, having launched nothing, when the pass is not
-    /// one the fused entries cover: wider than [`FUSED_SHARED_MAX_TOKENS`],
+    /// one the fused entries cover: wider than `FUSED_SHARED_MAX_TOKENS`,
     /// a community format on either side, a gate/up pair whose halves
     /// disagree, or the community override. The caller then takes the two
     /// separate paths, which is what the fused path is a strict shortcut
