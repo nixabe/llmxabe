@@ -148,6 +148,14 @@ impl MessagesRequest {
                         tool_calls: folded.tool_calls,
                     });
                 }
+                "tool" => {
+                    for result in folded.tool_results {
+                        conversation.push_tool_result(result);
+                    }
+                    if !folded.text.is_empty() {
+                        conversation.push_tool_result(folded.text);
+                    }
+                }
                 role => return Err(unsupported_role(DIALECT, role)),
             }
         }

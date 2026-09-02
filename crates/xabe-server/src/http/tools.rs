@@ -106,7 +106,7 @@ impl OfferedTools {
         Ok(offered)
     }
 
-    /// OpenAI chat completions: `{"type":"function","function":{…}}`.
+    /// OpenAI chat completions: `{"type":"function","function":{…}}` or flat functions.
     pub(crate) fn from_openai(values: &[Value]) -> Result<Self, String> {
         let mut offered = Self {
             definitions: Vec::new(),
@@ -114,39 +114,50 @@ impl OfferedTools {
         };
         for value in values {
             match Self::kind_of(value) {
-                "function" => offered
-                    .definitions
-                    .push(ToolDefinition::from_openai(value)?),
+                "function" => {
+                    offered
+                        .definitions
+                        .push(ToolDefinition::from_openai(value)?);
+                }
                 kind => offered.drop_kind(kind),
             }
         }
         Ok(offered)
     }
 
-    /// Anthropic: a client tool carries `input_schema` and either no `type` or
-    /// a `custom` one. A versioned `type` is one of Anthropic's own server
-    /// tools.
+    /// Anthropic: client tools include `custom` / untyped tools carrying
+    /// `input_schema` or `parameters`, as well as client-side tools like
+    /// `bash_*`, `text_editor_*`, and `computer_*` used by Claude Code.
+    /// Hosted server tools like `web_search_*` are dropped.
     pub(crate) fn from_anthropic(values: &[Value]) -> Result<Self, String> {
         let mut offered = Self {
             definitions: Vec::new(),
             unsupported: Vec::new(),
         };
         for value in values {
-            match Self::kind_of(value) {
-                "" | "custom" => {
-                    offered
-                        .definitions
-                        .push(ToolDefinition::from_anthropic(value)?);
-                }
-                kind if kind.starts_with("custom") => {
-                    offered
-                        .definitions
-                        .push(ToolDefinition::from_anthropic(value)?);
-                }
-                kind => offered.drop_kind(kind),
+            let kind = Self::kind_of(value);
+            if Self::is_anthropic_client_tool(kind, value) {
+                offered
+                    .definitions
+                    .push(ToolDefinition::from_anthropic(value)?);
+            } else {
+                offered.drop_kind(kind);
             }
         }
         Ok(offered)
+    }
+
+    fn is_anthropic_client_tool(kind: &str, value: &Value) -> bool {
+        kind.is_empty()
+            || kind == "custom"
+            || kind.starts_with("custom")
+            || kind == "function"
+            || kind.starts_with("bash")
+            || kind.starts_with("text_editor")
+            || kind.starts_with("computer")
+            || value.get("input_schema").is_some()
+            || value.get("parameters").is_some()
+            || value.get("function").is_some()
     }
 }
 
@@ -191,38 +202,100 @@ impl ToolDefinition {
 
     /// An OpenAI chat tool: `{"type":"function","function":{...}}`.
     pub(crate) fn from_openai(value: &Value) -> Result<Self, String> {
-        if value.get("type").and_then(Value::as_str) != Some("function") {
-            return Err("every tool must have `\"type\": \"function\"`".to_owned());
-        }
-        let function = value
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or("a tool needs a `function` object")?;
-        Self::build(
-            function.get("name").and_then(Value::as_str).unwrap_or(""),
-            function.get("description"),
-            function.get("parameters"),
-        )
+        let function = value.get("function").unwrap_or(value);
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        let description = function.get("description");
+        let parameters = function
+            .get("parameters")
+            .or_else(|| function.get("input_schema"));
+        Self::build(name, description, parameters)
     }
 
-    /// An Anthropic tool: `{"name": ..., "input_schema": ...}`.
+    /// An Anthropic tool: `{"name": ..., "input_schema": ...}` or built-in client tools like `bash_*`.
     pub(crate) fn from_anthropic(value: &Value) -> Result<Self, String> {
-        if value
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind != "custom" && !kind.starts_with("custom"))
-        {
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if !OfferedTools::is_anthropic_client_tool(kind, value) {
             return Err(format!(
-                "server tools of type `{}` are not supported; send client tools \
-                 (`name` + `input_schema`)",
-                value.get("type").and_then(Value::as_str).unwrap_or(""),
+                "server tools of type `{kind}` are not supported; send client tools (`name` + `input_schema`)"
             ));
         }
-        Self::build(
-            value.get("name").and_then(Value::as_str).unwrap_or(""),
-            value.get("description"),
-            value.get("input_schema"),
-        )
+        let function = value.get("function").unwrap_or(value);
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        let description = function.get("description");
+        let parameters = function
+            .get("input_schema")
+            .or_else(|| function.get("parameters"));
+
+        let (default_desc, default_params) = if kind.starts_with("bash") || name == "bash" {
+            (
+                Some(json!(
+                    "Execute a bash command in a persistent shell environment."
+                )),
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to run in the bash shell."
+                        },
+                        "restart": {
+                            "type": "boolean",
+                            "description": "Set to true to restart the bash session."
+                        }
+                    },
+                    "required": ["command"]
+                })),
+            )
+        } else if kind.starts_with("text_editor") || name == "str_replace_editor" {
+            (
+                Some(json!(
+                    "Custom text editor tool for viewing, creating and editing files."
+                )),
+                Some(json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
+                            "description": "The command to run."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "The absolute path to the file or directory to view or edit."
+                        },
+                        "file_text": {
+                            "type": "string",
+                            "description": "The content of the file to create."
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "The string to replace."
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "The replacement string."
+                        },
+                        "insert_line": {
+                            "type": "integer",
+                            "description": "The line number to insert text at."
+                        },
+                        "view_range": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "The range of lines to view."
+                        }
+                    },
+                    "required": ["command", "path"]
+                })),
+            )
+        } else {
+            (None, None)
+        };
+
+        let desc = description.or(default_desc.as_ref());
+        let params = parameters.or(default_params.as_ref());
+
+        Self::build(name, desc, params)
     }
 
     /// One entry of a Responses API `tools` array.
@@ -259,16 +332,20 @@ impl ToolDefinition {
                     .ok_or_else(|| format!("namespace `{group}` needs a `tools` array"))?
                     .iter()
                     .map(|tool| {
-                        if tool.get("type").and_then(Value::as_str) != Some("function") {
+                        let kind = tool.get("type").and_then(Value::as_str).unwrap_or("");
+                        if !kind.is_empty() && kind != "function" && kind != "custom" {
                             return Err(format!(
                                 "namespace `{group}` may only hold `function` tools"
                             ));
                         }
-                        let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+                        let function = tool.get("function").unwrap_or(tool);
+                        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
                         Self::build(
                             &format!("{group}.{name}"),
-                            tool.get("description"),
-                            tool.get("parameters"),
+                            function.get("description"),
+                            function
+                                .get("parameters")
+                                .or_else(|| function.get("input_schema")),
                         )
                     })
                     .collect()
@@ -277,19 +354,23 @@ impl ToolDefinition {
         }
     }
 
-    /// A Responses API tool: flat `{"type":"function","name":...}`.
+    /// A Responses API tool: flat `{"type":"function","name":...}` or nested `{"type":"function","function":...}`.
     pub(crate) fn from_responses(value: &Value) -> Result<Self, String> {
-        if value.get("type").and_then(Value::as_str) != Some("function") {
+        let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if !kind.is_empty() && kind != "function" && kind != "custom" {
             return Err(format!(
-                "tools of type `{}` are not supported; this server executes nothing itself, \
-                 so only `function` tools, and `namespace` groups of them, make sense",
-                value.get("type").and_then(Value::as_str).unwrap_or(""),
+                "tools of type `{kind}` are not supported; this server executes nothing itself, \
+                 so only `function` tools, and `namespace` groups of them, make sense"
             ));
         }
+        let function = value.get("function").unwrap_or(value);
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
         Self::build(
-            value.get("name").and_then(Value::as_str).unwrap_or(""),
-            value.get("description"),
-            value.get("parameters"),
+            name,
+            function.get("description"),
+            function
+                .get("parameters")
+                .or_else(|| function.get("input_schema")),
         )
     }
 }
@@ -556,8 +637,9 @@ mod tests {
 
     #[test]
     fn anthropic_server_tools_are_dropped_and_client_tools_beside_them_serve() {
-        // Anthropic's own hosted tools carry a dated type. The server runs
-        // them; this one cannot, but the caller's client tools are fine.
+        // Anthropic's own hosted tools (e.g. web_search) are dropped because this
+        // server does not run them, but client-side tools like Claude Code's bash,
+        // text_editor, and custom tools are served.
         let offered = OfferedTools::from_anthropic(&[
             json!({"type": "web_search_20250305", "name": "web_search"}),
             json!({"type": "bash_20250124", "name": "bash"}),
@@ -565,11 +647,12 @@ mod tests {
             json!({"type": "custom", "name": "lookup", "input_schema": {"type": "object"}}),
         ])
         .expect("hosted tools do not fail the request");
-        assert_eq!(offered.definitions.len(), 2, "both client tools serve");
         assert_eq!(
-            offered.unsupported,
-            vec!["web_search_20250305", "bash_20250124"]
+            offered.definitions.len(),
+            3,
+            "bash and custom client tools serve"
         );
+        assert_eq!(offered.unsupported, vec!["web_search_20250305"]);
     }
 
     #[test]
@@ -806,9 +889,12 @@ mod tests {
             ToolDefinition::from_openai(&json!({ "type": "function", "function": {} })).is_err()
         );
         assert!(
-            ToolDefinition::from_anthropic(&json!({ "type": "bash_20250124", "name": "bash" }))
-                .is_err()
+            ToolDefinition::from_anthropic(
+                &json!({ "type": "web_search_20250305", "name": "web_search" })
+            )
+            .is_err()
         );
+        assert!(ToolDefinition::from_anthropic(&json!({ "name": "" })).is_err());
         assert!(
             ToolDefinition::from_openai(&json!({
                 "type": "function",
@@ -828,5 +914,72 @@ mod tests {
                 .clone(),
         };
         assert_eq!(call.arguments_json(), r#"{"a":1,"b":"x"}"#);
+    }
+
+    #[test]
+    fn claude_code_client_tools_parse_with_default_schemas() {
+        let offered = OfferedTools::from_anthropic(&[
+            json!({"type": "bash_20250124", "name": "bash"}),
+            json!({"type": "text_editor_20250124", "name": "str_replace_editor"}),
+        ])
+        .expect("Claude Code tools parse");
+        assert_eq!(offered.definitions.len(), 2);
+        assert!(offered.unsupported.is_empty());
+        assert_eq!(offered.definitions[0].name, "bash");
+        assert!(
+            offered.definitions[0]
+                .wrapper
+                .to_string()
+                .contains("\"command\"")
+        );
+        assert_eq!(offered.definitions[1].name, "str_replace_editor");
+        assert!(
+            offered.definitions[1]
+                .wrapper
+                .to_string()
+                .contains("\"str_replace\"")
+        );
+    }
+
+    #[test]
+    fn openai_nested_and_flat_function_tools_both_parse() {
+        let nested = ToolDefinition::from_openai(&json!({
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "parameters": { "type": "object" }
+            }
+        }))
+        .expect("nested function tool parses");
+        assert_eq!(nested.name, "calc");
+
+        let flat = ToolDefinition::from_openai(&json!({
+            "type": "function",
+            "name": "calc",
+            "parameters": { "type": "object" }
+        }))
+        .expect("flat function tool parses");
+        assert_eq!(flat.name, "calc");
+    }
+
+    #[test]
+    fn responses_nested_and_flat_tools_both_parse() {
+        let nested = ToolDefinition::from_responses(&json!({
+            "type": "function",
+            "function": {
+                "name": "fetch",
+                "parameters": { "type": "object" }
+            }
+        }))
+        .expect("nested responses tool parses");
+        assert_eq!(nested.name, "fetch");
+
+        let flat = ToolDefinition::from_responses(&json!({
+            "type": "function",
+            "name": "fetch",
+            "parameters": { "type": "object" }
+        }))
+        .expect("flat responses tool parses");
+        assert_eq!(flat.name, "fetch");
     }
 }

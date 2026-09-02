@@ -276,6 +276,10 @@ struct Args {
     /// token, for requests that do not set it; 0 disables it
     #[arg(long, default_value_t = 0.0)]
     min_p: f32,
+
+    /// Keep only this many top candidate tokens for requests that do not set it; 0 disables it
+    #[arg(long, default_value_t = 0)]
+    top_k: u32,
 }
 
 /// Rewrite the two-letter shorts clap cannot express (`-pc`, `-tb`) into
@@ -910,6 +914,7 @@ fn main() -> std::process::ExitCode {
             temperature: args.temperature,
             top_p: args.top_p,
             min_p: args.min_p,
+            top_k: args.top_k,
         },
         vision: args.mmproj.is_some().then_some(http::VisionServingConfig {
             config: vision_config,
@@ -964,13 +969,15 @@ mod tests {
 
     #[test]
     fn the_sampling_default_flags_parse() {
-        let sampled = Args::parse_from(["--top-p", "0.95", "--min-p", "0.05"]);
+        let sampled = Args::parse_from(["--top-p", "0.95", "--min-p", "0.05", "--top-k", "20"]);
         assert_eq!(sampled.top_p, 0.95);
         assert_eq!(sampled.min_p, 0.05);
+        assert_eq!(sampled.top_k, 20);
         let silent = Args::parse_from([] as [&str; 0]);
         assert_eq!(silent.top_p, 1.0);
         assert_eq!(silent.min_p, 0.0);
         assert_eq!(silent.temperature, 1.0);
+        assert_eq!(silent.top_k, 0);
     }
 
     #[test]

@@ -408,13 +408,10 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
             .transpose()
             .map_err(|failure| ApiError::bad_request(DIALECT, failure))?
             .unwrap_or_default();
-        // This dialect replays tool calls through the `tool_calls` field and
-        // results through the `tool` role, never through content blocks.
-        if !folded.tool_calls.is_empty() || !folded.tool_results.is_empty() {
-            return Err(ApiError::bad_request(
-                DIALECT,
-                "`tool_use` and `tool_result` content blocks are not valid here",
-            ));
+        // Replayed tool calls and results may arrive either via dedicated
+        // fields/roles or folded into content blocks.
+        for result in folded.tool_results {
+            conversation.push_tool_result(result);
         }
         // Images render as user-turn markup and nothing else.
         if !folded.images.is_empty() && message.role != "user" {
@@ -433,13 +430,19 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
             }
             "user" => {
                 conversation.images.extend(folded.images);
-                conversation.turns.push(Turn::User(text));
+                if !text.is_empty() {
+                    conversation.turns.push(Turn::User(text));
+                }
             }
-            "assistant" => conversation.turns.push(Turn::Assistant {
-                reasoning: message.reasoning_content.unwrap_or(thinking),
-                content: text,
-                tool_calls: replayed_tool_calls(message.tool_calls)?,
-            }),
+            "assistant" => {
+                let mut tool_calls = replayed_tool_calls(message.tool_calls)?;
+                tool_calls.extend(folded.tool_calls);
+                conversation.turns.push(Turn::Assistant {
+                    reasoning: message.reasoning_content.unwrap_or(thinking),
+                    content: text,
+                    tool_calls,
+                });
+            }
             "tool" => conversation.push_tool_result(text),
             role => return Err(unsupported_role(DIALECT, role)),
         }

@@ -79,12 +79,13 @@ pub(crate) struct GenerationSpec {
 }
 
 /// The serving defaults a silent request samples with, set at startup by
-/// `--temperature`, `--top-p`, and `--min-p`.
+/// `--temperature`, `--top-p`, `--min-p`, and `--top-k`.
 #[derive(Debug, Clone, Copy)]
 pub struct SamplingDefaults {
     pub temperature: f32,
     pub top_p: f32,
     pub min_p: f32,
+    pub top_k: u32,
 }
 
 /// Resolve a request's sampling fields against the server defaults,
@@ -127,7 +128,7 @@ pub(crate) fn resolve_sampling(
     }
     let params = SamplingParams {
         temperature,
-        top_k: top_k.unwrap_or(0),
+        top_k: top_k.unwrap_or(defaults.top_k),
         top_p,
         min_p,
         // An unpinned seed still needs to differ between requests, or two
@@ -243,9 +244,10 @@ impl Detokenizer {
 /// The longest suffix of `text` that is a proper prefix of some stop
 /// sequence, and so cannot be emitted yet without risking a stop sequence
 /// being split across two chunks.
-fn held_back_len(text: &str, stop: &[String]) -> usize {
+fn held_back_len(text: &str, stop: &[impl AsRef<str>]) -> usize {
     let mut held = 0;
     for sequence in stop {
+        let sequence = sequence.as_ref();
         for (end, _) in sequence.char_indices().skip(1) {
             if text.len() >= end && text.is_char_boundary(text.len() - end) {
                 let candidate = &text[text.len() - end..];
@@ -540,10 +542,8 @@ impl Generation {
             };
             self.completion_tokens += 1;
 
-            // The reasoning span closes on a token, not on a substring: the
-            // model emits `</think>` as the single vocabulary entry it was
-            // trained on, so there is nothing to scan for and no chance of the
-            // marker being split across a chunk boundary.
+            // The reasoning span closes on its special token, or on explicit
+            // delimiters (`</think>`, `<tool_call>`) appearing in output.
             if self.reasoning_open && Some(token) == self.think_close {
                 let tail = std::mem::take(&mut self.pending);
                 let flushed = self.chunk(tail);
@@ -563,6 +563,34 @@ impl Generation {
             }
             self.pending.push_str(&delta);
 
+            if self.reasoning_open {
+                if let Some(pos) = self.pending.find("</think>") {
+                    let before: String = self.pending[..pos].to_owned();
+                    let rest = &self.pending[pos + "</think>".len()..];
+                    let after = rest.strip_prefix('\n').unwrap_or(rest).to_owned();
+                    self.pending = after;
+                    let flushed = self.chunk(before);
+                    self.reasoning_open = false;
+                    self.trim_span_start = self.trim_spans;
+                    if flushed.is_some() {
+                        return Ok(flushed);
+                    }
+                    continue;
+                }
+                if let Some(pos) = self.pending.find("<tool_call>") {
+                    let before: String = self.pending[..pos].to_owned();
+                    let rest = self.pending[pos..].to_owned();
+                    self.pending = rest;
+                    let flushed = self.chunk(before);
+                    self.reasoning_open = false;
+                    self.trim_span_start = false;
+                    if flushed.is_some() {
+                        return Ok(flushed);
+                    }
+                    continue;
+                }
+            }
+
             if let Some((at, sequence)) = earliest_stop(&self.pending, &self.stop) {
                 let sequence = sequence.to_owned();
                 self.pending.truncate(at);
@@ -573,7 +601,12 @@ impl Generation {
                 return Ok(self.chunk(text));
             }
 
-            let held = held_back_len(&self.pending, &self.stop);
+            let held = if self.reasoning_open {
+                held_back_len(&self.pending, &self.stop)
+                    .max(held_back_len(&self.pending, &["</think>", "<tool_call>"]))
+            } else {
+                held_back_len(&self.pending, &self.stop)
+            };
             let emit = self.pending.len() - held;
             if emit > 0 {
                 let text: String = self.pending.drain(..emit).collect();
@@ -629,6 +662,7 @@ mod tests {
             temperature: 1.0,
             top_p: 1.0,
             min_p: 0.0,
+            top_k: 0,
         }
     }
 
@@ -663,12 +697,14 @@ mod tests {
             temperature: 0.8,
             top_p: 0.95,
             min_p: 0.05,
+            top_k: 20,
         };
         let sampled = resolve_sampling(Dialect::OpenAi, defaults, None, None, None, None, Some(7))
             .expect("defaults resolve");
         assert_eq!(sampled.temperature, 0.8);
         assert_eq!(sampled.top_p, 0.95);
         assert_eq!(sampled.min_p, 0.05);
+        assert_eq!(sampled.top_k, 20);
         assert_eq!(sampled.seed, 7);
         let greedy_default = resolve_sampling(
             Dialect::OpenAi,

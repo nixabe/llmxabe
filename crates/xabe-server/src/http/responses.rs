@@ -284,13 +284,8 @@ impl ResponsesRequest {
                         .transpose()
                         .map_err(|failure| ApiError::bad_request(DIALECT, failure))?
                         .unwrap_or_default();
-                    // Tool traffic travels as `function_call` items in this
-                    // dialect, never as content blocks.
-                    if !folded.tool_calls.is_empty() || !folded.tool_results.is_empty() {
-                        return Err(ApiError::bad_request(
-                            DIALECT,
-                            "`tool_use` and `tool_result` content blocks are not valid here",
-                        ));
+                    for result in folded.tool_results {
+                        conversation.push_tool_result(result);
                     }
                     if !folded.images.is_empty() && item.role.as_deref() != Some("user") {
                         return Err(ApiError::bad_request(DIALECT, image_misplaced()));
@@ -312,11 +307,35 @@ impl ResponsesRequest {
                         }
                         Some("user") => {
                             conversation.images.extend(folded.images);
-                            conversation.turns.push(Turn::User(text));
+                            if !text.is_empty() {
+                                conversation.turns.push(Turn::User(text));
+                            }
                         }
-                        Some("assistant") => conversation
-                            .turns
-                            .push(Turn::assistant_text(thinking, text)),
+                        Some("assistant") => {
+                            if let Some(Turn::Assistant {
+                                reasoning,
+                                content,
+                                tool_calls,
+                            }) = conversation.turns.last_mut()
+                            {
+                                if reasoning.is_empty() {
+                                    *reasoning = thinking;
+                                }
+                                if !text.is_empty() {
+                                    if !content.is_empty() {
+                                        content.push('\n');
+                                    }
+                                    content.push_str(&text);
+                                }
+                                tool_calls.extend(folded.tool_calls);
+                            } else {
+                                conversation.turns.push(Turn::Assistant {
+                                    reasoning: thinking,
+                                    content: text,
+                                    tool_calls: folded.tool_calls,
+                                });
+                            }
+                        }
                         Some(role) => return Err(unsupported_role(DIALECT, role)),
                         None => {
                             return Err(ApiError::bad_request(

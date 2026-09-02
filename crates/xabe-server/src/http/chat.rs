@@ -250,9 +250,14 @@ impl Content {
                     | KnownPart::SummaryText { text: value },
                 ) => (&mut folded.thinking, value.as_str()),
                 Part::Known(KnownPart::ToolUse { name, input }) => {
+                    let arguments = match input {
+                        Value::Object(map) => map.clone(),
+                        Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
+                        _ => serde_json::Map::new(),
+                    };
                     folded.tool_calls.push(ParsedToolCall {
                         name: name.clone(),
-                        arguments: input.as_object().cloned().unwrap_or_default(),
+                        arguments,
                     });
                     continue;
                 }
@@ -335,6 +340,7 @@ pub(crate) enum Turn {
     ToolResults(Vec<String>),
 }
 
+#[cfg(test)]
 impl Turn {
     pub(crate) fn assistant_text(reasoning: String, content: String) -> Self {
         Self::Assistant {

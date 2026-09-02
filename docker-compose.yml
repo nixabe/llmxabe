@@ -64,6 +64,8 @@ services:
       - "0.95"
       - --min-p
       - "0.0"
+      - --top-k
+      - "20"
 
     environment:
       # `environment:` wins over `env_file:`, so pinning the bind here keeps a
