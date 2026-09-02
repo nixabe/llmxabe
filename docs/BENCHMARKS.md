@@ -1118,7 +1118,14 @@ same method and card, middle pair reversed:
 drifted −0.1% at N=1 and −1.4% at N=3 over the sitting, so the N=3 margin
 is inside its own drift and stands on the pairs, not on the means. By
 construction the step is 50 launches shorter at N=1 (745 → 665 after the
-shared-expert fold, 615 now) and 110 shorter at N=3. Where the first two
+shared-expert fold, 615 now) and 110 shorter at N=3. The dense model gets
+the qkv+gate merge, the rope+append batch and the convolution fold (its FFN
+has no shared expert and no dispatch table): against the tree before the
+first of them, `bench_decode_batch 2048 32` on the `UD-Q8_K_XL` file went
+17.8 → 18.0 tok/s at N=1 (+1.1%) and 46.1 → 47.2 / 47.1 at N=3 (+2.4% /
++2.2%) on two clean pairs — a peer's test run overlapped the first minute
+of a third, which agreed in sign and is dropped — with peak VRAM 38.4 →
+30.3 GiB from the residency change below. Where the first two
 folds each bought 1–3%, these three together bought about one, which is
 the shape of the remaining tail: what is left under ten microseconds is
 mostly norms and gates that sit between two dependent projections, and
