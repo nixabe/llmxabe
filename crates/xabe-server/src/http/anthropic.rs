@@ -156,6 +156,17 @@ impl MessagesRequest {
                         conversation.push_tool_result(folded.text);
                     }
                 }
+                "system" | "developer" => {
+                    if conversation.turns.is_empty() {
+                        let sys = conversation.system.get_or_insert_with(String::new);
+                        if !sys.is_empty() {
+                            sys.push('\n');
+                        }
+                        sys.push_str(&folded.text);
+                    } else {
+                        conversation.turns.push(Turn::System(folded.text));
+                    }
+                }
                 role => return Err(unsupported_role(DIALECT, role)),
             }
         }
@@ -601,6 +612,20 @@ mod tests {
             plain.conversation().unwrap().render(true),
             blocks.conversation().unwrap().render(true)
         );
+    }
+
+    #[test]
+    fn a_single_system_object_in_json_and_role_system_in_messages_are_both_accepted() {
+        let single_obj = request(
+            r#"{"max_tokens":16,"system":{"type":"text","text":"Be terse."},"messages":[{"role":"user","content":"Hi"}]}"#,
+        );
+        let in_messages = request(
+            r#"{"max_tokens":16,"messages":[{"role":"system","content":"Be terse."},{"role":"user","content":"Hi"}]}"#,
+        );
+        let rendered_single = single_obj.conversation().unwrap().render(true);
+        let rendered_in_msg = in_messages.conversation().unwrap().render(true);
+        assert!(rendered_single.contains("<|im_start|>system\nBe terse.<|im_end|>\n"));
+        assert!(rendered_in_msg.contains("<|im_start|>system\nBe terse.<|im_end|>\n"));
     }
 
     #[test]

@@ -37,6 +37,7 @@ const IM_END: &str = "<|im_end|>";
 pub(crate) enum Content {
     Text(String),
     Parts(Vec<Part>),
+    Single(Part),
 }
 
 /// One content part this server knows how to render. `text` is OpenAI chat
@@ -226,82 +227,104 @@ const CONTENT_THIS_SERVER_CANNOT_READ: &[&str] = &[
 ];
 
 impl Content {
+    fn fold_part(part: &Part, folded: &mut FoldedContent) -> Result<(), String> {
+        let (target, value): (_, &str) = match part {
+            Part::Known(
+                KnownPart::Text { text: value }
+                | KnownPart::InputText { text: value }
+                | KnownPart::OutputText { text: value }
+                | KnownPart::Refusal { refusal: value },
+            ) => (&mut folded.text, value.as_str()),
+            Part::Known(
+                KnownPart::Thinking { thinking: value }
+                | KnownPart::ReasoningText { text: value }
+                | KnownPart::SummaryText { text: value },
+            ) => (&mut folded.thinking, value.as_str()),
+            Part::Known(KnownPart::ToolUse { name, input }) => {
+                let arguments = match input {
+                    Value::Object(map) => map.clone(),
+                    Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
+                    _ => serde_json::Map::new(),
+                };
+                folded.tool_calls.push(ParsedToolCall {
+                    name: name.clone(),
+                    arguments,
+                });
+                return Ok(());
+            }
+            Part::Known(KnownPart::ToolResult { content }) => {
+                folded
+                    .tool_results
+                    .push(tool_result_text(content.as_ref())?);
+                return Ok(());
+            }
+            Part::Known(KnownPart::ImageUrl { image_url }) => {
+                folded.images.push(decode_image_url(image_url.url())?);
+                (&mut folded.text, IMAGE_MARKER)
+            }
+            Part::Known(KnownPart::Image { source }) => {
+                folded.images.push(source.decode()?);
+                (&mut folded.text, IMAGE_MARKER)
+            }
+            Part::Known(KnownPart::InputImage { image_url }) => {
+                let url = image_url.as_deref().ok_or(
+                    "an `input_image` part needs an `image_url`; file ids are not supported",
+                )?;
+                folded.images.push(decode_image_url(url)?);
+                (&mut folded.text, IMAGE_MARKER)
+            }
+            Part::Other(value) => {
+                let kind = value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("(untyped)");
+                if CONTENT_THIS_SERVER_CANNOT_READ.contains(&kind) {
+                    return Err(format!(
+                        "content parts of type `{kind}` are not supported; this server \
+                         reads text and images. Dropping one would answer about \
+                         something it never saw"
+                    ));
+                }
+                if let Some(text) = value.as_str() {
+                    if !folded.text.is_empty() {
+                        folded.text.push('\n');
+                    }
+                    folded.text.push_str(text);
+                    return Ok(());
+                }
+                if let Some(text) = value.get("text").and_then(Value::as_str) {
+                    if !folded.text.is_empty() {
+                        folded.text.push('\n');
+                    }
+                    folded.text.push_str(text);
+                    return Ok(());
+                }
+                warn!("skipping content part of type `{kind}`: nothing here produced it");
+                return Ok(());
+            }
+        };
+        if !target.is_empty() {
+            target.push('\n');
+        }
+        target.push_str(value);
+        Ok(())
+    }
+
     /// Fold content into its text, reasoning, and replayed tool blocks.
     pub(crate) fn fold(&self) -> Result<FoldedContent, String> {
         let mut folded = FoldedContent::default();
-        let parts = match self {
+        match self {
             Self::Text(text) => {
                 folded.text = text.clone();
-                return Ok(folded);
             }
-            Self::Parts(parts) => parts,
-        };
-        for part in parts {
-            let (target, value): (_, &str) = match part {
-                Part::Known(
-                    KnownPart::Text { text: value }
-                    | KnownPart::InputText { text: value }
-                    | KnownPart::OutputText { text: value }
-                    | KnownPart::Refusal { refusal: value },
-                ) => (&mut folded.text, value.as_str()),
-                Part::Known(
-                    KnownPart::Thinking { thinking: value }
-                    | KnownPart::ReasoningText { text: value }
-                    | KnownPart::SummaryText { text: value },
-                ) => (&mut folded.thinking, value.as_str()),
-                Part::Known(KnownPart::ToolUse { name, input }) => {
-                    let arguments = match input {
-                        Value::Object(map) => map.clone(),
-                        Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
-                        _ => serde_json::Map::new(),
-                    };
-                    folded.tool_calls.push(ParsedToolCall {
-                        name: name.clone(),
-                        arguments,
-                    });
-                    continue;
-                }
-                Part::Known(KnownPart::ToolResult { content }) => {
-                    folded
-                        .tool_results
-                        .push(tool_result_text(content.as_ref())?);
-                    continue;
-                }
-                Part::Known(KnownPart::ImageUrl { image_url }) => {
-                    folded.images.push(decode_image_url(image_url.url())?);
-                    (&mut folded.text, IMAGE_MARKER)
-                }
-                Part::Known(KnownPart::Image { source }) => {
-                    folded.images.push(source.decode()?);
-                    (&mut folded.text, IMAGE_MARKER)
-                }
-                Part::Known(KnownPart::InputImage { image_url }) => {
-                    let url = image_url.as_deref().ok_or(
-                        "an `input_image` part needs an `image_url`; file ids are not supported",
-                    )?;
-                    folded.images.push(decode_image_url(url)?);
-                    (&mut folded.text, IMAGE_MARKER)
-                }
-                Part::Other(value) => {
-                    let kind = value
-                        .get("type")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("(untyped)");
-                    if CONTENT_THIS_SERVER_CANNOT_READ.contains(&kind) {
-                        return Err(format!(
-                            "content parts of type `{kind}` are not supported; this server \
-                             reads text and images. Dropping one would answer about \
-                             something it never saw"
-                        ));
-                    }
-                    warn!("skipping content part of type `{kind}`: nothing here produced it");
-                    continue;
-                }
-            };
-            if !target.is_empty() {
-                target.push('\n');
+            Self::Single(part) => {
+                Self::fold_part(part, &mut folded)?;
             }
-            target.push_str(value);
+            Self::Parts(parts) => {
+                for part in parts {
+                    Self::fold_part(part, &mut folded)?;
+                }
+            }
         }
         Ok(folded)
     }
@@ -330,6 +353,7 @@ impl Content {
 #[derive(Debug)]
 pub(crate) enum Turn {
     User(String),
+    System(String),
     Assistant {
         reasoning: String,
         content: String,
@@ -452,6 +476,9 @@ impl Conversation {
             match turn {
                 Turn::User(content) => {
                     let _ = write!(out, "{IM_START}user\n{}{IM_END}\n", content.trim());
+                }
+                Turn::System(content) => {
+                    let _ = write!(out, "{IM_START}system\n{}{IM_END}\n", content.trim());
                 }
                 Turn::Assistant {
                     reasoning,
@@ -950,5 +977,39 @@ mod tests {
         let failure = content.split().expect_err("a video part should be refused");
         assert!(failure.contains("`video_url`"), "{failure}");
         assert!(failure.contains("not supported"), "{failure}");
+    }
+
+    #[test]
+    fn single_object_and_string_array_contents_fold_cleanly() {
+        let single_obj: Content =
+            serde_json::from_str(r#"{"type":"text","text":"hello single"}"#).unwrap();
+        assert_eq!(single_obj.fold().unwrap().text, "hello single");
+
+        let single_untyped: Content = serde_json::from_str(r#"{"text":"hello untyped"}"#).unwrap();
+        assert_eq!(single_untyped.fold().unwrap().text, "hello untyped");
+
+        let string_array: Content =
+            serde_json::from_str(r#"["hello part 1", "hello part 2"]"#).unwrap();
+        assert_eq!(
+            string_array.fold().unwrap().text,
+            "hello part 1\nhello part 2"
+        );
+    }
+
+    #[test]
+    fn turn_system_renders_system_chatml() {
+        let conv = Conversation {
+            system: None,
+            turns: vec![
+                Turn::User("Hi".to_owned()),
+                Turn::System("Context injection".to_owned()),
+            ],
+            tools: Vec::new(),
+            images: Vec::new(),
+        };
+        assert!(
+            conv.render(true)
+                .contains("<|im_start|>system\nContext injection<|im_end|>\n")
+        );
     }
 }

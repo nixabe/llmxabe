@@ -75,6 +75,8 @@ struct ResponsesRequest {
     #[serde(default)]
     instructions: Option<String>,
     #[serde(default)]
+    system: Option<String>,
+    #[serde(default)]
     max_output_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
@@ -145,7 +147,7 @@ impl ResponsesRequest {
 
     fn conversation(&self) -> Result<Conversation, ApiError> {
         let mut conversation = Conversation {
-            system: self.instructions.clone(),
+            system: self.instructions.clone().or_else(|| self.system.clone()),
             turns: Vec::new(),
             tools: Vec::new(),
             images: Vec::new(),
@@ -293,17 +295,15 @@ impl ResponsesRequest {
                     let (text, thinking) = (folded.text, folded.thinking);
                     match item.role.as_deref() {
                         Some("system" | "developer") => {
-                            if !conversation.turns.is_empty() {
-                                return Err(ApiError::bad_request(
-                                    DIALECT,
-                                    "a system input item must come before the first user item",
-                                ));
+                            if conversation.turns.is_empty() {
+                                let system = conversation.system.get_or_insert_with(String::new);
+                                if !system.is_empty() {
+                                    system.push('\n');
+                                }
+                                system.push_str(&text);
+                            } else {
+                                conversation.turns.push(Turn::System(text));
                             }
-                            let system = conversation.system.get_or_insert_with(String::new);
-                            if !system.is_empty() {
-                                system.push('\n');
-                            }
-                            system.push_str(&text);
                         }
                         Some("user") => {
                             conversation.images.extend(folded.images);
@@ -1061,6 +1061,17 @@ mod tests {
     fn instructions_become_the_system_turn() {
         let rendered = request(
             r#"{"instructions":"Be terse.","input":[{"role":"user","content":[{"type":"input_text","text":"Hi"}]}]}"#,
+        )
+        .conversation()
+        .expect("an item input should fold")
+        .render(true);
+        assert!(rendered.starts_with("<|im_start|>system\nBe terse.<|im_end|>\n"));
+    }
+
+    #[test]
+    fn system_field_becomes_the_system_turn() {
+        let rendered = request(
+            r#"{"system":"Be terse.","input":[{"role":"user","content":[{"type":"input_text","text":"Hi"}]}]}"#,
         )
         .conversation()
         .expect("an item input should fold")

@@ -420,13 +420,11 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
         let (text, thinking) = (folded.text, folded.thinking);
         match message.role.as_str() {
             "system" | "developer" => {
-                if !conversation.turns.is_empty() {
-                    return Err(ApiError::bad_request(
-                        DIALECT,
-                        "a system message must come before the first user or assistant message",
-                    ));
+                if conversation.turns.is_empty() {
+                    system.push(text);
+                } else {
+                    conversation.turns.push(Turn::System(text));
                 }
-                system.push(text);
             }
             "user" => {
                 conversation.images.extend(folded.images);
@@ -675,16 +673,13 @@ mod tests {
     }
 
     #[test]
-    fn a_late_system_message_is_refused_rather_than_dropped() {
-        // The model's own template silently discards it; silently discarding
-        // an instruction the caller wrote is worse than refusing it.
-        let error = conversation(vec![message("user", "Hi"), message("system", "Be terse.")])
-            .expect_err("a system message after a turn should be refused");
-        assert_eq!(
-            error.payload()["error"]["message"],
-            serde_json::json!(
-                "a system message must come before the first user or assistant message"
-            )
+    fn a_late_system_message_becomes_a_system_turn() {
+        let conv = conversation(vec![message("user", "Hi"), message("system", "Be terse.")])
+            .expect("a system message after a turn should become a system turn");
+        assert_eq!(conv.turns.len(), 2);
+        assert!(
+            conv.render(true)
+                .contains("<|im_start|>system\nBe terse.<|im_end|>\n")
         );
     }
 
