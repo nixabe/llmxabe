@@ -1087,6 +1087,44 @@ events it needs are themselves graph nodes on a step with no slack — a
 seam in `blockIdx` buys for free, as long as each body is left exactly as
 its separate launch ran it.
 
+**Three folds under a launch floor each, measured together.** Each too
+small to time alone, each bit-identical to what it replaces, and each with
+the differential that says so:
+
+- Rope over q, rope over k and the KV append for *every* decode sequence in
+  one launch (`attn_decode_rope_append_batch`, the same eight pointer slots
+  the step already uses, selected by `blockIdx.y`): three launches per
+  sequence per attention layer became one per layer.
+  `attention_differential`.
+- The dispatch table's 256-expert prefix sum as a shuffle scan across the
+  block instead of thread 0 walking 256 dependent shared-memory adds while
+  255 threads waited (`dispatch_token`; integer addition, so the table is
+  identical). `moe_differential`, slot for slot against the reference.
+- The Gated DeltaNet convolution step, SiLU and q/k/v split in one launch at
+  decode width (`gdn_conv_silu_split_step_batch`): the thread that
+  convolves a channel gates its own accumulator, so `conv_raw` is written
+  for the trace and never read back. `gdn_conv_silu_differential`, five
+  outputs and every cache at 1–8 sequences.
+
+Three interleaved pairs against the shared-expert fold as the baseline,
+same method and card, middle pair reversed:
+
+| width | pair 1 | pair 2 | pair 3 |
+| :--- | ---: | ---: | ---: |
+| N=3 | 216.5 → 217.4 | 215.0 → 218.0 | 213.5 → 217.0 |
+| N=1 | 114.3 → 115.9 | 114.3 → 115.1 | 114.2 → 115.5 |
+
+**+0.7–1.4% at N=1 and +0.4–1.6% at N=3**, every pair won. The baseline arm
+drifted −0.1% at N=1 and −1.4% at N=3 over the sitting, so the N=3 margin
+is inside its own drift and stands on the pairs, not on the means. By
+construction the step is 50 launches shorter at N=1 (745 → 665 after the
+shared-expert fold, 615 now) and 110 shorter at N=3. Where the first two
+folds each bought 1–3%, these three together bought about one, which is
+the shape of the remaining tail: what is left under ten microseconds is
+mostly norms and gates that sit between two dependent projections, and
+folding those means moving a reduction into a producer's tail rather than
+putting two bodies under one grid.
+
 ## Parallelism: fill the wave, and split the only axis decode has
 
 Decode attention's grid was `(1, q_heads)` — **sixteen blocks on a 72-SM
