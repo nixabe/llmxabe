@@ -58,7 +58,7 @@ use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::arena::memory_info;
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::DeviceWeights;
-use xabe_engine::forward::{Forward, arena_holds};
+use xabe_engine::forward::{Forward, arena_holds_entry};
 use xabe_gguf::GgufFile;
 use xabe_kernels::compare::{ComparisonResult, compare};
 use xabe_model::config::{LayerKind, ModelConfig};
@@ -312,18 +312,23 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
 
     // ---- 1. The model, resident. -------------------------------------
     //
-    // `arena_holds` keeps the nine roles `MoeLayerWeights` uploads for itself
-    // out of the arena, so the model is on the device exactly once. Loading
-    // all of it would put 28.3 GiB of expert weights in the slab that nothing
-    // reads, on top of the 28.3 GiB the MoE blocks hold — which does not fit.
+    // `arena_holds_entry` is the engine's own filter: it keeps the nine roles
+    // `MoeLayerWeights` uploads for itself out of the arena, so the model is
+    // on the device exactly once (loading all of it would put 28.3 GiB of
+    // expert weights in the slab that nothing reads, on top of the 28.3 GiB
+    // the MoE blocks hold — which does not fit), and it keeps the Q8_0 GDN
+    // projections and the attention projections out too, so this golden runs
+    // over the repack-from-transient-upload path the server runs over.
     let schema = WeightSchema::new(&config);
     let directory = schema
         .resolve(&file)
         .expect("the schema must resolve against the model file");
     let started = Instant::now();
     let (weights, report) =
-        DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
-            .expect("weight load");
+        DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
+            arena_holds_entry(config.ffn, role, ty)
+        })
+        .expect("weight load");
     println!(
         "arena: {} of {} tensors, {:.3} GiB in {:.1} s ({:.2} GB/s)",
         report.tensors,
@@ -356,7 +361,7 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
          \x20 arena (zero-copy aliases)      {:8.3} GiB\n\
          \x20 MoE weights (40 layers)        {:8.3} GiB\n\
          \x20 -- model resident, once        {:8.3} GiB\n\
-         \x20 attention duplicate (10 blk)   {:8.3} GiB   <- the one copy left\n\
+         \x20 attention arena dup (10 blk)   {:8.3} GiB   <- norms only under the entry filter\n\
          \x20 PEAK VRAM, driver accounting   {:8.3} GiB of {:.2} GiB",
         build_time.as_secs_f64(),
         gib(fr.arena_bytes),

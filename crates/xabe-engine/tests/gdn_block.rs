@@ -80,7 +80,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_engine::block::gdn::{GdnBlock, GdnGeometry, GdnLayerWeights, Mixer, Projection};
+use xabe_engine::block::gdn::{GdnBlock, GdnGeometry, GdnLayerWeights, Mixer};
 use xabe_gguf::{GgmlType, GgufFile};
 use xabe_kernels::compare::{ComparisonResult, Tolerance, ToleranceCheck, check, compare};
 use xabe_model::config::ModelConfig;
@@ -614,7 +614,7 @@ fn the_projection_gap_is_llama_cpps_activation_quantization() {
     block
         .project(
             &fx.stream,
-            Projection::Q8_0(&weights.qkv),
+            weights.qkv_projection().expect("uploaded"),
             &d_norm,
             &mut d_qkv,
             geo.hidden,
@@ -671,7 +671,7 @@ fn the_projection_gap_is_llama_cpps_activation_quantization() {
     block
         .project(
             &fx.stream,
-            Projection::Q8_0(&weights.out),
+            weights.out_projection().expect("uploaded"),
             &d_final,
             &mut d_proj,
             geo.value_dim(),
@@ -812,7 +812,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                Projection::Q8_0(&weights.qkv),
+                weights.qkv_projection().expect("uploaded"),
                 &d_gold_norm,
                 &mut d_qkv,
                 geo.hidden,
@@ -833,7 +833,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                Projection::Q8_0(&weights.gate),
+                weights.gate_projection().expect("uploaded"),
                 &d_gold_norm,
                 &mut d_z,
                 geo.hidden,
@@ -1039,7 +1039,7 @@ fn each_step_matches_llama_cpp_when_fed_its_own_input() {
         block
             .project(
                 &stream,
-                Projection::Q8_0(&weights.out),
+                weights.out_projection().expect("uploaded"),
                 &d_gold_final,
                 &mut d_out,
                 geo.value_dim(),

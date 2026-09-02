@@ -240,10 +240,19 @@ impl DeviceWeights {
 
     /// As [`Self::required_bytes`], over the roles `keep` accepts.
     pub fn required_bytes_where(directory: &Directory<'_>, keep: impl Fn(Role) -> bool) -> u64 {
+        Self::required_bytes_where_entry(directory, |role, _| keep(role))
+    }
+
+    /// As [`Self::required_bytes_where`], with the stored format beside the
+    /// role, for a filter that keeps a tensor in one format and not another.
+    pub fn required_bytes_where_entry(
+        directory: &Directory<'_>,
+        keep: impl Fn(Role, GgmlType) -> bool,
+    ) -> u64 {
         directory
             .entries()
             .iter()
-            .filter(|e| keep(e.spec.role))
+            .filter(|e| keep(e.spec.role, e.info.ggml_type))
             .map(|e| (e.info.n_bytes as usize).next_multiple_of(ALIGNMENT) as u64)
             .sum()
     }
@@ -283,7 +292,24 @@ impl DeviceWeights {
         directory: &Directory<'_>,
         keep: impl Fn(Role) -> bool,
     ) -> Result<(Self, LoadReport), LoadError> {
-        let capacity = Self::required_bytes_where(directory, &keep);
+        Self::load_where_entry(ctx, stream, file, directory, |role, _| keep(role))
+    }
+
+    /// As [`Self::load_where`], with the stored format beside the role.
+    ///
+    /// This is the filter the engine loads with: a Q8_0 Gated DeltaNet
+    /// projection is held only in its split int8 repack and never enters the
+    /// arena, while the same tensor in any other format has no repack and
+    /// must (`crate::forward::arena_holds_entry`). A role-only filter cannot
+    /// say that.
+    pub fn load_where_entry(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        file: &GgufFile,
+        directory: &Directory<'_>,
+        keep: impl Fn(Role, GgmlType) -> bool,
+    ) -> Result<(Self, LoadReport), LoadError> {
+        let capacity = Self::required_bytes_where_entry(directory, &keep);
         let (free_before, _) = memory_info(ctx)?;
 
         // Leave the driver room for its own allocations; a request that
@@ -303,7 +329,7 @@ impl DeviceWeights {
             directory
                 .entries()
                 .iter()
-                .filter(|e| keep(e.spec.role))
+                .filter(|e| keep(e.spec.role, e.info.ggml_type))
                 .count(),
             directory.len(),
             capacity as f64 / (1u64 << 30) as f64,
@@ -316,7 +342,11 @@ impl DeviceWeights {
         let mut index = HashMap::with_capacity(directory.len());
         let mut bytes = 0u64;
 
-        for entry in directory.entries().iter().filter(|e| keep(e.spec.role)) {
+        for entry in directory
+            .entries()
+            .iter()
+            .filter(|e| keep(e.spec.role, e.info.ggml_type))
+        {
             let name = entry.spec.name.as_str();
             let data = file
                 .tensor_bytes(name)

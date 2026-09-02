@@ -28,11 +28,15 @@
 //!
 //! Three things keep fixed-token shapes from duplicating model weights:
 //!
-//! - **Gated DeltaNet, the embedding, the final norm and the LM head take
-//!   [`crate::weights::ResidentTensor`] aliases.** Zero copy: the alias is the
-//!   arena's own pointer arithmetic, wrapped back into a `CudaSlice` and
-//!   sealed against `Drop`. 30 layers of GDN projections — 1.07 GiB — plus
-//!   1.06 GiB of embedding and LM head are read in place.
+//! - **The embedding, the final norm, the LM head and the Gated DeltaNet
+//!   layers' small tensors take [`crate::weights::ResidentTensor`]
+//!   aliases.** Zero copy: the alias is the arena's own pointer arithmetic,
+//!   wrapped back into a `CudaSlice` and sealed against `Drop`. The three
+//!   large GDN projections per layer are aliased the same way when the arena
+//!   holds them; under the engine's own filter ([`arena_holds_entry`]) a
+//!   Q8_0 one is not in the arena at all and lives only as its split int8
+//!   repack, built from a transient upload. Both shipped files store all
+//!   three Q8_0, so there the arena carries none of them.
 //! - **The MoE owns its expert tensors, and the arena does not.**
 //!   [`crate::block::moe::MoeLayerWeights`] uploads them into allocations of
 //!   its own, so the nine roles it reads are filtered out of the arena
@@ -41,10 +45,12 @@
 //!   allocations rather than in the slab. All 40 layers stay resident and
 //!   nothing is re-uploaded per pass.
 //! - **Gated Attention weights and their split-layout int8 repacks are shared
-//!   across shapes.** The first shape still holds one copied set outside the
-//!   arena, measured by [`ForwardReport::attention_duplicate_bytes`]. A
-//!   reshape reuses that set and reports zero additional duplicate bytes;
-//!   kernels and scratch remain shape-local.
+//!   across shapes.** The first shape uploads the ten layers' projections
+//!   from the file into a set of its own — which is why the arena does not
+//!   hold them — and a reshape reuses that set; kernels and scratch remain
+//!   shape-local. What the block copies *out of the arena* is the three norm
+//!   vectors per layer, measured by
+//!   [`ForwardReport::attention_duplicate_bytes`].
 //!
 //! # Prefill and decode are the same code
 //!
@@ -369,6 +375,10 @@ pub enum ForwardError {
     /// have to be replaced by *some* matrix, and every choice produces finite,
     /// plausible, wrong logits.
     MissingWeight { role: Role, layer: Option<u32> },
+    /// A Gated DeltaNet projection is resident only as its int8 repack, and
+    /// the caller asked for a pass that reads the stored format instead
+    /// ([`Forward::disable_tensor_cores`]). `slot` indexes the GDN layers.
+    ProjectionNotResident { role: Role, slot: usize },
     /// A resident tensor is stored in a format this pass does not unpack.
     WrongQuant {
         role: Role,
@@ -463,6 +473,11 @@ impl std::fmt::Display for ForwardError {
                 Some(l) => write!(f, "block {l} has no resident `{role}`"),
                 None => write!(f, "`{role}` is not resident"),
             },
+            Self::ProjectionNotResident { role, slot } => write!(
+                f,
+                "Gated DeltaNet layer {slot}'s `{role}` is resident only as its int8 repack; \
+                 the stored-format pass needs a load filtered by `arena_holds`",
+            ),
             Self::WrongQuant {
                 role,
                 layer,
@@ -584,7 +599,11 @@ pub struct ForwardReport {
     /// arena's copy of the same tensors. A reshape reports zero because it
     /// shares its donor's weights.
     ///
-    /// This one is genuine duplication. See the module docs.
+    /// This one is genuine duplication, and under [`arena_holds_entry`] it
+    /// is the three norm vectors per layer: the projections are uploaded from
+    /// the file and the arena never holds them. A role-only load
+    /// ([`arena_holds`]) puts the projections back in the arena and they
+    /// count here again. See the module docs.
     pub attention_duplicate_bytes: u64,
     /// Free VRAM before anything was allocated.
     pub free_before: u64,
@@ -656,8 +675,45 @@ pub fn arena_holds_for(ffn: FfnConfig, role: Role) -> bool {
 }
 
 /// [`arena_holds_for`] at the routed architecture.
+///
+/// Role-only, so it keeps every mixer projection in the arena in every
+/// format. That is the *fallback-complete* load the differential tests want
+/// (`tests/int8_forward.rs` builds an fp32 twin over the stored bytes); the
+/// engine loads with [`arena_holds_entry`] instead and holds ~1.3 GiB less
+/// on `qwen35moe`, ~8.9 GiB less on `qwen35`.
 pub fn arena_holds(role: Role) -> bool {
     !MOE_OWNED_ROLES.contains(&role)
+}
+
+/// Whether the weight arena should hold `role` stored as `ty`: the filter
+/// the engine loads with, for [`DeviceWeights::load_where_entry`].
+///
+/// [`arena_holds_for`], less the tensors a block holds in a form of its own
+/// and would otherwise hold twice:
+///
+/// - The four Gated Attention projections, in every format.
+///   `GatedAttentionBlock::new` uploads its own copy from the file (the
+///   decode GEMV reads the stored layout, the tensor-core path a repack of
+///   it), so the arena's copy was never read.
+/// - The three Gated DeltaNet projections **when stored Q8_0.** Every width
+///   reads the split int8 repack ([`GdnLayerInt8`]), which `Forward::new`
+///   builds from a transient upload. Any other format has no repack: its
+///   stored bytes are read in place by the generic kernels, so it stays.
+///
+/// The norm vectors those blocks also copy stay in the arena: 20 KiB a
+/// layer, and `InputNorm` is one role across both layer kinds.
+pub fn arena_holds_entry(ffn: FfnConfig, role: Role, ty: GgmlType) -> bool {
+    arena_holds_for(ffn, role) && !block_holds_own_copy(role, ty)
+}
+
+/// The mixer tensors that live outside the arena in a block's own form.
+/// See [`arena_holds_entry`].
+fn block_holds_own_copy(role: Role, ty: GgmlType) -> bool {
+    match role {
+        Role::AttnQGate | Role::AttnK | Role::AttnV | Role::AttnOut => true,
+        Role::GdnQkv | Role::GdnGate | Role::GdnOut => ty == GgmlType::Q8_0,
+        _ => false,
+    }
 }
 
 /// One timed span inside [`Forward::run`].
@@ -845,7 +901,10 @@ pub struct Forward {
     /// Q8_0 tile, which reopens the 7.15e-7 GDN layer-0 residual the split
     /// layout closed — invisibly at context 2048, where the prefill is
     /// already >=64.
-    gdn_int8: Arc<Vec<GdnLayerInt8>>,
+    ///
+    /// `None` for a layer whose projections are not all Q8_0: those have no
+    /// repack and take the generic kernels over their stored bytes.
+    gdn_int8: Arc<Vec<Option<GdnLayerInt8>>>,
     /// Shared with every other shape built over the same model.
     ///
     /// At 725 MiB per layer these are 28.3 GiB — the single largest thing on
@@ -1039,7 +1098,7 @@ impl Forward {
         config: ModelConfig,
         tokens: usize,
         shared_moe: Option<Arc<Vec<FfnLayerWeights>>>,
-        gdn_int8: Option<Arc<Vec<GdnLayerInt8>>>,
+        gdn_int8: Option<Arc<Vec<Option<GdnLayerInt8>>>>,
         shared_attention: Option<Arc<Vec<Arc<AttentionLayerWeights>>>>,
     ) -> Result<Self, ForwardError> {
         let hidden = config.hidden_size as usize;
@@ -1155,11 +1214,15 @@ impl Forward {
         let gdn_geometry = GdnGeometry::from_config(&config, tokens, rms_eps);
         let gdn = GdnBlock::new(ctx, gdn_geometry)?;
         let mut gdn_weights = Vec::new();
+        let mut gdn_layers = Vec::new();
         for layer in 0..config.num_layers {
             if config.layer_kind(layer) != LayerKind::GatedDeltaNet {
                 continue;
             }
-            gdn_weights.push(ManuallyDrop::new(alias_gdn_layer(weights, stream, layer)?));
+            gdn_weights.push(ManuallyDrop::new(alias_gdn_layer(
+                weights, directory, stream, layer,
+            )?));
+            gdn_layers.push(layer);
         }
 
         // The repack serves three paths: the tensor cores above the
@@ -1182,19 +1245,19 @@ impl Forward {
         // they spawned took the standard-layout tile (the 7.15e-7 GDN
         // layer-0 residual). Every width now has a consumer, so every
         // width builds it.
+        //
+        // A Q8_0 projection is repacked from a transient upload of the file's
+        // bytes rather than from the arena, which no longer carries it
+        // (`arena_holds_entry`): the repack is the only resident form, and
+        // the upload is dropped as soon as the kernel has read it. Where the
+        // arena *does* carry it — a load filtered by `arena_holds` — the
+        // repack reads the alias and nothing is uploaded.
         let gdn_int8 = match gdn_int8 {
-            Some(shared) if shared.is_empty() => {
-                let mut built = Vec::new();
-                for w in &gdn_weights {
-                    built.push(gdn.repack(stream, w)?);
-                }
-                Arc::new(built)
-            }
-            Some(shared) => shared,
-            None => {
-                let mut built = Vec::new();
-                for w in &gdn_weights {
-                    built.push(gdn.repack(stream, w)?);
+            Some(shared) if !shared.is_empty() => shared,
+            _ => {
+                let mut built = Vec::with_capacity(gdn_weights.len());
+                for (w, &layer) in gdn_weights.iter().zip(&gdn_layers) {
+                    built.push(repack_gdn_layer(&gdn, stream, file, directory, w, layer)?);
                 }
                 Arc::new(built)
             }
@@ -1228,6 +1291,8 @@ impl Forward {
                     Arc::clone(&attn_kernels),
                     stream,
                     weights,
+                    file,
+                    directory,
                     &config,
                     layer,
                     tokens,
@@ -1667,12 +1732,33 @@ impl Forward {
     /// Clears **both** mixers. Clearing only the Gated DeltaNet side would
     /// leave the ten Gated Attention layers on tensor cores in the supposed
     /// fp32 twin, and the differential test would silently stop covering them.
-    pub fn disable_tensor_cores(&mut self) {
+    ///
+    /// Errs when a Gated DeltaNet projection has no stored-format copy to
+    /// fall back to — the engine's own load (`arena_holds_entry`) keeps a
+    /// Q8_0 one only as its repack. The twin needs a load filtered by
+    /// [`arena_holds`], which is what the test uses.
+    pub fn disable_tensor_cores(&mut self) -> Result<(), ForwardError> {
+        if let Some((slot, w)) = self
+            .gdn_weights
+            .iter()
+            .enumerate()
+            .find(|(_, w)| !w.stored_projections_resident())
+        {
+            let role = if w.qkv.is_none() {
+                Role::GdnQkv
+            } else if w.gate.is_none() {
+                Role::GdnGate
+            } else {
+                Role::GdnOut
+            };
+            return Err(ForwardError::ProjectionNotResident { role, slot });
+        }
         self.gdn_int8 = Arc::new(Vec::new());
         for block in &mut self.attention {
             block.disable_tensor_cores();
         }
         self.moe.disable_tensor_cores();
+        Ok(())
     }
 
     /// Force decode off `attn_flash_decode_mma_wpo{4,2}` and back onto
@@ -1698,7 +1784,7 @@ impl Forward {
     /// mixers. A pass with one side repacked and not the other is a bug, so
     /// this reports the conjunction rather than either half.
     pub fn tensor_cores_enabled(&self) -> bool {
-        !self.gdn_int8.is_empty()
+        self.gdn_int8.iter().any(Option::is_some)
             && self.attention.iter().all(|b| b.tensor_cores_enabled())
             && self.moe.tensor_cores_enabled()
     }
@@ -1935,7 +2021,7 @@ impl Forward {
                     self.gdn.forward_batch_prefill(
                         stream,
                         &self.gdn_weights[gdn_slot],
-                        self.gdn_int8.get(gdn_slot),
+                        self.gdn_int8.get(gdn_slot).and_then(Option::as_ref),
                         &mut gdn_states,
                         chunk_tokens,
                         &self.hidden_state,
@@ -2348,7 +2434,7 @@ impl Forward {
                         .forward_batch_decode(
                             stream,
                             &self.gdn_weights[gdn_slot],
-                            self.gdn_int8.get(gdn_slot),
+                            self.gdn_int8.get(gdn_slot).and_then(Option::as_ref),
                             &mut gdn_states,
                             &self.hidden_state,
                             &mut self.mixer_out,
@@ -2713,7 +2799,7 @@ impl Forward {
                         stream,
                         &mut self.gdn,
                         &self.gdn_weights[gdn_slot],
-                        self.gdn_int8.get(gdn_slot),
+                        self.gdn_int8.get(gdn_slot).and_then(Option::as_ref),
                         state.gdn_mut(gdn_slot),
                         &self.hidden_state,
                         &mut self.mixer_out,
@@ -3009,7 +3095,7 @@ impl Forward {
                         stream,
                         &mut self.gdn,
                         &self.gdn_weights[gdn_slot],
-                        self.gdn_int8.get(gdn_slot),
+                        self.gdn_int8.get(gdn_slot).and_then(Option::as_ref),
                         &mut gdn_states,
                         &self.hidden_state,
                         &mut self.mixer_out,
@@ -3453,7 +3539,7 @@ impl Forward {
                     self.gdn.forward(
                         stream,
                         &self.gdn_weights[gdn_slot],
-                        self.gdn_int8.get(gdn_slot),
+                        self.gdn_int8.get(gdn_slot).and_then(Option::as_ref),
                         state.gdn_mut(gdn_slot),
                         &self.hidden_state,
                         &mut self.mixer_out,
@@ -3572,33 +3658,97 @@ impl Forward {
 /// anything [`ProjQuant`] names in a community quant; the tag travels with
 /// the bytes to `Projection`, which routes Q8_0 to the tiled kernels and the
 /// int8 repack and everything else to the plain generic ones.
+///
+/// The format comes from the *directory*, not the arena, because the arena
+/// may not hold the tensor: a Q8_0 projection filtered out by
+/// [`arena_holds_entry`] comes back as `None` with its tag, and the repack
+/// (`repack_gdn_layer`) is its only resident form. A tensor absent from the
+/// arena in any other format is an error, since nothing else can read it.
 fn alias_gdn_proj(
     weights: &DeviceWeights,
+    directory: &Directory<'_>,
     stream: &Arc<CudaStream>,
     role: Role,
     layer: u32,
-) -> Result<(CudaSlice<u8>, ProjQuant), ForwardError> {
+) -> Result<(Option<CudaSlice<u8>>, ProjQuant), ForwardError> {
     let layer = Some(layer);
-    let placement = weights
+    let entry = directory
         .find(role, layer)
         .ok_or(ForwardError::MissingWeight { role, layer })?;
-    let fmt = ProjQuant::from_ggml(placement.ggml_type).ok_or(ForwardError::WrongQuant {
+    let ty = entry.info.ggml_type;
+    let fmt = ProjQuant::from_ggml(ty).ok_or(ForwardError::WrongQuant {
         role,
         layer,
-        found: placement.ggml_type,
+        found: ty,
         expected: GgmlType::Q8_0,
     })?;
-    let alias = weights
-        .bytes_of(stream, role, layer)
-        .ok_or(ForwardError::MissingWeight { role, layer })?;
+    let Some(alias) = weights.bytes_of(stream, role, layer) else {
+        return if fmt == ProjQuant::Q8_0 {
+            Ok((None, fmt))
+        } else {
+            Err(ForwardError::MissingWeight { role, layer })
+        };
+    };
     // SAFETY: identical to `alias_projection` — the result is sealed in a
     // `GdnLayerWeights` the caller stores in `Forward` and never takes out of,
     // and `Forward` outlives nothing that the `DeviceWeights` it was built
     // from does not.
     Ok((
-        ManuallyDrop::into_inner(ManuallyDrop::new(unsafe { alias.into_aliasing_slice() })),
+        Some(ManuallyDrop::into_inner(ManuallyDrop::new(unsafe {
+            alias.into_aliasing_slice()
+        }))),
         fmt,
     ))
+}
+
+/// Build one Gated DeltaNet layer's split int8 repack, or `None` when its
+/// projections are not all Q8_0 (they then have no repack and take the
+/// generic kernels over their stored bytes — the old unconditional repack
+/// would have run the Q8_0 repacker over Q6_K superblocks).
+///
+/// Each projection is repacked from the arena alias when `w` holds one, and
+/// otherwise from a transient upload of the file's bytes that is dropped
+/// once the repack kernel has consumed it — the transient is on `stream`,
+/// so its free is ordered after the kernel. That transient is the peak of
+/// the build: one tensor at a time, 83 MiB at the dense model's widest.
+fn repack_gdn_layer(
+    gdn: &GdnBlock,
+    stream: &Arc<CudaStream>,
+    file: &GgufFile,
+    directory: &Directory<'_>,
+    w: &GdnLayerWeights,
+    layer: u32,
+) -> Result<Option<GdnLayerInt8>, ForwardError> {
+    if [w.qkv_fmt, w.gate_fmt, w.out_fmt]
+        .iter()
+        .any(|&fmt| fmt != ProjQuant::Q8_0)
+    {
+        return Ok(None);
+    }
+    let one = |role: Role,
+               resident: &Option<CudaSlice<u8>>,
+               fmt: ProjQuant|
+     -> Result<(CudaSlice<i8>, CudaSlice<u16>), ForwardError> {
+        match resident {
+            Some(bytes) => Ok(gdn.repack_projection(stream, role, bytes, fmt)?),
+            None => {
+                let layer = Some(layer);
+                let entry = directory
+                    .find(role, layer)
+                    .ok_or(ForwardError::MissingWeight { role, layer })?;
+                let bytes = file
+                    .tensor_bytes(&entry.spec.name)
+                    .ok_or(ForwardError::MissingWeight { role, layer })?;
+                let transient = stream.clone_htod(bytes)?;
+                Ok(gdn.repack_projection(stream, role, &transient, fmt)?)
+            }
+        }
+    };
+    Ok(Some(GdnLayerInt8::from_parts(
+        one(Role::GdnQkv, &w.qkv, w.qkv_fmt)?,
+        one(Role::GdnGate, &w.gate, w.gate_fmt)?,
+        one(Role::GdnOut, &w.out, w.out_fmt)?,
+    )))
 }
 
 /// Alias one resident Q8_0 tensor, rejecting any other stored format.
@@ -3721,15 +3871,17 @@ fn alias_f32(
 ///
 /// The mirror image of [`GdnLayerWeights::upload`], which reads the same ten
 /// roles out of the mapped file and copies each one onto the device. Nothing
-/// is copied here: the fields are the arena's own bytes.
+/// is copied here: the fields are the arena's own bytes, and a Q8_0
+/// projection the arena does not carry is `None` (see `alias_gdn_proj`).
 fn alias_gdn_layer(
     weights: &DeviceWeights,
+    directory: &Directory<'_>,
     stream: &Arc<CudaStream>,
     layer: u32,
 ) -> Result<GdnLayerWeights, ForwardError> {
-    let (qkv, qkv_fmt) = alias_gdn_proj(weights, stream, Role::GdnQkv, layer)?;
-    let (gate, gate_fmt) = alias_gdn_proj(weights, stream, Role::GdnGate, layer)?;
-    let (out, out_fmt) = alias_gdn_proj(weights, stream, Role::GdnOut, layer)?;
+    let (qkv, qkv_fmt) = alias_gdn_proj(weights, directory, stream, Role::GdnQkv, layer)?;
+    let (gate, gate_fmt) = alias_gdn_proj(weights, directory, stream, Role::GdnGate, layer)?;
+    let (out, out_fmt) = alias_gdn_proj(weights, directory, stream, Role::GdnOut, layer)?;
     Ok(GdnLayerWeights {
         input_norm: alias_f32(weights, stream, Role::InputNorm, layer)?,
         qkv,
@@ -3794,8 +3946,11 @@ fn alias_gate_proj(
 /// Bytes the Gated Attention blocks hold on top of the arena's own copy.
 ///
 /// Summed from the placements rather than from the geometry, so it reports
-/// what is really there. `GatedAttentionBlock::new` copies exactly these seven
-/// roles per layer.
+/// what is really there: `GatedAttentionBlock::new` copies these seven roles
+/// per layer, and the four projections among them count only when the arena
+/// holds them too — under the engine's own filter ([`arena_holds_entry`]) it
+/// does not, and the block's upload from the file is their only copy, which
+/// leaves the three norm vectors, 60 KiB a layer.
 fn attention_bytes(weights: &DeviceWeights, config: &ModelConfig) -> u64 {
     const COPIED: [Role; 7] = [
         Role::InputNorm,
@@ -4138,6 +4293,52 @@ mod tests {
         // the mixer, so it belongs on the MoE's side of the split.
         assert!(!arena_holds(Role::PostMixerNorm));
         assert_eq!(c.num_layers, 40);
+    }
+
+    /// The engine's filter drops what a block holds in a form of its own,
+    /// and nothing else: the attention projections in every format, the GDN
+    /// projections only when Q8_0 (any other format has no repack and the
+    /// stored bytes are the only copy).
+    #[test]
+    fn the_entry_filter_drops_only_what_a_block_holds_itself() {
+        let c = config();
+        let ffn = c.ffn;
+        for role in [Role::AttnQGate, Role::AttnK, Role::AttnV, Role::AttnOut] {
+            for ty in [GgmlType::Q8_0, GgmlType::Bf16, GgmlType::Q6K, GgmlType::F16] {
+                assert!(!arena_holds_entry(ffn, role, ty), "{role} {ty:?}");
+            }
+        }
+        for role in [Role::GdnQkv, Role::GdnGate, Role::GdnOut] {
+            assert!(!arena_holds_entry(ffn, role, GgmlType::Q8_0), "{role} Q8_0");
+            for ty in [GgmlType::Q6K, GgmlType::Q4K, GgmlType::Bf16] {
+                assert!(arena_holds_entry(ffn, role, ty), "{role} {ty:?}");
+            }
+        }
+        // The norms the blocks copy stay: 60 KiB a layer, and `InputNorm`
+        // is one role across both layer kinds.
+        for role in [
+            Role::InputNorm,
+            Role::AttnQNorm,
+            Role::AttnKNorm,
+            Role::GdnConv1d,
+            Role::GdnNorm,
+            Role::GdnAlpha,
+            Role::TokenEmbedding,
+            Role::LmHead,
+        ] {
+            assert!(arena_holds_entry(ffn, role, GgmlType::F32), "{role}");
+        }
+        // And the FFN split is untouched by the format.
+        for role in MOE_OWNED_ROLES {
+            assert!(!arena_holds_entry(ffn, role, GgmlType::Q6K), "{role}");
+        }
+        let dense = ModelConfig::qwen3_8_27b();
+        for role in DENSE_FFN_OWNED_ROLES {
+            assert!(
+                !arena_holds_entry(dense.ffn, role, GgmlType::Q8_0),
+                "{role}"
+            );
+        }
     }
 
     #[test]

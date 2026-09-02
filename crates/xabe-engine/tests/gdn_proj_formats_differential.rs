@@ -197,7 +197,9 @@ fn check(fmt: ProjQuant, label: &str) {
     let rows = geometry.conv_dim();
 
     // The file's own `attn_qkv`, dequantized: real weights, real magnitudes.
-    let q8_bytes = stream.clone_dtoh(&weights.qkv).expect("qkv back");
+    let q8_bytes = stream
+        .clone_dtoh(weights.qkv.as_ref().expect("uploaded"))
+        .expect("qkv back");
     stream.synchronize().expect("sync");
     let dense = dequantize_row_q8_0(&q8_bytes).expect("a whole number of Q8_0 blocks");
     assert_eq!(dense.len(), rows * k, "attn_qkv is [hidden, conv_dim]");

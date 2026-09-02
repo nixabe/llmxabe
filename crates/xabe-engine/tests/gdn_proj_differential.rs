@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
-use xabe_engine::block::gdn::{GdnBlock, GdnGeometry, GdnLayerWeights, Projection};
+use xabe_engine::block::gdn::{GdnBlock, GdnGeometry, GdnLayerWeights};
 use xabe_gguf::GgufFile;
 use xabe_kernels::rng::Xorshift64Star;
 use xabe_model::config::ModelConfig;
@@ -125,7 +125,7 @@ fn untiled_and_tiled_standard_layout_already_agree() {
     block
         .project(
             &stream,
-            Projection::Q8_0(&weights.qkv),
+            weights.qkv_projection().expect("uploaded"),
             &x_alone,
             &mut out_alone,
             hidden,
@@ -148,7 +148,7 @@ fn untiled_and_tiled_standard_layout_already_agree() {
     block
         .project(
             &stream,
-            Projection::Q8_0(&weights.qkv),
+            weights.qkv_projection().expect("uploaded"),
             &x_paired,
             &mut out_paired,
             hidden,
@@ -205,7 +205,7 @@ fn split_layout_gemv_disagrees_with_the_standard_layout() {
     block
         .project(
             &stream,
-            Projection::Q8_0(&weights.qkv),
+            weights.qkv_projection().expect("uploaded"),
             &x,
             &mut out_standard,
             hidden,

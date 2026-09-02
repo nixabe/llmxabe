@@ -26,7 +26,7 @@ use crate::block::attention::KvCache;
 use crate::block::gdn_verify::GdnSnapshotRing;
 use crate::block::mtp::{MtpBlock, MtpBlockError};
 use crate::dflash::{DFlashDraftCache, DFlashError, DFlashForward, load_dflash_weights};
-use crate::forward::{BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_for};
+use crate::forward::{BatchStepGraph, Forward, ForwardError, WaypointStage, arena_holds_entry};
 use crate::image::{
     ImagePlacement, SequenceImage, chunk_overlaps_images, fill_mrope_triples, rope_delta_at,
     validate_placements,
@@ -678,9 +678,10 @@ impl DeviceRuntime {
             .resolve(&file)
             .map_err(|errors| RuntimeError::Schema(format!("{errors:?}")))?;
         let ffn = config.ffn;
-        let (weights, _) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, |role| {
-            arena_holds_for(ffn, role)
-        })?;
+        let (weights, _) =
+            DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
+                arena_holds_entry(ffn, role, ty)
+            })?;
         debug!(
             device = device_ordinal,
             elapsed_ms = load_started.elapsed().as_secs_f64() * 1e3,
@@ -828,7 +829,8 @@ impl DeviceRuntime {
              -> Result<(), RuntimeError> {
                 if shapes.iter().all(|(t, _)| *t != tokens) {
                     let block = shapes[0].1.reshape(
-                        &ctx, &stream, &weights, &config, tokens, rms_eps, rope_theta, lm_head,
+                        &ctx, &stream, &file, &directory, &weights, &config, tokens, rms_eps,
+                        rope_theta, lm_head,
                     )?;
                     shapes.push((tokens, block));
                 }

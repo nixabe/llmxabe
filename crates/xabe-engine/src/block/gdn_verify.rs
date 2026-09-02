@@ -432,7 +432,7 @@ pub fn run_layer_with_snapshots_batch(
     } else {
         gdn.project(
             stream,
-            weights.qkv_projection(),
+            weights.qkv_projection()?,
             &scratch.normed,
             &mut scratch.qkv,
             g.hidden,
@@ -441,7 +441,7 @@ pub fn run_layer_with_snapshots_batch(
         )?;
         gdn.project(
             stream,
-            weights.gate_projection(),
+            weights.gate_projection()?,
             &scratch.normed,
             &mut scratch.z,
             g.hidden,
@@ -589,7 +589,7 @@ pub fn run_layer_with_snapshots_batch(
     } else {
         gdn.project(
             stream,
-            weights.out_projection(),
+            weights.out_projection()?,
             &scratch.final_output,
             &mut scratch.projected,
             value_dim,

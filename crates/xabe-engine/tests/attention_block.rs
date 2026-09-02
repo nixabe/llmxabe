@@ -1003,6 +1003,8 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
             Arc::clone(&kernels),
             &stream,
             &weights,
+            &file,
+            &directory,
             &config,
             layer,
             tokens,

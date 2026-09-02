@@ -861,6 +861,50 @@ Two operands, two reuses, and they are complementary: a **token tile**
 amortizes the weight, a **row band** amortizes the activation. The optimum is
 interior and is not where "bigger tile is better" would put it.
 
+## Residency: every projection on the card once, in the form its reader wants
+
+The same question, asked of the card instead of a grid: *how many copies of
+this tensor are resident, and how many are read?* The answer was two and
+one, for every mixer projection. The arena held the file's layout of the
+three Gated DeltaNet projections and the four attention projections, and
+nothing read those copies: the GDN block reads its split int8 repack at
+every width (the repack was built *from* the arena's copy and then the copy
+sat there), and the attention block copied its four out of the arena into
+allocations of its own for the decode GEMV and repacked from *those* for the
+tensor cores. Per tensor directory that was 8.3 GiB held twice on the
+dense file and about 1.3 GiB on `qwen35moe`.
+
+The fix is a filter, not a kernel. The engine loads with
+`arena_holds_entry`, which sees the stored format beside the role: the
+attention projections stay out of the arena in every format, the GDN
+projections stay out when Q8_0, and `Forward::new` repacks a Q8_0 GDN
+projection from a transient upload of the file's bytes that is freed once
+the repack kernel has read it — one tensor at a time, so the build's peak
+is one 83 MiB tensor above steady state. A GDN projection in any other
+format has no repack and stays in the arena, read in place by the generic
+kernels as before. The golden found the one width that still read the
+stored layout — the single-sequence pass at 2..63 tokens took the
+standard-layout Q8_0 tile where the batch paths took the split tile — and
+that path now takes the split tile too, which moved the 19-token golden's
+margins toward llama.cpp (final-logit cosine 0.999736 → 0.999759, max-abs
+0.464 → 0.415). Measured with `bench_forward` (512 tokens, three prompts,
+driver accounting), against the tree before it:
+
+| file | arena | peak VRAM |
+| :--- | ---: | ---: |
+| `Qwen3.8-27B-UD-Q8_K_XL` | 11.822 → 3.658 GiB | 39.387 → **31.262 GiB** |
+| `Qwen3.6-35B-A3B-UD-Q6_K_XL` | 2.291 → 1.025 GiB | 33.479 → **32.229 GiB** |
+
+Nothing any kernel reads changed — the repack and the block's copy are the
+same bytes they were — so throughput was not measured and none is claimed.
+What the 8.1 GiB buys on the dense card (a deeper KV pool, `draft-mtp`
+beside three 128K caches, a fourth slot) is not measured either; the
+Capability table above still says what was. The role-only filter
+`arena_holds` still exists for one reader: `tests/int8_forward.rs` builds
+an fp32 twin over the stored-format path, and that twin needs the arena to
+carry the bytes. Under the engine's filter `Forward::disable_tensor_cores`
+refuses rather than build a pass with nothing to read.
+
 ## The instruction-count bug that looks like a bandwidth bug
 
 Turing issues **4 load/store operations per SM per clock against 64 FMAs**. Any

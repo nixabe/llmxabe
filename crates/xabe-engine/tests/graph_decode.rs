@@ -52,7 +52,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use xabe_cuda::device::{DeviceInfo, driver_available};
 use xabe_engine::DeviceWeights;
-use xabe_engine::forward::{Forward, arena_holds};
+use xabe_engine::forward::{Forward, arena_holds_entry};
 use xabe_gguf::GgufFile;
 use xabe_model::config::ModelConfig;
 use xabe_model::weights::WeightSchema;
@@ -129,7 +129,10 @@ fn a_captured_step_generates_the_same_sequence_as_the_launch_path() {
 
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema resolves");
-    let (weights, _) = DeviceWeights::load_where(&ctx, &stream, &file, &directory, arena_holds)
+    let (weights, _) =
+        DeviceWeights::load_where_entry(&ctx, &stream, &file, &directory, |role, ty| {
+            arena_holds_entry(config.ffn, role, ty)
+        })
         .expect("weight load");
 
     let mut prefill = Forward::new(

@@ -274,7 +274,9 @@ impl SpeculativeSession {
             &positions,
         )?;
 
-        let draft = catchup.reshape(ctx, stream, weights, config, 1, rms_eps, rope_theta, true)?;
+        let draft = catchup.reshape(
+            ctx, stream, file, directory, weights, config, 1, rms_eps, rope_theta, true,
+        )?;
 
         // Timing-enabled events: `new_event(None)` would set
         // `CU_EVENT_DISABLE_TIMING` and `elapsed_ms` would then fail. Same

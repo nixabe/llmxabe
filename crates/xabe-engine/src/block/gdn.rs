@@ -1450,6 +1450,15 @@ pub enum GdnBlockError {
         found: GgmlType,
         expected: GgmlType,
     },
+    /// A projection has no resident copy in its stored format.
+    ///
+    /// A Q8_0 `attn_qkv`, `attn_gate` or `ssm_out` is held only as its split
+    /// int8 repack ([`GdnLayerInt8`]) once the arena stops carrying it; the
+    /// path that asked for the file's own layout has nothing to read. Every
+    /// shipped width reads the repack, so this names a construction with the
+    /// int8 handles missing — the fp32 twin `Forward::disable_tensor_cores`
+    /// builds — against a load that dropped the fallback bytes.
+    ProjectionNotResident { role: Role },
     /// A buffer length disagrees with the declared geometry.
     ShapeMismatch {
         what: &'static str,
@@ -1470,6 +1479,10 @@ impl std::fmt::Display for GdnBlockError {
             Self::MissingWeight { role, layer } => write!(
                 f,
                 "block {layer} has no `{role}`; is it a Gated DeltaNet layer?",
+            ),
+            Self::ProjectionNotResident { role } => write!(
+                f,
+                "`{role}` is resident only as its split int8 repack; the stored-format path has nothing to read",
             ),
             Self::UnsupportedQuant {
                 role,
@@ -1605,13 +1618,22 @@ impl GdnGeometry {
 /// view cannot satisfy. The three large matrices stay quantized exactly as the
 /// file stores them; only the norm vectors, the convolution filters and the two
 /// small gate projections are unpacked, and those are 660 KiB per layer.
+///
+/// The three projections are `Option` because a Q8_0 one need not be here
+/// at all: every width the engine builds reads its split int8 repack
+/// ([`GdnLayerInt8`]), so [`crate::forward::Forward`] loads with the arena
+/// not carrying the file's layout of it and repacks from a transient upload.
+/// `None` with a Q8_0 tag means exactly that. Any other format has no
+/// repack, so its stored bytes are the only copy and are always `Some`.
+/// [`Self::upload`] fills all three, for the tests that drive the block
+/// alone.
 pub struct GdnLayerWeights {
     /// `attn_norm.weight`, `[hidden]`.
     pub input_norm: CudaSlice<f32>,
-    /// `attn_qkv.weight`, Q8_0 `[hidden, conv_dim]`.
-    pub qkv: CudaSlice<u8>,
-    /// `attn_gate.weight`, Q8_0 `[hidden, value_dim]` — the output gate `z`.
-    pub gate: CudaSlice<u8>,
+    /// `attn_qkv.weight`, `[hidden, conv_dim]`, in [`Self::qkv_fmt`].
+    pub qkv: Option<CudaSlice<u8>>,
+    /// `attn_gate.weight`, `[hidden, value_dim]` — the output gate `z`.
+    pub gate: Option<CudaSlice<u8>>,
     /// `ssm_conv1d.weight`, `[conv_kernel, conv_dim]`, i.e. `conv_dim` rows of
     /// `conv_kernel` taps, which is what [`LayerOpsKernels::conv1d`] wants.
     pub conv1d: CudaSlice<f32>,
@@ -1625,8 +1647,8 @@ pub struct GdnLayerWeights {
     pub a: CudaSlice<f32>,
     /// `ssm_norm.weight`, `[head_dim]`.
     pub ssm_norm: CudaSlice<f32>,
-    /// `ssm_out.weight`, Q8_0 `[value_dim, hidden]`.
-    pub out: CudaSlice<u8>,
+    /// `ssm_out.weight`, `[value_dim, hidden]`.
+    pub out: Option<CudaSlice<u8>>,
     /// How `qkv`, `gate` and `out` are stored.
     ///
     /// Q8_0 in both shipped files, and a community quant may store any format
@@ -1643,29 +1665,43 @@ pub struct GdnLayerWeights {
 
 impl GdnLayerWeights {
     /// `attn_qkv` as a [`Projection`], in whichever form it is stored.
-    pub fn qkv_projection(&self) -> Projection<'_> {
-        Self::projection(&self.qkv, self.qkv_fmt)
+    ///
+    /// Errs with [`GdnBlockError::ProjectionNotResident`] when the tensor
+    /// lives only in its int8 repack; see the type docs.
+    pub fn qkv_projection(&self) -> Result<Projection<'_>, GdnBlockError> {
+        Self::projection(Role::GdnQkv, self.qkv.as_ref(), self.qkv_fmt)
     }
 
-    /// `attn_gate` as a [`Projection`].
-    pub fn gate_projection(&self) -> Projection<'_> {
-        Self::projection(&self.gate, self.gate_fmt)
+    /// `attn_gate` as a [`Projection`]. See [`Self::qkv_projection`].
+    pub fn gate_projection(&self) -> Result<Projection<'_>, GdnBlockError> {
+        Self::projection(Role::GdnGate, self.gate.as_ref(), self.gate_fmt)
     }
 
-    /// `ssm_out` as a [`Projection`].
-    pub fn out_projection(&self) -> Projection<'_> {
-        Self::projection(&self.out, self.out_fmt)
+    /// `ssm_out` as a [`Projection`]. See [`Self::qkv_projection`].
+    pub fn out_projection(&self) -> Result<Projection<'_>, GdnBlockError> {
+        Self::projection(Role::GdnOut, self.out.as_ref(), self.out_fmt)
+    }
+
+    /// Whether all three projections are resident in their stored format,
+    /// i.e. whether the paths that do not read the int8 repack can run.
+    pub fn stored_projections_resident(&self) -> bool {
+        self.qkv.is_some() && self.gate.is_some() && self.out.is_some()
     }
 
     /// Q8_0 keeps [`Projection::Q8_0`] and with it the tiled kernels and the
     /// int8 repack; everything else takes the plain generic path. Routing
     /// Q8_0 through `Projection::Quant` would be *correct* and would cost
     /// 59.1% of a 512-token prefill, which is what the token tile bought.
-    fn projection(bytes: &CudaSlice<u8>, fmt: ProjQuant) -> Projection<'_> {
-        match fmt {
+    fn projection(
+        role: Role,
+        bytes: Option<&CudaSlice<u8>>,
+        fmt: ProjQuant,
+    ) -> Result<Projection<'_>, GdnBlockError> {
+        let bytes = bytes.ok_or(GdnBlockError::ProjectionNotResident { role })?;
+        Ok(match fmt {
             ProjQuant::Q8_0 => Projection::Q8_0(bytes),
             other => Projection::Quant(bytes, other),
-        }
+        })
     }
 }
 
@@ -1747,9 +1783,10 @@ impl GateProjection {
 /// the instruction usable at all. See `docs/BENCHMARKS.md`.
 ///
 /// Costs about 37.7 MiB per layer, 1.13 GiB over the 30 Gated DeltaNet
-/// layers, held *in addition* to the arena's copy. That is the price of the
-/// alignment, and it is why this is built once at construction rather than
-/// per pass.
+/// layers. It used to be held *in addition* to the arena's copy of the same
+/// three tensors; since every width reads it, the engine now loads with those
+/// tensors kept out of the arena and this is their only resident form (see
+/// [`GdnLayerWeights`]). Built once at construction rather than per pass.
 pub struct GdnLayerInt8 {
     qkv_q: CudaSlice<i8>,
     qkv_s: CudaSlice<u16>,
@@ -1760,6 +1797,23 @@ pub struct GdnLayerInt8 {
 }
 
 impl GdnLayerInt8 {
+    /// Assemble a layer from three repacked projections, each a
+    /// [`GdnBlock::repack_projection`] result for the role named.
+    pub fn from_parts(
+        qkv: (CudaSlice<i8>, CudaSlice<u16>),
+        gate: (CudaSlice<i8>, CudaSlice<u16>),
+        out: (CudaSlice<i8>, CudaSlice<u16>),
+    ) -> Self {
+        Self {
+            qkv_q: qkv.0,
+            qkv_s: qkv.1,
+            gate_q: gate.0,
+            gate_s: gate.1,
+            out_q: out.0,
+            out_s: out.1,
+        }
+    }
+
     /// Device bytes held.
     pub fn bytes(&self) -> u64 {
         let q = self.qkv_q.len() + self.gate_q.len() + self.out_q.len();
@@ -1872,15 +1926,15 @@ impl GdnLayerWeights {
 
         Ok(Self {
             input_norm: floats(Role::InputNorm)?,
-            qkv,
-            gate,
+            qkv: Some(qkv),
+            gate: Some(gate),
             conv1d: floats(Role::GdnConv1d)?,
             alpha: gate_proj(Role::GdnAlpha)?,
             beta: gate_proj(Role::GdnBeta)?,
             dt_bias: floats(Role::GdnDtBias)?,
             a: floats(Role::GdnA)?,
             ssm_norm: floats(Role::GdnNorm)?,
-            out,
+            out: Some(out),
             qkv_fmt,
             gate_fmt,
             out_fmt,
@@ -1996,6 +2050,19 @@ impl ProjQuant {
             GgmlType::Bf16 => Self::Bf16,
             _ => return None,
         })
+    }
+
+    /// The GGUF type this tag names: the inverse of [`Self::from_ggml`].
+    pub fn ggml_type(self) -> GgmlType {
+        match self {
+            Self::Q8_0 => GgmlType::Q8_0,
+            Self::Q4_0 => GgmlType::Q4_0,
+            Self::Q6K => GgmlType::Q6K,
+            Self::Q4K => GgmlType::Q4K,
+            Self::Q5K => GgmlType::Q5K,
+            Self::F16 => GgmlType::F16,
+            Self::Bf16 => GgmlType::Bf16,
+        }
     }
 
     /// Index into the per-format kernel array, in declaration order.
@@ -2257,35 +2324,98 @@ impl GdnBlock {
         })
     }
 
-    /// Repack one layer's Q8_0 projections for the integer tensor cores.
+    /// Repack one layer's Q8_0 projections for the integer tensor cores, from
+    /// the copies `w` holds.
     ///
-    /// Called once per layer at construction. See [`GdnLayerInt8`] for what it
-    /// costs and why it is worth it.
+    /// See [`GdnLayerInt8`] for what it costs and why it is worth it. The
+    /// engine repacks from transient uploads instead
+    /// ([`Self::repack_projection`]) so the file's layout never has to be
+    /// resident; this form serves the tests that upload a layer whole.
+    /// Errs with [`GdnBlockError::UnsupportedQuant`] on a projection that is
+    /// not Q8_0 — the repacker reads 34-byte blocks and would turn any other
+    /// format into finite, wrong int8 — and
+    /// [`GdnBlockError::ProjectionNotResident`] on one `w` does not hold.
     pub fn repack(
         &self,
         stream: &Arc<CudaStream>,
         w: &GdnLayerWeights,
     ) -> Result<GdnLayerInt8, GdnBlockError> {
+        fn resident(
+            role: Role,
+            bytes: &Option<CudaSlice<u8>>,
+        ) -> Result<&CudaSlice<u8>, GdnBlockError> {
+            bytes
+                .as_ref()
+                .ok_or(GdnBlockError::ProjectionNotResident { role })
+        }
+        Ok(GdnLayerInt8::from_parts(
+            self.repack_projection(
+                stream,
+                Role::GdnQkv,
+                resident(Role::GdnQkv, &w.qkv)?,
+                w.qkv_fmt,
+            )?,
+            self.repack_projection(
+                stream,
+                Role::GdnGate,
+                resident(Role::GdnGate, &w.gate)?,
+                w.gate_fmt,
+            )?,
+            self.repack_projection(
+                stream,
+                Role::GdnOut,
+                resident(Role::GdnOut, &w.out)?,
+                w.out_fmt,
+            )?,
+        ))
+    }
+
+    /// Repack one Q8_0 projection — `role` names which of the three, and
+    /// with it the element count — into the split int8 layout.
+    ///
+    /// `src` is the tensor exactly as the file stores it and may be a
+    /// transient upload: nothing here keeps a reference to it. Any `fmt` but
+    /// Q8_0 is refused rather than misread.
+    pub fn repack_projection(
+        &self,
+        stream: &Arc<CudaStream>,
+        role: Role,
+        src: &CudaSlice<u8>,
+        fmt: ProjQuant,
+    ) -> Result<(CudaSlice<i8>, CudaSlice<u16>), GdnBlockError> {
+        if fmt != ProjQuant::Q8_0 {
+            return Err(GdnBlockError::UnsupportedQuant {
+                role,
+                found: fmt.ggml_type(),
+                expected: GgmlType::Q8_0,
+            });
+        }
         let g = self.geometry;
-        let one = |src: &CudaSlice<u8>, elements: usize| -> Result<_, GdnBlockError> {
-            let mut q = stream.alloc_zeros::<i8>(elements)?;
-            let mut sc = stream.alloc_zeros::<u16>(elements / 32)?;
-            self.mma
-                .repack_q8_0_half(stream, src, &mut q, &mut sc, elements)
-                .map_err(GdnBlockError::Mma)?;
-            Ok((q, sc))
+        let elements = match role {
+            Role::GdnQkv => g.hidden * g.conv_dim(),
+            Role::GdnGate => g.hidden * g.value_dim(),
+            Role::GdnOut => g.value_dim() * g.hidden,
+            other => {
+                return Err(GdnBlockError::MissingWeight {
+                    role: other,
+                    layer: 0,
+                });
+            }
         };
-        let (qkv_q, qkv_s) = one(&w.qkv, g.hidden * g.conv_dim())?;
-        let (gate_q, gate_s) = one(&w.gate, g.hidden * g.value_dim())?;
-        let (out_q, out_s) = one(&w.out, g.value_dim() * g.hidden)?;
-        Ok(GdnLayerInt8 {
-            qkv_q,
-            qkv_s,
-            gate_q,
-            gate_s,
-            out_q,
-            out_s,
-        })
+        let expected_bytes = elements / 32 * 34;
+        if src.len() != expected_bytes {
+            return Err(GdnBlockError::ShapeMismatch {
+                what: "Q8_0 projection bytes",
+                expected: expected_bytes,
+                got: src.len(),
+            });
+        }
+        let mut q = stream.alloc_zeros::<i8>(elements)?;
+        let mut sc = stream.alloc_zeros::<u16>(elements / 32)?;
+        self.mma
+            .repack_q8_0_half(stream, src, &mut q, &mut sc, elements)
+            .map_err(GdnBlockError::Mma)?;
+        Ok((q, sc))
     }
 
     /// Whether a batch of `tokens` should take the integer tensor-core path.
@@ -2633,7 +2763,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                w.qkv_projection(),
+                w.qkv_projection()?,
                 &s.normed,
                 &mut s.qkv,
                 g.hidden,
@@ -2642,7 +2772,7 @@ impl GdnBlock {
             )?;
             self.project(
                 stream,
-                w.gate_projection(),
+                w.gate_projection()?,
                 &s.normed,
                 &mut s.z,
                 g.hidden,
@@ -2815,7 +2945,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                w.out_projection(),
+                w.out_projection()?,
                 &s.final_output,
                 &mut s.projected,
                 g.value_dim(),
@@ -2932,7 +3062,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                w.qkv_projection(),
+                w.qkv_projection()?,
                 &s.normed,
                 &mut s.qkv,
                 g.hidden,
@@ -2941,7 +3071,7 @@ impl GdnBlock {
             )?;
             self.project(
                 stream,
-                w.gate_projection(),
+                w.gate_projection()?,
                 &s.normed,
                 &mut s.z,
                 g.hidden,
@@ -3164,7 +3294,7 @@ impl GdnBlock {
         } else {
             self.project(
                 stream,
-                w.out_projection(),
+                w.out_projection()?,
                 &s.final_output,
                 &mut s.projected,
                 g.value_dim(),
@@ -3195,6 +3325,12 @@ impl GdnBlock {
         // layout's contiguous quants are worth having even when the
         // arithmetic stays fp32. See `gdn_proj_split_gemv`.
         let gemv = tc.filter(|_| tokens == 1);
+        // 2..63 tokens take the split tile, as the batch paths do at the
+        // same widths: it is the GEMV's own grouping and reduction order,
+        // and it is the only resident form of a Q8_0 projection under the
+        // engine's load (`GdnLayerWeights`). The standard-layout tile
+        // below it now serves the other formats.
+        let split_tiled = tc.filter(|_| tokens > 1 && !Self::uses_tensor_cores(tokens));
         let tc = tc.filter(|_| Self::uses_tensor_cores(tokens));
 
         // 1. attn_norm-N
@@ -3247,10 +3383,19 @@ impl GdnBlock {
                 g.hidden,
                 1,
             )?;
+        } else if let Some(i8w) = split_tiled {
+            self.project_split_pair(
+                stream,
+                (&i8w.qkv_q, &i8w.qkv_s, &mut s.qkv, g.conv_dim()),
+                (&i8w.gate_q, &i8w.gate_s, &mut s.z, g.value_dim()),
+                &s.normed,
+                g.hidden,
+                tokens,
+            )?;
         } else {
             self.project(
                 stream,
-                w.qkv_projection(),
+                w.qkv_projection()?,
                 &s.normed,
                 &mut s.qkv,
                 g.hidden,
@@ -3259,7 +3404,7 @@ impl GdnBlock {
             )?;
             self.project(
                 stream,
-                w.gate_projection(),
+                w.gate_projection()?,
                 &s.normed,
                 &mut s.z,
                 g.hidden,
@@ -3377,10 +3522,23 @@ impl GdnBlock {
                 g.value_dim(),
                 g.hidden,
             )?;
+        } else if let Some(i8w) = split_tiled {
+            self.project_split_add(
+                stream,
+                &i8w.out_q,
+                &i8w.out_s,
+                &s.final_output,
+                hidden,
+                &mut s.projected,
+                out,
+                g.value_dim(),
+                g.hidden,
+                tokens,
+            )?;
         } else {
             self.project(
                 stream,
-                w.out_projection(),
+                w.out_projection()?,
                 &s.final_output,
                 &mut s.projected,
                 g.value_dim(),

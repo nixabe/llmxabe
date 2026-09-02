@@ -89,11 +89,14 @@
 //! `tokens = 19` and a decode block at `tokens = 1` write to and read from the
 //! same cache — which is what makes the second of those a continuation of the
 //! first rather than a separate sequence. The weights are not duplicated
-//! either: [`GatedAttentionBlock::new`] copies a layer out of
-//! [`DeviceWeights`] into a shared `Arc`, and [`crate::forward::Forward`]
-//! hands that same `Arc` — with its lazy split-layout repack — to every shape
-//! it builds, so a second full-model shape adds only shape-local kernels and
-//! scratch.
+//! either: [`GatedAttentionBlock::new`] uploads a layer's four projections
+//! from the file and its norms out of [`DeviceWeights`] into a shared `Arc`,
+//! and [`crate::forward::Forward`] hands that same `Arc` — with its lazy
+//! split-layout repack — to every shape it builds, so a second full-model
+//! shape adds only shape-local kernels and scratch. The projections come
+//! from the file rather than the arena so the arena need not hold them at
+//! all (`crate::forward::arena_holds_entry`); the block's copy is the only
+//! one.
 
 use std::sync::{Arc, Mutex};
 
@@ -108,9 +111,9 @@ use xabe_cuda::kernels::lm_head::{
     HeadFormat, HeadTensor, LmHeadError, LmHeadGeometry, LmHeadKernels,
 };
 use xabe_cuda::kernels::mma::{MMA_SPLIT_TOKENS, MmaError, MmaKernels};
-use xabe_gguf::GgmlType;
+use xabe_gguf::{GgmlType, GgufFile};
 use xabe_model::config::ModelConfig;
-use xabe_model::weights::Role;
+use xabe_model::weights::{Directory, Role};
 
 use crate::weights::DeviceWeights;
 
@@ -1004,21 +1007,30 @@ impl GatedAttentionBlock {
         kernels: Arc<AttentionKernelSet>,
         stream: &Arc<CudaStream>,
         weights: &DeviceWeights,
+        file: &GgufFile,
+        directory: &Directory<'_>,
         config: &ModelConfig,
         layer: u32,
         tokens: usize,
         rms_eps: f32,
         rope_theta: f32,
     ) -> Result<Self, AttentionBlockError> {
-        let shared = Arc::new(Self::load_weights(stream, weights, config, layer)?);
+        let shared = Arc::new(Self::load_weights(
+            stream, weights, file, directory, config, layer,
+        )?);
         Self::from_shared(
             kernels, stream, shared, config, layer, tokens, rms_eps, rope_theta,
         )
     }
 
+    /// The three norms come out of the arena, the four projections out of
+    /// the file: `directory` must have been resolved against `file`, and
+    /// the arena need not hold the projections at all.
     fn load_weights(
         stream: &Arc<CudaStream>,
         weights: &DeviceWeights,
+        file: &GgufFile,
+        directory: &Directory<'_>,
         config: &ModelConfig,
         layer: u32,
     ) -> Result<AttentionLayerWeights, AttentionBlockError> {
@@ -1034,19 +1046,13 @@ impl GatedAttentionBlock {
         let w_input_norm = f32_weight(weights, stream, Role::InputNorm, layer, &[h])?;
         let w_q_norm = f32_weight(weights, stream, Role::AttnQNorm, layer, &[head_dim as u64])?;
         let w_k_norm = f32_weight(weights, stream, Role::AttnKNorm, layer, &[head_dim as u64])?;
-        let (w_qgate, f_qgate) = projection_weight(
-            weights,
-            stream,
-            Role::AttnQGate,
-            layer,
-            &[h, 2 * q_dim as u64],
-        )?;
-        let (w_k, f_k) =
-            projection_weight(weights, stream, Role::AttnK, layer, &[h, kv_dim as u64])?;
-        let (w_v, f_v) =
-            projection_weight(weights, stream, Role::AttnV, layer, &[h, kv_dim as u64])?;
-        let (w_out, f_out) =
-            projection_weight(weights, stream, Role::AttnOut, layer, &[q_dim as u64, h])?;
+        let projection = |role: Role, dims: &[u64]| {
+            projection_weight(file, directory, stream, role, layer, dims)
+        };
+        let (w_qgate, f_qgate) = projection(Role::AttnQGate, &[h, 2 * q_dim as u64])?;
+        let (w_k, f_k) = projection(Role::AttnK, &[h, kv_dim as u64])?;
+        let (w_v, f_v) = projection(Role::AttnV, &[h, kv_dim as u64])?;
+        let (w_out, f_out) = projection(Role::AttnOut, &[q_dim as u64, h])?;
 
         Ok(AttentionLayerWeights {
             w_input_norm,
@@ -2235,17 +2241,21 @@ impl GatedAttentionBlock {
 /// placement rather than assuming it is what lets one block serve both — and
 /// what makes a third format fail by name instead of being unpacked as
 /// something it is not.
+///
+/// Uploaded straight from the mapped file: this is the tensor's only copy
+/// on the device, so the arena is not consulted and need not hold it.
 fn projection_weight(
-    weights: &DeviceWeights,
+    file: &GgufFile,
+    directory: &Directory<'_>,
     stream: &Arc<CudaStream>,
     role: Role,
     layer: u32,
     dims: &[u64],
 ) -> Result<(CudaSlice<u8>, HeadFormat), AttentionBlockError> {
-    let placement = weights
+    let entry = directory
         .find(role, Some(layer))
         .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
-    let format = match placement.ggml_type {
+    let format = match entry.info.ggml_type {
         GgmlType::Q8_0 => HeadFormat::Q8_0,
         GgmlType::Bf16 => HeadFormat::Bf16,
         GgmlType::Q6K => HeadFormat::Q6K,
@@ -2254,16 +2264,18 @@ fn projection_weight(
             return Err(AttentionBlockError::WrongQuant { role, layer, found });
         }
     };
-    if placement.dims != dims {
+    if entry.info.dims != dims {
         return Err(AttentionBlockError::WrongShape {
             role,
             layer,
             expected: dims.to_vec(),
-            found: placement.dims.clone(),
+            found: entry.info.dims.clone(),
         });
     }
-    let bytes = weights.arena().read(stream, &placement.alloc)?;
-    Ok((stream.clone_htod(bytes.as_slice())?, format))
+    let bytes = file
+        .tensor_bytes(&entry.spec.name)
+        .ok_or(AttentionBlockError::MissingWeight { role, layer })?;
+    Ok((stream.clone_htod(bytes)?, format))
 }
 
 /// Copy a resident f32 norm vector into a typed buffer.

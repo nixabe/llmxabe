@@ -167,7 +167,8 @@ fn integer_tensor_cores_agree_with_the_fp32_path_on_the_real_model() {
     let mut fp32 = int8
         .reshape(&ctx, &stream, &file, &directory, &weights, TOKENS)
         .expect("the fp32 twin builds");
-    fp32.disable_tensor_cores();
+    fp32.disable_tensor_cores()
+        .expect("a load filtered by `arena_holds` keeps the stored projections");
     assert!(!fp32.tensor_cores_enabled());
 
     let ids: Vec<i32> = (0..TOKENS)
