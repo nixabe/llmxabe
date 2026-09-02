@@ -1128,9 +1128,10 @@ of a third, which agreed in sign and is dropped — with peak VRAM 38.4 →
 30.3 GiB from the residency change below. Where the first two
 folds each bought 1–3%, these three together bought about one, which is
 the shape of the remaining tail: what is left under ten microseconds is
-mostly norms and gates that sit between two dependent projections, and
-folding those means moving a reduction into a producer's tail rather than
-putting two bodies under one grid.
+mostly norms and gates that sit between two dependent projections. Moving
+one of those into a producer's tail was measured and lost (WHY NOT, "The
+next layer's RMSNorm in the MoE combine kernel's tail"); what is left of
+the tail needs the consumer to normalize as it reads.
 
 ## Parallelism: fill the wave, and split the only axis decode has
 
@@ -1505,6 +1506,7 @@ proposed twice.
 | --- | --- |
 | GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call against RT=4's 33.9. RT=1 octuples the warps and the in-flight bytes and is the *worst* of the three, so memory-level parallelism was never the binding constraint — instruction count per byte is, and it falls with RT. |
 | The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical by construction and **flat at N=1** (23.0 us either way), **+25% at N=3** (28.2 → 35.2 us). Same finding as the row above on a second shape: the grid was 0.44 waves deep and doubling its warps bought nothing, because the kernel's cost at three tokens is the activation instruction count per weight byte, which RT halving doubles. Wave fill is not what binds a decode-width GEMV on this card; do not re-derive it from the grid arithmetic. |
+| The next layer's RMSNorm in the MoE combine kernel's tail (fixed-order last-block reduction, the mixer skips its norm launch; 41 launches a step) | **Flat to −0.6%**: N=1 116.3 → 115.8, 115.2 → 114.7, 115.2 → 115.3; N=3 218.4 → 217.5, 218.0 → 216.7, 217.8 → 217.1, three pairs, middle reversed. The norm agreed with the separate launch to 2 ulps and every decode gate passed; it lost on time. The combine kernel runs eight blocks per token row, so the fold adds a block reduce, a fence and an atomic to every one of them and then serializes a whole-row pass on the block that arrives last, and that repays the ~2.8 us floor it removes. A tail fold pays only where the producer's blocks already stream the row — the shape a peer engine measured it winning in — not where the row is split across blocks that must first agree. The launch tail that remains here is norms and gates between dependent kernels, and this is the evidence that removing them needs the *consumer* to normalize on the fly, not the producer to reduce across blocks. |
 | GDN split projection, char4 partition + row tile + prefetch | 40.0/36.7 us against the shipped `uint4` form's 33.9/29.3, despite fully-coalesced activation loads and ~2.7x fewer L1 wavefronts per byte on paper. The wavefront model predicted the wrong winner; the wide weight load won anyway. |
 | `q8_0` KV cache (llama.cpp side) | −2.5% at depth 0, **−15.5%** at 32K, **−35.8%** at 128K. Turing's in-kernel dequant costs more than the halved traffic saves, and the KV path already ran at ~80% of peak. Keep `-ctk f16 -ctv f16`. |
 | Requantize experts Q6_K → Q8_0 | 4–8% for **+30% VRAM**. The dequantization format is not what limits that kernel. |
