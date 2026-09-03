@@ -71,16 +71,23 @@ impl MessagesRequest {
     }
 
     /// Whether the caller's `tool_choice` lets the tools be offered at all.
+    ///
+    /// Anthropic spells the choice as an object, but a harness pointing an
+    /// OpenAI-shaped client at this endpoint sends the bare string — the same
+    /// reason `min_p` is accepted here. Reading only an object's `type` meant
+    /// a string fell through to the absent arm and was silently taken as
+    /// `auto`: `"none"` offered the tools it asked this server not to offer,
+    /// and `"required"` was accepted as a guarantee nothing here keeps.
     fn tools_offered(&self) -> Result<bool, ApiError> {
-        match self
-            .tool_choice
-            .as_ref()
-            .and_then(|choice| choice.get("type"))
-            .and_then(serde_json::Value::as_str)
-        {
-            None | Some("auto") => Ok(true),
-            Some("none") => Ok(false),
-            Some(choice) => Err(unsupported_tool_choice(DIALECT, choice)),
+        let choice = match self.tool_choice.as_ref() {
+            None => return Ok(true),
+            Some(Value::String(choice)) => choice.as_str(),
+            Some(choice) => choice.get("type").and_then(Value::as_str).unwrap_or(""),
+        };
+        match choice {
+            "" | "auto" => Ok(true),
+            "none" => Ok(false),
+            choice => Err(unsupported_tool_choice(DIALECT, choice)),
         }
     }
 
@@ -702,5 +709,23 @@ mod tests {
         assert!(auto.tools_offered().expect("auto offers"));
         assert!(!none.tools_offered().expect("none withholds"));
         assert!(any.tools_offered().is_err());
+    }
+
+    #[test]
+    fn a_bare_string_tool_choice_is_read_rather_than_ignored() {
+        // The regression. Only an object's `type` was read, so the string
+        // form an OpenAI-shaped client sends fell through to the absent arm
+        // and became `auto`: `"none"` offered the tools it asked this server
+        // to withhold, and `"required"` was answered 200 as a guarantee
+        // nothing here keeps.
+        let auto = request(r#"{"max_tokens":1,"messages":[],"tool_choice":"auto"}"#);
+        let none = request(r#"{"max_tokens":1,"messages":[],"tool_choice":"none"}"#);
+        let required = request(r#"{"max_tokens":1,"messages":[],"tool_choice":"required"}"#);
+        assert!(auto.tools_offered().expect("auto offers"));
+        assert!(!none.tools_offered().expect("none withholds"));
+        assert!(
+            required.tools_offered().is_err(),
+            "forcing is still refused"
+        );
     }
 }
