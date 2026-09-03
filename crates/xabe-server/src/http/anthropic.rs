@@ -249,6 +249,37 @@ fn tool_use_id(request_id: u64, index: usize) -> String {
     format!("toolu_{request_id}_{index}")
 }
 
+/// The events that close whatever content block is open, if any.
+///
+/// Anthropic signs a thinking block on the way out, as a `signature_delta`
+/// just before the block closes. Clients accumulate it and replay the block
+/// with it attached, so a block that closes without one arrives back
+/// unsigned — and a harness that drops unsigned thinking drops the model's
+/// chain exactly where an agentic loop needs it, across a tool call.
+///
+/// One function rather than a copy at each of the three places a block
+/// closes: the copy on the tool-call path consumed `open` before testing it,
+/// so that path — a thinking block closed by a tool call, which is every
+/// reasoning turn that calls a tool — was the one case that never signed.
+fn close_block(open: Option<&str>, index: usize, request_id: u64) -> Vec<Value> {
+    let Some(kind) = open else {
+        return Vec::new();
+    };
+    let mut events = Vec::with_capacity(2);
+    if kind == "thinking" {
+        events.push(json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {
+                "type": "signature_delta",
+                "signature": thinking_signature(request_id),
+            },
+        }));
+    }
+    events.push(json!({ "type": "content_block_stop", "index": index }));
+    events
+}
+
 fn stop_sequence(finish: &Finish) -> serde_json::Value {
     match finish {
         Finish::StopSequence(sequence) => json!(sequence),
@@ -360,24 +391,13 @@ pub(crate) async fn messages(
                 // A call parses only once its block is complete, so it
                 // streams as one self-contained tool_use block: start, one
                 // input_json_delta with the whole input, stop.
-                if open.take().is_some() {
-                    // Anthropic signs a thinking block on the way out, as a
-                    // `signature_delta` just before the block closes. Clients
-                    // accumulate it and replay the block with it attached, so a
-                    // block that closes without one arrives back unsigned.
-                    if open == Some("thinking") {
-                        yield Ok(sse_named("content_block_delta", &json!({
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {
-                                "type": "signature_delta",
-                                "signature": thinking_signature(request_id),
-                            },
-                        })));
+                if open.is_some() {
+                    for event in close_block(open.take(), index, request_id) {
+                        yield Ok(sse_named(
+                            event["type"].as_str().expect("close_block sets `type`"),
+                            &event,
+                        ));
                     }
-                    yield Ok(sse_named("content_block_stop", &json!({
-                        "type": "content_block_stop", "index": index,
-                    })));
                     index += 1;
                 }
                 yield Ok(sse_named("content_block_start", &json!({
@@ -409,23 +429,12 @@ pub(crate) async fn messages(
             };
             if open != Some(kind) {
                 if open.is_some() {
-                    // Anthropic signs a thinking block on the way out, as a
-                    // `signature_delta` just before the block closes. Clients
-                    // accumulate it and replay the block with it attached, so a
-                    // block that closes without one arrives back unsigned.
-                    if open == Some("thinking") {
-                        yield Ok(sse_named("content_block_delta", &json!({
-                            "type": "content_block_delta",
-                            "index": index,
-                            "delta": {
-                                "type": "signature_delta",
-                                "signature": thinking_signature(request_id),
-                            },
-                        })));
+                    for event in close_block(open.take(), index, request_id) {
+                        yield Ok(sse_named(
+                            event["type"].as_str().expect("close_block sets `type`"),
+                            &event,
+                        ));
                     }
-                    yield Ok(sse_named("content_block_stop", &json!({
-                        "type": "content_block_stop", "index": index,
-                    })));
                     index += 1;
                 }
                 let block = if kind == "thinking" {
@@ -455,24 +464,11 @@ pub(crate) async fn messages(
             })));
             open = Some("text");
         }
-        if open.is_some() {
-            // Anthropic signs a thinking block on the way out, as a
-            // `signature_delta` just before the block closes. Clients
-            // accumulate it and replay the block with it attached, so a
-            // block that closes without one arrives back unsigned.
-            if open == Some("thinking") {
-                yield Ok(sse_named("content_block_delta", &json!({
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "signature_delta",
-                        "signature": thinking_signature(request_id),
-                    },
-                })));
-            }
-            yield Ok(sse_named("content_block_stop", &json!({
-                "type": "content_block_stop", "index": index,
-            })));
+        for event in close_block(open.take(), index, request_id) {
+            yield Ok(sse_named(
+                event["type"].as_str().expect("close_block sets `type`"),
+                &event,
+            ));
         }
 
         let finish = generation.finish();
@@ -727,5 +723,49 @@ mod tests {
             required.tools_offered().is_err(),
             "forcing is still refused"
         );
+    }
+
+    #[test]
+    fn a_thinking_block_closed_by_a_tool_call_is_still_signed() {
+        // The regression, and the reason this is one function rather than a
+        // copy at each of the three places a block closes: the copy on the
+        // tool-call path had already consumed `open` when it tested it, so
+        // the signature was skipped on exactly the path that carries it —
+        // every reasoning turn that ends in a tool call. A client that keeps
+        // only signed thinking then replays the turn without it, and the
+        // model loses its chain across the tool boundary.
+        let events = close_block(Some("thinking"), 0, 7);
+        assert_eq!(events.len(), 2, "sign, then stop: {events:?}");
+        assert_eq!(events[0]["delta"]["type"], "signature_delta");
+        assert_eq!(events[0]["delta"]["signature"], thinking_signature(7));
+        assert_eq!(events[0]["index"], 0);
+        assert_eq!(events[1]["type"], "content_block_stop");
+        assert_eq!(events[1]["index"], 0);
+    }
+
+    #[test]
+    fn only_a_thinking_block_is_signed_and_a_closed_one_emits_nothing() {
+        let text = close_block(Some("text"), 3, 7);
+        assert_eq!(text.len(), 1, "a text block only stops: {text:?}");
+        assert_eq!(text[0]["type"], "content_block_stop");
+        assert_eq!(text[0]["index"], 3);
+        assert!(
+            close_block(None, 0, 7).is_empty(),
+            "nothing open, nothing to close"
+        );
+    }
+
+    #[test]
+    fn every_close_block_event_names_itself_in_type() {
+        // The stream names each SSE event after this field, so a payload
+        // without one would be yielded under a panicking `expect`.
+        for open in [Some("thinking"), Some("text")] {
+            for event in close_block(open, 0, 1) {
+                assert!(
+                    event.get("type").and_then(Value::as_str).is_some(),
+                    "no `type` in {event:?}"
+                );
+            }
+        }
     }
 }
