@@ -257,7 +257,10 @@ tool callable, which is the better failure.
 
 Results go back in the dialect's own shape — the `tool` role with
 `tool_call_id`, a `tool_result` content block, a `function_call_output`
-item — and render into the model's template as `<tool_response>` blocks.
+item — and render into the model's template as `<tool_response>` blocks. A
+result is content, not just text: it may carry images as well (see
+[Image input](#image-input)), which is how a tool that took a screenshot
+hands one back.
 `POST /v1/messages/count_tokens` accepts tools and prices the same prompt the
 request itself would render.
 
@@ -278,7 +281,8 @@ guarantee about the output, and nothing here constrains decoding to keep it.
 ## Image input
 
 With the server started with `--mmproj` (see [CLI.md](CLI.md#model-and-network)),
-user messages may carry images in each dialect's own spelling:
+user messages and tool results may carry images in each dialect's own
+spelling:
 
 - **OpenAI chat**: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}`
 - **Anthropic**: `{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "..."}}`
@@ -288,8 +292,14 @@ user messages may carry images in each dialect's own spelling:
 Images are inline only — `data:` URIs or base64. Remote `http(s)` URLs are
 refused: this server does not fetch content on a caller's behalf. PNG, JPEG,
 and WebP decode; the container format is sniffed from the bytes, not from the
-declared media type. Images are only meaningful in user messages; in a
-system, assistant, or tool message they are refused rather than dropped.
+declared media type.
+
+Images are only meaningful where the model's template has vision markup,
+which is a user turn — so a user message, or a tool result, which renders
+inside one. That covers a `tool_result` block's `content`, a `tool` role
+message's own content, and a `function_call_output` whose `output` is a list
+of content parts rather than a string. In a system or assistant message an
+image is refused rather than dropped.
 
 Each image renders into the prompt as the model's own
 `<|vision_start|><|image_pad|><|vision_end|>` markup at the position of its
@@ -315,7 +325,7 @@ question than the one asked:
 
 Video parts are refused as unknown part types, and images are refused
 whenever the rules in [Image input](#image-input) are not met — no
-`--mmproj`, a remote URL, or an image outside a user message.
+`--mmproj`, a remote URL, or an image in a system or assistant message.
 
 ## Conversation rendering
 
