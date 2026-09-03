@@ -164,38 +164,68 @@ pub(crate) struct FoldedContent {
     pub(crate) text: String,
     pub(crate) thinking: String,
     pub(crate) tool_calls: Vec<ParsedToolCall>,
-    pub(crate) tool_results: Vec<String>,
+    pub(crate) tool_results: Vec<ToolResult>,
     pub(crate) images: Vec<DecodedImage>,
 }
 
-/// A `tool_result` block's content: a bare string, or text blocks joined.
-fn tool_result_text(content: Option<&Value>) -> Result<String, String> {
-    match content {
-        None => Ok(String::new()),
-        Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Array(blocks)) => {
-            let mut out = String::new();
-            for block in blocks {
-                match block.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
-                    }
-                    kind => {
-                        return Err(format!(
-                            "tool_result content of type `{}` is not supported: tool results \
-                             fold to text",
-                            kind.unwrap_or("(untyped)"),
-                        ));
-                    }
-                }
-            }
-            Ok(out)
+/// One tool result, folded to what its `<tool_response>` block renders.
+///
+/// `text` carries an [`IMAGE_MARKER`] wherever an image block sat and
+/// `images` holds those images in the same order, on the same terms as
+/// [`FoldedContent`] — the result's own images travel with the result
+/// rather than with the message's, because the result renders as its own
+/// turn, ahead of any text beside it in the same message.
+#[derive(Debug, Default)]
+pub(crate) struct ToolResult {
+    pub(crate) text: String,
+    pub(crate) images: Vec<DecodedImage>,
+}
+
+impl ToolResult {
+    /// A result that is only text — what every dialect's plain string, and a
+    /// `tool` role message's own content, folds to.
+    pub(crate) fn text(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
         }
-        Some(_) => Err("tool_result `content` must be a string or a list of blocks".to_owned()),
     }
+}
+
+/// Whether a JSON array is a list of typed content blocks rather than data a
+/// tool happened to return as an array.
+///
+/// A Responses `function_call_output` is free-form JSON and has always been
+/// handed to the model as its JSON spelling; only an array that is content
+/// gets folded as content, so `[1, 2, 3]` still reaches the model as
+/// `[1,2,3]`.
+pub(crate) fn is_content_blocks(values: &[Value]) -> bool {
+    !values.is_empty()
+        && values
+            .iter()
+            .all(|value| value.get("type").and_then(Value::as_str).is_some())
+}
+
+/// A `tool_result` block's content: a bare string, or content blocks.
+///
+/// The blocks are the same content parts every other message carries, so
+/// they fold through the same path: text joins, an image contributes its
+/// marker and its pixels, a part this server cannot read is refused by name,
+/// and a part some provider invented is skipped rather than failing the
+/// turn. That is a change of behaviour for the last two — this used to
+/// refuse every block that was not `text` — and it is the point: a tool that
+/// returns a screenshot is a normal agent shape, and the model's own
+/// template renders vision markup inside a `tool` turn.
+fn fold_tool_result(content: Option<&Value>) -> Result<ToolResult, String> {
+    let blocks = match content {
+        None => return Ok(ToolResult::default()),
+        Some(Value::String(text)) => return Ok(ToolResult::text(text.clone())),
+        Some(Value::Array(blocks)) => blocks,
+        Some(_) => {
+            return Err("tool_result `content` must be a string or a list of blocks".to_owned());
+        }
+    };
+    Content::fold_blocks(blocks)
 }
 
 /// Content this server must refuse rather than skip.
@@ -255,7 +285,7 @@ impl Content {
             Part::Known(KnownPart::ToolResult { content }) => {
                 folded
                     .tool_results
-                    .push(tool_result_text(content.as_ref())?);
+                    .push(fold_tool_result(content.as_ref())?);
                 return Ok(());
             }
             Part::Known(KnownPart::ImageUrl { image_url }) => {
@@ -327,6 +357,27 @@ impl Content {
             }
         }
         Ok(folded)
+    }
+
+    /// Fold a list of raw content blocks into one tool result.
+    ///
+    /// The blocks go through the same [`fold_part`](Self::fold_part) every
+    /// other message's content does, so a result's text, images and refusals
+    /// all behave the way they do anywhere else.
+    pub(crate) fn fold_blocks(blocks: &[Value]) -> Result<ToolResult, String> {
+        let parts: Vec<Part> = serde_json::from_value(Value::Array(blocks.to_vec()))
+            .map_err(|failure| format!("tool result content blocks do not parse: {failure}"))?;
+        let mut folded = FoldedContent::default();
+        for part in &parts {
+            Self::fold_part(part, &mut folded)?;
+        }
+        if !folded.tool_calls.is_empty() || !folded.tool_results.is_empty() {
+            return Err("a tool result cannot contain tool blocks of its own".to_owned());
+        }
+        Ok(ToolResult {
+            text: folded.text,
+            images: folded.images,
+        })
     }
 
     /// Split content into its answer text and its reasoning text, for the
@@ -537,11 +588,17 @@ impl Conversation {
 
     /// Append a tool result, merging into a preceding results turn the way
     /// the template merges consecutive `tool` messages into one user turn.
-    pub(crate) fn push_tool_result(&mut self, result: String) {
+    ///
+    /// The result's images join the conversation's here, which is what keeps
+    /// them in render order: a results turn is always pushed before any text
+    /// turn from the same message, so its markers come first in the prompt
+    /// and its images must come first in the list that zips against them.
+    pub(crate) fn push_tool_result(&mut self, result: ToolResult) {
+        self.images.extend(result.images);
         if let Some(Turn::ToolResults(results)) = self.turns.last_mut() {
-            results.push(result);
+            results.push(result.text);
         } else {
-            self.turns.push(Turn::ToolResults(vec![result]));
+            self.turns.push(Turn::ToolResults(vec![result.text]));
         }
     }
 }
@@ -551,11 +608,15 @@ pub(crate) fn unsupported_role(dialect: Dialect, role: &str) -> ApiError {
     ApiError::bad_request(dialect, format!("the `{role}` role is not supported"))
 }
 
-/// The refusal for an image anywhere but a user message. The model's
-/// template only places vision markup in user turns; rendering it elsewhere
-/// would feed the encoder's output where the model never saw one.
+/// The refusal for an image anywhere the template has no vision markup for.
+///
+/// The model's template only places vision markup in user turns; rendering
+/// it elsewhere would feed the encoder's output where the model never saw
+/// one. A tool result is not an exception to that rule but an instance of
+/// it: the template renders one inside a user turn, which is why an image
+/// may travel in a `tool_result` block or a `tool` role message.
 pub(crate) fn image_misplaced() -> &'static str {
-    "image content is only supported in user messages"
+    "image content is only supported in user messages and tool results"
 }
 
 /// Reject a `tool_choice` that would require constrained decoding.
@@ -892,10 +953,10 @@ mod tests {
             r#"[{"type":"tool_result","tool_use_id":"tu_1","content":[{"type":"text","text":"Sunny"}]}]"#,
         )
         .expect("tool_result blocks parse");
-        assert_eq!(
-            result.fold().expect("results fold").tool_results,
-            vec!["Sunny".to_owned()]
-        );
+        let results = result.fold().expect("results fold").tool_results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, "Sunny");
+        assert!(results[0].images.is_empty());
     }
 
     #[test]
@@ -919,6 +980,94 @@ mod tests {
     /// A 1x1 red PNG, small enough to inline in every image test.
     const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4\
                            2mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    /// A 2x1 PNG, so a test that cares which image landed where can tell it
+    /// from [`PNG_1X1`] by its width rather than by trusting the order it
+    /// asserts.
+    const PNG_2X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4\
+                           nGNgYPgPRAAFAgH/wSuWnwAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn a_tool_result_folds_its_image_to_a_marker_and_its_pixels() {
+        // A tool that returns a screenshot. The marker has to sit where the
+        // block sat, because that is what the pads zip against.
+        let result: Content = serde_json::from_str(&format!(
+            r#"[{{"type":"tool_result","tool_use_id":"tu_1","content":[
+                {{"type":"text","text":"here is the page"}},
+                {{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{PNG_1X1}"}}}}
+            ]}}]"#
+        ))
+        .expect("a tool_result with an image parses");
+        let results = result.fold().expect("the result folds").tool_results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].text, format!("here is the page\n{IMAGE_MARKER}"));
+        assert_eq!(results[0].images.len(), 1);
+        assert_eq!(results[0].images[0].width, 1);
+    }
+
+    #[test]
+    fn every_dialects_image_block_works_inside_a_tool_result() {
+        // Anthropic `image`, OpenAI `image_url` and Responses `input_image`
+        // all reach this path, because a tool result folds through the same
+        // part folding every other message's content does.
+        for block in [
+            format!(r#"{{"type":"image","source":{{"type":"base64","data":"{PNG_1X1}"}}}}"#),
+            format!(
+                r#"{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{PNG_1X1}"}}}}"#
+            ),
+            format!(r#"{{"type":"input_image","image_url":"data:image/png;base64,{PNG_1X1}"}}"#),
+        ] {
+            let blocks: Vec<Value> =
+                serde_json::from_str(&format!("[{block}]")).expect("block parses");
+            let folded = Content::fold_blocks(&blocks).expect("the block folds");
+            assert_eq!(folded.text, IMAGE_MARKER, "in {block}");
+            assert_eq!(folded.images.len(), 1, "in {block}");
+        }
+    }
+
+    #[test]
+    fn a_tool_result_carrying_something_unreadable_is_still_refused() {
+        // The exception the module already draws, now reachable through a
+        // tool result: a document is the caller's own material, and folding
+        // it away would answer about something never seen.
+        let blocks: Vec<Value> =
+            serde_json::from_str(r#"[{"type":"input_file","file_id":"f_1"}]"#).expect("parses");
+        assert!(Content::fold_blocks(&blocks).is_err());
+    }
+
+    #[test]
+    fn a_tool_results_image_joins_the_conversation_ahead_of_a_later_turns() {
+        // The ordering rule, and the one that is easy to get wrong: pads and
+        // images zip positionally, a results turn renders before any text
+        // turn pushed after it, so the result's images must be in the list
+        // first. The 2x1 image is the tool result's; the 1x1 is the user's.
+        let mut conversation = Conversation::default();
+        let blocks: Vec<Value> = serde_json::from_str(&format!(
+            r#"[{{"type":"image","source":{{"type":"base64","data":"{PNG_2X1}"}}}}]"#
+        ))
+        .expect("parses");
+        conversation.push_tool_result(Content::fold_blocks(&blocks).expect("folds"));
+        conversation
+            .images
+            .push(decode_base64_image(PNG_1X1).expect("the user's own image decodes"));
+        conversation
+            .turns
+            .push(Turn::User(format!("and this one {IMAGE_MARKER}")));
+
+        assert_eq!(conversation.images.len(), 2);
+        assert_eq!(conversation.images[0].width, 2, "the tool result's, first");
+        assert_eq!(conversation.images[1].width, 1, "the user's, second");
+
+        let rendered = conversation.render(true);
+        assert_eq!(
+            rendered.matches(IMAGE_MARKER).count(),
+            conversation.images.len(),
+            "one marker per image, or the pads misplace every span after: {rendered}"
+        );
+        let results_at = rendered.find("<tool_response>").expect("a results turn");
+        let user_at = rendered.find("and this one").expect("a user turn");
+        assert!(results_at < user_at, "results render first: {rendered}");
+    }
 
     #[test]
     fn each_dialects_image_part_folds_to_the_same_marker_and_pixels() {

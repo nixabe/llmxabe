@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use super::chat::{
-    Content, Conversation, Turn, image_misplaced, unsupported_role, unsupported_tool_choice,
+    Content, Conversation, ToolResult, Turn, image_misplaced, unsupported_role,
+    unsupported_tool_choice,
 };
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
@@ -413,8 +414,10 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
         for result in folded.tool_results {
             conversation.push_tool_result(result);
         }
-        // Images render as user-turn markup and nothing else.
-        if !folded.images.is_empty() && message.role != "user" {
+        // Images render as user-turn markup and nothing else — and a tool
+        // result is user-turn markup, which is why a `tool` message may
+        // carry one.
+        if !folded.images.is_empty() && !matches!(message.role.as_str(), "user" | "tool") {
             return Err(ApiError::bad_request(DIALECT, image_misplaced()));
         }
         let (text, thinking) = (folded.text, folded.thinking);
@@ -441,7 +444,10 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
                     tool_calls,
                 });
             }
-            "tool" => conversation.push_tool_result(text),
+            "tool" => conversation.push_tool_result(ToolResult {
+                text,
+                images: folded.images,
+            }),
             role => return Err(unsupported_role(DIALECT, role)),
         }
     }
@@ -770,6 +776,44 @@ mod tests {
         assert!(reject_shape_changing(None, Some(4)).is_err());
         assert!(reject_shape_changing(Some(1), Some(1)).is_ok());
         assert!(reject_shape_changing(None, None).is_ok());
+    }
+
+    #[test]
+    fn a_tool_message_may_carry_an_image_and_an_assistant_one_may_not() {
+        // OpenAI has no `tool_result` block, so a tool that returns an image
+        // sends it as the `tool` message's own content. That renders inside a
+        // user turn, which is the only place the template has vision markup —
+        // an assistant turn still has none.
+        /// A 1x1 PNG, small enough to inline.
+        const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        let image = format!(
+            r#"{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{PNG_1X1}"}}}}"#
+        );
+        let tool = ChatMessage {
+            role: "tool".to_owned(),
+            content: Some(
+                serde_json::from_str(&format!("[{image}]")).expect("an image part parses"),
+            ),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        let folded = conversation(vec![message("user", "screenshot it"), tool])
+            .expect("a tool message's image folds");
+        assert_eq!(folded.images.len(), 1);
+        assert!(matches!(
+            folded.turns.last(),
+            Some(Turn::ToolResults(results)) if results.len() == 1
+        ));
+
+        let assistant = ChatMessage {
+            role: "assistant".to_owned(),
+            content: Some(
+                serde_json::from_str(&format!("[{image}]")).expect("an image part parses"),
+            ),
+            reasoning_content: None,
+            tool_calls: None,
+        };
+        assert!(conversation(vec![message("user", "hi"), assistant]).is_err());
     }
 
     #[test]

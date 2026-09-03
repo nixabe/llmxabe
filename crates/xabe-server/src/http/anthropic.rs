@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::chat::{
-    Content, Conversation, Turn, image_misplaced, unsupported_role, unsupported_tool_choice,
+    Content, Conversation, ToolResult, Turn, image_misplaced, unsupported_role,
+    unsupported_tool_choice,
 };
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Collected, Finish, Generation, GenerationSpec, resolve_sampling};
@@ -159,8 +160,14 @@ impl MessagesRequest {
                     for result in folded.tool_results {
                         conversation.push_tool_result(result);
                     }
+                    // The message's own content is a result too, and it may
+                    // carry an image: the template renders a `tool` turn's
+                    // content through the same macro as a user turn's.
                     if !folded.text.is_empty() {
-                        conversation.push_tool_result(folded.text);
+                        conversation.push_tool_result(ToolResult {
+                            text: folded.text,
+                            images: folded.images,
+                        });
                     }
                 }
                 "system" | "developer" => {
@@ -524,6 +531,7 @@ pub(crate) async fn count_tokens(
 mod tests {
     use super::*;
     use crate::http::tools::ParsedToolCall;
+    use crate::http::vision::IMAGE_MARKER;
 
     fn collected(reasoning: &str, text: &str, calls: Vec<ParsedToolCall>) -> Collected {
         Collected {
@@ -705,6 +713,83 @@ mod tests {
         assert!(auto.tools_offered().expect("auto offers"));
         assert!(!none.tools_offered().expect("none withholds"));
         assert!(any.tools_offered().is_err());
+    }
+
+    /// A 1x1 PNG and a 2x1 PNG, so a test can say which image landed where
+    /// by its width rather than by trusting the order it asserts.
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const PNG_2X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGNgYPgPRAAFAgH/wSuWnwAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn a_tool_results_image_is_served_and_ordered_ahead_of_the_user_text_beside_it() {
+        // The hazard this endpoint owns: a results turn is pushed before the
+        // user turn from the same message whatever order the parts arrived
+        // in, so the result's image has to reach `images` first — pads and
+        // images zip positionally, and one transposition misplaces every
+        // span after it. Here the user's own image part sits *before* the
+        // tool result in the array, and must still come second.
+        let request = request(&format!(
+            r#"{{"max_tokens":16,"messages":[
+                {{"role":"user","content":"look at this"}},
+                {{"role":"assistant","content":[
+                    {{"type":"tool_use","id":"tu_1","name":"screenshot","input":{{}}}}]}},
+                {{"role":"user","content":[
+                    {{"type":"image","source":{{"type":"base64","data":"{PNG_1X1}"}}}},
+                    {{"type":"tool_result","tool_use_id":"tu_1","content":[
+                        {{"type":"text","text":"the page"}},
+                        {{"type":"image","source":{{"type":"base64","data":"{PNG_2X1}"}}}}]}}]}}
+            ]}}"#
+        ));
+        let conversation = request
+            .conversation()
+            .expect("a tool result with an image folds");
+        assert_eq!(conversation.images.len(), 2);
+        assert_eq!(conversation.images[0].width, 2, "the tool result's, first");
+        assert_eq!(conversation.images[1].width, 1, "the user's own, second");
+
+        let rendered = conversation.render(true);
+        assert_eq!(
+            rendered.matches(IMAGE_MARKER).count(),
+            conversation.images.len(),
+            "one marker per image: {rendered}"
+        );
+        let results_at = rendered.find("the page").expect("a results turn");
+        let user_at = rendered.rfind("<|im_start|>user").expect("a user turn");
+        assert!(
+            results_at < user_at,
+            "the results turn renders first: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_tool_role_message_may_carry_an_image_too() {
+        let request = request(&format!(
+            r#"{{"max_tokens":16,"messages":[
+                {{"role":"user","content":"screenshot it"}},
+                {{"role":"tool","content":[
+                    {{"type":"image","source":{{"type":"base64","data":"{PNG_2X1}"}}}}]}}
+            ]}}"#
+        ));
+        let conversation = request.conversation().expect("a tool turn's image folds");
+        assert_eq!(conversation.images.len(), 1);
+        assert_eq!(conversation.images[0].width, 2);
+        assert!(conversation.render(true).contains(&format!(
+            "<tool_response>\n{IMAGE_MARKER}\n</tool_response>"
+        )));
+    }
+
+    #[test]
+    fn an_image_in_an_assistant_turn_is_still_refused() {
+        // Widening this to tool results did not widen it to the model's own
+        // turns: the template has no vision markup there.
+        let request = request(&format!(
+            r#"{{"max_tokens":16,"messages":[
+                {{"role":"user","content":"hi"}},
+                {{"role":"assistant","content":[
+                    {{"type":"image","source":{{"type":"base64","data":"{PNG_1X1}"}}}}]}}
+            ]}}"#
+        ));
+        assert!(request.conversation().is_err());
     }
 
     #[test]

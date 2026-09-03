@@ -20,7 +20,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::chat::{
-    Content, Conversation, Turn, image_misplaced, unsupported_role, unsupported_tool_choice,
+    Content, Conversation, ToolResult, Turn, image_misplaced, is_content_blocks, unsupported_role,
+    unsupported_tool_choice,
 };
 use super::error::{ApiError, Dialect, parse_body};
 use super::generate::{Chunk, Finish, Generation, GenerationSpec, resolve_sampling};
@@ -204,14 +205,24 @@ impl ResponsesRequest {
                             continue;
                         }
                         Some("function_call_output") => {
-                            let output = match &item.output {
-                                None => String::new(),
-                                Some(Value::String(text)) => text.clone(),
-                                Some(other) => {
-                                    serde_json::to_string(other).expect("JSON values serialize")
+                            // `output` is free-form JSON, and anything that
+                            // is not content reaches the model as its JSON
+                            // spelling — but the API also lets it be a list
+                            // of content parts, which is how a tool returns
+                            // an image.
+                            let result = match &item.output {
+                                None => ToolResult::default(),
+                                Some(Value::String(text)) => ToolResult::text(text.clone()),
+                                Some(Value::Array(blocks)) if is_content_blocks(blocks) => {
+                                    Content::fold_blocks(blocks).map_err(|failure| {
+                                        ApiError::bad_request(DIALECT, failure)
+                                    })?
                                 }
+                                Some(other) => ToolResult::text(
+                                    serde_json::to_string(other).expect("JSON values serialize"),
+                                ),
                             };
-                            conversation.push_tool_result(output);
+                            conversation.push_tool_result(result);
                             continue;
                         }
                         // The model's own prior thinking, handed back. This is
@@ -1045,6 +1056,48 @@ mod tests {
 
     fn request(body: &str) -> ResponsesRequest {
         serde_json::from_str(body).expect("test request should parse")
+    }
+
+    #[test]
+    fn a_function_call_output_of_content_parts_carries_its_image() {
+        /// A 2x1 PNG, so the test can say which image landed by its width.
+        const PNG_2X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGNgYPgPRAAFAgH/wSuWnwAAAABJRU5ErkJggg==";
+        let request = request(&format!(
+            r#"{{"input":[
+                {{"type":"message","role":"user","content":"screenshot it"}},
+                {{"type":"function_call","name":"screenshot","arguments":"{{}}","call_id":"c1"}},
+                {{"type":"function_call_output","call_id":"c1","output":[
+                    {{"type":"output_text","text":"the page"}},
+                    {{"type":"input_image","image_url":"data:image/png;base64,{PNG_2X1}"}}]}}
+            ]}}"#
+        ));
+        let conversation = request
+            .conversation()
+            .expect("a function_call_output of content parts folds");
+        assert_eq!(conversation.images.len(), 1);
+        assert_eq!(conversation.images[0].width, 2);
+        assert!(conversation.render(true).contains("the page"));
+    }
+
+    #[test]
+    fn a_function_call_output_that_is_not_content_still_reaches_the_model_as_json() {
+        // `output` is free-form JSON. Only an array of typed content blocks
+        // is read as content; a tool that returned a list of numbers must
+        // still arrive spelled as one.
+        let request = request(
+            r#"{"input":[
+                {"type":"message","role":"user","content":"count"},
+                {"type":"function_call","name":"count","arguments":"{}","call_id":"c1"},
+                {"type":"function_call_output","call_id":"c1","output":[1,2,3]}
+            ]}"#,
+        );
+        let conversation = request.conversation().expect("a JSON output folds");
+        assert!(conversation.images.is_empty());
+        assert!(
+            conversation.render(true).contains("[1,2,3]"),
+            "{}",
+            conversation.render(true)
+        );
     }
 
     #[test]
