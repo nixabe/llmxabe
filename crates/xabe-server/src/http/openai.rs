@@ -461,8 +461,13 @@ fn conversation(messages: Vec<ChatMessage>) -> Result<Conversation, ApiError> {
 struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<&'static str>,
+    /// Two levels because the field has three states on the wire and they
+    /// are not interchangeable: absent (a streaming delta that carries no
+    /// text), `null` (a message whose whole turn was tool calls — what
+    /// OpenAI sends, and what a client deserializing `content` as a required
+    /// nullable field needs to see), and a string.
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -561,8 +566,10 @@ pub(crate) async fn chat_completions(
                     role: Some("assistant"),
                     // `null` content alongside tool calls is OpenAI's shape
                     // for a turn that only called tools.
-                    content: (tool_calls.is_none() || !collected.text.is_empty())
-                        .then_some(collected.text),
+                    content: Some(
+                        (tool_calls.is_none() || !collected.text.is_empty())
+                            .then_some(collected.text),
+                    ),
                     reasoning_content: (!collected.reasoning.is_empty())
                         .then_some(collected.reasoning),
                     tool_calls,
@@ -592,7 +599,7 @@ pub(crate) async fn chat_completions(
         };
         // OpenAI's first chunk announces the role and carries no content.
         yield Ok::<_, std::convert::Infallible>(chunk(
-            ChatDelta { role: Some("assistant"), content: Some(String::new()), ..ChatDelta::default() },
+            ChatDelta { role: Some("assistant"), content: Some(Some(String::new())), ..ChatDelta::default() },
             None,
             None,
         ));
@@ -601,7 +608,7 @@ pub(crate) async fn chat_completions(
         loop {
             match generation.next().await {
                 Ok(Some(Chunk::Text(text))) => {
-                    yield Ok(chunk(ChatDelta { content: Some(text), ..ChatDelta::default() }, None, None));
+                    yield Ok(chunk(ChatDelta { content: Some(Some(text)), ..ChatDelta::default() }, None, None));
                 }
                 Ok(Some(Chunk::Reasoning(text))) => {
                     yield Ok(chunk(
@@ -763,5 +770,34 @@ mod tests {
         assert!(reject_shape_changing(None, Some(4)).is_err());
         assert!(reject_shape_changing(Some(1), Some(1)).is_ok());
         assert!(reject_shape_changing(None, None).is_ok());
+    }
+
+    #[test]
+    fn a_turn_that_only_called_tools_carries_a_null_content_not_a_missing_one() {
+        // The regression: one `Option` served both the streaming delta, where
+        // the field is absent, and the message, where OpenAI writes `null`.
+        // `skip_serializing_if` won, so a client that reads `content` as a
+        // required nullable field saw no key at all.
+        let message = ChatDelta {
+            role: Some("assistant"),
+            content: Some(None),
+            reasoning_content: None,
+            tool_calls: Some(vec![json!({"id": "call_1_0"})]),
+        };
+        let wire = serde_json::to_value(&message).expect("serializes");
+        assert_eq!(wire["content"], Value::Null);
+        assert!(wire.as_object().expect("object").contains_key("content"));
+    }
+
+    #[test]
+    fn a_delta_that_carries_no_text_omits_content_entirely() {
+        // The other half of the same field: a streaming delta announcing a
+        // tool call has no `content` key, which is what clients accumulate by.
+        let delta = ChatDelta {
+            tool_calls: Some(vec![json!({"index": 0})]),
+            ..ChatDelta::default()
+        };
+        let wire = serde_json::to_value(&delta).expect("serializes");
+        assert!(!wire.as_object().expect("object").contains_key("content"));
     }
 }
