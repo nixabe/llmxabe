@@ -311,7 +311,7 @@ fn start(state: &AppState, request: &MessagesRequest) -> Result<Generation, ApiE
     // parameter name the schema does not declare, and does.
     let constraint = super::tools::grammar(&conversation.tools, &state.grammar_vocab)
         .map(|grammar| Box::new(xabe_grammar::ToolConstraint::new(grammar)));
-    let prompt = conversation.render(thinking);
+    let prompt = state.render(&conversation, thinking, DIALECT)?;
     let encoding = state
         .tokenizer
         .encode(prompt, false)
@@ -518,7 +518,11 @@ pub(crate) async fn count_tokens(
         warn_unsupported(&offered);
         conversation.tools = offered.definitions;
     }
-    let prompt = conversation.render(request.thinking_enabled(state.default_reasoning));
+    let prompt = state.render(
+        &conversation,
+        request.thinking_enabled(state.default_reasoning),
+        DIALECT,
+    )?;
     let encoding = state
         .tokenizer
         .encode(prompt, false)

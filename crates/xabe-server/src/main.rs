@@ -264,6 +264,16 @@ struct Args {
     #[arg(long)]
     no_reasoning: bool,
 
+    /// Render prompts with the model's own `tokenizer.chat_template` (the
+    /// default; asking for it explicitly also makes a model that has no
+    /// template a startup failure rather than a fallback)
+    #[arg(long, overrides_with = "no_jinja")]
+    jinja: bool,
+
+    /// Render prompts with this server's hand-written ChatML instead
+    #[arg(long, overrides_with = "jinja", env = "LLMXABE_NO_JINJA")]
+    no_jinja: bool,
+
     /// Sampling temperature for requests that do not set one; 0 is greedy
     #[arg(
         long,
@@ -927,6 +937,45 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // The model's own template renders every prompt, as llama.cpp does by
+    // default. Read here, so a template this engine cannot use is known at
+    // startup rather than on the first chat request.
+    //
+    // What happens when it cannot be used depends on who asked. `--jinja` on
+    // the command line is a requirement, and an unusable template fails the
+    // process. On the default it is a preference: the hand-written ChatML
+    // serves instead, and the reason is said out loud rather than left to be
+    // inferred from the output.
+    let chat_template = if args.no_jinja {
+        None
+    } else {
+        let required = args.jinja;
+        match tokenizer::chat_template_from_gguf(&model_path) {
+            Ok(Some(template)) => Some(template),
+            Ok(None) if required => {
+                error!("--jinja given, but the model file has no `tokenizer.chat_template`");
+                return std::process::ExitCode::FAILURE;
+            }
+            Ok(None) => {
+                warn!(
+                    "model file has no `tokenizer.chat_template` — rendering prompts with the \
+                     built-in ChatML instead (pass --no-jinja to silence this)"
+                );
+                None
+            }
+            Err(failure) if required => {
+                error!("chat template    FAIL — {failure}");
+                return std::process::ExitCode::FAILURE;
+            }
+            Err(failure) => {
+                warn!(
+                    "could not read `tokenizer.chat_template` ({failure}) — rendering prompts \
+                     with the built-in ChatML instead"
+                );
+                None
+            }
+        }
+    };
     let address = format!("{}:{}", args.host, args.port);
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -951,6 +1000,8 @@ fn main() -> std::process::ExitCode {
             max_tokens: args.image_max_tokens,
         }),
         grammar_vocab,
+        chat_template,
+        jinja_required: args.jinja,
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,

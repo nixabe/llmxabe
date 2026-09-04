@@ -527,7 +527,7 @@ pub(crate) async fn chat_completions(
     // parameter name the schema does not declare, and does.
     let constraint = super::tools::grammar(&conversation.tools, &state.grammar_vocab)
         .map(|grammar| Box::new(xabe_grammar::ToolConstraint::new(grammar)));
-    let prompt = conversation.render(thinking);
+    let prompt = state.render(&conversation, thinking, DIALECT)?;
     let encoding = state
         .tokenizer
         .encode(prompt, false)

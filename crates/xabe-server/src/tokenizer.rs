@@ -111,6 +111,17 @@ pub fn pieces_from_gguf(path: &Path) -> Result<(Vec<Vec<u8>>, Vec<u32>), Tokeniz
     Ok((pieces, eog))
 }
 
+/// The model's own `tokenizer.chat_template`, if the file carries one.
+///
+/// What `--jinja` renders prompts with instead of the hand-written ChatML in
+/// `http::chat`. A GGUF without the key cannot serve that mode, which is a
+/// startup failure rather than a per-request one.
+pub fn chat_template_from_gguf(path: &Path) -> Result<Option<String>, TokenizerError> {
+    Ok(GgufFile::open(path)?
+        .get_str("tokenizer.chat_template")
+        .map(str::to_owned))
+}
+
 /// Load the GPT-2 byte-level BPE used by Qwen3.5/Qwen3.6 from a GGUF file.
 pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
     let gguf = GgufFile::open(path)?;

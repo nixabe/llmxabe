@@ -19,6 +19,9 @@ xabe-cache.workspace = true
 xabe-sched.workspace = true
 xabe-engine.workspace = true
 xabe-grammar.workspace = true
+# The model's own `tokenizer.chat_template`, behind `--jinja`. `preserve_order`
+# so a rendered tool schema keeps the key order the caller sent.
+minijinja = { version = "2", features = ["json", "preserve_order"] }
 xabe-cuda.workspace = true
 xabe-gguf.workspace = true
 xabe-kernels.workspace = true

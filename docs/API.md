@@ -282,10 +282,10 @@ server does for the same format — `grammar_type = "tool_calls"`, attached to
 every request with tools — and it is not optional there either. (llama.cpp
 picks that format from the template's own contents, not from the model name:
 a template holding `<tool_call>`, `<function=` and `<parameter=` takes the
-XML-parameter path, and Qwen3.6-35B-A3B's does.) Without it the model invents:
-a `file_path` where the schema said `filePath` reaches the client as a call the
-harness rejects, and a `</tool_call>` the model forgot turns the whole call
-back into prose.
+XML-parameter path, and Qwen3.6-35B-A3B's does.) Without it the
+model invents: a `file_path` where the schema said `filePath` reaches the
+client as a call the harness rejects, and a `</tool_call>` the model forgot
+turns the whole call back into prose.
 
 The grammar is *lazy*: nothing is masked until `<tool_call>` or a
 `<function=…>` for an offered tool appears in the output, so ordinary prose
@@ -346,7 +346,6 @@ question than the one asked:
 | `n`, `best_of` above 1 | One completion per request; returning one where four were asked for is a wrong answer, not an approximate one. |
 | A forcing `tool_choice` | See above. |
 | `previous_response_id` | Responses are not stored, so the reference cannot be resolved; the model would answer without context the caller believed it had sent. |
-| A system message after the first turn | The model's own template silently discards it. Discarding an instruction the caller wrote is worse than refusing it. |
 | A batch of prompts in `/v1/completions` | One prompt per request. |
 
 Video parts are refused as unknown part types, and images are refused
@@ -377,6 +376,21 @@ Details that follow the model's own template:
   conversation's prompt from growing with every past reasoning span.
 - The generation prompt ends with an open `<think>` block, or with a closed
   empty one when reasoning is off.
+**A system message after the first turn is accepted, and the model's own
+template discards it.** Its message loop skips every `system`/`developer` past
+the leading ones, so under the default rendering the text does not reach the
+model — the server logs a `WARN` naming that rather than letting it go
+silently. `--no-jinja` renders it as its own `system` turn. (An earlier
+version of this document said such a message was refused with `400`; it has
+not been since late system turns were accepted.)
+
+The prompt is rendered with the model's own `tokenizer.chat_template`, as
+llama.cpp does by default; `--no-jinja` (see
+[CLI.md](CLI.md#model-and-network)) switches to the hand-written renderer
+described below, which is a copy of that template. A test renders the same
+conversation both ways against the served model's own template and requires
+them byte-identical.
+
 - With tools, the system turn opens with the template's `# Tools` section —
   the definitions inside `<tools>` tags and the call-format instructions —
   and the caller's own system text follows it. Replayed assistant calls

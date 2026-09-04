@@ -20,6 +20,7 @@ mod auth;
 mod chat;
 mod error;
 mod generate;
+mod jinja;
 mod openai;
 mod responses;
 mod tools;
@@ -75,6 +76,13 @@ pub struct ServerConfig {
     /// The vocabulary a tool-call grammar masks against, read out of the
     /// same GGUF the tokenizer came from.
     pub grammar_vocab: Arc<xabe_grammar::Vocab>,
+    /// The model's own `tokenizer.chat_template`, when prompts are to be
+    /// rendered with it. `None` hand-renders.
+    pub chat_template: Option<String>,
+    /// Whether `--jinja` was asked for explicitly. On the default, a template
+    /// this engine cannot compile falls back to the hand-written ChatML with
+    /// a warning; asked for by name, it fails startup.
+    pub jinja_required: bool,
 }
 
 #[derive(Clone)]
@@ -96,6 +104,9 @@ struct AppState {
     /// The token pieces a tool-call grammar is masked against, built once at
     /// startup and shared by every request that offers tools.
     grammar_vocab: Arc<xabe_grammar::Vocab>,
+    /// `Some` under `--jinja`: the model's own template, which renders every
+    /// prompt in place of `Conversation::render`.
+    chat_template: Option<Arc<jinja::ChatTemplate>>,
     /// Handlers currently blocked trying to take a worker lock to submit a
     /// request. A driver loop holds its worker's lock for a whole GPU step
     /// and would otherwise reacquire it immediately; this is how it learns
@@ -108,6 +119,28 @@ impl AppState {
     /// server's own name.
     fn model_name(&self, requested: Option<String>) -> String {
         requested.unwrap_or_else(|| self.model.to_string())
+    }
+
+    /// Render a conversation to the model's prompt.
+    ///
+    /// The model's own `tokenizer.chat_template` by default; the hand-written
+    /// ChatML under `--no-jinja`, or when the file carried no template this
+    /// engine could use. A template that fails on a particular conversation —
+    /// one raising `raise_exception`, say — is the caller's problem to see, so
+    /// it comes back as a 400 naming what the template said rather than as a
+    /// 500.
+    fn render(
+        &self,
+        conversation: &chat::Conversation,
+        thinking: bool,
+        dialect: error::Dialect,
+    ) -> Result<String, error::ApiError> {
+        match &self.chat_template {
+            Some(template) => template
+                .render(conversation, thinking)
+                .map_err(|failure| error::ApiError::bad_request(dialect, failure)),
+            None => Ok(conversation.render(thinking)),
+        }
     }
 }
 
@@ -353,6 +386,20 @@ pub async fn serve(
             }))
         })
         .transpose()?;
+    // Compiled once, at startup: a template this engine cannot parse is a
+    // configuration error, not something to discover on the first request.
+    let chat_template = match config.chat_template.map(jinja::ChatTemplate::compile) {
+        None => None,
+        Some(Ok(template)) => Some(template),
+        Some(Err(failure)) if config.jinja_required => return Err(failure),
+        Some(Err(failure)) => {
+            warn!(
+                "{failure} — rendering prompts with the built-in ChatML instead \
+                 (pass --jinja to make this a startup failure)"
+            );
+            None
+        }
+    };
     let state = AppState {
         engine: Arc::new(engine),
         tokenizer: Arc::new(tokenizer),
@@ -367,6 +414,7 @@ pub async fn serve(
         sampling_defaults: config.sampling_defaults,
         vision,
         grammar_vocab: config.grammar_vocab,
+        chat_template,
     };
     // One driver thread per worker. They share nothing but the client map
     // and the engine's shared prefix cache, so a card that is prefilling no
