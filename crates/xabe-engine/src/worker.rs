@@ -35,6 +35,7 @@ use crate::runtime::{DeviceRuntimeHandle, DeviceStep, RuntimeConfig, RuntimeErro
 use crate::sampling::SamplingParams;
 use crate::state::{SequenceSnapshot, SnapshotSlots};
 use tracing::debug;
+use xabe_grammar::ToolConstraint;
 
 /// Which speculative decoder a worker runs.
 ///
@@ -216,6 +217,7 @@ struct PendingSequence {
     images: Vec<crate::image::SequenceImage>,
     snapshot: Option<Arc<SequenceSnapshot>>,
     sampling: SamplingParams,
+    constraint: Option<Box<ToolConstraint>>,
 }
 
 impl Worker {
@@ -471,6 +473,7 @@ impl Worker {
         prompt: Vec<i32>,
         images: Vec<crate::image::SequenceImage>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<RequestId, WorkerExecutionError> {
         self.validate_pending(req, &prompt, None)?;
         let id = self
@@ -485,6 +488,7 @@ impl Worker {
                 images,
                 snapshot: None,
                 sampling,
+                constraint,
             },
         );
         Ok(id)
@@ -497,6 +501,7 @@ impl Worker {
         images: Vec<crate::image::SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<RequestId, WorkerExecutionError> {
         self.validate_pending(req, &prompt, Some(&snapshot))?;
         let prefix = snapshot.position() as u32;
@@ -512,6 +517,7 @@ impl Worker {
                 images,
                 snapshot: Some(snapshot),
                 sampling,
+                constraint,
             },
         );
         Ok(id)
@@ -552,12 +558,14 @@ impl Worker {
                         pending.images,
                         snapshot,
                         pending.sampling,
+                        pending.constraint,
                     )?,
                     None => runtime.admit(
                         pending.request,
                         pending.prompt,
                         pending.images,
                         pending.sampling,
+                        pending.constraint,
                     )?,
                 }
             }

@@ -37,6 +37,7 @@ fn admit(
             prompt(id, tokens, model.vocab_size),
             Vec::new(),
             SamplingParams::GREEDY,
+            None,
         )
         .map(|placement| placement.worker)
         .map_err(|failure| failure.to_string())

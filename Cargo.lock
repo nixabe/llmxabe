@@ -1724,6 +1724,7 @@ dependencies = [
  "xabe-cache",
  "xabe-cuda",
  "xabe-gguf",
+ "xabe-grammar",
  "xabe-kernels",
  "xabe-log",
  "xabe-model",
@@ -1738,6 +1739,14 @@ dependencies = [
  "thiserror",
  "tracing",
  "xabe-log",
+]
+
+[[package]]
+name = "xabe-grammar"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -1799,6 +1808,7 @@ dependencies = [
  "xabe-cuda",
  "xabe-engine",
  "xabe-gguf",
+ "xabe-grammar",
  "xabe-kernels",
  "xabe-log",
  "xabe-model",

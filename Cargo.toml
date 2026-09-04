@@ -8,6 +8,7 @@ members = [
     "crates/xabe-kernels",
     "crates/xabe-log",
     "crates/xabe-cuda",
+    "crates/xabe-grammar",
     "crates/xabe-engine",
     "crates/xabe-server",
 ]
@@ -27,6 +28,7 @@ xabe-sched = { path = "crates/xabe-sched" }
 xabe-kernels = { path = "crates/xabe-kernels" }
 xabe-log = { path = "crates/xabe-log" }
 xabe-cuda = { path = "crates/xabe-cuda" }
+xabe-grammar = { path = "crates/xabe-grammar" }
 xabe-engine = { path = "crates/xabe-engine" }
 
 clap = { version = "4", features = ["derive", "env"] }

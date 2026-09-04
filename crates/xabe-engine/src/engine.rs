@@ -27,6 +27,7 @@ use crate::runtime::{DeviceStep, RuntimeError};
 use crate::sampling::SamplingParams;
 use crate::state::SequenceSnapshot;
 use crate::worker::{ServingConfig, Worker, WorkerExecutionError, WorkerId};
+use xabe_grammar::ToolConstraint;
 
 #[derive(Debug)]
 pub enum EngineExecutionError {
@@ -391,6 +392,7 @@ impl Engine {
         prompt: Vec<i32>,
         images: Vec<crate::image::SequenceImage>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<Placement, EngineExecutionError> {
         let placements: Vec<crate::image::ImagePlacement> =
             images.iter().map(|i| i.placement).collect();
@@ -443,9 +445,9 @@ impl Engine {
                 .worker(worker)
                 .expect("router returned an existing worker");
             if let Some(snapshot) = snapshot {
-                target.admit_tokens_restored(req, prompt, images, snapshot, sampling)
+                target.admit_tokens_restored(req, prompt, images, snapshot, sampling, constraint)
             } else {
-                target.admit_tokens(req, prompt, images, sampling)
+                target.admit_tokens(req, prompt, images, sampling, constraint)
             }
         }
         .map_err(|source| EngineExecutionError::Worker { worker, source })?;

@@ -76,6 +76,9 @@ pub(crate) struct GenerationSpec {
     /// `Some` scans the answer span for `<tool_call>` blocks and reports
     /// them as [`Chunk::ToolCall`] instead of text.
     pub(crate) tool_parser: Option<ToolCallParser>,
+    /// `Some` keeps generation inside the tool-call grammar once the model
+    /// starts one. Paired with `tool_parser`: the same tools decide both.
+    pub(crate) constraint: Option<Box<xabe_grammar::ToolConstraint>>,
 }
 
 /// The serving defaults a silent request samples with, set at startup by
@@ -361,6 +364,7 @@ impl Generation {
             tokens,
             spec.images,
             spec.sampling,
+            spec.constraint,
         );
         // Cleared once the submission is through, not once a lock is held:
         // `place_tokens` takes each worker's lock in turn to score it and

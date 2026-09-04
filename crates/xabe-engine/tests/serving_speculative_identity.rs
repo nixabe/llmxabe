@@ -133,7 +133,13 @@ fn run_serving(
             max_output_tokens: (MIN_TOKENS + 16) as u32,
         };
         worker
-            .admit_tokens(request, prompt.clone(), Vec::new(), SamplingParams::GREEDY)
+            .admit_tokens(
+                request,
+                prompt.clone(),
+                Vec::new(),
+                SamplingParams::GREEDY,
+                None,
+            )
             .map_err(|e| e.to_string())?;
     }
 

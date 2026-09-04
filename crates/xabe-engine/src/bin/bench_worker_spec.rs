@@ -222,6 +222,7 @@ fn run_width(
                 synthetic_prompt(sequence, context, model.vocab_size as usize),
                 Vec::new(),
                 SamplingParams::GREEDY,
+                None,
             )
             .map_err(|error| error.to_string())?;
     }

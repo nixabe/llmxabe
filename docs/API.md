@@ -273,10 +273,36 @@ text rather than dropped. Because a call only parses once its closing tag
 arrives, streamed calls arrive as one complete delta each, not
 token-by-token.
 
+**Offering tools constrains decoding.** A request that carries `tools` gets a
+grammar built from those tools' own schemas, and from the trigger onward the
+model can only emit tokens that grammar admits: a tool name it was offered, a
+parameter name the schema declares, no repeats, every required parameter
+before `</function>`, and the closing `</tool_call>`. This is what llama.cpp's
+server does for the same format — `grammar_type = "tool_calls"`, attached to
+every request with tools — and it is not optional there either. (llama.cpp
+picks that format from the template's own contents, not from the model name:
+a template holding `<tool_call>`, `<function=` and `<parameter=` takes the
+XML-parameter path, and Qwen3.6-35B-A3B's does.) Without it the model invents:
+a `file_path` where the schema said `filePath` reaches the client as a call the
+harness rejects, and a `</tool_call>` the model forgot turns the whole call
+back into prose.
+
+The grammar is *lazy*: nothing is masked until `<tool_call>` or a
+`<function=…>` for an offered tool appears in the output, so ordinary prose
+and reasoning cost nothing. While it is masking, a sequence picks its token on
+the host rather than from the on-device argmax, at roughly 50 µs a step over
+this model's 248K-token vocabulary.
+
+One thing is constrained less than llama.cpp constrains it: a parameter whose
+schema is an object or an array is held to its surrounding markup but not
+inside its own value, where llama.cpp runs the parameter's full schema through
+`json_schema_to_grammar`. Scalars — strings, enums, booleans, numbers,
+`null` — are constrained the same.
+
 `tool_choice` `"auto"` and `"none"` are honoured (`none` withholds the tools
 from the prompt while still rendering tool history). Forcing a call —
-`required`, `any`, or a named function — is refused with `400`: it is a
-guarantee about the output, and nothing here constrains decoding to keep it.
+`required`, `any`, or a named function — is refused with `400`: the grammar
+above keeps a call *well-formed*, but nothing makes the model start one.
 
 ## Image input
 

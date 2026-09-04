@@ -61,9 +61,13 @@ fn main() -> ExitCode {
         prompt_tokens: PROMPT as u32,
         max_output_tokens: OUTPUT,
     };
-    if let Err(failure) =
-        cold.admit_tokens(request, prompt.clone(), Vec::new(), SamplingParams::GREEDY)
-    {
+    if let Err(failure) = cold.admit_tokens(
+        request,
+        prompt.clone(),
+        Vec::new(),
+        SamplingParams::GREEDY,
+        None,
+    ) {
         error!("cold admission failed: {failure}");
         return ExitCode::FAILURE;
     }
@@ -84,6 +88,7 @@ fn main() -> ExitCode {
         Vec::new(),
         snapshot,
         SamplingParams::GREEDY,
+        None,
     ) {
         error!("restored admission failed: {failure}");
         return ExitCode::FAILURE;

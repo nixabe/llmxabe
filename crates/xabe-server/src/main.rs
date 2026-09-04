@@ -917,6 +917,16 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // The byte spelling of every token, for grammar-constrained tool calls.
+    // Built once here rather than per request: it is the same table for
+    // every caller, and building it walks the whole vocabulary.
+    let grammar_vocab = match tokenizer::pieces_from_gguf(&model_path) {
+        Ok((pieces, eog)) => std::sync::Arc::new(xabe_grammar::Vocab::new(&pieces, &eog)),
+        Err(failure) => {
+            error!("tool grammar     FAIL — {failure}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let address = format!("{}:{}", args.host, args.port);
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -940,6 +950,7 @@ fn main() -> std::process::ExitCode {
             config: vision_config,
             max_tokens: args.image_max_tokens,
         }),
+        grammar_vocab,
     };
     match runtime.block_on(http::serve(engine, tokenizer, &address, server)) {
         Ok(()) => std::process::ExitCode::SUCCESS,

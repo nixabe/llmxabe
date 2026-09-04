@@ -306,6 +306,11 @@ fn start(state: &AppState, request: &MessagesRequest) -> Result<Generation, ApiE
     }
     let tool_parser =
         (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
+    // Offering tools means constraining output to them, exactly as
+    // llama.cpp's server does: without this the model is free to invent a
+    // parameter name the schema does not declare, and does.
+    let constraint = super::tools::grammar(&conversation.tools, &state.grammar_vocab)
+        .map(|grammar| Box::new(xabe_grammar::ToolConstraint::new(grammar)));
     let prompt = conversation.render(thinking);
     let encoding = state
         .tokenizer
@@ -331,6 +336,7 @@ fn start(state: &AppState, request: &MessagesRequest) -> Result<Generation, ApiE
         trim_spans: true,
         sampling: request.sampling(state)?,
         tool_parser,
+        constraint,
     };
     Generation::start(state, spec, DIALECT)
 }

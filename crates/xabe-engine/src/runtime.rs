@@ -35,6 +35,7 @@ use crate::sampling::{Sampler, SamplingParams};
 use crate::state::{SequenceSnapshot, SnapshotArena, SnapshotSlots};
 use crate::vision::VisionForward;
 use crate::{DeviceWeights, LoadError, SequenceState, StateError};
+use xabe_grammar::ToolConstraint;
 
 /// Pinned snapshot capacity per worker when no budget is given. One
 /// default-retention slot is 102.8125 MiB, so 24 slots consume 2.41 GiB per
@@ -312,11 +313,71 @@ struct RuntimeSequence {
     /// `None` is greedy argmax, decided entirely on the device. `Some` pays a
     /// host round-trip per emitted token, only for this sequence.
     sampler: Option<Sampler>,
+    /// The request's tool-call grammar, if it offered tools. Idle — and free
+    /// — until a `<tool_call>` or `<function=…>` trigger appears in the
+    /// output; from there it masks every step, which costs this sequence the
+    /// same host round-trip a sampler does.
+    constraint: Option<Box<ToolConstraint>>,
     /// The prompt's image spans, sorted. Empty for text-only requests.
     images: Vec<ImagePlacement>,
     /// Projected image embeddings, all images concatenated in placement
     /// order, `sum(tokens) * hidden` f32. Encoded once at admission.
     image_embeds: Option<cudarc::driver::CudaSlice<f32>>,
+}
+
+impl RuntimeSequence {
+    /// Whether this sequence's next token has to be picked on the host
+    /// rather than taken from the device argmax: because it is sampled,
+    /// because the grammar has to mask first, or because a constraint is
+    /// still watching for its trigger and must not be handed a token it did
+    /// not get to constrain first.
+    fn chooses_on_the_host(&self) -> bool {
+        self.sampler.is_some() || self.constraint.is_some()
+    }
+
+    /// Pick one token from a logits row already on the host, with the
+    /// grammar applied first.
+    fn choose(&mut self, logits: &mut [f32], scratch: &mut Vec<(f32, u32)>) -> i32 {
+        if let Some(constraint) = self.constraint.as_mut() {
+            constraint.mask(logits);
+        }
+        match self.sampler.as_mut() {
+            Some(sampler) => sampler.sample(logits, scratch),
+            None => argmax(logits),
+        }
+    }
+
+    /// Advance the grammar over a token that was actually emitted.
+    fn observe(&mut self, token: i32) {
+        if let Some(constraint) = self.constraint.as_mut() {
+            constraint.observe(token);
+        }
+    }
+
+    /// Whether the grammar is masking right now, which is what decides
+    /// whether a drafted window may be chosen a token at a time.
+    fn is_masking(&self) -> bool {
+        self.constraint
+            .as_ref()
+            .is_some_and(|constraint| constraint.is_masking())
+    }
+}
+
+/// The most likely token in a logits row.
+///
+/// The device kernel's verdict for an unconstrained sequence; this is the
+/// host copy, for a row the grammar has just masked. Non-finite logits lose
+/// to everything, which is exactly how a masked-out token should behave.
+fn argmax(logits: &[f32]) -> i32 {
+    let mut best = 0usize;
+    let mut best_logit = f32::NEG_INFINITY;
+    for (index, &logit) in logits.iter().enumerate() {
+        if logit > best_logit {
+            best_logit = logit;
+            best = index;
+        }
+    }
+    best as i32
 }
 
 fn choose_prefill_width(
@@ -454,6 +515,7 @@ enum RuntimeCommand {
         images: Vec<SequenceImage>,
         snapshot: Option<Arc<SequenceSnapshot>>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
         reply: SyncSender<Result<(), RuntimeError>>,
     },
     Remove {
@@ -504,13 +566,16 @@ impl DeviceRuntimeHandle {
                                     images,
                                     snapshot,
                                     sampling,
+                                    constraint,
                                     reply,
                                 } => {
                                     let result = match snapshot {
                                         Some(snapshot) => runtime.admit_restored(
-                                            req, prompt, images, snapshot, sampling,
+                                            req, prompt, images, snapshot, sampling, constraint,
                                         ),
-                                        None => runtime.admit(req, prompt, images, sampling),
+                                        None => {
+                                            runtime.admit(req, prompt, images, sampling, constraint)
+                                        }
                                     };
                                     let _ = reply.send(result);
                                 }
@@ -565,6 +630,7 @@ impl DeviceRuntimeHandle {
         prompt: Vec<i32>,
         images: Vec<SequenceImage>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
@@ -572,6 +638,7 @@ impl DeviceRuntimeHandle {
             images,
             snapshot: None,
             sampling,
+            constraint,
             reply,
         })?
     }
@@ -583,6 +650,7 @@ impl DeviceRuntimeHandle {
         images: Vec<SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<(), RuntimeError> {
         self.request(|reply| RuntimeCommand::Admit {
             req,
@@ -590,6 +658,7 @@ impl DeviceRuntimeHandle {
             images,
             snapshot: Some(snapshot),
             sampling,
+            constraint,
             reply,
         })?
     }
@@ -1020,6 +1089,7 @@ impl DeviceRuntime {
         prompt: Vec<i32>,
         images: Vec<SequenceImage>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<(), RuntimeError> {
         if self.sequences.contains_key(&req.id) {
             return Err(RuntimeError::DuplicateRequest(req.id));
@@ -1097,6 +1167,7 @@ impl DeviceRuntime {
                 last_snapshot: None,
                 retention_disabled: false,
                 sampler: (!sampling.is_greedy()).then(|| Sampler::new(sampling)),
+                constraint,
                 images: placements,
                 image_embeds,
             },
@@ -1164,6 +1235,7 @@ impl DeviceRuntime {
         images: Vec<SequenceImage>,
         snapshot: Arc<SequenceSnapshot>,
         sampling: SamplingParams,
+        constraint: Option<Box<ToolConstraint>>,
     ) -> Result<(), RuntimeError> {
         let prefix = snapshot.position();
         if prefix > prompt.len() {
@@ -1172,7 +1244,7 @@ impl DeviceRuntime {
                 prompt: prompt.len(),
             });
         }
-        self.admit(req, prompt, images, sampling)?;
+        self.admit(req, prompt, images, sampling, constraint)?;
         let seq = self
             .sequences
             .get_mut(&req.id)
@@ -1413,12 +1485,20 @@ impl DeviceRuntime {
             // read-back, so the logits rows are final. Draft acceptance below
             // stays exact under sampling: the emitted token *is* the target
             // model's draw, and a draft is accepted only by equaling it.
-            if active.iter().any(|&index| owned[index].1.sampler.is_some()) {
+            //
+            // A grammar-constrained sequence takes the same route for the
+            // same reason: the device argmax chose from every token in the
+            // vocabulary, and the tokens the tool-call grammar forbids have
+            // to be excluded before anything is chosen at all.
+            if active
+                .iter()
+                .any(|&index| owned[index].1.chooses_on_the_host())
+            {
                 let stream = Arc::clone(&self.stream);
                 let mut host = std::mem::take(&mut self.host_logits);
                 let mut scratch = std::mem::take(&mut self.sample_scratch);
                 for (row, &index) in active.iter().enumerate() {
-                    if owned[index].1.sampler.is_none() {
+                    if !owned[index].1.chooses_on_the_host() {
                         continue;
                     }
                     let pass = self.decode[width]
@@ -1431,11 +1511,16 @@ impl DeviceRuntime {
                         self.sample_scratch = scratch;
                         return Err(error.into());
                     }
-                    let sampler = owned[index].1.sampler.as_mut().expect("checked above");
-                    outputs[row] = sampler.sample(&host, &mut scratch);
+                    outputs[row] = owned[index].1.choose(&mut host, &mut scratch);
                 }
                 self.host_logits = host;
                 self.sample_scratch = scratch;
+            }
+            // Every emitted token advances the grammar, whether or not this
+            // step was masked: an idle constraint is watching for its
+            // trigger, and it can only see one here.
+            for (row, &index) in active.iter().enumerate() {
+                owned[index].1.observe(outputs[row]);
             }
 
             let mut next_active: SmallVec<[usize; 3]> = SmallVec::new();
@@ -1766,7 +1851,7 @@ impl DeviceRuntime {
             // prefix, which the loop has already proven equal to the
             // emitted prefix.
             let mut emit: SmallVec<[i32; 8]> = SmallVec::new();
-            if let Some(sampler) = seq.sampler.as_mut() {
+            if seq.chooses_on_the_host() {
                 let pass = self.verify[width].as_ref().expect("checked above");
                 // Not a loop over `seq.draft`, which is why the range is
                 // inclusive: it runs one row *past* the last draft to draw
@@ -1784,9 +1869,15 @@ impl DeviceRuntime {
                         result = Err(error.into());
                         break;
                     }
-                    let token = sampler.sample(&host, &mut scratch);
+                    // Whether the grammar was masking *before* this token
+                    // decides whether the window may continue: a constraint
+                    // that arms here did not get to constrain the rows after
+                    // it, which the verify pass computed in one shot.
+                    let was_masking = seq.is_masking();
+                    let token = seq.choose(&mut host, &mut scratch);
+                    seq.observe(token);
                     emit.push(token);
-                    if j >= d_real || token != seq.draft[j] {
+                    if j >= d_real || token != seq.draft[j] || (!was_masking && seq.is_masking()) {
                         break;
                     }
                 }
@@ -1795,6 +1886,8 @@ impl DeviceRuntime {
                     continue;
                 }
             } else {
+                // No sampler and no grammar: the device argmax already
+                // decided every row, and acceptance is plain equality.
                 let mut accepted = 0usize;
                 while accepted < d_real && seq_rows[accepted] == seq.draft[accepted] {
                     accepted += 1;
@@ -2328,6 +2421,11 @@ impl DeviceRuntime {
                 self.prefill_pass(last_shape).sample_argmax(&stream)?
             };
             seq.next_token = Some(next);
+            // The first output token, whether this pass drew it or a
+            // whole-prompt snapshot supplied it. No mask is owed here — a
+            // constraint has seen no output yet, so it cannot be armed — but
+            // this is where it starts watching for its trigger.
+            seq.observe(next);
             if self.eos_token == Some(next) {
                 seq.emitted = seq.max_output;
                 stopped.push(id);

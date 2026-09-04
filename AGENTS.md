@@ -119,6 +119,7 @@ it runs.
 | `xabe-cache` | Two-group pager, radix prefix tree, snapshot retention | `xabe-model` |
 | `xabe-sched` | Chunked prefill, decode priority, admission control | `xabe-model`, `xabe-cache` |
 | `xabe-kernels` | CPU reference kernels, differential harness | `xabe-model` |
+| `xabe-grammar` | Tool-call grammar, vocabulary mask for constrained decoding | — |
 | `xabe-cuda` | Driver API, streams, graphs, device probe | — |
 | `xabe-engine` | Worker, cache-aware router, orchestration | all of the above |
 | `xabe-server` | HTTP surface, admission queue | `xabe-engine` |

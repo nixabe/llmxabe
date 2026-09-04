@@ -510,6 +510,11 @@ pub(crate) async fn create(
     }
     let tool_parser =
         (!conversation.tools.is_empty()).then(|| ToolCallParser::new(&conversation.tools));
+    // Offering tools means constraining output to them, exactly as
+    // llama.cpp's server does: without this the model is free to invent a
+    // parameter name the schema does not declare, and does.
+    let constraint = super::tools::grammar(&conversation.tools, &state.grammar_vocab)
+        .map(|grammar| Box::new(xabe_grammar::ToolConstraint::new(grammar)));
     let prompt = conversation.render(thinking);
     let encoding = state
         .tokenizer
@@ -540,6 +545,7 @@ pub(crate) async fn create(
             None,
         )?,
         tool_parser,
+        constraint,
     };
     let mut generation = Generation::start(&state, spec, DIALECT)?;
     // Read off the request before `model` is moved out of it.

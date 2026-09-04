@@ -3,7 +3,7 @@
 //! calls.
 //!
 //! Qwen3.6's template (the GGUF's `tokenizer.chat_template`) speaks the
-//! XML-parameter format Qwen3-Coder introduced:
+//! XML-parameter format Qwen3-Coder introduced, and which Qwen3.6 kept:
 //!
 //! ```text
 //! <tool_call>
@@ -15,8 +15,10 @@
 //! </tool_call>
 //! ```
 //!
-//! The parsing rules follow llama.cpp's parser for this family
-//! (`common/chat.cpp`, `common_chat_params_init_qwen3_coder`): a parameter
+//! The parsing rules follow llama.cpp's parser for this format — which it
+//! selects by what the template contains rather than by the model's name, so
+//! Qwen3.6 takes it (`common/chat.cpp`,
+//! `common_chat_params_init_qwen3_coder`): a parameter
 //! whose schema type is `string` takes the raw text between its tags, any
 //! other parameter is parsed as JSON, and a call may open with a bare
 //! `<function=name>` — for a *known* name only — because the model
@@ -27,8 +29,10 @@
 //! rather than dropped: the caller can at least see what the model said.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
+use xabe_grammar::{ToolGrammar, ToolSpec, Vocab};
 
 /// One tool the caller offered, in the shape the prompt and the parser need.
 #[derive(Debug, Clone)]
@@ -373,6 +377,23 @@ impl ToolDefinition {
                 .or_else(|| function.get("input_schema")),
         )
     }
+}
+
+/// The grammar that keeps the model inside the tools it was offered.
+///
+/// llama.cpp attaches one to every request that carries `tools`
+/// (`tools/server/server-common.cpp`, `grammar_type = "tool_calls"`), and
+/// this is the same decision: tools offered means output constrained. A tool
+/// whose wrapper does not name a function is skipped rather than failing the
+/// request — it could not be called anyway.
+pub(crate) fn grammar(tools: &[ToolDefinition], vocab: &Arc<Vocab>) -> Option<Arc<ToolGrammar>> {
+    let specs: Vec<ToolSpec> = tools
+        .iter()
+        .filter_map(|tool| ToolSpec::from_wrapper(&tool.wrapper))
+        .collect();
+    // Parallel calls: this model's template writes them and the parser reads
+    // them, so the grammar admits them too.
+    ToolGrammar::new(&specs, true, Arc::clone(vocab)).map(Arc::new)
 }
 
 /// One call parsed out of the model's output.

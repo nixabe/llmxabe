@@ -17,6 +17,7 @@ cudarc = { version = "0.19.9", features = ["driver", "nvrtc", "fallback-dynamic-
 xabe-cache.workspace = true
 xabe-sched.workspace = true
 xabe-kernels.workspace = true
+xabe-grammar.workspace = true
 parking_lot.workspace = true
 rustc-hash.workspace = true
 half.workspace = true

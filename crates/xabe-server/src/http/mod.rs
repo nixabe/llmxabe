@@ -72,6 +72,9 @@ pub struct ServerConfig {
     /// `Some` when `--mmproj` loaded a vision tower; `None` serves text
     /// only and refuses image parts with a 400 that names the flag.
     pub vision: Option<VisionServingConfig>,
+    /// The vocabulary a tool-call grammar masks against, read out of the
+    /// same GGUF the tokenizer came from.
+    pub grammar_vocab: Arc<xabe_grammar::Vocab>,
 }
 
 #[derive(Clone)]
@@ -90,6 +93,9 @@ struct AppState {
     sampling_defaults: SamplingDefaults,
     /// The vision serving state, with the pad token already resolved.
     vision: Option<Arc<vision::VisionServing>>,
+    /// The token pieces a tool-call grammar is masked against, built once at
+    /// startup and shared by every request that offers tools.
+    grammar_vocab: Arc<xabe_grammar::Vocab>,
     /// Handlers currently blocked trying to take a worker lock to submit a
     /// request. A driver loop holds its worker's lock for a whole GPU step
     /// and would otherwise reacquire it immediately; this is how it learns
@@ -360,6 +366,7 @@ pub async fn serve(
         default_reasoning: config.default_reasoning,
         sampling_defaults: config.sampling_defaults,
         vision,
+        grammar_vocab: config.grammar_vocab,
     };
     // One driver thread per worker. They share nothing but the client map
     // and the engine's shared prefix cache, so a card that is prefilling no
