@@ -342,6 +342,17 @@ differ. This is an acceptance check, not a performance benchmark or proof of
 equivalence on arbitrary prompts, models, or context lengths. It does not test
 vision or execute real tools.
 
+For another checkpoint such as Ornith 1.5, set `LLMXABE_MODEL` for the live
+template test and capture a separate numerical golden from that exact GGUF
+using [the oracle procedure](ORACLE.md). Never pair Ornith weights with the
+Qwen3.6 golden. Matching architecture and vocabulary do not establish equal
+templates or numerical behavior; the Qwen3.6 thresholds must not be widened
+just to clear another checkpoint. To localize an attention-layer failure,
+extend the capture filter's `(3|39)` group with that layer. `attention_block`
+keeps blocks 3 and 39 mandatory and checks every additional captured attention
+block with the same gates, reporting numerical failures together so a
+reference discrepancy does not hide a device-versus-CPU discrepancy.
+
 Prefill partitioning is another source of numerical variation: a scheduler
 grant can end inside a GDN chunk, so concurrent admission or a different token
 budget can change a later greedy choice. This also occurs in the original

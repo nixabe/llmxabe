@@ -3,7 +3,7 @@
 //! [`xabe_engine::block::attention`] assembles ten of Qwen3.6's forty layers.
 //! This is its gate: the real block, on the real Q8_0 weights, over the real
 //! 19-token prompt `docs/ORACLE.md` describes, compared against **every**
-//! intermediate llama.cpp recorded for blocks 3 and 39 — not just the block
+//! intermediate llama.cpp recorded (at least blocks 3 and 39) — not just the block
 //! output, so a divergence localizes to one operation instead of to "the
 //! attention block".
 //!
@@ -341,23 +341,19 @@ fn measure(candidate: &[f32], reference: &[f32]) -> Agreement {
 /// its own RMS would report a 118% error for a step that is doing nothing
 /// wrong. Those call sites pass the RMS that actually sets the scale, and say
 /// which one.
-fn assert_gate(label: &str, a: &Agreement, gate: &Gate, scale: f64) {
-    assert!(
-        a.max_abs <= gate.abs_over_rms * scale,
-        "{label}: worst absolute error is {:.3e}, {:.3e} x the scale RMS {:.3e}, \
-         above the bound {:.3e} (element {})",
-        a.max_abs,
-        a.max_abs / scale,
-        scale,
-        gate.abs_over_rms,
-        a.max_abs_index,
-    );
-    assert!(
-        a.cosine >= gate.min_cosine,
-        "{label}: cosine similarity {:.12} is below {:.12}",
-        a.cosine,
-        gate.min_cosine,
-    );
+fn assert_gate(label: &str, a: &Agreement, gate: &Gate, scale: f64, failures: &mut Vec<String>) {
+    if a.max_abs.is_nan() || scale.is_nan() || a.max_abs > gate.abs_over_rms * scale {
+        failures.push(format!(
+            "{label}: worst absolute error is {:.3e}, {:.3e} x the scale RMS {:.3e}, above the bound {:.3e} (element {})",
+            a.max_abs, a.max_abs / scale, scale, gate.abs_over_rms, a.max_abs_index,
+        ));
+    }
+    if a.cosine.is_nan() || a.cosine < gate.min_cosine {
+        failures.push(format!(
+            "{label}: cosine similarity {:.12} is below {:.12}",
+            a.cosine, gate.min_cosine,
+        ));
+    }
 }
 
 fn model_path() -> PathBuf {
@@ -449,8 +445,8 @@ fn dequantize_q8_0_tensor(bytes: &[u8], out_dim: usize, in_dim: usize) -> Vec<f3
 
 /// llama.cpp's `q8_1` activation quantization, round-tripped back to f32.
 ///
-/// `d = amax / 127` over each block of 32, `q = roundf(x / d)`, value
-/// `q * d`. `roundf` is half-away-from-zero, which is `f32::round`. The
+/// `inv = 127 / amax` over each block of 32, `q = roundf(x * inv)`, value
+/// `q * (1 / inv)`. `roundf` is half-away-from-zero, which is `f32::round`. The
 /// scale is kept in fp32: the test asserts below that this reproduces the
 /// capture, and an fp16 scale — which is what the non-MMQ `quantize_q8_1`
 /// stores — does **not**, by three orders of magnitude.
@@ -466,8 +462,12 @@ fn quantize_activations_q8_1(x: &[f32]) -> Vec<f32> {
             out.extend(std::iter::repeat_n(0.0f32, QK8_1));
             continue;
         }
-        let d = amax / Q8_1_LEVELS;
-        out.extend(block.iter().map(|&v| (v / d).round() * d));
+        // llama.cpp ggml-cuda/quantize.cu::quantize_mmq_q8_1 uses
+        // reciprocal multiplication, not x / (amax / 127). At half-step
+        // boundaries those operations can select different integers.
+        let d_inv = Q8_1_LEVELS / amax;
+        let d = 1.0 / d_inv;
+        out.extend(block.iter().map(|&v| (v * d_inv).round() * d));
     }
     out
 }
@@ -963,7 +963,17 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
     for &l in &CAPTURED_LAYERS {
         assert_eq!(config.layer_kind(l), LayerKind::GatedAttention);
         assert!(layers.contains(&l));
+        g.expect(&format!("Qcur_full-{l}"));
     }
+    // A diagnostic capture may include additional attention blocks. Keep
+    // the required baseline coverage and apply the same gates to every
+    // extra block, so a full-forward failure can be localized without
+    // changing this test's thresholds or hard-coding another layer list.
+    let captured_layers: Vec<u32> = layers
+        .iter()
+        .copied()
+        .filter(|layer| g.get(&format!("Qcur_full-{layer}")).is_some())
+        .collect();
     println!(
         "block shape covers {} of {} layers: {layers:?}",
         layers.len(),
@@ -991,7 +1001,10 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         AttentionKernelSet::new(&ctx, &config, tokens).expect("attention kernels must compile"),
     );
 
-    for &layer in &CAPTURED_LAYERS {
+    // Collect numerical failures so a reference discrepancy does not hide
+    // the device-vs-host checks. The final assertion still requires every gate.
+    let mut failures = Vec::new();
+    for &layer in &captured_layers {
         println!("\n================ block {layer} ================");
         let hw = HostWeights::load(&file, &config, layer);
 
@@ -1148,6 +1161,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 &m,
                 &s.gate,
                 m.rms_ref,
+                &mut failures,
             );
         }
 
@@ -1207,6 +1221,7 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 &m_quant,
                 &PROJECTION_Q8_1,
                 m_quant.rms_ref,
+                &mut failures,
             );
             // The contrast is what licenses PROJECTION_VS_GOLDEN's width. If
             // the two ever converge, the explanation is wrong and this fails.
@@ -1412,12 +1427,14 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
                 &vs_host,
                 &s.host_gate,
                 s.scale.map_or(vs_host.rms_ref, |(scale, _)| scale),
+                &mut failures,
             );
             assert_gate(
                 &format!("{}-{layer} dev|gold", s.name),
                 &vs_gold,
                 &s.gate,
                 s.scale.map_or(vs_gold.rms_ref, |(scale, _)| scale),
+                &mut failures,
             );
         }
 
@@ -1525,6 +1542,11 @@ fn the_gated_attention_block_reproduces_every_captured_intermediate_of_blocks_3_
         PROJECTION_VS_GOLDEN.abs_over_rms,
         PROJECTION_VS_GOLDEN.min_cosine,
     );
+    assert!(
+        failures.is_empty(),
+        "numerical gates failed:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -1561,7 +1583,7 @@ fn the_imrope_section_mapping_matches_the_upstream_branch() {
 
 #[test]
 fn the_q8_1_emulation_is_the_quantization_it_claims_to_be() {
-    // No device, no model file. `d = amax/127`, `q = roundf(x/d)`, and the
+    // No device, no model file. `inv = 127/amax`, `q = roundf(x*inv)`, and the
     // reconstruction is `q * d` — so the block maximum is reproduced exactly
     // and everything else lands on a multiple of `d`.
     let block: Vec<f32> = (0..32).map(|i| (i as f32 - 15.5) * 0.37).collect();
@@ -1585,6 +1607,17 @@ fn the_q8_1_emulation_is_the_quantization_it_claims_to_be() {
             .iter()
             .all(|&v| v == 0.0)
     );
+}
+
+#[test]
+fn the_mmq_emulation_matches_reciprocal_multiplication_at_a_half_step() {
+    let mut block = [0.0; QK8_1];
+    block[0] = 0.1;
+    block[1] = f32::from_bits(0x3d80_339a);
+    let inv = 127.0 / block[0];
+    assert_eq!((block[1] / (block[0] / 127.0)).round(), 80.0);
+    assert_eq!((block[1] * inv).round(), 79.0);
+    assert_eq!(quantize_activations_q8_1(&block)[1], 79.0 * (1.0 / inv));
 }
 
 #[test]

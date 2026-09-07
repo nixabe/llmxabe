@@ -241,10 +241,14 @@ and adding formats there would be a different decision from this one.
 
 `ornith-ai/Ornith-1.5-35B-A3B` is a different finetune of the same
 architecture. Its GGUF metadata is byte-identical to Qwen3.6's on every
-`qwen35moe.*` hyperparameter, with the same 753 tensor names — only
-provenance keys and one `tokenizer.ggml.padding_token_id` differ. It needs no
-code change. What it needs is the recipe above, because its published
-quantizations are uniform.
+`qwen35moe.*` hyperparameter, with the same 753 tensor names. The tokenizer
+vocabulary also matches, but provenance, `tokenizer.ggml.padding_token_id`,
+and the embedded chat template differ. Ornith's template always replays
+assistant reasoning; Qwen3.6's normally drops reasoning from turns before
+the last user query unless `preserve_thinking` is enabled. Serve each file
+with its own embedded template and compare correctness against llama.cpp
+loading that same checkpoint. It needs no architecture change. What it needs
+is the recipe above, because its published quantizations are uniform.
 
 Reproducing the shipped mix from full weights, read off the reference file
 rather than guessed at:

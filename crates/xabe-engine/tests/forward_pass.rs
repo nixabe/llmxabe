@@ -481,6 +481,16 @@ fn the_forward_pass_reproduces_llama_cpps_logits_and_its_argmax() {
         "the embedding lookup is not bit-identical to llama.cpp's: {r}",
     );
 
+    // Report the endpoint before any intermediate gate can abort. The
+    // assertions below remain unchanged; a layer failure must not hide
+    // whether it also moved the final distribution or winning token.
+    println!(
+        "\n=== final logits diagnostic (gates below) ===\n  {}\n  ours {:?}, reference {:?}",
+        compare(&logits, g.logits()),
+        argmax(&logits),
+        argmax(g.logits()),
+    );
+
     // ---- 5. Every block boundary, as a curve. -------------------------
     println!(
         "\n=== l_out-N, every block ===\n\
