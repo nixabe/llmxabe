@@ -26,13 +26,12 @@
 //! below `min_p` times the most likely token's, and the final draw
 //! renormalizes over what is left.
 //!
-//! Temperature scales log-probabilities *before* any filter looks at them —
-//! vLLM's order. llama.cpp's default chain instead applies temperature after
-//! its truncation filters, so at temperatures far from 1 its filters cut a
-//! differently-shaped distribution; there is no one spec here, and the
-//! temperature-first order is chosen because it makes each filter's
-//! documented meaning ("cumulative probability", "relative probability")
-//! true of the distribution actually being sampled.
+//! Temperature scales the surviving logits only after top-k, top-p, and
+//! min-p, matching llama.cpp's default chain (`common/common.h`,
+//! `common_params_sampling::samplers`). Applying it before truncation changes
+//! which tokens remain reachable even when both servers receive the same
+//! settings. RNG algorithms still differ, so equal seeds do not imply equal
+//! sampled text across engines.
 //!
 //! Speculative decoding needs no changes to stay exact under sampling: the
 //! runtime samples the *target* model's token and accepts a draft only when
@@ -48,7 +47,7 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingParams {
     /// Softmax temperature. Zero selects greedy argmax; values above zero
-    /// scale the logits by `1/temperature` before sampling.
+    /// scale the surviving logits by `1/temperature` after filtering.
     pub temperature: f32,
     /// Keep only the `top_k` most likely tokens. Zero disables the filter.
     pub top_k: u32,
@@ -197,8 +196,7 @@ impl Sampler {
             return 0;
         }
 
-        let inv_t = f64::from(self.params.temperature).recip();
-        let weight = |logit: f32| (f64::from(logit - max) * inv_t).exp();
+        let weight = |logit: f32| f64::from(logit - max).exp();
 
         if self.params.top_p < 1.0 {
             let target = f64::from(self.params.top_p.max(0.0));
@@ -247,6 +245,9 @@ impl Sampler {
             scratch.retain(|&(logit, _)| weight(logit) >= threshold);
         }
 
+        // llama.cpp truncates at temperature 1, then heats/cools the draw.
+        let inv_t = f64::from(self.params.temperature).recip();
+        let weight = |logit: f32| (f64::from(logit - max) * inv_t).exp();
         let total: f64 = scratch.iter().map(|&(logit, _)| weight(logit)).sum();
         let mut draw = self.rng.next_f64() * total;
         for &(logit, index) in scratch.iter() {
@@ -421,6 +422,34 @@ mod tests {
             (frequency - 0.75).abs() < 0.03,
             "observed {frequency}, expected 0.75 ± 0.03"
         );
+    }
+
+    #[test]
+    fn truncation_precedes_temperature_like_llama_cpp() {
+        // Known distribution: top-p .7 keeps .5 and .3; min-p .5 also
+        // keeps those two. Temperature-first would keep only .5 when cold,
+        // and all three when hot. Inspect support, independently of the RNG.
+        let logits = [0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()];
+        for temperature in [0.2, 1.0, 2.0] {
+            for (top_p, min_p) in [(0.7, 0.0), (1.0, 0.5), (0.7, 0.5)] {
+                let mut sampler = Sampler::new(SamplingParams {
+                    temperature,
+                    top_k: 0,
+                    top_p,
+                    min_p,
+                    seed: 42,
+                });
+                let mut scratch = Vec::new();
+                sampler.sample(&logits, &mut scratch);
+                let mut ids: Vec<_> = scratch.iter().map(|&(_, id)| id).collect();
+                ids.sort_unstable();
+                assert_eq!(
+                    ids,
+                    [0, 1],
+                    "temperature={temperature}, top_p={top_p}, min_p={min_p}"
+                );
+            }
+        }
     }
 
     #[test]

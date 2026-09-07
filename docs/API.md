@@ -162,15 +162,17 @@ kind of extension); `seed` is honoured on the OpenAI shapes that carry it.
   operator who wants the old always-greedy behaviour sets the temperature
   default to `0`; one who wants llama-server's flavour sets, say,
   `--temp 0.8 --top-p 0.95 --min-p 0.05`.
-- Filters run in the sequence llama.cpp's chain uses: temperature scales
-  the logits first, `top_k` keeps the k most likely, `top_p` keeps the
+- Filters run in the sequence llama.cpp's default chain uses: `top_k`
+  keeps the k most likely, `top_p` keeps the
   smallest set of the survivors whose cumulative probability reaches `p`,
   `min_p` drops survivors below `min_p` times the most likely token's
-  probability, and the draw renormalizes over what is left. `top_k: 1`,
+  probability, then temperature scales the surviving logits and the draw
+  renormalizes over what is left. `top_k: 1`,
   `top_p: 0`, and `min_p: 1` all degenerate to greedy and are served as
   such.
 - Equal `seed`s with equal parameters replay equal outputs. Without a seed,
-  each request draws fresh entropy.
+  each request draws fresh entropy. RNG algorithms differ from llama.cpp,
+  so equal seeds across the two engines do not promise identical text.
 - `temperature` outside `[0, 2]`, and `top_p` or `min_p` outside `[0, 1]`,
   are refused with `400`.
 
@@ -180,9 +182,10 @@ Speculative decoding stays exact under sampling — a draft is accepted only
 when it equals the token the target model drew — it just accepts fewer
 drafts as temperature rises.
 
-Still *accepted and ignored*, because refusing them would break standard
-clients and they only nudge which plausible answer you get:
-`presence_penalty`, `frequency_penalty`, `logit_bias`.
+Still *accepted and ignored*: `presence_penalty`, `frequency_penalty`, and
+`logit_bias`. They do not change this server's output distribution. Comparisons
+against llama.cpp must leave these disabled; in particular, a caller's repetition
+penalties do not currently suppress repetition here.
 
 ## Tool calling
 
