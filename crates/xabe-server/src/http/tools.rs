@@ -181,12 +181,17 @@ impl ToolDefinition {
         }
         let mut function = Map::new();
         function.insert("name".to_owned(), json!(name));
-        if let Some(description) = description {
-            function.insert("description".to_owned(), description.clone());
-        }
-        if let Some(parameters) = parameters {
-            function.insert("parameters".to_owned(), parameters.clone());
-        }
+        // common/chat.cpp, common_chat_tools_parse_oaicompat and
+        // common_chat_tools_to_json_oaicompat: even omitted fields reach the
+        // template, as an empty description and an empty schema.
+        function.insert(
+            "description".to_owned(),
+            description.cloned().unwrap_or(json!("")),
+        );
+        function.insert(
+            "parameters".to_owned(),
+            parameters.cloned().unwrap_or(json!({})),
+        );
         let string_params = parameters
             .and_then(|parameters| parameters.get("properties"))
             .and_then(Value::as_object)
@@ -716,6 +721,22 @@ mod tests {
             },
         }))
         .expect("a well-formed tool parses")
+    }
+
+    #[test]
+    fn omitted_tool_fields_match_llama_cpps_prompt_defaults() {
+        let tool = ToolDefinition::from_openai(&json!({
+            "type": "function", "function": {"name": "ping"},
+        }))
+        .expect("parameterless tool parses");
+        assert_eq!(
+            tool.wrapper,
+            json!({
+                "type": "function", "function": {
+                    "name": "ping", "description": "", "parameters": {},
+                },
+            })
+        );
     }
 
     fn events(parser: &mut ToolCallParser, pieces: &[&str]) -> Vec<ToolEvent> {

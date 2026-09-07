@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 
-use minijinja::value::{Value as JinjaValue, ValueKind};
+use minijinja::value::{Kwargs, Value as JinjaValue, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, State, context};
 use serde_json::{Map, Value, json};
 use tracing::warn;
@@ -59,6 +59,11 @@ impl ChatTemplate {
     pub(crate) fn compile(source: String) -> Result<Arc<Self>, String> {
         let mut env = Environment::new();
         env.set_unknown_method_callback(python_method);
+        // This is a model prompt, not HTML. Minijinja's built-in emits
+        // compact JSON and HTML escapes; llama.cpp's minja uses spaces after
+        // separators and preserves characters such as '<' in tool schemas.
+        env.add_filter("tojson", prompt_tojson);
+        env.add_filter("string", prompt_string);
         // Templates call this to reject inputs they cannot render — a system
         // message holding an image, say. It has to fail the render, not
         // return a string.
@@ -120,6 +125,83 @@ impl ChatTemplate {
             })
             .map_err(|error| format!("chat template failed to render: {error:#}"))
     }
+}
+
+struct PromptJsonFormatter;
+
+fn prompt_string(value: JinjaValue) -> String {
+    match value.kind() {
+        ValueKind::None => "None".to_owned(),
+        ValueKind::Bool => if value.is_true() { "True" } else { "False" }.to_owned(),
+        _ => value.to_string(),
+    }
+}
+
+impl serde_json::ser::Formatter for PromptJsonFormatter {
+    fn begin_array_value<W: std::io::Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: std::io::Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: std::io::Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+}
+
+/// Default JSON spelling observed in llama.cpp's `/apply-template` output.
+pub(crate) fn prompt_json(value: &impl serde::Serialize) -> Result<String, serde_json::Error> {
+    let mut bytes = Vec::new();
+    value.serialize(&mut serde_json::Serializer::with_formatter(
+        &mut bytes,
+        PromptJsonFormatter,
+    ))?;
+    Ok(String::from_utf8(bytes).expect("JSON serialization emits UTF-8"))
+}
+
+fn prompt_tojson(
+    value: JinjaValue,
+    indent: Option<usize>,
+    kwargs: Kwargs,
+) -> Result<JinjaValue, Error> {
+    let indent = indent.or(kwargs.get("indent")?);
+    kwargs.assert_all_used()?;
+    let encoded = if let Some(indent) = indent {
+        let mut bytes = Vec::new();
+        let spaces = " ".repeat(indent);
+        let mut serializer = serde_json::Serializer::with_formatter(
+            &mut bytes,
+            serde_json::ser::PrettyFormatter::with_indent(spaces.as_bytes()),
+        );
+        serde::Serialize::serialize(&value, &mut serializer)
+            .map(|()| String::from_utf8(bytes).expect("JSON serialization emits UTF-8"))
+    } else {
+        prompt_json(&value)
+    };
+    encoded.map(JinjaValue::from_safe_string).map_err(|error| {
+        Error::new(ErrorKind::InvalidOperation, "cannot serialize prompt JSON").with_source(error)
+    })
 }
 
 /// The conversation as the OpenAI message list a chat template expects.
@@ -362,7 +444,7 @@ mod tests {
             .expect("the conversation renders");
         // The tool schema reached the template, the replayed call kept its
         // parameter markup, and the result became a `<tool_response>` turn.
-        assert!(rendered.contains(r#"{"type":"function","function":{"name":"read""#));
+        assert!(rendered.contains(r#"{"type": "function", "function": {"name": "read""#));
         assert!(rendered.contains("<tool_call>\n<function=read>\n<parameter=filePath>\na.rs\n"));
         assert!(rendered.contains("<tool_response>\ncontents\n</tool_response>"));
         assert!(rendered.ends_with("<|im_start|>assistant\n"));
@@ -403,6 +485,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prompt_json_matches_minja_spacing_without_html_escaping() {
+        // Independently checked with llama.cpp /apply-template: spaces are
+        // tokens too, and its tojson is not minijinja's HTML-safe filter.
+        let source = "{{ {'name': 'read', 'description': '台北 <tag> & a,b:c', \
+                      'enum': ['a', 'b'], 'required': true} | tojson }}";
+        let template = ChatTemplate::compile(source.to_owned()).expect("compiles");
+        assert_eq!(
+            template
+                .render(&Conversation::default(), false)
+                .expect("renders"),
+            r#"{"name": "read", "description": "台北 <tag> & a,b:c", "enum": ["a", "b"], "required": true}"#,
+        );
+        let template = ChatTemplate::compile("{{ {'a': 1} | tojson(indent=2) }}".to_owned())
+            .expect("compiles");
+        assert_eq!(
+            template
+                .render(&Conversation::default(), false)
+                .expect("renders"),
+            "{\n  \"a\": 1\n}",
+        );
+    }
+
     /// The hand-written ChatML and the model's own template, on the same
     /// conversation, byte for byte.
     ///
@@ -432,6 +537,91 @@ mod tests {
                     conversation.render(thinking),
                     "hand-written ChatML and `tokenizer.chat_template` disagree on \
                      `{name}` (enable_thinking = {thinking})"
+                );
+            }
+        }
+    }
+
+    /// Opt-in live oracle; comparing our two renderers alone can bless a
+    /// shared mistake. Run against the same GGUF loaded in llama-server
+    /// with --no-prefill-assistant (both renderers append a new turn).
+    #[test]
+    fn the_model_template_matches_llama_cpp_when_requested() {
+        let Ok(base) = std::env::var("LLMXABE_LLAMA_URL") else {
+            eprintln!("SKIPPED: set LLMXABE_LLAMA_URL for live llama.cpp template parity");
+            return;
+        };
+        let path = std::env::var_os("LLMXABE_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::tokenizer::DEFAULT_MODEL_PATH.into());
+        let source = crate::tokenizer::chat_template_from_gguf(&path)
+            .expect("model file reads")
+            .expect("model has a template");
+        let template = ChatTemplate::compile(source).expect("compiles");
+        let tokenizer = crate::tokenizer::from_gguf(&path).expect("tokenizer loads");
+        for (name, conversation) in fixtures() {
+            for thinking in [true, false] {
+                let mut request = json!({
+                    "messages": messages(&conversation),
+                    "chat_template_kwargs": {"enable_thinking": thinking},
+                });
+                if !conversation.tools.is_empty() {
+                    request["tools"] = json!(
+                        conversation
+                            .tools
+                            .iter()
+                            .map(|tool| &tool.wrapper)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                let call = |endpoint: &str, body: &Value| {
+                    use std::io::Write;
+                    use std::process::{Command, Stdio};
+                    let mut child = Command::new("curl")
+                        .args([
+                            "--fail-with-body",
+                            "--silent",
+                            "--show-error",
+                            "--max-time",
+                            "30",
+                            "-H",
+                            "Content-Type: application/json",
+                            "--data-binary",
+                            "@-",
+                            &format!("{}{endpoint}", base.trim_end_matches('/')),
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .expect("curl starts");
+                    child
+                        .stdin
+                        .take()
+                        .expect("stdin")
+                        .write_all(body.to_string().as_bytes())
+                        .expect("request writes");
+                    let output = child.wait_with_output().expect("curl exits");
+                    assert!(
+                        output.status.success(),
+                        "oracle failed: {}",
+                        String::from_utf8_lossy(&output.stdout)
+                    );
+                    serde_json::from_slice::<Value>(&output.stdout).expect("oracle returns JSON")
+                };
+                let oracle = call("/apply-template", &request);
+                let expected = oracle["prompt"].as_str().expect("oracle prompt");
+                let actual = template.render(&conversation, thinking).expect("renders");
+                assert_eq!(actual, expected, "{name}, thinking={thinking}");
+                let tokens = call(
+                    "/tokenize",
+                    &json!({"content": expected, "add_special": false, "parse_special": true}),
+                );
+                let expected: Vec<u32> =
+                    serde_json::from_value(tokens["tokens"].clone()).expect("token ids");
+                assert_eq!(
+                    tokenizer.encode(actual, false).expect("encodes").get_ids(),
+                    expected,
+                    "tokenization: {name}, thinking={thinking}"
                 );
             }
         }
@@ -539,6 +729,33 @@ mod tests {
         });
         all.push(("a multi-line value and an integer", widths));
 
+        let mut typed = Conversation::default();
+        typed.turns.push(Turn::User("apply the edit".to_owned()));
+        typed.turns.push(Turn::Assistant {
+            reasoning: String::new(),
+            content: String::new(),
+            tool_calls: vec![ParsedToolCall {
+                name: "edit".to_owned(),
+                arguments: json!({"replaceAll": true, "skip": false, "optional": null,
+                                  "data": {"items": [1, 2], "text": "台北 <tag> & a,b:c"}})
+                .as_object()
+                .expect("object")
+                .clone(),
+            }],
+        });
+        all.push(("boolean, null, nested JSON and Unicode arguments", typed));
+
+        let mut no_params = Conversation {
+            tools: OfferedTools::from_openai(&[
+                json!({"type": "function", "function": {"name": "ping"}}),
+            ])
+            .expect("tool parses")
+            .definitions,
+            ..Conversation::default()
+        };
+        no_params.turns.push(Turn::User("ping".to_owned()));
+        all.push(("tool with omitted description and parameters", no_params));
+
         all
     }
 
@@ -586,15 +803,10 @@ mod tests {
         );
     }
 
-    /// The one divergence, pinned so it is a decision and not a surprise.
-    ///
-    /// The template renders a non-string argument through Python's `str()`,
-    /// so a boolean comes out `True`; the hand-renderer writes the JSON
-    /// spelling the value arrived as, `true`. Both parse back to the same
-    /// argument, and the JSON spelling is what the model is asked to emit in
-    /// the first place, so the hand-renderer keeps it.
+    /// Python scalar spelling is part of the prompt, even though generated
+    /// calls use JSON spelling. Both renderers must replay it like minja.
     #[test]
-    fn a_boolean_argument_is_the_one_place_the_two_renderings_differ() {
+    fn a_boolean_argument_replays_with_python_spelling() {
         let path = std::env::var_os("LLMXABE_MODEL")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(crate::tokenizer::DEFAULT_MODEL_PATH));
@@ -619,11 +831,10 @@ mod tests {
                     .clone(),
             }],
         });
-        assert!(conversation.render(true).contains("\ntrue\n</parameter>"));
+        assert!(conversation.render(true).contains("\nTrue\n</parameter>"));
         let through_template = template.render(&conversation, true).expect("renders");
         assert!(
-            through_template.contains("\ntrue\n</parameter>")
-                || through_template.contains("\nTrue\n</parameter>"),
+            through_template.contains("\nTrue\n</parameter>"),
             "{through_template}"
         );
     }

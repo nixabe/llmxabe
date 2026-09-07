@@ -314,11 +314,60 @@ runtime plumbing is not where throughput goes. Serving numbers belong in
 ## Running
 
 ```sh
-cargo test --workspace                # everything
-cargo test -p xabe-kernels            # references and harness
-cargo test -p xabe-kernels gdn        # the critical path
+cargo test --workspace --release -- --test-threads=1 # serialize GPU allocations
+cargo test --release -p xabe-kernels                 # references and harness
+cargo test --release -p xabe-kernels gdn             # the critical path
 cargo run -p xabe-cuda --bin probe    # device gate and milestone-00 spike
 ```
+
+### Live llama.cpp parity
+
+Use the same GGUF in both servers. The golden checks one short cold prompt;
+`tools/serving/check_correctness.py` adds live known-answer checks, identical
+raw prompts, Unicode, a long-context lookup, cache reuse in mixed concurrent
+batches, and tool calls plus result replay in all three chat dialects. It also
+checks each dialect's streaming tool response. Results go outside the repository:
+
+```sh
+python tools/serving/check_correctness.py \
+  --candidate http://127.0.0.1:18080 --reference http://127.0.0.1:18081 \
+  --output /tmp/llmxabe-quality.json
+```
+
+Start the candidate fresh for the first long prompt to be a cold control. The
+harness asserts known answers and cache identity, and reports free-form greedy
+text agreement separately. Different reduction/activation arithmetic can flip
+near ties; equal seeds also do not imply identical sampled text because the RNGs
+differ. This is an acceptance check, not a performance benchmark or proof of
+equivalence on arbitrary prompts, models, or context lengths. It does not test
+vision or execute real tools.
+
+Prefill partitioning is another source of numerical variation: a scheduler
+grant can end inside a GDN chunk, so concurrent admission or a different token
+budget can change a later greedy choice. This also occurs in the original
+engine, independently of the prompt renderer and host sampler. Exact batched
+decode agreement from an identical initial state does not establish identical
+states after different prefill partitions. Keep the prompt and partitioning
+fixed for an exact comparison; investigate changed continuations with numerical
+oracles rather than assuming either corruption or harmlessness from the prose.
+
+The prompt/tokenization oracle catches shared mistakes that comparing our two
+renderers cannot. Start llama-server with `--jinja --no-prefill-assistant` and
+the same model, then run (requires `curl`):
+
+```sh
+LLMXABE_LLAMA_URL=http://127.0.0.1:18081 \
+  cargo test --release -p xabe-server \
+  the_model_template_matches_llama_cpp_when_requested -- --nocapture
+```
+
+It compares rendered bytes and token IDs for both thinking modes, tool loops,
+parallel calls, omitted tool fields, and typed/Unicode arguments. Minijinja's
+HTML-oriented JSON filter and scalar string spelling differ from minja's;
+prompt filters must match the latter, including JSON separator spaces and
+Python `True`/`None` in replayed arguments. `--no-prefill-assistant` aligns the
+reference with this server's next-turn behavior: llama.cpp otherwise continues
+a final assistant message automatically, while this server appends a new turn.
 
 ### A green run is not the same as a run
 

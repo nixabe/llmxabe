@@ -456,14 +456,14 @@ normal with your current knowledge and do not tell the user about function calls
 
 /// How a replayed call argument appears between its `<parameter>` tags.
 ///
-/// Strings verbatim, everything else as JSON. The template renders scalars
-/// through Python's `str()` (`True`, `None`), but JSON spellings are what the
-/// values were before the wire carried them; the difference is cosmetic and
-/// this one is pinned by tests.
+/// Strings verbatim, containers as JSON, scalars through Python's `str()`
+/// (`True`, `None`), as the model's template does under llama.cpp's minja.
 fn parameter_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        other => serde_json::to_string(other).expect("JSON values serialize"),
+        Value::Bool(value) => if *value { "True" } else { "False" }.to_owned(),
+        Value::Null => "None".to_owned(),
+        other => super::jinja::prompt_json(other).expect("JSON values serialize"),
     }
 }
 
@@ -495,7 +495,7 @@ impl Conversation {
             for tool in &self.tools {
                 out.push('\n');
                 out.push_str(
-                    &serde_json::to_string(&tool.wrapper).expect("tool wrappers serialize"),
+                    &super::jinja::prompt_json(&tool.wrapper).expect("tool wrappers serialize"),
                 );
             }
             out.push_str("\n</tools>");
@@ -818,8 +818,8 @@ mod tests {
         };
         let rendered = conversation.render(true);
         let expected_open = "<|im_start|>system\n# Tools\n\nYou have access to the following \
-             functions:\n\n<tools>\n{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\
-             \"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}\
+             functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"\", \
+             \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}}\
              \n</tools>";
         assert!(rendered.starts_with(expected_open), "{rendered}");
         assert!(rendered.contains("ONLY reply in the following format with NO suffix"));
@@ -970,10 +970,12 @@ mod tests {
     #[test]
     fn non_string_parameter_values_render_as_json() {
         assert_eq!(parameter_value(&serde_json::json!("plain")), "plain");
-        assert_eq!(parameter_value(&serde_json::json!(true)), "true");
+        assert_eq!(parameter_value(&serde_json::json!(true)), "True");
+        assert_eq!(parameter_value(&serde_json::json!(false)), "False");
+        assert_eq!(parameter_value(&serde_json::Value::Null), "None");
         assert_eq!(
             parameter_value(&serde_json::json!({ "a": 1 })),
-            r#"{"a":1}"#
+            r#"{"a": 1}"#
         );
     }
 
