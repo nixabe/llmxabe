@@ -1,12 +1,8 @@
 //! Attention alone, at the context depths where the throughput curve bends.
 //!
-//! `docs/BENCHMARKS.md` establishes that prefill throughput falls from 1.13x
-//! llama.cpp at 512 tokens to 0.45x at 131,072, and that the decay is
-//! attention: it is the only term whose cost per token grows with the context
-//! already in the cache. Every measurement of it so far has come from a whole
-//! forward pass, which means a 30 GiB model load and a minute of wall clock per
-//! A/B — expensive enough that the honest response to a small change was to not
-//! measure it.
+//! See Current standing in `docs/BENCHMARKS.md` for model-level measurements.
+//! This harness isolates the term whose cost
+//! grows with the context already in the cache.
 //!
 //! This runs the attention launch and nothing else, at the geometry Qwen3.6
 //! actually has, so a kernel change can be measured in seconds and interleaved
@@ -45,9 +41,8 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
 
-use cudarc::driver::CudaContext;
+use cudarc::driver::{CudaContext, sys::CUevent_flags};
 use tracing::{error, info};
 
 use xabe_cuda::device::{DeviceInfo, driver_available};
@@ -219,7 +214,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             stream.synchronize()?;
         }
 
-        let start = Instant::now();
+        // Time the GPU span, joining concurrent streams before the stop event.
+        // This is their combined elapsed time, not the sum of stream times.
+        let start = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+        let stop = ctx.new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))?;
+        let joins = (1..streams.len())
+            .map(|_| ctx.new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING)))
+            .collect::<Result<Vec<_>, _>>()?;
+        start.record(&streams[0])?;
+        for stream in &streams[1..] {
+            stream.wait(&start)?;
+        }
         for _ in 0..REPS {
             for (index, (((stream, dec), out), position)) in streams
                 .iter()
@@ -243,10 +248,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
             }
         }
-        for stream in &streams {
-            stream.synchronize()?;
+        for (stream, join) in streams[1..].iter().zip(&joins) {
+            join.record(stream)?;
+            streams[0].wait(join)?;
         }
-        let ms = start.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+        stop.record(&streams[0])?;
+        stop.synchronize()?;
+        let ms = f64::from(start.elapsed_ms(&stop)?) / REPS as f64;
 
         let (issued, minimum) = traffic(&kernels, depth, chunk);
         let issued = issued * concurrent;
