@@ -55,6 +55,12 @@ order on odd pairs. Each CUDA event interval contains 100 graph-captured
 launches. Small shapes therefore reflect repeated cache-hot execution;
 whole-model measurements are required before drawing an inference-speed claim.
 
+An optional third argument selects a baseline PTX containing `tensor_add`,
+instead of compiling the NVRTC baseline. This compares a compiler or kernel
+change directly with the previous Rust artifact. The gate includes all float
+alignments modulo 16, independently offset input/output pointers, and all
+four-float tail lengths; wider accesses must preserve the sliced-buffer ABI.
+
 To test inside the model, pass `--features xabe-cuda/rust-kernels` to
 `bench_forward`, `bench_decode_batch`, and the existing forward tests. Keep
 separate target directories for candidate and baseline, build both before

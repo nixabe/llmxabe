@@ -1,5 +1,5 @@
 //! Differential and CUDA-event A/B gate for the experimental Rust residual.
-//! Usage: bench_rust_add <oxide.ptx> <entry-name>
+//! Usage: bench_rust_add <oxide.ptx> <entry-name> [baseline.ptx]
 use std::sync::Arc;
 
 use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};
@@ -40,8 +40,8 @@ fn launch(
 fn main() -> Result<(), Error> {
     xabe_log::init_from_args();
     let args: Vec<_> = std::env::args().collect();
-    if args.len() != 3 {
-        return Err("usage: bench_rust_add <oxide.ptx> <entry-name>".into());
+    if !(3..=4).contains(&args.len()) {
+        return Err("usage: bench_rust_add <oxide.ptx> <entry-name> [baseline.ptx]".into());
     }
     let source = std::fs::read_to_string(&args[1])?;
     if !source.lines().any(|line| line.trim() == ".target sm_75") {
@@ -51,10 +51,15 @@ fn main() -> Result<(), Error> {
     // SAFETY: one stream, all storage retained until synchronization below.
     unsafe { ctx.disable_event_tracking() };
     let stream = ctx.new_stream()?;
-    let baseline = ctx.load_module(xabe_cuda::kernels::compile(
-        xabe_cuda::kernels::layer_ops::LAYER_OPS_SRC,
-        "rust_add_baseline",
-    )?)?;
+    let baseline_ptx = if let Some(path) = args.get(3) {
+        Ptx::from_src(std::fs::read_to_string(path)?)
+    } else {
+        xabe_cuda::kernels::compile(
+            xabe_cuda::kernels::layer_ops::LAYER_OPS_SRC,
+            "rust_add_baseline",
+        )?
+    };
+    let baseline = ctx.load_module(baseline_ptx)?;
     let candidate = ctx.load_module(Ptx::from_src(source))?;
     let kernels = [
         baseline.load_function("tensor_add")?,
@@ -62,7 +67,10 @@ fn main() -> Result<(), Error> {
     ];
 
     // Ragged tails, empty input, decode, prefill, and multiple grid strides.
-    for n in [0, 1, 255, 256, 257, 2048, 6144, 1_048_576, 8_388_608] {
+    for n in [
+        0, 1, 3, 4, 5, 255, 256, 257, 2048, 6144, 16383, 16384, 16385, 16386, 16387, 1_048_576,
+        8_388_608,
+    ] {
         let mut a: Vec<f32> = (0..n)
             .map(|i| ((i % 1009) as f32 - 504.0) / 127.0)
             .collect();
@@ -86,33 +94,49 @@ fn main() -> Result<(), Error> {
         }
         let reference = residual_add(&a, &b);
         for (arm, kernel) in kernels.iter().enumerate() {
-            for alias in 0..3 {
-                let guarded = |values: &[f32]| {
-                    let mut v = vec![12345.0];
-                    v.extend_from_slice(values);
-                    v.push(12345.0);
-                    v
-                };
-                let da = stream.clone_htod(&guarded(&a))?;
-                let db = stream.clone_htod(&guarded(&b))?;
-                let output = stream.clone_htod(&guarded(&vec![0.0; n]))?;
-                let pa = da.device_ptr(&stream).0 + 4;
-                let pb = db.device_ptr(&stream).0 + 4;
-                let pc = output.device_ptr(&stream).0 + 4;
-                let out_ptr = [pc, pa, pb][alias];
-                launch(&stream, kernel, [pa, pb, out_ptr], n)?;
-                let actual = stream.clone_dtoh([&output, &da, &db][alias])?;
-                assert_eq!(actual[0], 12345.0, "leading guard arm={arm}");
-                assert_eq!(actual[n + 1], 12345.0, "trailing guard arm={arm}");
-                if n > 0 {
-                    assert_matches(&actual[1..=n], &reference, &Tolerance::exact());
+            // Exercise every float alignment modulo 16, including independently
+            // offset pointers that must disable a candidate's vector path.
+            for guards in [
+                [1, 1, 1],
+                [2, 2, 2],
+                [3, 3, 3],
+                [4, 4, 4],
+                [4, 1, 4],
+                [4, 4, 1],
+                [1, 4, 4],
+            ] {
+                for alias in 0..3 {
+                    let guarded = |values: &[f32], guard: usize| {
+                        let mut v = vec![12345.0; guard];
+                        v.extend_from_slice(values);
+                        v.push(12345.0);
+                        v
+                    };
+                    let da = stream.clone_htod(&guarded(&a, guards[0]))?;
+                    let db = stream.clone_htod(&guarded(&b, guards[1]))?;
+                    let output = stream.clone_htod(&guarded(&vec![0.0; n], guards[2]))?;
+                    let pa = da.device_ptr(&stream).0 + (guards[0] * 4) as u64;
+                    let pb = db.device_ptr(&stream).0 + (guards[1] * 4) as u64;
+                    let pc = output.device_ptr(&stream).0 + (guards[2] * 4) as u64;
+                    let out_ptr = [pc, pa, pb][alias];
+                    launch(&stream, kernel, [pa, pb, out_ptr], n)?;
+                    let actual = stream.clone_dtoh([&output, &da, &db][alias])?;
+                    let guard = [guards[2], guards[0], guards[1]][alias];
+                    assert!(
+                        actual[..guard].iter().all(|&v| v == 12345.0),
+                        "leading guard arm={arm}"
+                    );
+                    assert_eq!(actual[n + guard], 12345.0, "trailing guard arm={arm}");
+                    if n > 0 {
+                        assert_matches(&actual[guard..n + guard], &reference, &Tolerance::exact());
+                    }
+                    assert!(
+                        actual[guard..n + guard]
+                            .iter()
+                            .zip(&reference)
+                            .all(|(x, y)| x.to_bits() == y.to_bits())
+                    );
                 }
-                assert!(
-                    actual[1..n + 1]
-                        .iter()
-                        .zip(&reference)
-                        .all(|(x, y)| x.to_bits() == y.to_bits())
-                );
             }
         }
         info!(
