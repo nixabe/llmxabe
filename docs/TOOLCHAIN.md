@@ -15,18 +15,61 @@ The design plan offered two options.
 | Option | For | Against |
 | --- | --- | --- |
 | `cudarc` + CUDA C++ via NVRTC | Stable on sm_75; JIT specialization at load; inline PTX always available | Two languages; kernel code outside Rust's type system |
-| NVlabs `cuda-oxide` | Single-source Rust; compile-time kernel policies; monomorphization | Alpha; pinned nightly; feature surface aimed at Hopper/Blackwell; sm_75 undertested |
+| NVlabs `cuda-oxide` | Single-source Rust; compile-time kernel policies; monomorphization; PTX interop with existing launchers | Alpha; separate pinned nightly; sm_75 needs an explicit target and workload validation |
+| NVlabs `cutile-rs` | Rust tile DSL; compiler-managed layout; stable Rust; graph replay | Explicitly excludes sm_75; cannot target the deployment cards |
 
 The decision rule was explicit: any "no" on the inline-PTX question collapses
 the choice to cudarc, because without an escape hatch you cannot reach
 `mma.sync.m16n8k8.f16` or `ldmatrix`, and you cannot route around a codegen
 bug.
 
-**cuda-oxide is not obtainable.** `cargo oxide` is not published to crates.io,
-and the `cuda-oxide` crate that *is* published is an unrelated, older
-high-level CUDA wrapper rather than the single-source compiler the plan
-referred to. Not being installable is a stronger "no" than failing a gate, so
-the remaining questions were evaluated against cudarc.
+**cuda-oxide is obtainable from NVlabs.** The original availability rejection
+is obsolete. Do not confuse it with Protryon's older `cuda-oxide` driver
+wrapper. Availability alone does not validate a replacement kernel.
+
+## Rust compiler evaluation
+
+Source revisions checked on 2026-09-10:
+
+- [cuda-oxide `26754ae5`](https://github.com/NVlabs/cuda-oxide/tree/26754ae52c26c097dc1c465a1e42c4c5d05a3d40)
+  declares version 0.2.1 and pins `nightly-2026-08-28`. Its installation guide
+  lists sm_80+, but `cargo-oxide/src/commands/codegen_env.rs` explicitly handles
+  Turing and accepts `--arch sm_75`. Its `ptx_asm!` macro supplies an inline-PTX
+  escape hatch. The residual-add probe ran on sm_75; this does not establish
+  support or performance for all of our tensor-core kernels.
+- [cutile-rs `2eed75e8`](https://github.com/NVlabs/cutile-rs/tree/2eed75e8f552be31216ddf2019288f03dfec4939)
+  declares version 0.3.1. Its README explicitly excludes architectures below
+  sm_80, including sm_75, with no plan to support them. CUDA 13.2 adds Ampere
+  support; 13.3 adds Hopper. Neither makes Turing a supported target.
+
+The candidate in [`experiments/cuda-oxide`](../experiments/cuda-oxide) ports
+`layer_ops.rs::tensor_add` to Rust, preserving its raw-pointer ABI, grid-stride
+loop and input/output aliasing. It uses a separate Cargo workspace so compiler
+experiments do not change the engine's nightly or dependency graph. The
+[`bench_rust_add`](../crates/xabe-engine/src/bin/bench_rust_add.rs) gate loads
+its PTX through the engine's existing cudarc runtime, compares both compilers
+against `xabe_kernels::norm::residual_add`, and measures alternating pairs
+with CUDA events. The opt-in `xabe-cuda/rust-kernels` feature embeds the
+generated PTX, so using it requires neither the experimental compiler nor its
+host runtime at engine build or run time. Source changes require regeneration.
+The server and engine expose a forwarding `rust-kernels` feature: build with
+`cargo build --release -p xabe-server --features rust-kernels` to enable it.
+It is disabled by default and has no runtime switch; see the
+[build instructions](DEVELOPMENT.md#optional-rust-cuda-kernels).
+
+On GPU 1, the residual matched its CPU oracle bit for bit, including both
+in-place aliases, signed zero, subnormals and ragged tails. All 12 existing
+layer-op differentials passed with the feature enabled. The 19-token Qwen3.6
+forward golden also passed all 40 block gates and selected token 25358.
+These checks do not establish long-context performance or validate another
+Rust kernel. [The paired measurements](BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher)
+show a faster standalone kernel and model-level parity at the measured N=3/2K
+configurations. The default remains NVRTC.
+
+The current host runtime dependency (`cuda-core`/`cuda-bindings` 0.3.1) requires
+CUDA 13.0+ headers. On this host the shell selects CUDA 12.4 even though CUDA
+13.0 is also installed. Select the latter explicitly for the experiment;
+ordinary engine builds continue to use NVRTC as before.
 
 ## Gating results
 

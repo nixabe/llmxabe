@@ -719,6 +719,54 @@ enough to flip expert selection and spike a layer's divergence 26×.
 The reasons the engine is shaped the way it is. Each is a mechanism that paid,
 stated so it transfers to the next kernel rather than as a changelog entry.
 
+## Rust kernel authoring can keep the existing launcher
+
+The opt-in `xabe-cuda/rust-kernels` feature replaces `tensor_add` with
+cuda-oxide-generated PTX. It preserves the existing cudarc ABI, allocations
+and graph capture. The pinned Rust source, compiler revision and regeneration
+procedure are in [TOOLCHAIN.md](TOOLCHAIN.md) and
+[`experiments/cuda-oxide`](../experiments/cuda-oxide). CUDA C++ remains the
+default; this is a tested migration path, not an inference-speed claim.
+
+The compiler difference is concrete: NVRTC unrolls the grid-stride loop,
+where cuda-oxide leaves one loop body. Offline CUDA 12.4 `ptxas -arch=sm_75`
+uses 36 registers for the former and 16 for the latter, with no spills.
+Those are offline assembler counts, not measurements of the driver's JIT.
+Six alternating GPU 1 CUDA-event pairs, order reversed on odd pairs, timed
+100 graph-captured launches per interval:
+
+| Elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
+| ---: | ---: | ---: |
+| 2,048 | 1.716–1.767 | 1.484–1.515 |
+| 6,144 | 1.721–1.755 | 1.500–1.531 |
+| 1,048,576 | 23.859–23.940 | 23.817–23.879 |
+| 8,388,608 | 183.419–183.807 | 180.163–180.305 |
+
+Repeated small inputs are cache-hot. The whole Qwen3.6 model has only 40
+standalone mixer residuals per step; the MoE residual is already fused.
+Three alternating process pairs on GPU 1, middle pair reversed, therefore
+read as parity. Both arms used the same source tree with only the feature
+different, prebuilt in separate target directories, with the box otherwise
+quiet. Values within each cell are pair 0 / 1 / 2:
+
+| N=3, 2K per sequence | NVRTC tok/s | Rust tok/s | Rust change across pairs |
+| --- | --- | --- | --- |
+| Decode, 64 steps after 4 warmup | 217.8 / 216.8 / 216.5 | 217.3 / 216.8 / 216.7 | −0.23% / 0.00% / +0.09% |
+| Prefill, 1,536 total chunk rows, 5 timed repetitions | 3073.34 / 3055.24 / 3057.28 | 3062.50 / 3059.73 / 3054.73 | −0.35% / +0.15% / −0.08% |
+
+Prefill's within-process standard deviations were 6.88–12.42 tok/s for
+NVRTC and 7.21–9.79 for Rust. This compares the two kernel backends at a
+fixed 512-row-per-sequence chunk; the standing configuration and llama.cpp
+comparison remain in [Current standing](#current-standing). Deep contexts,
+the dense model and concurrent three-card serving were not measured for this
+feature. A full context sweep is required before changing the default.
+
+The residual differential is bit-exact, including signed zero, subnormals,
+ragged tails, both in-place aliases and graph replay. All 12 layer-op GPU
+differentials and the 19-token, 40-block Qwen3.6 forward golden passed with
+the feature enabled. The narrow gain establishes a viable Rust kernel; its
+sign-changing model pairs establish no engine throughput improvement.
+
 ## Compile-time formats free registers that ptxas then spends
 
 The MoE expert prologue took its format as a runtime argument inside a

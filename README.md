@@ -129,8 +129,13 @@ tables for any context length.
 ```sh
 git clone <repo> && cd llmxabe
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --release
 ```
+
+The experimental Rust residual-add kernel is disabled by default. Enable it
+at compile time with `cargo build --release -p xabe-server --features rust-kernels`.
+See [optional Rust CUDA kernels](docs/DEVELOPMENT.md#optional-rust-cuda-kernels)
+for build, test and regeneration instructions.
 
 The whole workspace builds and tests without a GPU or CUDA toolkit — that is
 what CI runs. Tests that need a device detect its absence and skip, reporting

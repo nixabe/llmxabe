@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Opt-in until model-level measurements justify changing the default.
+rust-kernels = []
+
 [dependencies]
 half.workspace = true
 tracing.workspace = true

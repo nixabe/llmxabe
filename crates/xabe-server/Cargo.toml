@@ -11,6 +11,10 @@ authors.workspace = true
 name = "llmxabe"
 path = "src/main.rs"
 
+[features]
+default = []
+rust-kernels = ["xabe-engine/rust-kernels"]
+
 [dependencies]
 tracing.workspace = true
 xabe-log.workspace = true

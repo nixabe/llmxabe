@@ -23,7 +23,7 @@ because the design plan carried them as estimates:
 
 ```sh
 cargo build --workspace
-cargo test --workspace
+cargo test --workspace --release
 ```
 
 No crate needs a GPU or a CUDA toolkit to build and test, including
@@ -41,6 +41,43 @@ by accident. Everything device-gated funnels through
 `xabe_cuda::device::driver_available`, which has to answer `false` — not
 abort — on a machine with no driver, because `cudarc` panics rather than
 erroring when it cannot find `libcuda` at all.
+
+### Optional Rust CUDA kernels
+
+`rust-kernels` is a **compile-time Cargo feature, disabled by default**.
+Enable it when building the server:
+
+```sh
+cargo build --release -p xabe-server --features rust-kernels
+```
+
+This builds `target/release/llmxabe` with the cuda-oxide residual-add kernel.
+The server feature forwards through `xabe-engine` to `xabe-cuda`. Engine
+benchmarks and tests can use the same flag:
+
+```sh
+cargo build --release -p xabe-engine --bin bench_decode_batch --features rust-kernels
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kernels \
+  --test layer_ops_differential -- --nocapture
+```
+
+The feature currently replaces only residual addition; other kernels still
+use CUDA C++ through NVRTC. It embeds checked-in PTX generated from pinned
+Rust source, so ordinary feature-enabled builds need neither cuda-oxide nor
+CUDA toolkit headers. Regenerating that PTX uses the separate toolchain in
+[`experiments/cuda-oxide`](../experiments/cuda-oxide).
+
+To build the default CUDA C++ path again, omit the feature:
+
+```sh
+cargo build --release -p xabe-server
+```
+
+Kernel selection is fixed in the compiled binary. There is no runtime flag
+or environment variable to enable it. Cargo's `--all-features` also enables
+`rust-kernels`; the default feature lists are empty. See
+[TOOLCHAIN.md](TOOLCHAIN.md#rust-compiler-evaluation) for correctness checks
+and measured limitations.
 
 ## Reference checkouts
 

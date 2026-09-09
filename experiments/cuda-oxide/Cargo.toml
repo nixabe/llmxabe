@@ -1,0 +1,13 @@
+[package]
+name = "xabe-rust-device"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep the experimental compiler's nightly and dependencies out of the engine.
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", rev = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide", rev = "26754ae52c26c097dc1c465a1e42c4c5d05a3d40" }
+cuda-core = "=0.3.1"

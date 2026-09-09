@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+rust-kernels = ["xabe-cuda/rust-kernels"]
+
 [dependencies]
 tracing.workspace = true
 xabe-log.workspace = true
