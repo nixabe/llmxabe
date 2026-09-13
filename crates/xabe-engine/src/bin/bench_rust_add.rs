@@ -1,5 +1,5 @@
 //! Differential and CUDA-event A/B gate for the experimental Rust residual.
-//! Usage: bench_rust_add <oxide.ptx> <entry-name> [baseline.ptx]
+//! Usage: `bench_rust_add <oxide.ptx> <entry-name> [baseline.ptx]`
 use std::sync::Arc;
 
 use cudarc::driver::sys::{CUevent_flags, CUgraphInstantiate_flags, CUstreamCaptureMode};

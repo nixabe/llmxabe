@@ -53,7 +53,7 @@ const FIRST_SPECIAL: usize = 248_000;
 /// A byte-level BPE writes each of the 256 bytes as one printable character,
 /// so a token's stored spelling is not its bytes. Reversing that is what lets
 /// a grammar be matched against the vocabulary
-/// ([`crate::http::tools`] hands the result to `xabe-grammar`).
+/// (`crate::http::tools` hands the result to `xabe-grammar`).
 fn byte_of_char() -> std::collections::HashMap<char, u8> {
     let mut direct: Vec<u8> = (b'!'..=b'~')
         .chain(0xA1..=0xAC)
