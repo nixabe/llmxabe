@@ -3,6 +3,10 @@
 A single-process CUDA inference engine for `Qwen3.6-35B-A3B` on 3× Quadro
 RTX 8000, written in Rust.
 
+> **NOTICE**: This project was created for experiment and was fully driven by
+> **AI Agent**. It is NOT fully optimized, tested on multiple devices or
+> production-ready. Issues and undercover bugs are expected.
+
 > **Status: the engine serves, and it is ahead of the baseline.** The model is
 > resident on one GPU, a full 40-block forward pass runs entirely on the
 > device — Gated DeltaNet, gated attention, and the 256-expert MoE — it
@@ -190,6 +194,7 @@ of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | | |
 | --- | --- |
+| [docs/LICENSE.md](docs/LICENSE.md) | License, project notice, and reference acknowledgements |
 | [AGENTS.md](AGENTS.md) | Instructions for AI agents; the binding design rules |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Setup, workflow, console output, commit and review conventions |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | **Current standing, and why / why not — start here for performance** |
@@ -209,4 +214,8 @@ of [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
-MIT OR Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE) for the full text and [NOTICE](NOTICE)
+for reference acknowledgements and third-party notices. Model weights are
+not distributed here and retain their publishers' terms.
+
+See [docs/LICENSE.md](docs/LICENSE.md) for the license and project notice.
