@@ -676,27 +676,25 @@ pub struct LayerOpsKernels {
 }
 
 impl LayerOpsKernels {
-    /// Compile layer ops with NVRTC. With `rust-kernels`, load the residual
-    /// add from the embedded Rust-generated PTX instead. All loading happens
-    /// during construction, before any hot-path launches or graph capture.
+    /// Compile layer ops with NVRTC. With `rust-kernels`, load residual add,
+    /// SwiGLU and sigmoid gating from one embedded Rust-generated module.
+    /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
         let ptx = compile(LAYER_OPS_SRC, "layer_ops").map_err(LayerOpsError::Compile)?;
         let module = ctx.load_module(ptx)?;
         #[cfg(feature = "rust-kernels")]
-        let add = ctx
-            .load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
-                "rust/tensor_add.ptx"
-            )))?
-            .load_function("tensor_add")?;
+        let elementwise = ctx.load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
+            "rust/tensor_add.ptx"
+        )))?;
         #[cfg(not(feature = "rust-kernels"))]
-        let add = module.load_function("tensor_add")?;
+        let elementwise = &module;
         Ok(Self {
             rms_norm: module.load_function("rms_norm_rows")?,
             rms_norm_swiglu: module.load_function("rms_norm_swiglu_rows")?,
             rope: module.load_function("rope_partial")?,
-            swiglu: module.load_function("swiglu_mul")?,
-            sigmoid_gate: module.load_function("sigmoid_gate_mul")?,
-            add,
+            swiglu: elementwise.load_function("swiglu_mul")?,
+            sigmoid_gate: elementwise.load_function("sigmoid_gate_mul")?,
+            add: elementwise.load_function("tensor_add")?,
             softplus: module.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,

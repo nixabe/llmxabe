@@ -728,6 +728,9 @@ procedure are in [TOOLCHAIN.md](TOOLCHAIN.md) and
 [`experiments/cuda-oxide`](../experiments/cuda-oxide). CUDA C++ remains the
 default; this is a tested migration path, not an inference-speed claim.
 
+The following residual-only measurements isolate that port from the
+activation ports now selected by the same feature.
+
 The compiler difference is concrete: NVRTC unrolls the grid-stride loop,
 where cuda-oxide leaves one loop body. Offline CUDA 12.4 `ptxas -arch=sm_75`
 uses 36 registers for the former and 16 for the latter, with no spills.
@@ -766,6 +769,63 @@ ragged tails, both in-place aliases and graph replay. All 12 layer-op GPU
 differentials and the 19-token, 40-block Qwen3.6 forward golden passed with
 the feature enabled. The narrow gain establishes a viable Rust kernel; its
 sign-changing model pairs establish no engine throughput improvement.
+
+### Activation ports need their own shape measurements
+
+The single, disabled-by-default `rust-kernels` feature also selects
+`swiglu_mul` and `sigmoid_gate_mul`, including per-row broadcasting and the
+separate sigmoid waypoint. It forwards from the server through the engine
+to `xabe-cuda`. Their raw-pointer ABI and launch geometry are unchanged;
+loading happens at construction. The same generated PTX contains the
+residual entry, whose instructions are unchanged apart from label numbering.
+
+`bench_rust_activations` compares both implementations with the existing CPU
+oracles and tolerances, including empty/ragged/grid-stride lengths, saturated
+gates, guarded buffers, supported exact aliases and graph replay. All cases
+passed on GPU 1. The feature-enabled layer-op suite passed all 12 tests;
+SwiGLU's million-element max-abs error was **2.861e-6**, and elementwise
+sigmoid gating's 262,144-element max-abs error was **4.768e-7**, both with
+cosine **1.000000000**. The 19-token Qwen3.6 golden passed all 40 block gates
+and selected token **25358**. CUDA 12.4 offline `ptxas -arch=sm_75` uses
+22 registers for Rust SwiGLU and 26 for Rust sigmoid gating, with no spills;
+these are not driver-JIT measurements.
+
+Six alternating GPU 1 pairs, order reversed on odd pairs, each timed 100
+graph-captured launches with CUDA events. Small shapes are cache-hot. Both
+arms use the normal 256-thread grid capped at 1,024 blocks:
+
+| Kernel / shape | Elements | NVRTC us/launch, min–max | Rust us/launch, min–max |
+| --- | ---: | ---: | ---: |
+| SwiGLU | 12,288 | 2.115–2.151 | 1.882–1.899 |
+| SwiGLU | 262,145 | 5.693–5.713 | 4.424–4.459 |
+| SwiGLU | 8,388,608 | 182.156–182.255 | 186.574–186.675 |
+| Sigmoid, elementwise | 12,288 | 1.556–1.592 | 1.434–1.452 |
+| Sigmoid, elementwise | 262,145 | 4.182–4.219 | 3.418–3.438 |
+| Sigmoid, elementwise | 8,388,608 | 253.953–254.505 | 252.453–252.785 |
+| Sigmoid, per row, width 2,048 | 12,288 | 1.638–1.672 | 1.619–1.720 |
+| Sigmoid, per row, width 2,048 | 262,145 | 4.585–4.618 | 4.356–4.380 |
+| Sigmoid, per row, width 2,048 | 8,388,608 | 132.924–133.251 | 142.222–142.510 |
+
+The model uses fused SwiGLU and shared-expert paths, so the activation
+ports change only the standalone attention sigmoid gates in the current
+forward path. The following measurements isolate those ports from residual
+addition; they do not measure the combined `rust-kernels` switch. Three alternating process pairs on GPU 1 used prebuilt
+binaries from the same tree, selecting Rust activations only in the candidate
+and CUDA C++ residual addition in both arms. No other GPU work or builds ran during
+timing. Values are pair 0 / 1 / 2; the middle pair reversed order:
+
+| Qwen3.6, N=3, 2K per sequence | NVRTC tok/s | Rust activations tok/s | Rust change across pairs |
+| --- | --- | --- | --- |
+| Decode, 64 steps after 4 warmup | 217.6 / 216.8 / 217.0 | 217.4 / 217.5 / 217.0 | −0.09% / +0.32% / 0.00% |
+| Prefill, 1,536 total chunk rows, 5 timed repetitions | 3080.91 / 3059.20 / 3060.56 | 3071.82 / 3065.06 / 3059.15 | −0.30% / +0.19% / −0.05% |
+
+Prefill's within-process standard deviations were 8.49–10.13 tok/s for
+NVRTC and 6.84–8.23 for Rust. Both model comparisons change sign across
+pairs: no engine throughput improvement is established. Large standalone
+SwiGLU and broadcast sigmoid regress despite passing correctness, so the
+migration remains opt-in. Deep contexts, the dense model and concurrent
+three-card serving were not measured for this feature. The llama.cpp
+comparison remains in [Current standing](#current-standing).
 
 ## Compile-time formats free registers that ptxas then spends
 
@@ -1557,6 +1617,7 @@ proposed twice.
 | Attempt | Result |
 | --- | --- |
 | Alternating shared K/V buffers in prefill attention | Removes the arrival barrier before staging each 8-key tile, preserving arithmetic and the existing register prefetch. Shared memory grows 13,952 → 22,272 B; offline CUDA 12.4 `ptxas` uses 255 registers without spills in both arms. Four prefill CPU differentials (including 128K keys), carried-chunk and wide N=3 prefill checks, and the 19-token/40-block forward golden passed; the optional divergence audit was not run. Three GPU 1 pairs, middle reversed, with `rust-kernels` in both arms: N=3 **2K** at total chunk 6,144 gives **3640.53 / 3622.19 / 3631.72 → 3635.66 / 3630.55 / 3626.47 tok/s** (−0.13 / +0.23 / −0.14%); **8K** at chunk 24,576 gives **3490.51 / 3481.65 / 3475.60 → 3491.82 / 3482.26 / 3477.35** (+0.04 / +0.02 / +0.05%). One warmup and three timed repetitions per process; 8K within-process SD is 9.80–23.47 tok/s, much larger than the difference. The 2,048-query CUDA-event attention bench gains 1.2–1.5% at offset zero but loses 5.0–16.6% at offset 8K, and changes sign at several deeper offsets. Fewer barriers bought no meaningful full-prefill throughput. Reverted; full-model depths above 8K were not measured. |
+| Enabling the plain Rust activation ports by default | Six alternating GPU 1 CUDA-event pairs, 100 captured launches per interval, at 8,388,608 elements: standalone SwiGLU **182.156–182.255 us NVRTC** versus **186.574–186.675 us Rust** (2.3–2.4% lower throughput); per-row sigmoid at width 2,048 **132.924–133.251 us** versus **142.222–142.510 us** (6.4–6.7% lower). Width 7 also loses 4.2–4.3%. The direct grid-stride port preserves the runtime broadcast indexing and memory geometry; passing CPU/replay gates and winning cache-hot shapes does not establish a universal replacement. Current forward execution uses only its elementwise sigmoid path; three N=3/2K model pairs change sign on both prefill and decode. Retained behind `rust-kernels`, rejected as a default or speed claim. |
 | Four-float Rust residual loads/stores with the existing launch grid | Bit-exact against the CPU, including aligned and unaligned buffers, both aliases and ragged tails. Six alternating GPU 1 CUDA-event pairs against the scalar Rust kernel, 100 graph-captured launches per interval: at 16,384 elements scalar **1.577–1.640 us**, vector **1.798–1.835 us** (8.9–13.9% lower kernel throughput); at 8,388,608 elements scalar **180.408–180.593 us**, vector **179.876–180.062 us** (only 0.20–0.35% higher). The candidate used cuda-oxide `vector::F32x4`, confirmed `ld/st.global.v4.b32`, scalar fallback below 16K or on misalignment, and a scalar tail. Retaining the scalar-sized grid while assigning four elements per thread leaves three quarters of its blocks empty at 16K; at large sizes it moves the same bytes and changes little. Rejected at the narrow gate; no whole-model throughput claim. |
 | GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call against RT=4's 33.9. RT=1 octuples the warps and the in-flight bytes and is the *worst* of the three, so memory-level parallelism was never the binding constraint — instruction count per byte is, and it falls with RT. |
 | The output projection at row tile 2 (2,048 rows, 512 warps at RT = 4 — under half a wave) | Bit-identical by construction and **flat at N=1** (23.0 us either way), **+25% at N=3** (28.2 → 35.2 us). Same finding as the row above on a second shape: the grid was 0.44 waves deep and doubling its warps bought nothing, because the kernel's cost at three tokens is the activation instruction count per weight byte, which RT halving doubles. Wave fill is not what binds a decode-width GEMV on this card; do not re-derive it from the grid arithmetic. |

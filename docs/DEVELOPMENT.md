@@ -51,7 +51,7 @@ Enable it when building the server:
 cargo build --release -p xabe-server --features rust-kernels
 ```
 
-This builds `target/release/llmxabe` with the cuda-oxide residual-add kernel.
+This builds `target/release/llmxabe` with the cuda-oxide residual-add, SwiGLU and sigmoid kernels.
 The server feature forwards through `xabe-engine` to `xabe-cuda`. Engine
 benchmarks and tests can use the same flag:
 
@@ -61,10 +61,14 @@ CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kerne
   --test layer_ops_differential -- --nocapture
 ```
 
-The feature currently replaces only residual addition; other kernels still
-use CUDA C++ through NVRTC. It embeds checked-in PTX generated from pinned
-Rust source, so ordinary feature-enabled builds need neither cuda-oxide nor
-CUDA toolkit headers. Regenerating that PTX uses the separate toolchain in
+The single `rust-kernels` feature selects every migrated kernel: residual
+addition, standalone SwiGLU and sigmoid gating (elementwise and per-row).
+The model's fused SwiGLU paths remain CUDA C++. All ports are disabled when
+the feature is omitted.
+
+The feature embeds checked-in PTX generated from pinned Rust source, so
+ordinary feature-enabled builds need neither cuda-oxide nor CUDA toolkit
+headers. Regenerating PTX uses the separate toolchain in
 [`experiments/cuda-oxide`](../experiments/cuda-oxide).
 
 To build the default CUDA C++ path again, omit the feature:

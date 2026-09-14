@@ -18,7 +18,10 @@ subprocess.run(
 if SOURCE.read_bytes() != source_before:
     raise SystemExit("Rust source changed during compilation; refusing to publish PTX")
 ptx = (HERE / "xabe_rust_device.ptx").read_text()
-if ".target sm_75\n" not in ptx or ".visible .entry tensor_add(" not in ptx:
+if ".target sm_75\n" not in ptx or any(
+    f".visible .entry {entry}(" not in ptx
+    for entry in ("tensor_add", "swiglu_mul", "sigmoid_gate_mul")
+):
     raise SystemExit("compiler output has the wrong target or entry point")
 header = (
     "// Generated from experiments/cuda-oxide/src/main.rs; do not edit.\n"

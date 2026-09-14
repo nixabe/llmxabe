@@ -1,9 +1,10 @@
-# Rust residual kernel
+# Rust elementwise kernels
 
 This standalone experiment compiles `src/main.rs` with NVlabs cuda-oxide
 `26754ae52c26c097dc1c465a1e42c4c5d05a3d40` (0.2.1, nightly-2026-08-28).
-The engine's opt-in `xabe-cuda/rust-kernels` feature loads its generated PTX
-through cudarc. Normal builds do not need cuda-oxide or its nightly. The
+The engine's single opt-in `rust-kernels` feature loads residual add,
+standalone SwiGLU and sigmoid gating through cudarc. The feature forwards
+from the server and engine crates. Normal builds need no cuda-oxide. The
 embedded PTX is generated code, not an independently maintained kernel.
 
 Install the matching compiler, with the CUDA 13 toolkit and libclang available:
@@ -69,3 +70,22 @@ remains NVRTC while this feature is evaluated.
 
 The measured correctness and performance results are recorded in
 [BENCHMARKS.md](../../docs/BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher).
+
+The activation gate uses the same per-tensor tolerances as
+`layer_ops_differential`, checks both sigmoid shapes and the sigmoid waypoint,
+empty/ragged/grid-stride lengths, saturation, guarded buffers, supported exact
+aliases, and graph replay. Six alternating pairs time 100 captured launches
+per CUDA event interval, with reversed order on odd pairs:
+
+```sh
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_activations
+CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kernels \
+  --test layer_ops_differential --test forward_pass -- --nocapture --test-threads=1
+```
+
+`bench_rust_activations` always compares the embedded Rust artifact against
+NVRTC, independently of feature selection. The historical `tensor_add.ptx`
+filename now contains all three generated entries. Standalone SwiGLU is not
+used by the model's fused MoE/FFN paths. The current feature changes residual
+addition and sigmoid gating in the forward path. Recorded activation-only
+model pairs isolated sigmoid gating; they do not measure the combined switch.

@@ -43,9 +43,10 @@ Source revisions checked on 2026-09-10:
   support; 13.3 adds Hopper. Neither makes Turing a supported target.
 
 The candidate in [`experiments/cuda-oxide`](../experiments/cuda-oxide) ports
-`layer_ops.rs::tensor_add` to Rust, preserving its raw-pointer ABI, grid-stride
-loop and input/output aliasing. It uses a separate Cargo workspace so compiler
-experiments do not change the engine's nightly or dependency graph. The
+`layer_ops.rs::{tensor_add, swiglu_mul, sigmoid_gate_mul}` to Rust, preserving
+the raw-pointer ABIs, grid-stride loops and supported input/output aliasing.
+It uses a separate Cargo workspace so compiler experiments do not change the
+engine's nightly or dependency graph. The
 [`bench_rust_add`](../crates/xabe-engine/src/bin/bench_rust_add.rs) gate loads
 its PTX through the engine's existing cudarc runtime, compares both compilers
 against `xabe_kernels::norm::residual_add`, and measures alternating pairs
@@ -54,7 +55,10 @@ generated PTX, so using it requires neither the experimental compiler nor its
 host runtime at engine build or run time. Source changes require regeneration.
 The server and engine expose a forwarding `rust-kernels` feature: build with
 `cargo build --release -p xabe-server --features rust-kernels` to enable it.
-It is disabled by default and has no runtime switch; see the
+`bench_rust_activations` checks both sigmoid shapes, waypoint outputs,
+guards, aliases and graph replay against
+the existing CPU tolerances before reporting six alternating event pairs.
+The feature is disabled by default and has no runtime switch; see the
 [build instructions](DEVELOPMENT.md#optional-rust-cuda-kernels).
 
 On GPU 1, the residual matched its CPU oracle bit for bit, including both
