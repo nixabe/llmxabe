@@ -3,9 +3,9 @@
 This standalone experiment compiles `src/main.rs` with NVlabs cuda-oxide
 `26754ae52c26c097dc1c465a1e42c4c5d05a3d40` (0.2.1, nightly-2026-08-28).
 The engine's single opt-in `rust-kernels` feature loads residual add,
-standalone SwiGLU, sigmoid gating, RMSNorm and fused RMSNorm/SwiGLU through
-cudarc. The feature forwards
-from the server and engine crates. Normal builds need no cuda-oxide. The
+standalone SwiGLU, sigmoid gating, softplus, both partial RoPE APIs, RMSNorm and
+fused RMSNorm/SwiGLU through cudarc. The feature forwards from the server and
+engine crates. Normal builds need no cuda-oxide. The
 embedded PTX is generated code, not an independently maintained kernel.
 
 Install the matching compiler, with the CUDA 13 toolkit and libclang available:
@@ -86,15 +86,19 @@ CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kerne
 
 `bench_rust_activations` always compares the embedded Rust artifact against
 NVRTC, independently of feature selection. The historical `tensor_add.ptx`
-filename now contains all five generated entries. Standalone SwiGLU is not
+filename now contains all eight generated entries. Standalone SwiGLU is not
 used by the model's fused MoE/FFN paths. The current feature changes residual
-addition, sigmoid gating and both normalization paths in the forward pass. Recorded activation-only
-model pairs isolated sigmoid gating; they do not measure the combined switch.
+addition, sigmoid gating, the production tiled RoPE and both normalization
+paths in the forward pass. Standalone softplus and layer-ops RoPE are API
+ports; production uses other gate and rotary implementations. Combined-switch
+results are in [BENCHMARKS.md](../../docs/BENCHMARKS.md#rust-normalization-and-rotary-kernels-need-separate-kernel-and-model-gates).
 
-
-The normalization ports preserve the CUDA C++ shuffle tree, serial sum of
-warp partials, two block barriers, exact division/square root, and dynamic
-shared-memory launch size. They use the same `rust-kernels` switch.
+The normalization ports use two levels of warp shuffles and one block
+barrier, preserving exact division/square root and the dynamic shared-memory
+launch size. The final warp-partial reduction changes the addition order;
+CPU and model gates must pass without relaxed tolerances. Small fused rows
+keep the input and gate in registers across the reduction. They use the same
+`rust-kernels` switch.
 `bench_rust_norm` checks both outputs of fused normalization against the CPU
 RMSNorm/SwiGLU composition with the existing layer-op tolerances. It covers
 sub-warp and ragged widths, multiple grid-stride iterations, zero/sparse
@@ -104,3 +108,28 @@ replay before reporting six alternating CUDA-event pairs:
 ```sh
 CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_norm
 ```
+
+`bench_rust_rope` checks rotated spans against CPU `apply_rope`, exact tail
+bits (including signed zero), independent output sentinels, ragged/full/zero
+rotary spans, positions through `u32::MAX`, and graph replay. Its event pairs
+use positions starting at 2,048, including the 512-token per-sequence band
+in an N=3 1,536-row batch, plus 1,536-token individual calls.
+The standalone Rust kernel assigns one thread per rotated pair, sharing its double
+precision frequency, sine/cosine and input loads. The tail remains a copy.
+`bench_rust_activations` also checks softplus, including the overflow-guard
+boundary, and measures the 96-element decode and 49,152-element prefill shapes.
+
+```sh
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_rope
+```
+
+The production attention counterpart is `attn_rope_partial_neox`. It already
+shares pair calculations and reuses frequencies over 16 tokens in C++.
+Its Rust port preserves that band and reads the base position from device
+memory. Grids of at most 72 blocks use both halves of
+rotary threads for alternate tokens; larger grids keep 16-token frequency
+reuse. This heuristic targets the 72-SM RTX 8000 and preserves the launch ABI.
+`bench_rust_rope` measures both APIs separately, at the model's 10,000,000
+frequency base. Standalone speedups do not imply the same gain
+for the tiled production kernel. Fused batched decode rotary/append and
+multimodal IMRoPE remain CUDA C++.

@@ -44,8 +44,9 @@ Source revisions checked on 2026-09-10:
 
 The candidate in [`experiments/cuda-oxide`](../experiments/cuda-oxide) ports
 `layer_ops.rs::{tensor_add, swiglu_mul, sigmoid_gate_mul, rms_norm_rows,
-rms_norm_swiglu_rows}` to Rust, preserving
-the raw-pointer ABIs, grid-stride loops and supported input/output aliasing.
+rms_norm_swiglu_rows, softplus_elementwise, rope_partial}` and
+`attention.rs::attn_rope_partial_neox` to Rust, preserving the raw-pointer
+ABIs and supported input/output aliasing.
 It uses a separate Cargo workspace so compiler experiments do not change the
 engine's nightly or dependency graph. The
 [`bench_rust_add`](../crates/xabe-engine/src/bin/bench_rust_add.rs) gate loads
@@ -56,9 +57,11 @@ generated PTX, so using it requires neither the experimental compiler nor its
 host runtime at engine build or run time. Source changes require regeneration.
 The server and engine expose a forwarding `rust-kernels` feature: build with
 `cargo build --release -p xabe-server --features rust-kernels` to enable it.
-`bench_rust_activations` checks both sigmoid shapes, waypoint outputs,
+`bench_rust_activations` checks softplus, both sigmoid shapes, waypoint outputs,
 guards, aliases and graph replay against
 the existing CPU tolerances before reporting six alternating event pairs.
+`bench_rust_rope` checks both partial rotary APIs, including exact tail bits;
+`bench_rust_norm` checks both normalization ports and their CPU gates.
 The feature is disabled by default and has no runtime switch; see the
 [build instructions](DEVELOPMENT.md#optional-rust-cuda-kernels).
 
@@ -66,10 +69,9 @@ On GPU 1, the residual matched its CPU oracle bit for bit, including both
 in-place aliases, signed zero, subnormals and ragged tails. All 12 existing
 layer-op differentials passed with the feature enabled. The 19-token Qwen3.6
 forward golden also passed all 40 block gates and selected token 25358.
-These checks do not establish long-context performance or validate another
-Rust kernel. [The paired measurements](BENCHMARKS.md#rust-kernel-authoring-can-keep-the-existing-launcher)
-show a faster standalone kernel and model-level parity at the measured N=3/2K
-configurations. The default remains NVRTC.
+These checks do not establish long-context performance.
+[The paired measurements](BENCHMARKS.md#rust-normalization-and-rotary-kernels-need-separate-kernel-and-model-gates)
+show gains for specific kernel shapes and model-level parity at N=3/2K. The default remains NVRTC.
 
 The current host runtime dependency (`cuda-core`/`cuda-bindings` 0.3.1) requires
 CUDA 13.0+ headers. On this host the shell selects CUDA 12.4 even though CUDA

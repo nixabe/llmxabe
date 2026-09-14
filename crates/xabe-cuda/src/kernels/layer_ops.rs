@@ -677,7 +677,8 @@ pub struct LayerOpsKernels {
 
 impl LayerOpsKernels {
     /// Compile layer ops with NVRTC. With `rust-kernels`, load residual add,
-    /// SwiGLU, sigmoid gating, RMSNorm and fused RMSNorm/SwiGLU from one
+    /// SwiGLU, sigmoid gating, softplus, partial RoPE, RMSNorm and fused
+    /// RMSNorm/SwiGLU from one
     /// embedded Rust-generated module.
     /// All loading happens before hot-path launches or graph capture.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, LayerOpsError> {
@@ -692,11 +693,11 @@ impl LayerOpsKernels {
         Ok(Self {
             rms_norm: migrated.load_function("rms_norm_rows")?,
             rms_norm_swiglu: migrated.load_function("rms_norm_swiglu_rows")?,
-            rope: module.load_function("rope_partial")?,
+            rope: migrated.load_function("rope_partial")?,
             swiglu: migrated.load_function("swiglu_mul")?,
             sigmoid_gate: migrated.load_function("sigmoid_gate_mul")?,
             add: migrated.load_function("tensor_add")?,
-            softplus: module.load_function("softplus_elementwise")?,
+            softplus: migrated.load_function("softplus_elementwise")?,
             conv1d: module.load_function("conv1d_causal_depthwise")?,
             conv1d_state: module.load_function("conv1d_update_state")?,
             conv1d_step: module.load_function("conv1d_step")?,

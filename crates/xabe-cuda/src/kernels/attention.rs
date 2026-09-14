@@ -261,7 +261,8 @@ const DECODE_KEY_TILE: usize = 8;
 /// exponential phase gives one key slot to one lane.
 const GQA_KEY_TILE: usize = 8;
 
-const ATTENTION_SRC: &str = r#"
+/// CUDA C++ baseline exposed for differential CUDA-event benchmarks.
+pub const ATTENTION_SRC: &str = r#"
 extern "C" {
 
 // NVRTC compiles from a string with no include path, so <math.h>'s INFINITY
@@ -2790,9 +2791,15 @@ impl AttentionKernels {
         }
         let ptx = compile(ATTENTION_SRC, "attention").map_err(AttentionError::Compile)?;
         let module = ctx.load_module(ptx)?;
+        #[cfg(feature = "rust-kernels")]
+        let migrated = ctx.load_module(cudarc::nvrtc::Ptx::from_src(include_str!(
+            "rust/tensor_add.ptx"
+        )))?;
+        #[cfg(not(feature = "rust-kernels"))]
+        let migrated = &module;
         Ok(Self {
             split: module.load_function("attn_split_query_gate")?,
-            rope: module.load_function("attn_rope_partial_neox")?,
+            rope: migrated.load_function("attn_rope_partial_neox")?,
             rope_imrope: module.load_function("attn_rope_partial_imrope")?,
             flash: module.load_function("attn_flash_causal")?,
             flash_gqa: module.load_function("attn_flash_causal_gqa")?,

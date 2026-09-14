@@ -81,7 +81,130 @@ mod kernels {
         }
     }
 
-    /// Same shuffle tree and serial warp accumulation as layer_ops.rs.
+    /// Softplus with the baseline overflow guard and libdevice exp/log.
+    ///
+    /// # Safety
+    /// x/out cover n floats, n >= 0, and the launch is nonempty and 1-D.
+    /// Output may exactly alias x; partial overlap is forbidden.
+    #[kernel]
+    pub unsafe fn softplus_elementwise(x: *const f32, out: *mut f32, n: i64) {
+        let stride = thread::blockDim_x() as i64 * thread::gridDim_x() as i64;
+        let mut i = thread::blockIdx_x() as i64 * thread::blockDim_x() as i64
+            + thread::threadIdx_x() as i64;
+        while i < n {
+            unsafe {
+                let v = *x.add(i as usize);
+                *out.add(i as usize) = if v > 20.0 { v } else { (1.0 + v.exp()).ln() };
+            }
+            i += stride;
+        }
+    }
+
+    /// Split-half partial RoPE; paired outputs share double-precision angles.
+    ///
+    /// # Safety
+    /// x/out are disjoint buffers covering gridDim.y * heads * head_dim
+    /// floats. positions covers gridDim.y. gridDim.x == heads, blockDim.x ==
+    /// head_dim, and 0 <= rope_dim <= head_dim is even. theta_base > 0.
+    #[kernel]
+    pub unsafe fn rope_partial(
+        x: *const f32,
+        positions: *const u32,
+        out: *mut f32,
+        heads: i32,
+        head_dim: i32,
+        rope_dim: i32,
+        theta_base: f32,
+    ) {
+        let h = thread::blockIdx_x() as usize;
+        let t = thread::blockIdx_y() as usize;
+        let j = thread::threadIdx_x() as i32;
+        let base = (t * heads as usize + h) * head_dim as usize;
+        unsafe {
+            if j >= rope_dim {
+                *out.add(base + j as usize) = *x.add(base + j as usize);
+            } else if j < rope_dim / 2 {
+                let half = rope_dim / 2;
+                let freq = (theta_base as f64).powf(-2.0 * j as f64 / rope_dim as f64);
+                let angle = *positions.add(t) as f64 * freq;
+                let sin_a = angle.sin() as f32;
+                let cos_a = angle.cos() as f32;
+                let x0 = *x.add(base + j as usize);
+                let x1 = *x.add(base + (j + half) as usize);
+                // Match NVRTC's contraction while sharing the angle and loads.
+                *out.add(base + j as usize) = x0.mul_add(cos_a, -(x1 * sin_a));
+                *out.add(base + (j + half) as usize) = x0.mul_add(sin_a, x1 * cos_a);
+            }
+        }
+    }
+
+    /// Production attention RoPE, using two token groups on underfilled grids.
+    ///
+    /// # Safety
+    /// input/output are disjoint and cover tokens * heads * head_dim floats.
+    /// position covers one i32; grid is (ceil(tokens/16), heads), blockDim.x
+    /// equals head_dim, and rotated is even and between zero and head_dim.
+    #[kernel]
+    pub unsafe fn attn_rope_partial_neox(
+        input: *const f32,
+        output: *mut f32,
+        heads: i32,
+        head_dim: i32,
+        rotated: i32,
+        position: *const i32,
+        theta: f32,
+        tokens: i32,
+    ) {
+        let t0 = thread::blockIdx_x() as i32 * 16;
+        // One loop bound, also valid for a partial tile at i32::MAX.
+        let end = t0 + (tokens - t0).min(16);
+        let h = thread::blockIdx_y() as usize;
+        let d = thread::threadIdx_x() as i32;
+        unsafe {
+            if d >= rotated {
+                let mut t = t0;
+                while t < end {
+                    let base = (t as usize * heads as usize + h) * head_dim as usize;
+                    *output.add(base + d as usize) = *input.add(base + d as usize);
+                    t += 1;
+                }
+                return;
+            }
+            let half = rotated / 2;
+            // On the 72-SM target, a grid with at most one block per SM
+            // needs more active rotary warps. Both halves then own alternating
+            // tokens. Larger grids retain one frequency calculation per pair.
+            let split_tokens = thread::gridDim_x() as u64 * thread::gridDim_y() as u64 <= 72;
+            let stripe = if d < half { 0 } else { 1 };
+            if stripe == 1 && !split_tokens {
+                return;
+            }
+            let step = if split_tokens { 2 } else { 1 };
+            let pair = if d < half { d } else { d - half };
+            let mut u = stripe;
+            let count = end - t0;
+            if u >= count {
+                return;
+            }
+            let freq = (theta as f64).powf(-2.0 * pair as f64 / rotated as f64);
+            let pos = *position as f64;
+            while u < count {
+                let t = t0 + u;
+                let base = (t as usize * heads as usize + h) * head_dim as usize;
+                let angle = (pos + t as f64) * freq;
+                let sin_a = angle.sin() as f32;
+                let cos_a = angle.cos() as f32;
+                let x0 = *input.add(base + pair as usize);
+                let x1 = *input.add(base + (pair + half) as usize);
+                *output.add(base + pair as usize) = x0.mul_add(cos_a, -(x1 * sin_a));
+                *output.add(base + (pair + half) as usize) = x0.mul_add(sin_a, x1 * cos_a);
+                u += step;
+            }
+        }
+    }
+
+    /// Two-level warp reduction with one block barrier.
+    /// Each warp reduces the immutable partials and broadcasts locally.
     ///
     /// # Safety
     /// Every thread participates in a 1-D block of 32..=1024 threads, a
@@ -100,23 +223,23 @@ mod kernels {
                 *scratch.add((tid >> 5) as usize) = v;
             }
             thread::sync_threads();
-            if tid == 0 {
-                let mut total = 0.0;
-                let mut w = 0;
-                let warps = thread::blockDim_x() / 32;
-                #[unroll(4)]
-                while w < warps {
-                    total += *scratch.add(w as usize);
-                    w += 1;
-                }
-                *scratch = total;
+            let lane = tid & 31;
+            let warps = thread::blockDim_x() / 32;
+            let mut total = if lane < warps {
+                *scratch.add(lane as usize)
+            } else {
+                0.0
+            };
+            let mut offset = 16;
+            while offset > 0 {
+                total += warp::shuffle_down_f32_sync(u32::MAX, total, offset);
+                offset >>= 1;
             }
-            thread::sync_threads();
-            *scratch
+            warp::shuffle_f32_sync(u32::MAX, total, 0)
         }
     }
 
-    /// Compute the inverse RMS using the baseline reduction and division.
+    /// Compute the inverse RMS with the parallel reduction and exact division.
     ///
     /// # Safety
     /// x covers width floats for every grid row, width > 0, and block_sum's
@@ -180,6 +303,30 @@ mod kernels {
         eps: f32,
     ) {
         unsafe {
+            // Small head rows fit one element per thread. Keep both operands
+            // live across the reduction and overlap the gate's math with it.
+            if width <= thread::blockDim_x() as i32 {
+                let j = thread::threadIdx_x() as i32;
+                let base = thread::blockIdx_x() as usize * width as usize;
+                let v = if j < width {
+                    *x.add(base + j as usize)
+                } else {
+                    0.0
+                };
+                let g = if j < width {
+                    *gate.add(base + j as usize)
+                } else {
+                    0.0
+                };
+                let silu = g / (1.0 + (-g).exp());
+                let inv = 1.0 / (block_sum(v * v) / width as f32 + eps).sqrt();
+                if j < width {
+                    let nv = v * inv * *weight.add(j as usize);
+                    *normed.add(base + j as usize) = nv;
+                    *out.add(base + j as usize) = silu * nv;
+                }
+                return;
+            }
             let inv = inverse_rms(x, width, eps);
             let base = thread::blockIdx_x() as usize * width as usize;
             let mut j = thread::threadIdx_x() as i32;

@@ -63,9 +63,9 @@ CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kerne
 
 The single `rust-kernels` feature selects every migrated kernel: residual
 addition, standalone SwiGLU, sigmoid gating (elementwise and per-row),
-RMSNorm and fused RMSNorm/SwiGLU.
-The model's fused SwiGLU paths remain CUDA C++. All ports are disabled when
-the feature is omitted.
+softplus, standalone and tiled attention RoPE, RMSNorm and fused RMSNorm/SwiGLU.
+The model's fused MoE/FFN SwiGLU paths remain CUDA C++. All ports are disabled
+when the feature is omitted.
 
 The feature embeds checked-in PTX generated from pinned Rust source, so
 ordinary feature-enabled builds need neither cuda-oxide nor CUDA toolkit

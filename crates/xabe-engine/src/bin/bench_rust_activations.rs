@@ -9,19 +9,21 @@ use cudarc::driver::{
 use cudarc::nvrtc::Ptx;
 use tracing::info;
 use xabe_kernels::compare::{Tolerance, assert_matches};
-use xabe_kernels::norm::{sigmoid, sigmoid_gate, swiglu};
+use xabe_kernels::norm::{sigmoid, sigmoid_gate, softplus, swiglu};
 
 type Error = Box<dyn std::error::Error>;
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
     Swiglu,
+    Softplus,
     Sigmoid { width: usize, broadcast: bool },
 }
 impl Op {
     fn name(self) -> &'static str {
         match self {
             Self::Swiglu => "swiglu_mul",
+            Self::Softplus => "softplus_elementwise",
             Self::Sigmoid { .. } => "sigmoid_gate_mul",
         }
     }
@@ -37,7 +39,7 @@ impl Op {
     fn tolerance(self) -> Tolerance {
         // Same gates as tests/layer_ops_differential.rs; never relaxed for Rust.
         let (abs, rel) = match self {
-            Self::Swiglu => (1e-5, 1e-4),
+            Self::Swiglu | Self::Softplus => (1e-5, 1e-4),
             _ => (5e-6, 3e-6),
         };
         Tolerance {
@@ -63,6 +65,9 @@ fn launch(
         _ => (1, 0),
     };
     match op {
+        Op::Softplus => {
+            args.arg(&pointers[0]).arg(&pointers[3]).arg(&n);
+        }
         Op::Swiglu => {
             args.arg(&pointers[1])
                 .arg(&pointers[0])
@@ -106,6 +111,7 @@ fn main() -> Result<(), Error> {
     )))?;
     for op in [
         Op::Swiglu,
+        Op::Softplus,
         Op::Sigmoid {
             width: 4096,
             broadcast: false,
@@ -123,8 +129,17 @@ fn main() -> Result<(), Error> {
             base.load_function(op.name())?,
             rust.load_function(op.name())?,
         ];
-        for n in [0, 1, 255, 256, 257, 4096, 12288, 262145, 8_388_608] {
-            let x: Vec<f32> = (0..n).map(|i| ((i % 997) as f32 - 498.0) / 166.0).collect();
+        for n in [
+            0, 1, 96, 255, 256, 257, 4096, 12288, 49152, 262145, 8_388_608,
+        ] {
+            let mut x: Vec<f32> = (0..n).map(|i| ((i % 997) as f32 - 498.0) / 166.0).collect();
+            if matches!(op, Op::Softplus) {
+                for (v, edge) in x.iter_mut().zip([
+                    -100.0, -20.0, -0.0, 0.0, 19.999998, 20.0, 20.000002, 100.0, 1000.0,
+                ]) {
+                    *v = edge;
+                }
+            }
             let mut gate: Vec<f32> = (0..op.gate_len(n))
                 .map(|i| ((i % 991) as f32 - 495.0) / 41.25)
                 .collect();
@@ -134,6 +149,7 @@ fn main() -> Result<(), Error> {
             }
             let reference = match op {
                 Op::Swiglu => swiglu(&gate, &x),
+                Op::Softplus => x.iter().copied().map(softplus).collect(),
                 Op::Sigmoid { width, broadcast } => {
                     let expanded: Vec<_> = (0..n)
                         .map(|i| gate[if broadcast { i / width } else { i }])
@@ -169,7 +185,7 @@ fn main() -> Result<(), Error> {
                             n,
                         )?;
                         for (buffer, expected) in [(output, &reference), (&ds, &sig_ref)] {
-                            if std::ptr::eq(buffer, &ds) && matches!(op, Op::Swiglu) {
+                            if std::ptr::eq(buffer, &ds) && !matches!(op, Op::Sigmoid { .. }) {
                                 continue;
                             }
                             let actual = stream.clone_dtoh(buffer)?;
@@ -190,7 +206,7 @@ fn main() -> Result<(), Error> {
                     n, arm, "CPU differential passed including aliases and guards"
                 );
             }
-            if n < 4096 {
+            if n < 4096 && !(matches!(op, Op::Softplus) && n == 96) {
                 continue;
             }
             let dx = stream.clone_htod(&x)?;
@@ -244,7 +260,7 @@ fn main() -> Result<(), Error> {
             for graph in &graphs {
                 graph.launch()?;
                 assert_matches(&stream.clone_dtoh(&dout)?, &reference, &tol);
-                if !matches!(op, Op::Swiglu) {
+                if matches!(op, Op::Sigmoid { .. }) {
                     assert_matches(&stream.clone_dtoh(&ds)?, &sig_ref, &tol);
                 }
             }

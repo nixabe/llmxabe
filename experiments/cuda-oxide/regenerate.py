@@ -22,7 +22,8 @@ if ".target sm_75\n" not in ptx or any(
     f".visible .entry {entry}(" not in ptx
     for entry in (
         "tensor_add", "swiglu_mul", "sigmoid_gate_mul",
-        "rms_norm_rows", "rms_norm_swiglu_rows",
+        "rms_norm_rows", "rms_norm_swiglu_rows", "softplus_elementwise", "rope_partial",
+        "attn_rope_partial_neox",
     )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")
@@ -31,4 +32,5 @@ header = (
     f"// cuda-oxide: {REVISION}; nightly-2026-08-28; sm_75\n"
     f"// Rust source SHA-256: {hashlib.sha256(source_before).hexdigest()}\n"
 )
-OUTPUT.write_text(header + ptx)
+# libdevice inline PTX can carry trailing spaces; normalize only whitespace.
+OUTPUT.write_text(header + "\n".join(line.rstrip() for line in ptx.splitlines()) + "\n")
