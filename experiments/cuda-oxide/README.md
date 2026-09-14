@@ -1,9 +1,10 @@
-# Rust elementwise kernels
+# Rust layer kernels
 
 This standalone experiment compiles `src/main.rs` with NVlabs cuda-oxide
 `26754ae52c26c097dc1c465a1e42c4c5d05a3d40` (0.2.1, nightly-2026-08-28).
 The engine's single opt-in `rust-kernels` feature loads residual add,
-standalone SwiGLU and sigmoid gating through cudarc. The feature forwards
+standalone SwiGLU, sigmoid gating, RMSNorm and fused RMSNorm/SwiGLU through
+cudarc. The feature forwards
 from the server and engine crates. Normal builds need no cuda-oxide. The
 embedded PTX is generated code, not an independently maintained kernel.
 
@@ -85,7 +86,21 @@ CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kerne
 
 `bench_rust_activations` always compares the embedded Rust artifact against
 NVRTC, independently of feature selection. The historical `tensor_add.ptx`
-filename now contains all three generated entries. Standalone SwiGLU is not
+filename now contains all five generated entries. Standalone SwiGLU is not
 used by the model's fused MoE/FFN paths. The current feature changes residual
-addition and sigmoid gating in the forward path. Recorded activation-only
+addition, sigmoid gating and both normalization paths in the forward pass. Recorded activation-only
 model pairs isolated sigmoid gating; they do not measure the combined switch.
+
+
+The normalization ports preserve the CUDA C++ shuffle tree, serial sum of
+warp partials, two block barriers, exact division/square root, and dynamic
+shared-memory launch size. They use the same `rust-kernels` switch.
+`bench_rust_norm` checks both outputs of fused normalization against the CPU
+RMSNorm/SwiGLU composition with the existing layer-op tolerances. It covers
+sub-warp and ragged widths, multiple grid-stride iterations, zero/sparse
+rows, two epsilon values, guards, in-place standalone RMSNorm, and graph
+replay before reporting six alternating CUDA-event pairs:
+
+```sh
+CUDA_VISIBLE_DEVICES=1 cargo run --release -p xabe-engine --bin bench_rust_norm
+```

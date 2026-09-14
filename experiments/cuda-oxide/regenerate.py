@@ -20,7 +20,10 @@ if SOURCE.read_bytes() != source_before:
 ptx = (HERE / "xabe_rust_device.ptx").read_text()
 if ".target sm_75\n" not in ptx or any(
     f".visible .entry {entry}(" not in ptx
-    for entry in ("tensor_add", "swiglu_mul", "sigmoid_gate_mul")
+    for entry in (
+        "tensor_add", "swiglu_mul", "sigmoid_gate_mul",
+        "rms_norm_rows", "rms_norm_swiglu_rows",
+    )
 ):
     raise SystemExit("compiler output has the wrong target or entry point")
 header = (

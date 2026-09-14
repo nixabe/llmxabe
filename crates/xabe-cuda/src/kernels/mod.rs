@@ -1,7 +1,7 @@
 //! CUDA kernels, compiled from CUDA C++ at load time through NVRTC by default.
 //! The opt-in `rust-kernels` feature loads embedded cuda-oxide residual-add,
-//! SwiGLU and sigmoid-gating kernels. Their pinned Rust source and regeneration
-//! tool live in `experiments/cuda-oxide`.
+//! SwiGLU, sigmoid-gating, RMSNorm and fused RMSNorm/SwiGLU kernels. Their
+//! pinned Rust source and regeneration tool live in `experiments/cuda-oxide`.
 //!
 //! Every kernel here has a scalar fp32 counterpart in `xabe-kernels` and a
 //! differential test that checks one against the other. Per `AGENTS.md`, a

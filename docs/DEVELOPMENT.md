@@ -51,7 +51,7 @@ Enable it when building the server:
 cargo build --release -p xabe-server --features rust-kernels
 ```
 
-This builds `target/release/llmxabe` with the cuda-oxide residual-add, SwiGLU and sigmoid kernels.
+This builds `target/release/llmxabe` with the migrated cuda-oxide kernels.
 The server feature forwards through `xabe-engine` to `xabe-cuda`. Engine
 benchmarks and tests can use the same flag:
 
@@ -62,7 +62,8 @@ CUDA_VISIBLE_DEVICES=1 cargo test --release -p xabe-engine --features rust-kerne
 ```
 
 The single `rust-kernels` feature selects every migrated kernel: residual
-addition, standalone SwiGLU and sigmoid gating (elementwise and per-row).
+addition, standalone SwiGLU, sigmoid gating (elementwise and per-row),
+RMSNorm and fused RMSNorm/SwiGLU.
 The model's fused SwiGLU paths remain CUDA C++. All ports are disabled when
 the feature is omitted.
 

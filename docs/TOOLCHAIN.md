@@ -43,7 +43,8 @@ Source revisions checked on 2026-09-10:
   support; 13.3 adds Hopper. Neither makes Turing a supported target.
 
 The candidate in [`experiments/cuda-oxide`](../experiments/cuda-oxide) ports
-`layer_ops.rs::{tensor_add, swiglu_mul, sigmoid_gate_mul}` to Rust, preserving
+`layer_ops.rs::{tensor_add, swiglu_mul, sigmoid_gate_mul, rms_norm_rows,
+rms_norm_swiglu_rows}` to Rust, preserving
 the raw-pointer ABIs, grid-stride loops and supported input/output aliasing.
 It uses a separate Cargo workspace so compiler experiments do not change the
 engine's nightly or dependency graph. The

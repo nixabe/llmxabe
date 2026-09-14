@@ -827,6 +827,76 @@ migration remains opt-in. Deep contexts, the dense model and concurrent
 three-card serving were not measured for this feature. The llama.cpp
 comparison remains in [Current standing](#current-standing).
 
+### Rust normalization preserves the reduction, not the compiler's schedule
+
+`rust-kernels` also selects `rms_norm_rows` and `rms_norm_swiglu_rows`.
+These ports retain the existing row/block geometry and dynamic shared-memory
+size: one float per warp. The reduction uses the same five downward warp
+shuffles, serial warp-partial sum, and two block barriers. The column loops
+use 32-bit counters and the warp-partial sum is unrolled four ways without
+reassociating additions. Squared-value accumulation explicitly uses FMA as
+NVRTC does; inverse RMS remains division by the square root, not an
+approximate reciprocal square root. Fused normalization still writes its
+normalized intermediate before returning the gated output.
+
+`bench_rust_norm` checks both compilers against CPU RMSNorm and composed
+RMSNorm/SwiGLU with the unchanged layer-op tolerances. Tested widths include
+1, 31, 33, 129, 1,025 and 5,120, alongside the target widths 128, 256 and
+2,048. Zero/sparse rows, two epsilon values, guarded/alignment-offset buffers,
+in-place standalone normalization and graph replay all passed. The unified
+feature also passed all 12 layer-op differentials and the 19-token, 40-block
+Qwen3.6 golden, selecting token 25358. RMSNorm's maximum absolute CPU error
+was **3.099e-6** at hidden width, **1.192e-6** at attention-head width and
+**9.537e-7** at GDN-head width; all three cosines were **1.000000000**.
+Offline CUDA 12.4 `ptxas -arch=sm_75` uses **25 registers** for each Rust
+normalization kernel with no spills, not a measurement of the driver's JIT.
+
+Six alternating GPU 1 CUDA-event pairs, reversing order on odd pairs,
+measured 100 graph-captured launches per interval. The small shapes are
+cache-hot. The 1,536-row hidden shape is a physical prefill chunk; head-row
+counts multiply that token count by the number of heads:
+
+| Kernel | Rows × width | NVRTC us/launch, min–max | Rust us/launch, min–max |
+| --- | ---: | ---: | ---: |
+| RMSNorm | 3 × 2,048 | 3.368–3.420 | 3.474–3.502 |
+| RMSNorm | 96 × 128 | 2.557–2.567 | 2.495–2.518 |
+| RMSNorm | 48 × 256 | 2.706–2.724 | 2.664–2.678 |
+| RMSNorm | 1,536 × 2,048 | 57.010–57.815 | 58.663–59.412 |
+| RMSNorm | 49,152 × 128 | 100.549–102.359 | 98.099–99.078 |
+| RMSNorm | 24,576 × 256 | 100.259–101.213 | 99.347–100.224 |
+| RMSNorm/SwiGLU | 3 × 2,048 | 3.850–3.930 | 4.243–4.280 |
+| RMSNorm/SwiGLU | 96 × 128 | 2.866–2.894 | 2.986–3.011 |
+| RMSNorm/SwiGLU | 48 × 256 | 2.900–2.908 | 3.072–3.104 |
+| RMSNorm/SwiGLU | 1,536 × 2,048 | 93.565–93.822 | 95.568–95.918 |
+| RMSNorm/SwiGLU | 49,152 × 128 | 182.862–182.975 | 183.027–183.187 |
+| RMSNorm/SwiGLU | 24,576 × 256 | 182.896–182.966 | 183.235–183.360 |
+
+The model's fused GDN norm uses width 128; the other fused widths exercise
+the generic API. Head-width standalone normalization improves kernel
+throughput by **0.9–3.3%**, while hidden-width normalization and fused
+normalization lose. A faithful arithmetic port does not guarantee the same
+instruction scheduling or cache behavior.
+
+The actual single-switch comparison enables **all five Rust kernels**
+(residual add, SwiGLU, sigmoid, RMSNorm and fused RMSNorm/SwiGLU). Three
+alternating prebuilt process pairs on GPU 1 used the same tree with only
+`rust-kernels` different, the middle pair reversed, and no other GPU work
+or builds during timing. These numbers measure the combined switch, not
+normalization in isolation:
+
+| Qwen3.6, N=3, 2K per sequence | CUDA C++ tok/s | All Rust ports tok/s | Rust change across pairs |
+| --- | --- | --- | --- |
+| Decode, 64 steps after 4 warmup | 217.3 / 216.7 / 217.1 | 217.0 / 216.6 / 216.5 | −0.14% / −0.05% / −0.28% |
+| Prefill, 1,536 total chunk rows, 5 timed repetitions | 3067.44 / 3052.63 / 3052.44 | 3055.93 / 3051.08 / 3049.80 | −0.38% / −0.05% / −0.09% |
+
+Prefill's within-process standard deviations were **6.83–8.10 tok/s** for
+CUDA C++ and **6.08–8.34** for Rust. Both modes are slightly slower in all
+three pairs; this is a migration result, not a performance win, and the
+single feature remains disabled by default. Deep-context performance,
+dense-model Rust correctness and concurrent three-card serving were not
+checked for these ports. The authoritative llama.cpp comparison remains
+in [Current standing](#current-standing).
+
 ## Compile-time formats free registers that ptxas then spends
 
 The MoE expert prologue took its format as a runtime argument inside a
@@ -1617,6 +1687,8 @@ proposed twice.
 | Attempt | Result |
 | --- | --- |
 | Alternating shared K/V buffers in prefill attention | Removes the arrival barrier before staging each 8-key tile, preserving arithmetic and the existing register prefetch. Shared memory grows 13,952 → 22,272 B; offline CUDA 12.4 `ptxas` uses 255 registers without spills in both arms. Four prefill CPU differentials (including 128K keys), carried-chunk and wide N=3 prefill checks, and the 19-token/40-block forward golden passed; the optional divergence audit was not run. Three GPU 1 pairs, middle reversed, with `rust-kernels` in both arms: N=3 **2K** at total chunk 6,144 gives **3640.53 / 3622.19 / 3631.72 → 3635.66 / 3630.55 / 3626.47 tok/s** (−0.13 / +0.23 / −0.14%); **8K** at chunk 24,576 gives **3490.51 / 3481.65 / 3475.60 → 3491.82 / 3482.26 / 3477.35** (+0.04 / +0.02 / +0.05%). One warmup and three timed repetitions per process; 8K within-process SD is 9.80–23.47 tok/s, much larger than the difference. The 2,048-query CUDA-event attention bench gains 1.2–1.5% at offset zero but loses 5.0–16.6% at offset 8K, and changes sign at several deeper offsets. Fewer barriers bought no meaningful full-prefill throughput. Reverted; full-model depths above 8K were not measured. |
+| Literal `usize` column loops and a rolled warp sum in the Rust normalization port | CPU and graph-replay gates passed, but six alternating GPU 1 CUDA-event pairs (100 captured launches per interval) at 24,576 × 256 gave **100.606–102.575 us NVRTC** versus **104.244–105.007 us Rust** (2.3–3.5% lower throughput); at 49,152 × 128, **100.073–100.855 us** versus **101.102–101.683 us** (0.8–1.1% lower). The first translation used 64-bit column counters where NVRTC uses 32-bit ones, and a single warp-partial loop body where NVRTC unrolls four ways. Retain 32-bit counters and four-way unrolling while preserving addition order. The narrower code still needs model validation; lower register counts alone did not predict throughput. |
+| Promoting the five Rust layer kernels to the default backend | Three alternating Qwen3.6 GPU 1 N=3/2K pairs: the combined switch loses **0.05–0.28% decode** and **0.05–0.38% prefill**, despite head-width standalone RMSNorm winning its narrow gate. Fused width-128 decode normalization loses **3.8–4.4%** kernel throughput, and hidden-width RMSNorm also loses. Matching the arithmetic and keeping shared memory/launch geometry unchanged does not guarantee a compiler-neutral migration. Keep the entire bundle behind the single disabled-by-default `rust-kernels` switch; no whole-engine speedup claim. |
 | Enabling the plain Rust activation ports by default | Six alternating GPU 1 CUDA-event pairs, 100 captured launches per interval, at 8,388,608 elements: standalone SwiGLU **182.156–182.255 us NVRTC** versus **186.574–186.675 us Rust** (2.3–2.4% lower throughput); per-row sigmoid at width 2,048 **132.924–133.251 us** versus **142.222–142.510 us** (6.4–6.7% lower). Width 7 also loses 4.2–4.3%. The direct grid-stride port preserves the runtime broadcast indexing and memory geometry; passing CPU/replay gates and winning cache-hot shapes does not establish a universal replacement. Current forward execution uses only its elementwise sigmoid path; three N=3/2K model pairs change sign on both prefill and decode. Retained behind `rust-kernels`, rejected as a default or speed claim. |
 | Four-float Rust residual loads/stores with the existing launch grid | Bit-exact against the CPU, including aligned and unaligned buffers, both aliases and ragged tails. Six alternating GPU 1 CUDA-event pairs against the scalar Rust kernel, 100 graph-captured launches per interval: at 16,384 elements scalar **1.577–1.640 us**, vector **1.798–1.835 us** (8.9–13.9% lower kernel throughput); at 8,388,608 elements scalar **180.408–180.593 us**, vector **179.876–180.062 us** (only 0.20–0.35% higher). The candidate used cuda-oxide `vector::F32x4`, confirmed `ld/st.global.v4.b32`, scalar fallback below 16K or on misalignment, and a scalar tail. Retaining the scalar-sized grid while assigning four elements per thread leaves three quarters of its blocks empty at 16K; at large sizes it moves the same bytes and changes little. Rejected at the narrow gate; no whole-model throughput claim. |
 | GDN split projection at row tiles 1 and 2 (`uint4` form, N=3) | 78.4 and 46.4 us per qkv/gate call against RT=4's 33.9. RT=1 octuples the warps and the in-flight bytes and is the *worst* of the three, so memory-level parallelism was never the binding constraint — instruction count per byte is, and it falls with RT. |
