@@ -17,6 +17,7 @@
 pub mod budget;
 pub mod config;
 pub mod dflash;
+pub mod gguf;
 pub mod verify;
 pub mod vision;
 pub mod weights;
@@ -28,3 +29,5 @@ pub use config::{
 pub use dflash::DFlashConfig;
 pub use vision::VisionConfig;
 pub use weights::{Directory, Role, Section, TensorSpec, WeightError, WeightSchema};
+
+pub use gguf::ConfigLoadError;

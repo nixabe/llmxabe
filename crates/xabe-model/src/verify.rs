@@ -158,6 +158,10 @@ pub fn check_config(c: &ModelConfig) -> Result<(), ConfigError> {
     }
 
     let advertised = c.advertised_params;
+    // GGUF geometry has no independently known marketing parameter count.
+    if advertised == 0 {
+        return Ok(());
+    }
     let derived = c.total_params();
     let slack = advertised as f64 * PARAM_BAND;
     if (derived as f64 - advertised as f64).abs() > slack {

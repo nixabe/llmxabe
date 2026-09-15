@@ -27,11 +27,28 @@ feed-forward block and in every width:
 | KV per token, f16 | 20 KiB (10 layers) | 64 KiB (16 layers) |
 | GDN state per sequence | ~60 MiB (30 layers) | ~144 MiB (48 layers) |
 
-Which one a file is comes from its own `general.architecture`, read at
-startup; `ModelConfig::for_architecture` has no fallback, because inferring
-hyperparameters from tensor shapes would produce a model that loads and is
-wrong. The rest of this document describes `qwen35moe` unless it says
-otherwise; the dense model has its own section at the end.
+`ModelConfig::from_gguf` selects semantics from `general.architecture`
+(`qwen35moe` or `qwen35`) and reads geometry from architecture-scoped GGUF
+metadata: layer count minus MTP blocks, hidden width, attention and GDN heads,
+rotary width, hybrid interval, FFN dimensions, and native context. Vocabulary
+size comes from `tokenizer.ggml.tokens`. Tensor shapes are then checked by
+`WeightSchema`; they do not select the architecture.
+
+The named constructors and `for_architecture` remain reference presets for
+tests and budget examples. Loading does not use their dimensions or marketing
+parameter counts. Loaded configurations use native context as the context
+budget, without assuming a preset's YaRN extension; GDN chunk length remains
+an engine tuning choice. Missing or malformed required metadata fails loading.
+The family default for an absent attention interval is four; an absent MTP
+count means zero, following llama.cpp.
+
+This is geometry-driven loading within the two implemented architectures,
+not support for arbitrary GGUF architectures. The current representation requires
+whole hybrid periods, matching attention K/V head widths, at most one MTP
+block, and one shared MoE expert with the routed expert width. Explicit recurrent
+layer arrays must agree with the periodic layout. Kernel and tensor-format
+constraints still apply; new model sizes need GPU differential validation.
+The rest of this document describes `qwen35moe` unless stated otherwise.
 
 ## Structure
 

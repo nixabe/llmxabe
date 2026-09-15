@@ -43,7 +43,7 @@ fn open() -> Option<GgufFile> {
 #[test]
 fn the_dense_schema_resolves_against_the_real_file_with_no_mismatches() {
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_8_27b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::with_mtp(&config);
 
     let directory = match schema.resolve(&file) {

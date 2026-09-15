@@ -39,7 +39,7 @@ fn open() -> Option<GgufFile> {
 #[test]
 fn schema_resolves_against_the_real_file_with_no_mismatches() {
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::with_mtp(&config);
 
     let directory = match schema.resolve(&file) {
@@ -95,7 +95,7 @@ fn schema_resolves_against_the_real_file_with_no_mismatches() {
 #[test]
 fn text_path_excludes_the_mtp_block_and_is_smaller_for_it() {
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
 
     let text_schema = WeightSchema::new(&config);
     let full_schema = WeightSchema::with_mtp(&config);
@@ -122,7 +122,7 @@ fn text_path_excludes_the_mtp_block_and_is_smaller_for_it() {
 #[test]
 fn resolved_parameter_count_lands_where_the_model_name_claims() {
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::new(&config);
     let text = schema
         .resolve(&file)
@@ -152,7 +152,7 @@ fn derived_parameter_count_agrees_with_the_file_section_by_section() {
     // including it on one side but not the other accounts for exactly the
     // 2.4% gap an earlier hand-rolled comparison reported.
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::new(&config);
     let d = schema.resolve(&file).expect("schema must resolve");
 
@@ -197,7 +197,7 @@ fn predicted_weight_vram_matches_what_the_file_actually_needs() {
     // Resolving the schema gives the real number, so the prediction can be
     // checked rather than trusted.
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::new(&config);
     let d = schema.resolve(&file).expect("schema must resolve");
 
@@ -218,7 +218,7 @@ fn predicted_weight_vram_matches_what_the_file_actually_needs() {
 #[test]
 fn the_lm_head_is_the_single_largest_tensor() {
     let Some(file) = open() else { return };
-    let config = ModelConfig::qwen3_6_35b_a3b();
+    let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
     let schema = WeightSchema::new(&config);
     let directory = schema.resolve(&file).expect("schema must resolve");
 

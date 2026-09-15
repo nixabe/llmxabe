@@ -1,13 +1,14 @@
-//! Qwen3.6-35B-A3B structural configuration.
+//! Structural configuration for Qwen3.5-family text models.
 //!
 //! Every derived quantity in this crate — VRAM budgets, bandwidth rooflines,
 //! cache page geometry — comes from [`ModelConfig`]. It is the single place
 //! the architecture is described, so that a wrong number is wrong in exactly
 //! one location.
 //!
-//! The defaults in [`ModelConfig::qwen3_6_35b_a3b`] are transcribed from
+//! The reference values in [`ModelConfig::qwen3_6_35b_a3b`] are transcribed from
 //! Qwen's published `config.json`. [`crate::verify`] re-derives the total
-//! parameter count from them as a transcription check.
+//! parameter count from them as a transcription check. Runtime geometry comes
+//! from [`ModelConfig::from_gguf`].
 
 use core::fmt;
 
@@ -267,7 +268,7 @@ pub struct ModelConfig {
     /// what [`Self::hparam_key`] builds metadata lookups from rather than any
     /// module hard-coding `"qwen35moe."`.
     pub architecture: &'static str,
-    /// Parameter count the model is published under, used only as the centre
+    /// Parameter count the model is published under (zero when unknown), used only as the centre
     /// of [`crate::verify::check_config`]'s plausibility band.
     pub advertised_params: u64,
     /// Total transformer layers.
@@ -292,7 +293,7 @@ pub struct ModelConfig {
     pub ffn: FfnConfig,
     /// Native trained context length in tokens.
     pub native_context: u32,
-    /// Extended context length reachable with YaRN scaling.
+    /// Extended context budget for reference presets; loaded files use native context.
     pub yarn_context: u32,
     /// Whether the model ships a trained multi-token-prediction head.
     pub has_mtp: bool,
@@ -396,7 +397,8 @@ impl ModelConfig {
     /// Every model this engine has a transcribed configuration for.
     pub const KNOWN: [fn() -> Self; 2] = [Self::qwen3_6_35b_a3b, Self::qwen3_8_27b];
 
-    /// The configuration for a GGUF `general.architecture` string.
+    /// The reference preset for an architecture, for examples and tests.
+    /// Runtime callers must use [`Self::from_gguf`] to read actual geometry.
     ///
     /// Returns `None` rather than guessing: a file whose architecture is not
     /// listed here has hyperparameters nobody has transcribed, and inferring
@@ -409,19 +411,12 @@ impl ModelConfig {
             .find(|c| c.architecture == architecture)
     }
 
-    /// The configuration for whatever `file` declares itself to be.
+    /// Derive geometry from a supported GGUF's architecture-scoped metadata.
     ///
-    /// The one place "which model is this" is answered. Everything that opens
-    /// a GGUF — the server, every benchmark, every smoke binary — goes
-    /// through here rather than defaulting to one architecture, because
-    /// defaulting produces a wall of shape mismatches for what is one fact.
-    pub fn from_gguf(file: &xabe_gguf::GgufFile) -> Result<Self, UnknownArchitecture> {
-        let declared = file.get_str("general.architecture");
-        declared
-            .and_then(Self::for_architecture)
-            .ok_or_else(|| UnknownArchitecture {
-                declared: declared.unwrap_or("<absent>").to_string(),
-            })
+    /// Named constructors remain reference presets for tests and budget examples;
+    /// loading never uses their dimensions as defaults.
+    pub fn from_gguf(file: &xabe_gguf::GgufFile) -> Result<Self, crate::gguf::ConfigLoadError> {
+        crate::gguf::load(file)
     }
 
     /// The full GGUF metadata key for an architecture-scoped hyperparameter.
