@@ -419,6 +419,21 @@ impl ModelConfig {
         crate::gguf::load(file)
     }
 
+    /// Whether the declared MTP block's complete tensor set is in the file.
+    ///
+    /// Some exports retain MTP metadata while stripping its weights. Keep
+    /// `has_mtp` as structural metadata so removing those weights never changes
+    /// the trunk layer count. Activation additionally requires an explicit
+    /// serving request. Tensor shapes are validated when the head is loaded.
+    pub fn mtp_available(&self, file: &xabe_gguf::GgufFile) -> bool {
+        self.has_mtp
+            && crate::WeightSchema::with_mtp(self)
+                .specs()
+                .iter()
+                .filter(|spec| spec.layer == Some(self.num_layers))
+                .all(|spec| file.tensor(&spec.name).is_some())
+    }
+
     /// The full GGUF metadata key for an architecture-scoped hyperparameter.
     ///
     /// `cfg.hparam_key("rope.freq_base")` is `"qwen35moe.rope.freq_base"` for

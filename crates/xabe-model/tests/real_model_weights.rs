@@ -40,6 +40,10 @@ fn open() -> Option<GgufFile> {
 fn schema_resolves_against_the_real_file_with_no_mismatches() {
     let Some(file) = open() else { return };
     let config = ModelConfig::from_gguf(&file).expect("GGUF geometry");
+    assert!(
+        config.mtp_available(&file),
+        "installed model carries its MTP head"
+    );
     let schema = WeightSchema::with_mtp(&config);
 
     let directory = match schema.resolve(&file) {

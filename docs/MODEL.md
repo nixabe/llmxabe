@@ -48,6 +48,13 @@ whole hybrid periods, matching attention K/V head widths, at most one MTP
 block, and one shared MoE expert with the routed expert width. Explicit recurrent
 layer arrays must agree with the periodic layout. Kernel and tensor-format
 constraints still apply; new model sizes need GPU differential validation.
+MTP serving requires both `--spec-type draft-mtp` and the complete declared
+MTP block's tensor set. If those weights are absent or incomplete, startup
+logs that MTP is disabled and uses ordinary decode, with no draft token budget
+or MTP weight/cache allocation. Tensor availability never enables MTP by itself.
+The metadata's MTP count still excludes that block from the main transformer
+stack even when an export strips its weights.
+
 The rest of this document describes `qwen35moe` unless stated otherwise.
 
 ## Structure

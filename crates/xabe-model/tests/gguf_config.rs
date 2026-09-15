@@ -52,13 +52,17 @@ fn fixture(c: &ModelConfig) -> Vec<(String, Value)> {
 }
 
 fn file(values: &[(String, Value)]) -> GgufFile {
+    file_with_tensors(values, &[])
+}
+
+fn file_with_tensors(values: &[(String, Value)], tensors: &[String]) -> GgufFile {
     fn string(bytes: &mut Vec<u8>, text: &str) {
         bytes.extend((text.len() as u64).to_le_bytes());
         bytes.extend(text.as_bytes());
     }
     let mut bytes = b"GGUF".to_vec();
     bytes.extend(3u32.to_le_bytes());
-    bytes.extend(0u64.to_le_bytes());
+    bytes.extend((tensors.len() as u64).to_le_bytes());
     bytes.extend((values.len() as u64).to_le_bytes());
     for (key, value) in values {
         string(&mut bytes, key);
@@ -91,7 +95,16 @@ fn file(values: &[(String, Value)]) -> GgufFile {
             }
         }
     }
+    // Presence-only fixtures: shapes are checked separately by WeightSchema.
+    for (i, name) in tensors.iter().enumerate() {
+        string(&mut bytes, name);
+        bytes.extend(1u32.to_le_bytes());
+        bytes.extend(1u64.to_le_bytes());
+        bytes.extend(0u32.to_le_bytes()); // F32
+        bytes.extend((i as u64 * 32).to_le_bytes());
+    }
     bytes.resize(bytes.len().next_multiple_of(32), 0);
+    bytes.resize(bytes.len() + tensors.len() * 32, 0);
     GgufFile::from_bytes(bytes).unwrap()
 }
 
@@ -237,4 +250,39 @@ fn optional_metadata_defaults_and_explicit_layout_are_checked() {
             .to_string()
             .contains("exceeds u32")
     );
+}
+
+#[test]
+fn mtp_availability_requires_every_head_tensor_and_preserves_trunk_geometry() {
+    for preset in ModelConfig::KNOWN {
+        let mut c = preset();
+        c.vocab_size = 32;
+        let values = fixture(&c);
+        let schema = xabe_model::WeightSchema::with_mtp(&c);
+        let names: Vec<String> = schema
+            .specs()
+            .iter()
+            .filter(|s| s.layer == Some(c.num_layers))
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(!names.is_empty());
+        let complete = file_with_tensors(&values, &names);
+        let loaded = ModelConfig::from_gguf(&complete).unwrap();
+        assert!(loaded.mtp_available(&complete));
+        let stripped = file(&values);
+        let stripped_config = ModelConfig::from_gguf(&stripped).unwrap();
+        assert_eq!(stripped_config.num_layers, c.num_layers);
+        assert_eq!(stripped_config.num_blocks(), c.num_blocks());
+        assert!(!stripped_config.mtp_available(&stripped));
+        for missing in &names {
+            let partial: Vec<String> = names.iter().filter(|n| *n != missing).cloned().collect();
+            assert!(
+                !loaded.mtp_available(&file_with_tensors(&values, &partial)),
+                "{missing}"
+            );
+        }
+        let mut undeclared = loaded;
+        undeclared.has_mtp = false;
+        assert!(!undeclared.mtp_available(&complete));
+    }
 }

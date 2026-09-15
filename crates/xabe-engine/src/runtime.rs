@@ -477,7 +477,7 @@ pub struct DeviceRuntime {
     verify_rings: Vec<Vec<GdnSnapshotRing>>,
     /// Verify window width: `1 + draft_tokens`. Zero when drafting is off.
     window: usize,
-    /// The MTP draft head, present iff `mtp_drafts > 0` was configured — the
+    /// The MTP draft head, present when requested and its tensors exist — the
     /// non-speculative baseline allocates and runs none of this.
     mtp: Option<MtpRuntime>,
     /// The DFlash drafter, present iff one was configured. Same rule: off
@@ -730,6 +730,14 @@ impl DeviceRuntime {
         );
 
         let file = GgufFile::open(model_path)?;
+        // Recheck at worker bind as well: callers can bypass server preflight,
+        // and the model file can change between preflight and binding.
+        let mtp_drafts = if mtp_drafts > 0 && !config.mtp_available(&file) {
+            tracing::warn!("MTP disabled: GGUF is missing required MTP tensors");
+            0
+        } else {
+            mtp_drafts
+        };
         let eos_token = stop_on_eos
             .then(|| file.get_u32("tokenizer.ggml.eos_token_id"))
             .flatten()

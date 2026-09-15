@@ -500,12 +500,22 @@ fn resolve_speculation(args: &Args) -> Result<(u32, Speculation), String> {
     }
 }
 
+/// Resolve the effective CLI mode before scheduler budgets and worker setup.
+fn gate_mtp(args: &mut Args, available: bool) {
+    if matches!(args.spec_type, SpecType::DraftMtp) && !available {
+        warn!(
+            "MTP disabled: GGUF does not contain the complete MTP tensor set; using ordinary decode"
+        );
+        args.spec_type = SpecType::None;
+    }
+}
+
 /// The transcribed configuration for whatever `path` declares itself to be.
 ///
 /// Opening the GGUF here costs an mmap and a header parse; the alternative —
 /// defaulting to one architecture and letting `WeightSchema::resolve` object
 /// — produces a hundred shape mismatches for what is one fact.
-fn model_config_for(path: &std::path::Path) -> Result<(ModelConfig, Option<String>), String> {
+fn model_config_for(path: &std::path::Path) -> Result<(ModelConfig, Option<String>, bool), String> {
     if !path.is_file() {
         return Err(format!("{} is not a file", path.display()));
     }
@@ -516,22 +526,19 @@ fn model_config_for(path: &std::path::Path) -> Result<(ModelConfig, Option<Strin
     // thing for a shape check and the wrong thing to serve: a second
     // checkpoint of the same architecture would advertise itself as the
     // first. See the `qwen35moe` note in docs/MODEL.md.
-    Ok((config, file.get_str("general.name").map(str::to_owned)))
+    let mtp_available = config.mtp_available(&file);
+    Ok((
+        config,
+        file.get_str("general.name").map(str::to_owned),
+        mtp_available,
+    ))
 }
 
 fn main() -> std::process::ExitCode {
     let rest = xabe_log::init_from_args();
-    let args = Args::parse_from(expand_two_letter_shorts(rest));
+    let mut args = Args::parse_from(expand_two_letter_shorts(rest));
 
     info!("llmxabe preflight\n");
-
-    let (draft_tokens, speculation) = match resolve_speculation(&args) {
-        Ok(resolved) => resolved,
-        Err(failure) => {
-            error!("speculation      FAIL — {failure}");
-            return std::process::ExitCode::FAILURE;
-        }
-    };
 
     // The sampling defaults stand in for per-request values, which are
     // range-checked at request time; a default outside that range would turn
@@ -575,13 +582,22 @@ fn main() -> std::process::ExitCode {
     //    engine serves have the same tensor *names* for the mixer and would
     //    otherwise fail deep in the weight resolver with a wall of shape
     //    mismatches instead of one line naming the architecture.
-    let (model, file_name) = match model_config_for(&args.model) {
+    let (model, file_name, mtp_available) = match model_config_for(&args.model) {
         Ok(m) => m,
         Err(e) => {
             error!("model            FAIL — {e}");
             return std::process::ExitCode::FAILURE;
         }
     };
+    gate_mtp(&mut args, mtp_available);
+    let (draft_tokens, speculation) = match resolve_speculation(&args) {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            error!("speculation      FAIL — {failure}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     // `--alias`, else what the file calls itself, else the architecture's
     // configuration name.
     let served_name = args
@@ -1226,6 +1242,34 @@ mod tests {
         assert_eq!(
             resolve_speculation(&parsed),
             Ok((12, Speculation::NgramSimple { size_n: 6 }))
+        );
+    }
+
+    #[test]
+    fn mtp_needs_both_the_cli_flag_and_available_tensors() {
+        for available in [false, true] {
+            for requested in [false, true] {
+                let mut options = args(if requested {
+                    SpecType::DraftMtp
+                } else {
+                    SpecType::None
+                });
+                gate_mtp(&mut options, available);
+                let (drafts, mode) = resolve_speculation(&options).unwrap();
+                if requested && available {
+                    assert_eq!(mode, Speculation::Mtp);
+                    assert!(drafts > 0);
+                } else {
+                    assert_eq!(mode, Speculation::None);
+                    assert_eq!(drafts, 0);
+                }
+            }
+        }
+        let mut options = args(SpecType::Ngram);
+        gate_mtp(&mut options, false);
+        assert_eq!(
+            resolve_speculation(&options),
+            resolve_speculation(&args(SpecType::Ngram))
         );
     }
 
