@@ -626,7 +626,21 @@ fn main() -> std::process::ExitCode {
         },
         model.vocab_size
     );
-    let vision_config = xabe_model::VisionConfig::for_model(&model);
+    let vision_config = match args
+        .mmproj
+        .as_ref()
+        .map(|path| {
+            let file = xabe_gguf::GgufFile::open(path).map_err(|e| e.to_string())?;
+            xabe_model::VisionConfig::from_gguf(&file, &model).map_err(|e| e.to_string())
+        })
+        .transpose()
+    {
+        Ok(config) => config,
+        Err(e) => {
+            error!("vision           FAIL — {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     // 2. Cache geometry. Construction enforces that the retention interval is
     //    block-aligned; the two page sizes are never unified.
@@ -930,7 +944,9 @@ fn main() -> std::process::ExitCode {
         mmproj: args.mmproj.clone(),
         // The runtime's encode buffers are sized in pre-merge patches; the
         // serving ceiling is in post-merge tokens.
-        max_image_patches: (args.image_max_tokens * vision_config.merge_factor()) as usize,
+        max_image_patches: vision_config.map_or(0, |c| {
+            args.image_max_tokens as usize * c.merge_factor() as usize
+        }),
     };
     if let Err((worker, failure)) = engine.bind_devices(&model_path, model, serving) {
         error!("worker {worker} failed to load: {failure}");
@@ -1011,8 +1027,8 @@ fn main() -> std::process::ExitCode {
             min_p: args.min_p,
             top_k: args.top_k,
         },
-        vision: args.mmproj.is_some().then_some(http::VisionServingConfig {
-            config: vision_config,
+        vision: vision_config.map(|config| http::VisionServingConfig {
+            config,
             max_tokens: args.image_max_tokens,
         }),
         grammar_vocab,

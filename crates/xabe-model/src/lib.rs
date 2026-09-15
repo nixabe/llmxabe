@@ -18,6 +18,7 @@ pub mod budget;
 pub mod config;
 pub mod dflash;
 pub mod gguf;
+mod metadata;
 pub mod verify;
 pub mod vision;
 pub mod weights;

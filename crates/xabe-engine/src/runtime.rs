@@ -961,7 +961,9 @@ impl DeviceRuntime {
         // refused here where the message can name both numbers.
         let dflash = match &dflash_serving {
             Some(serving) => {
-                let dconfig = xabe_model::DFlashConfig::qwen3_6_35b_a3b();
+                let dfile = GgufFile::open(&serving.gguf)?;
+                let dconfig = xabe_model::DFlashConfig::from_gguf(&dfile, &config)
+                    .map_err(|e| RuntimeError::Schema(e.to_string()))?;
                 if serving.drafts > dconfig.max_draft_tokens() as usize {
                     return Err(RuntimeError::Schema(format!(
                         "draft count {} exceeds the drafter's trained block ({} drafts max)",
@@ -969,7 +971,6 @@ impl DeviceRuntime {
                         dconfig.max_draft_tokens(),
                     )));
                 }
-                let dfile = GgufFile::open(&serving.gguf)?;
                 let dweights = load_dflash_weights(&stream, &dfile, &dconfig)?;
                 let drafter_bytes = dweights.bytes;
                 let ctx_tokens = prefill_chunk
@@ -1015,7 +1016,8 @@ impl DeviceRuntime {
         let vision = match &mmproj {
             Some(path) => {
                 let vision_file = GgufFile::open(path)?;
-                let vision_cfg = xabe_model::VisionConfig::qwen3_6_35b_a3b();
+                let vision_cfg = xabe_model::VisionConfig::from_gguf(&vision_file, &config)
+                    .map_err(|e| RuntimeError::Vision(e.to_string()))?;
                 let vision_weights = crate::vision::load_vision_weights(&vision_file, &vision_cfg)
                     .map_err(RuntimeError::Vision)?;
                 let tower = VisionForward::new(
@@ -1023,7 +1025,7 @@ impl DeviceRuntime {
                     Arc::clone(&stream),
                     &vision_cfg,
                     &vision_weights,
-                    max_image_patches.max(4),
+                    max_image_patches.max(vision_cfg.merge_factor() as usize),
                 )
                 .map_err(|e| RuntimeError::Vision(e.to_string()))?;
                 debug!(

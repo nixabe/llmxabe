@@ -11,9 +11,8 @@
 //! post-LayerNorm, and a 2×2 spatial merge feeding a two-layer GELU MLP
 //! into the language model's 2048-wide embedding space.
 //!
-//! Everything here is transcribed from the mmproj GGUF's metadata; the
-//! loader cross-checks the file against these numbers rather than trusting
-//! either side alone. This model ships **no deepstack layers** — the
+//! Runtime configuration is read from the mmproj GGUF metadata; the
+//! tensor schema checks those dimensions against the weight directory. This model ships **no deepstack layers** — the
 //! projector output is spliced into the token embedding stream at exactly
 //! one point, which is what makes vision support orthogonal to the decode
 //! hot path.
@@ -97,6 +96,72 @@ impl VisionConfig {
             projection_dim: config.hidden_size,
             ..Self::qwen3_6_35b_a3b()
         }
+    }
+
+    /// Read the implemented qwen3vl_merger tower from its own mmproj metadata.
+    /// Temporal pairing and rotary base are projector-family semantics, matching
+    /// llama.cpp tools/mtmd/clip.cpp, clip_model_loader's PROJECTOR_TYPE_QWEN3VL branch.
+    pub fn from_gguf(
+        file: &GgufFile,
+        target: &crate::ModelConfig,
+    ) -> Result<Self, crate::ConfigLoadError> {
+        use crate::metadata::Metadata;
+        let m = Metadata(file);
+        m.text("general.architecture", "clip")?;
+        m.text("clip.projector_type", "qwen3vl_merger")?;
+        if file.get("clip.use_gelu") != Some(&xabe_gguf::GgufValue::Bool(true)) {
+            return Err(Metadata::error(
+                "clip.use_gelu",
+                "only GELU towers are implemented",
+            ));
+        }
+        let c = Self {
+            num_layers: m.positive("clip.vision.block_count")?,
+            hidden_size: m.positive("clip.vision.embedding_length")?,
+            num_heads: m.positive("clip.vision.attention.head_count")?,
+            ffn_size: m.positive("clip.vision.feed_forward_length")?,
+            image_size: m.positive("clip.vision.image_size")?,
+            patch_size: m.positive("clip.vision.patch_size")?,
+            spatial_merge: m.positive("clip.vision.spatial_merge_size")?,
+            projection_dim: m.positive("clip.vision.projection_dim")?,
+            ln_eps: m.float("clip.vision.attention.layer_norm_epsilon")?,
+            image_mean: m.rgb("clip.vision.image_mean", false)?,
+            image_std: m.rgb("clip.vision.image_std", true)?,
+            temporal_patch_size: 2,
+            rope_theta: 10_000.0,
+        };
+        if c.projection_dim != target.hidden_size {
+            return Err(Metadata::error(
+                "clip.vision.projection_dim",
+                "must match the target hidden width",
+            ));
+        }
+        if !c.hidden_size.is_multiple_of(c.num_heads) || !c.head_dim().is_multiple_of(4) {
+            return Err(Metadata::error(
+                "clip.vision.attention.head_count",
+                "must divide hidden width into heads divisible by four",
+            ));
+        }
+        if !c.image_size.is_multiple_of(c.patch_size) || c.spatial_merge != 2 {
+            return Err(Metadata::error(
+                "clip.vision.spatial_merge_size",
+                "requires a two-by-two merger and an integral native patch grid",
+            ));
+        }
+        if file.get("clip.vision.is_deepstack_layers").is_some() {
+            let layers = file
+                .get_bool_array("clip.vision.is_deepstack_layers")
+                .ok_or_else(|| {
+                    Metadata::error("clip.vision.is_deepstack_layers", "expected bool array")
+                })?;
+            if layers.len() != c.num_layers as usize || layers.iter().any(|v| *v) {
+                return Err(Metadata::error(
+                    "clip.vision.is_deepstack_layers",
+                    "deepstack is unsupported; expected one false per layer",
+                ));
+            }
+        }
+        Ok(c)
     }
 
     /// Dimension of each attention head.

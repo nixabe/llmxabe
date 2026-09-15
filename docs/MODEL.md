@@ -57,6 +57,10 @@ stack even when an export strips its weights.
 
 The rest of this document describes `qwen35moe` unless stated otherwise.
 
+The remaining serving-path assumptions and their treatment are listed in
+[the model-dependent constants audit](HARDCODING.md). Auxiliary vision and
+DFlash configuration now comes from each auxiliary file's own GGUF metadata.
+
 ## Structure
 
 | Property | Value |

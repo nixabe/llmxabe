@@ -10,8 +10,8 @@
 //! `[last_token, MASK × n]` then predicts every masked position at once:
 //! one drafter NFE per accept/verify round, regardless of `n`.
 //!
-//! This module owns the *shape* of that drafter — configuration transcribed
-//! from the checkpoint and the tensor directory it must contain — the same
+//! This module owns the *shape* of that drafter — configuration read
+//! from GGUF metadata and the tensor directory it must contain — the same
 //! split [`crate::vision`] uses for the mmproj tower. The execution lives
 //! in `xabe-engine`.
 //!
@@ -91,6 +91,103 @@ impl DFlashConfig {
             block_size: 16,
             mask_token_id: 248_077,
         }
+    }
+
+    /// Read the supported Qwen-style drafter and validate its target bindings.
+    /// Metadata follows llama.cpp src/models/dflash.cpp::load_arch_hparams.
+    pub fn from_gguf(
+        file: &GgufFile,
+        target: &crate::ModelConfig,
+    ) -> Result<Self, crate::ConfigLoadError> {
+        use crate::metadata::Metadata;
+        let m = Metadata(file);
+        m.text("general.architecture", DFLASH_ARCHITECTURE)?;
+        // The execution path shares the target's embeddings and output head.
+        for name in ["token_embd.weight", "output.weight", "markov_w1.weight"] {
+            if file.tensor(name).is_some() {
+                return Err(Metadata::error(
+                    name,
+                    "independent embeddings/heads and DSpark are unsupported",
+                ));
+            }
+        }
+        if file.get("dflash.hyper_connection.count").is_some()
+            && m.uint("dflash.hyper_connection.count")? != 0
+        {
+            return Err(Metadata::error(
+                "dflash.hyper_connection.count",
+                "only the Qwen-style dense backbone is supported",
+            ));
+        }
+        let num_layers = m.positive("dflash.block_count")?;
+        let sliding_window = m.uint("dflash.attention.sliding_window")?;
+        let swa_pattern = file
+            .get_bool_array("dflash.attention.sliding_window_pattern")
+            .ok_or_else(|| {
+                Metadata::error(
+                    "dflash.attention.sliding_window_pattern",
+                    "required bool array missing or malformed",
+                )
+            })?
+            .to_vec();
+        let taps = file.get_i32_array("dflash.target_layers").ok_or_else(|| {
+            Metadata::error(
+                "dflash.target_layers",
+                "required i32 array missing or malformed",
+            )
+        })?;
+        let mut target_layers = Vec::with_capacity(taps.len());
+        for &tap in taps {
+            if tap <= 0 || tap as u32 >= target.num_layers || target_layers.contains(&(tap as u32))
+            {
+                return Err(Metadata::error(
+                    "dflash.target_layers",
+                    "taps must be unique and inside 1..target.num_layers",
+                ));
+            }
+            target_layers.push(tap as u32);
+        }
+        let c = Self {
+            num_layers,
+            hidden_size: m.positive("dflash.embedding_length")?,
+            num_q_heads: m.positive("dflash.attention.head_count")?,
+            num_kv_heads: m.positive("dflash.attention.head_count_kv")?,
+            head_dim: m.positive("dflash.attention.key_length")?,
+            ffn_size: m.positive("dflash.feed_forward_length")?,
+            rms_eps: m.float("dflash.attention.layer_norm_rms_epsilon")?,
+            rope_theta: m.float("dflash.rope.freq_base")?,
+            sliding_window,
+            swa_pattern,
+            target_layers,
+            block_size: m.positive("dflash.block_size")?,
+            mask_token_id: m.uint("tokenizer.ggml.mask_token_id")?,
+        };
+        if c.hidden_size != target.hidden_size || c.mask_token_id >= target.vocab_size {
+            return Err(Metadata::error(
+                "dflash.embedding_length/tokenizer.ggml.mask_token_id",
+                "drafter must match target width and vocabulary bounds",
+            ));
+        }
+        if c.block_size < 2
+            || c.target_layers.is_empty()
+            || c.swa_pattern.len() != c.num_layers as usize
+            || (c.sliding_window == 0 && c.swa_pattern.iter().any(|v| *v))
+        {
+            return Err(Metadata::error(
+                "dflash",
+                "invalid block size, target taps, or sliding-window pattern",
+            ));
+        }
+        if !c.num_q_heads.is_multiple_of(c.num_kv_heads)
+            || c.head_dim != m.positive("dflash.attention.value_length")?
+            || !c.head_dim.is_multiple_of(2)
+        {
+            return Err(Metadata::error(
+                "dflash.attention",
+                "requires integral GQA and equal, even key/value head dimensions",
+            ));
+        }
+        Ok(c)
     }
 
     /// Width of one query projection output: `num_q_heads * head_dim`.

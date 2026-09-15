@@ -17,6 +17,7 @@ pub enum TokenizerError {
     Gguf(xabe_gguf::GgufError),
     Missing(&'static str),
     InvalidMerge(String),
+    InvalidMetadata(String),
     Build(tokenizers::Error),
 }
 
@@ -25,6 +26,7 @@ impl core::fmt::Display for TokenizerError {
         match self {
             Self::Gguf(error) => write!(f, "could not read GGUF tokenizer: {error}"),
             Self::Missing(key) => write!(f, "GGUF tokenizer metadata `{key}` is missing"),
+            Self::InvalidMetadata(reason) => write!(f, "invalid GGUF tokenizer metadata: {reason}"),
             Self::InvalidMerge(merge) => write!(f, "invalid tokenizer merge `{merge}`"),
             Self::Build(error) => write!(f, "could not construct tokenizer: {error}"),
         }
@@ -44,9 +46,23 @@ impl From<xabe_gguf::GgufError> for TokenizerError {
 pub const DEFAULT_MODEL_PATH: &str =
     "/home/nixabe/llmxabe/models/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf";
 
-/// The id at and above which this vocabulary's entries are special tokens
-/// carried verbatim rather than byte-level encoded.
-const FIRST_SPECIAL: usize = 248_000;
+/// GGUF token types, not vocabulary positions, determine verbatim tokens.
+fn special_flags(types: &[i32], count: usize) -> Result<Vec<bool>, TokenizerError> {
+    if types.len() != count || types.iter().any(|t| !(1..=6).contains(t)) {
+        return Err(TokenizerError::InvalidMetadata(
+            "token_type must contain one valid GGUF type per token".into(),
+        ));
+    }
+    // UNKNOWN, CONTROL, USER_DEFINED, UNUSED; NORMAL and BYTE use byte BPE.
+    Ok(types.iter().map(|t| (2..=5).contains(t)).collect())
+}
+
+fn special_tokens(gguf: &GgufFile, count: usize) -> Result<Vec<bool>, TokenizerError> {
+    let types = gguf
+        .get_i32_array("tokenizer.ggml.token_type")
+        .ok_or(TokenizerError::Missing("tokenizer.ggml.token_type"))?;
+    special_flags(types, count)
+}
 
 /// The GPT-2 byte-level alphabet, as a char-to-byte map.
 ///
@@ -87,11 +103,12 @@ pub fn pieces_from_gguf(path: &Path) -> Result<(Vec<Vec<u8>>, Vec<u32>), Tokeniz
     let tokens = gguf
         .get_string_array("tokenizer.ggml.tokens")
         .ok_or(TokenizerError::Missing("tokenizer.ggml.tokens"))?;
+    let special = special_tokens(&gguf, tokens.len())?;
     let map = byte_of_char();
     let mut pieces = Vec::with_capacity(tokens.len());
     let mut eog = Vec::new();
     for (id, token) in tokens.iter().enumerate() {
-        if id >= FIRST_SPECIAL {
+        if special[id] {
             // `<|im_end|>` ends a turn; `<tool_call>` and `</tool_call>` are
             // markup the grammar itself writes, and reach it as their own
             // bytes like any other piece.
@@ -128,6 +145,14 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
     let tokens = gguf
         .get_string_array("tokenizer.ggml.tokens")
         .ok_or(TokenizerError::Missing("tokenizer.ggml.tokens"))?;
+    let special = special_tokens(&gguf, tokens.len())?;
+    if gguf.get_str("tokenizer.ggml.model") != Some("gpt2")
+        || gguf.get_str("tokenizer.ggml.pre") != Some("qwen35")
+    {
+        return Err(TokenizerError::InvalidMetadata(
+            "only gpt2/qwen35 pre-tokenization is implemented".into(),
+        ));
+    }
     let merge_strings = gguf
         .get_string_array("tokenizer.ggml.merges")
         .ok_or(TokenizerError::Missing("tokenizer.ggml.merges"))?;
@@ -168,7 +193,7 @@ pub fn from_gguf(path: &Path) -> Result<Tokenizer, TokenizerError> {
     let special_tokens = tokens
         .iter()
         .enumerate()
-        .filter(|(id, _)| *id >= FIRST_SPECIAL)
+        .filter(|(id, _)| special[*id])
         .map(|(_, token)| AddedToken::from(token.clone(), true))
         .collect::<Vec<_>>();
     tokenizer.add_special_tokens(&special_tokens);
@@ -180,6 +205,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tracing::info;
+
+    #[test]
+    fn special_tokens_follow_types_even_below_the_old_cutoff() {
+        assert_eq!(
+            special_flags(&[3, 1, 4, 6, 5, 2], 6).unwrap(),
+            vec![true, false, true, false, true, true]
+        );
+        assert!(special_flags(&[3], 2).is_err());
+        assert!(special_flags(&[0], 1).is_err());
+    }
 
     /// The grammar, against the real vocabulary, on the call that failed.
     ///
